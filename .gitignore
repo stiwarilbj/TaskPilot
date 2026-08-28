@@ -1,0 +1,13 @@
+# Swift Package Manager and Xcode build products
+.build/
+DerivedData/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+
+# macOS metadata
+.DS_Store
+
+# Local snapshot kept as a pre-fix backup
+TaskPilot.app.before-taskpilot-fix/

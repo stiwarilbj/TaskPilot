@@ -1,0 +1,2 @@
+# TaskPilot's shipped runtime uses only Python's standard library. PyInstaller is
+# a build-time dependency installed by Scripts/build-openclaw-runtime.sh.

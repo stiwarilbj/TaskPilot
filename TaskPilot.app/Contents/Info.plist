@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>OrbitAgent</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.orbitagent.controller</string>
+  <key>CFBundleName</key>
+  <string>TaskPilot</string>
+  <key>CFBundleDisplayName</key>
+  <string>TaskPilot</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>2.9.0</string>
+  <key>CFBundleVersion</key>
+  <string>290</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>14.0</string>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
+  <key>OrbitLocalSigningMarker</key>
+  <string>6C2A812B-5978-4E6A-9CA1-7DB0D7D6E947</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>TaskPilot captures application, window, and display pixels on its assigned screen so it can understand and complete your task.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>TaskPilot accesses Desktop files only when your task asks it to read, write, organize, or open them.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>TaskPilot accesses Documents only when your task asks it to read, write, organize, or open them.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>TaskPilot accesses Downloads only when your task asks it to read, write, organize, or open them.</string>
+  <key>NSNetworkVolumesUsageDescription</key>
+  <string>TaskPilot accesses a network volume only when your task explicitly requires a file there.</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>TaskPilot accesses a removable volume only when your task explicitly requires a file there.</string>
+</dict>
+</plist>
