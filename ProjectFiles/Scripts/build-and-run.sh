@@ -98,7 +98,15 @@ PLIST
 
 USED_STABLE_ADHOC=0
 if [[ -n "${CODE_SIGN_IDENTITY:-}" ]]; then
-  codesign --force --deep --sign "$CODE_SIGN_IDENTITY" "$APP_BUNDLE" >/dev/null
+  SIGNING_ARGS=(--force --deep)
+  if [[ "${ORBIT_HARDENED_RUNTIME:-0}" == "1" ]]; then
+    SIGNING_ARGS+=(--options runtime --timestamp)
+  fi
+  if [[ -n "${CODE_SIGN_KEYCHAIN:-}" ]]; then
+    SIGNING_ARGS+=(--keychain "$CODE_SIGN_KEYCHAIN")
+  fi
+  SIGNING_ARGS+=(--sign "$CODE_SIGN_IDENTITY" "$APP_BUNDLE")
+  codesign "${SIGNING_ARGS[@]}" >/dev/null
 elif [[ "${ORBIT_LOCAL_CERT_SIGN:-0}" == "1" ]]; then
   SIGNING_CONFIGURATION="$("$PROJECT_FILES_DIR/Scripts/setup-local-signing.sh")"
   SIGNING_IDENTITY="${SIGNING_CONFIGURATION%%$'\n'*}"

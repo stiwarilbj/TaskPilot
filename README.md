@@ -49,3 +49,33 @@ Open Settings, add a Gemini key, install OpenClaw, connect an agent screen, and 
 *The key is hidden here. Settings also shows the screen, OpenClaw, notifications, and permission status.*
 
 You need macOS 14 or newer, Xcode Command Line Tools, and Python 3.11.
+
+## Gatekeeper and packaging
+
+The bundled app in a source ZIP is signed ad hoc for local development. That
+signature is valid on disk, but it is not a publisher identity that macOS can
+trust after a browser download, so Gatekeeper may show “TaskPilot Not Opened.”
+This is separate from the Accessibility and Screen Recording permissions that
+TaskPilot requests after it launches.
+
+For a source copy that you trust on your own Mac, use macOS’s explicit
+one-time approval: Control-click `TaskPilot.app`, choose **Open**, then choose
+**Open** in the confirmation dialog. This does not grant Accessibility or
+Screen Recording access; those permissions must still be enabled in System
+Settings.
+
+For a package that opens normally after download, run
+`ProjectFiles/Scripts/package-release.sh` on a Mac with a **Developer ID
+Application** certificate and an `xcrun notarytool` keychain profile:
+
+```sh
+CODE_SIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' \
+NOTARYTOOL_PROFILE='your-notary-profile' \
+ProjectFiles/Scripts/package-release.sh
+```
+
+The script builds the app, enables the hardened runtime, signs nested code,
+submits the ZIP for notarization, staples the ticket, validates Gatekeeper,
+and writes the final ZIP to `dist/`. It intentionally refuses ad-hoc or
+self-signed certificates. Do not remove quarantine metadata or disable
+Gatekeeper as a substitute for signing and notarization.
