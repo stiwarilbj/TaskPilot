@@ -233,7 +233,7 @@ final class TaskPilotCoordinator: ObservableObject {
 
     var hasGeminiModelCheckFailure: Bool {
         // One responsive model is enough because TaskPilot's runtime skips any
-        // failed entry and rotates to the next model in the five-model list.
+        // failed entry and rotates through the configured model list.
         if hasWorkingGeminiModel { return false }
         let hasFailedModel = geminiModelChecks.contains {
             if case .failed = $0.state { return true }
@@ -485,7 +485,7 @@ final class TaskPilotCoordinator: ObservableObject {
 
         isCheckingGeminiModels = true
         geminiAPIKeyVerified = false
-        geminiAPIKeyStatus = "Sending five simple requests — one to each Gemini model…"
+        geminiAPIKeyStatus = "Sending nine simple requests — one to each Gemini model…"
         geminiModelChecks = OpenClawService.allGeminiModels.map {
             GeminiModelCheck(model: $0, state: .checking)
         }
@@ -505,7 +505,7 @@ final class TaskPilotCoordinator: ObservableObject {
                     hasSavedGeminiAPIKey = true
                     geminiAPIKeyVerified = true
                     geminiAPIKeyStatus = workingCount == results.count
-                        ? "All five Gemini models responded, so Check saved the API key in \(TaskPilotIdentity.displayName)."
+                        ? "All nine Gemini models responded, so Check saved the API key in \(TaskPilotIdentity.displayName)."
                         : "\(workingCount) of \(results.count) Gemini models responded, so Check saved the key. \(TaskPilotIdentity.displayName) will skip unavailable models automatically."
                 } catch {
                     geminiAPIKeyVerified = false
@@ -514,8 +514,8 @@ final class TaskPilotCoordinator: ObservableObject {
             } else {
                 geminiAPIKeyVerified = false
                 geminiAPIKeyStatus = wasAlreadySaved
-                    ? "None of the five models responded. The previously saved copy remains unchanged; review the results below."
-                    : "None of the five models responded, so Check did not save this key. Review the results below or use Save to keep it without verification."
+                    ? "None of the nine models responded. The previously saved copy remains unchanged; review the results below."
+                    : "None of the nine models responded, so Check did not save this key. Review the results below or use Save to keep it without verification."
             }
             pinStatus(geminiAPIKeyStatus, for: 30)
         }
@@ -546,7 +546,7 @@ final class TaskPilotCoordinator: ObservableObject {
                 // The guided installer and normal Run path must use the same
                 // app-owned credential. Saving it here also means the
                 // key remains available when installation finishes or the app
-                // is reopened; Check can validate all five models afterward.
+                // is reopened; Check can validate all nine models afterward.
                 try geminiAPIKeyStore.save(key)
                 savedGeminiAPIKey = key
                 hasSavedGeminiAPIKey = true

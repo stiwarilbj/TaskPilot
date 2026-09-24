@@ -53,6 +53,37 @@ chmod +x \
   "$APP_RESOURCES/OpenClaw/openclaw-setup.command" \
   "$APP_RESOURCES/OpenClaw/taskpilot-openclaw-bootstrap.sh"
 
+# GitHub's generated source ZIPs do not preserve symbolic links when Finder
+# unpacks them. PyInstaller's embedded Python framework normally contains a
+# few links, so materialize those links before signing the app bundle.
+materialize_runtime_symlinks() {
+  local link target
+
+  while IFS= read -r -d '' link; do
+    [[ -L "$link" ]] || continue
+
+    if ! target="$(/bin/realpath "$link")"; then
+      echo "Unable to resolve bundled runtime symlink: $link" >&2
+      exit 1
+    fi
+    if [[ ! -e "$target" && ! -d "$target" ]]; then
+      echo "Bundled runtime symlink target is missing: $link -> $target" >&2
+      exit 1
+    fi
+
+    unlink "$link"
+    /usr/bin/ditto "$target" "$link"
+  done < <(find "$RUNTIME_DESTINATION" -type l -print0)
+}
+
+materialize_runtime_symlinks
+
+REMAINING_RUNTIME_SYMLINK="$(find "$RUNTIME_DESTINATION" -type l -print -quit)"
+if [[ -n "$REMAINING_RUNTIME_SYMLINK" ]]; then
+  echo "The bundled runtime still contains a symbolic link: $REMAINING_RUNTIME_SYMLINK" >&2
+  exit 1
+fi
+
 cat >"$INFO_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -69,9 +100,9 @@ cat >"$INFO_PLIST" <<PLIST
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>2.9.0</string>
+  <string>2.9.2</string>
   <key>CFBundleVersion</key>
-  <string>290</string>
+  <string>292</string>
   <key>LSMinimumSystemVersion</key>
   <string>$MIN_SYSTEM_VERSION</string>
   <key>NSPrincipalClass</key>

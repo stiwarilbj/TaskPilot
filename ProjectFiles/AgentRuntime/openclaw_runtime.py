@@ -34,14 +34,21 @@ PROMPT_TIMEOUT_SECONDS = 75
 ACTION_SETTLE_SECONDS = 0.22
 PRODUCT_NAME = "TaskPilot"
 LEGACY_APPLICATION_SUPPORT_FOLDER = "Orbit Agent"
-ALL_MODELS = (
-    "google/gemini-3.5-flash",
-    "google/gemini-3-flash-preview",
+PRIMARY_MODELS = (
+    "google/gemini-3.5-flash-lite",
     "google/gemini-3.1-flash-lite",
-    "google/gemini-2.5-flash",
     "google/gemini-2.5-flash-lite",
 )
-MODEL_ROUTER_STATE_VERSION = 2
+FALLBACK_MODELS = (
+    "google/gemini-3.8-flash",
+    "google/gemini-3.7-flash",
+    "google/gemini-3.6-flash",
+    "google/gemini-3.5-flash",
+    "google/gemini-3-flash-preview",
+    "google/gemini-2.5-flash",
+)
+ALL_MODELS = PRIMARY_MODELS + FALLBACK_MODELS
+MODEL_ROUTER_STATE_VERSION = 4
 MAX_COMPACT_ELEMENTS = 360
 MAX_RECENT_ACTIONS = 8
 VALID_ACTIONS = {
@@ -89,7 +96,7 @@ def default_model_router_state_path() -> Path:
 
 
 class RoundRobinModelRouter:
-    """Persistently rotates every request across all five Gemini models."""
+    """Rotate request starts among Flash-Lite models; retry all nine twice."""
 
     def __init__(self, state_path: Path | None = None) -> None:
         self.state_path = state_path or default_model_router_state_path()
@@ -99,7 +106,7 @@ class RoundRobinModelRouter:
     def _default_state() -> dict[str, Any]:
         return {
             "version": MODEL_ROUTER_STATE_VERSION,
-            "next_model": 0,
+            "next_primary": 0,
         }
 
     def _load_state(self) -> dict[str, Any]:
@@ -109,8 +116,8 @@ class RoundRobinModelRouter:
             return self._default_state()
         if not isinstance(value, dict) or value.get("version") != MODEL_ROUTER_STATE_VERSION:
             return self._default_state()
-        next_model = value.get("next_model")
-        if not isinstance(next_model, int) or not 0 <= next_model < len(ALL_MODELS):
+        next_primary = value.get("next_primary")
+        if not isinstance(next_primary, int) or not 0 <= next_primary < len(PRIMARY_MODELS):
             return self._default_state()
         return value
 
@@ -126,46 +133,46 @@ class RoundRobinModelRouter:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def _take_next_model(self) -> str:
-        index = int(self.state["next_model"])
-        model = ALL_MODELS[index]
+    def _take_next_primary(self) -> int:
+        index = int(self.state["next_primary"])
         # Advance before starting the provider request. A cancelled task or app
         # restart therefore cannot pin TaskPilot to the same model indefinitely.
-        self.state["next_model"] = (index + 1) % len(ALL_MODELS)
+        self.state["next_primary"] = (index + 1) % len(PRIMARY_MODELS)
         self._save_state()
-        return model
+        return index
 
     def execute(self, operation: Any) -> Any:
         last_model_error: BaseException | None = None
-        for _ in ALL_MODELS:
-            model = self._take_next_model()
-            position = ALL_MODELS.index(model) + 1
-            emit(
-                "status",
-                message=f"OpenClaw is using {model.split('/', 1)[-1]} ({position} of 5)…",
-            )
-            try:
-                return operation(model)
-            except Exception as error:
-                if is_nonretryable_provider_failure(error):
-                    raise
-                last_model_error = error
+        start = self._take_next_primary()
+        primary_order = PRIMARY_MODELS[start:] + PRIMARY_MODELS[:start]
+        attempt_order = primary_order + FALLBACK_MODELS
+        for pass_number in (1, 2):
+            for position, model in enumerate(attempt_order, start=1):
                 emit(
                     "status",
-                    message=f"{model.split('/', 1)[-1]} failed; moving to the next model…",
+                    message=(f"OpenClaw is using {model.split('/', 1)[-1]} "
+                             f"({position} of {len(ALL_MODELS)}, pass {pass_number} of 2)…"),
                 )
+                try:
+                    return operation(model)
+                except Exception as error:
+                    if is_nonretryable_provider_failure(error):
+                        raise
+                    last_model_error = error
+                    emit(
+                        "status",
+                        message=f"{model.split('/', 1)[-1]} failed; moving to the next model…",
+                    )
         raise RuntimeError(
-            "All five Gemini models failed this request. Check the saved key or try again after their limits reset."
+            "All nine Gemini models failed twice for this request (18 attempts). "
+            "Check model access and quota, then try again."
         ) from last_model_error
 
 
 def is_nonretryable_provider_failure(error: BaseException | str) -> bool:
-    """Return true only when changing models cannot repair the request."""
+    """Return true only when the ACP/controller cannot make another attempt."""
     message = str(error).lower()
     markers = (
-        "api key not valid", "invalid api key", "invalid credential",
-        "rejected the saved api key", "did not authorize the saved api key",
-        "permission denied", "forbidden", "unauthorized", "not configured",
         "lost contact with the native orbit controller", "openclaw acp stopped",
         "openclaw acp exited", "openclaw cancelled the orbit turn",
     )
@@ -402,11 +409,6 @@ def user_facing_openclaw_error(detail: str) -> str:
         return (
             "Gemini rejected the saved API key. Open Settings → Gemini API key, enter the current key, "
             "click Check, then click Reconfigure Gemini."
-        )
-    if "permission denied" in lowered or "forbidden" in lowered or "unauthorized" in lowered:
-        return (
-            "Gemini did not authorize the saved API key. Open Settings → Gemini API key, click Check, "
-            "then click Reconfigure Gemini."
         )
     return cleaned[:400]
 

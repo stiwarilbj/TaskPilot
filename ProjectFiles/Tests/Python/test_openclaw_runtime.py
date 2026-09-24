@@ -445,14 +445,14 @@ class OpenClawRuntimeTests(unittest.TestCase):
     def test_taskpilot_screen_captures_use_png(self):
         self.assertEqual(runtime.image_mime_type(Path("screen-123.png")), "image/png")
 
-    def test_round_robin_cycles_all_five_models_across_restarts(self):
+    def test_new_requests_rotate_only_the_three_primary_models_across_restarts(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "router.json"
             selected = []
-            for _ in range(6):
+            for _ in range(4):
                 router = runtime.RoundRobinModelRouter(state_path)
                 selected.append(router.execute(lambda model: model))
-            self.assertEqual(selected, [*runtime.ALL_MODELS, runtime.ALL_MODELS[0]])
+            self.assertEqual(selected, [*runtime.PRIMARY_MODELS, runtime.PRIMARY_MODELS[0]])
 
     def test_failed_model_moves_immediately_to_the_next_model(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -469,9 +469,9 @@ class OpenClawRuntimeTests(unittest.TestCase):
             self.assertEqual(router.execute(fail_first), runtime.ALL_MODELS[1])
             self.assertEqual(attempted, list(runtime.ALL_MODELS[:2]))
             restarted = runtime.RoundRobinModelRouter(state_path)
-            self.assertEqual(restarted.execute(lambda model: model), runtime.ALL_MODELS[2])
+            self.assertEqual(restarted.execute(lambda model: model), runtime.PRIMARY_MODELS[1])
 
-    def test_old_phase_state_migrates_to_the_new_five_model_cycle(self):
+    def test_old_phase_state_migrates_to_the_primary_model_cycle(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "router.json"
             state_path.write_text(
@@ -481,15 +481,66 @@ class OpenClawRuntimeTests(unittest.TestCase):
             router = runtime.RoundRobinModelRouter(state_path)
             self.assertEqual(router.execute(lambda model: model), runtime.ALL_MODELS[0])
 
-    def test_invalid_credential_fails_without_wasting_requests_on_other_models(self):
+    def test_backups_follow_all_three_primaries_and_second_pass_retries_every_model(self):
         with tempfile.TemporaryDirectory() as directory:
             router = runtime.RoundRobinModelRouter(Path(directory) / "router.json")
             attempts = []
-            with self.assertRaisesRegex(RuntimeError, "invalid credential"):
+
+            def always_fail(model):
+                attempts.append(model)
+                raise runtime.ModelCapacityError("quota exhausted")
+
+            with self.assertRaisesRegex(RuntimeError, "All nine Gemini models failed twice"):
+                router.execute(always_fail)
+            self.assertEqual(attempts, list(runtime.ALL_MODELS) * 2)
+            self.assertEqual(len(attempts), 18)
+
+    def test_second_pass_can_recover_after_every_model_fails_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = runtime.RoundRobinModelRouter(Path(directory) / "router.json")
+            attempts = []
+
+            def recover_on_second_pass(model):
+                attempts.append(model)
+                if len(attempts) <= len(runtime.ALL_MODELS):
+                    raise runtime.ModelCapacityError("temporarily unavailable")
+                return model
+
+            self.assertEqual(router.execute(recover_on_second_pass), runtime.PRIMARY_MODELS[0])
+            self.assertEqual(attempts, [*runtime.ALL_MODELS, runtime.PRIMARY_MODELS[0]])
+
+    def test_failed_request_advances_next_request_to_next_primary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "router.json"
+            router = runtime.RoundRobinModelRouter(state_path)
+            with self.assertRaisesRegex(RuntimeError, "All nine Gemini models failed twice"):
+                router.execute(lambda model: (_ for _ in ()).throw(RuntimeError("unavailable")))
+            restarted = runtime.RoundRobinModelRouter(state_path)
+            self.assertEqual(restarted.execute(lambda model: model), runtime.PRIMARY_MODELS[1])
+
+    def test_invalid_credential_still_attempts_each_model_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = runtime.RoundRobinModelRouter(Path(directory) / "router.json")
+            attempts = []
+            with self.assertRaisesRegex(RuntimeError, "All nine Gemini models failed twice"):
                 router.execute(lambda model: attempts.append(model) or (_ for _ in ()).throw(
                     RuntimeError("invalid credential")
                 ))
-            self.assertEqual(attempts, [runtime.ALL_MODELS[0]])
+            self.assertEqual(attempts, list(runtime.ALL_MODELS) * 2)
+
+    def test_model_specific_permission_denial_moves_to_next_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = runtime.RoundRobinModelRouter(Path(directory) / "router.json")
+            attempts = []
+
+            def operation(model):
+                attempts.append(model)
+                if len(attempts) == 1:
+                    raise RuntimeError("Permission denied for this model")
+                return model
+
+            self.assertEqual(router.execute(operation), runtime.PRIMARY_MODELS[1])
+            self.assertEqual(attempts, list(runtime.PRIMARY_MODELS[:2]))
 
     def test_noncredential_model_error_rotates_to_next_model(self):
         with tempfile.TemporaryDirectory() as directory:

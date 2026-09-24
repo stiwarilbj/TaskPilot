@@ -25,17 +25,23 @@ final class OpenClawService {
     static let dashboardArguments = ["dashboard", "--yes"]
     static let installedWithoutKeyExitStatus: Int32 = 10
     static let installURL = URL(string: "https://docs.openclaw.ai/install")!
-    static let allGeminiModels = [
-        "google/gemini-3.5-flash",
-        "google/gemini-3-flash-preview",
+    static let primaryGeminiModels = [
+        "google/gemini-3.5-flash-lite",
         "google/gemini-3.1-flash-lite",
-        "google/gemini-2.5-flash",
         "google/gemini-2.5-flash-lite"
     ]
+    static let fallbackGeminiModels = [
+        "google/gemini-3.8-flash",
+        "google/gemini-3.7-flash",
+        "google/gemini-3.6-flash",
+        "google/gemini-3.5-flash",
+        "google/gemini-3-flash-preview",
+        "google/gemini-2.5-flash"
+    ]
+    static let allGeminiModels = primaryGeminiModels + fallbackGeminiModels
     // OpenClaw's base configuration still needs one default plus fallbacks;
-    // TaskPilot's runtime independently round-robins the complete list above.
-    static let primaryGeminiModel = allGeminiModels[0]
-    static let fallbackGeminiModels = Array(allGeminiModels.dropFirst())
+    // TaskPilot's runtime rotates request starts among the three Flash-Lite models.
+    static let primaryGeminiModel = primaryGeminiModels[0]
 
     private let setupIOQueue = DispatchQueue(label: "com.orbitagent.openclaw-setup-io")
     private var automatedSetupProcess: Process?
@@ -229,8 +235,10 @@ final class OpenClawService {
             arguments: primaryModelArguments,
             timeout: 8
         )
+        // Setup may promote any responding candidate when the preferred model
+        // is overloaded or unavailable for this API key.
         let usesRequestedPrimary = primaryModelResult.status == 0 &&
-            primaryModelResult.output.contains(primaryGeminiModel)
+            allGeminiModels.contains { primaryModelResult.output.contains($0) }
         if setupResult.status == 0 && modelResult.status == 0 && usesRequestedPrimary {
             return OpenClawProbe(
                 executableURL: executable,

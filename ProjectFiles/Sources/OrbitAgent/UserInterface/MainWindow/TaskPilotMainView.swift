@@ -675,7 +675,7 @@ private struct TaskPilotSetupView: View {
                     setupRow(
                         icon: "key.fill",
                         title: "Gemini API key",
-                        detail: "Paste the key once. Save keeps it immediately in \(TaskPilotIdentity.displayName)’s private Application Support data without testing it. Check tests all five models and saves the key only if at least one works. Saved keys return whenever the app opens, with no Keychain lookup.",
+                        detail: "Paste the key once. Save keeps it immediately in \(TaskPilotIdentity.displayName)’s private Application Support data without testing it. Check tests all nine models and saves the key only if at least one works. Saved keys return whenever the app opens, with no Keychain lookup.",
                         complete: model.hasWorkingGeminiModel,
                         iconTint: model.hasWorkingGeminiModel
                             ? Color.green
@@ -849,7 +849,7 @@ private struct TaskPilotSetupView: View {
                         detail: model.hasGeminiModelCheckFailure
                             ? "No Gemini model responded. Reconfigure Gemini before running \(TaskPilotIdentity.displayName) through OpenClaw."
                             : (model.openClawConfigured
-                                ? "Ready. \(TaskPilotIdentity.displayName) cycles through all five Gemini models in order for every request and immediately moves to the next model when one fails."
+                                ? "Ready. \(TaskPilotIdentity.displayName) rotates the three Flash-Lite models for new requests. If they fail, it tries six backup models, then repeats the full list once before ending the request."
                                 : model.openClawDetail),
                         complete: model.openClawConfigured && !model.hasGeminiModelCheckFailure
                     ) {
@@ -1251,12 +1251,19 @@ private struct AutomatedOpenClawSetupView: View {
 
     private var modelOrder: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Five-model Gemini rotation")
+            Text("Gemini model rotation")
                 .font(.headline)
-            ForEach(Array(OpenClawService.allGeminiModels.enumerated()), id: \.offset) { index, modelName in
-                modelLine(modelName, label: "Cycle \(index + 1)")
+            Text("Primary Flash-Lite models")
+                .font(.subheadline.weight(.semibold))
+            ForEach(Array(OpenClawService.primaryGeminiModels.enumerated()), id: \.offset) { index, modelName in
+                modelLine(modelName, label: "Primary \(index + 1)")
             }
-            Text("\(TaskPilotIdentity.displayName) uses these five models in order, advances after every request, and returns to Cycle 1 after Cycle 5. If one model fails, it immediately tries the next model.")
+            Text("Backup models")
+                .font(.subheadline.weight(.semibold))
+            ForEach(Array(OpenClawService.fallbackGeminiModels.enumerated()), id: \.offset) { index, modelName in
+                modelLine(modelName, label: "Backup \(index + 1)")
+            }
+            Text("Each new request starts with the next Flash-Lite model. If a model fails, TaskPilot tries the other two Flash-Lite models, then all six backups. It repeats that full sequence once and ends the request only if every model fails both times. Setup selects a responding model as OpenClaw’s default.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

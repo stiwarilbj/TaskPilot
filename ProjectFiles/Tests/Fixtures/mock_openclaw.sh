@@ -8,6 +8,10 @@ if [[ "${1:-}" == "models" && "${2:-}" == "auth" ]]; then
   printf 'credential-bytes=%s\n' "${#mock_key}" >>"$ORBIT_MOCK_OPENCLAW_LOG"
 fi
 if [[ "${1:-}" == "agent" ]]; then
+  if [[ -n "${ORBIT_MOCK_FAIL_MODEL:-}" && " $* " == *" --model $ORBIT_MOCK_FAIL_MODEL "* ]]; then
+    echo "FailoverError: The AI service is temporarily overloaded." >&2
+    exit 1
+  fi
   printf '{"reply":"ORBIT_OPENCLAW_READY"}\n'
 else
   printf '{}\n'

@@ -160,19 +160,30 @@ final class TaskPilotTests: XCTestCase {
     }
 
     func testAutomatedOpenClawSetupUsesTheRequestedGeminiOrder() {
-        XCTAssertEqual(OpenClawService.primaryGeminiModel, "google/gemini-3.5-flash")
-        XCTAssertEqual(OpenClawService.fallbackGeminiModels, [
-            "google/gemini-3-flash-preview",
+        XCTAssertEqual(OpenClawService.primaryGeminiModel, "google/gemini-3.5-flash-lite")
+        XCTAssertEqual(OpenClawService.primaryGeminiModels, [
+            "google/gemini-3.5-flash-lite",
             "google/gemini-3.1-flash-lite",
-            "google/gemini-2.5-flash",
             "google/gemini-2.5-flash-lite"
         ])
-        XCTAssertEqual(OpenClawService.allGeminiModels, [
+        XCTAssertEqual(OpenClawService.fallbackGeminiModels, [
+            "google/gemini-3.8-flash",
+            "google/gemini-3.7-flash",
+            "google/gemini-3.6-flash",
             "google/gemini-3.5-flash",
             "google/gemini-3-flash-preview",
+            "google/gemini-2.5-flash"
+        ])
+        XCTAssertEqual(OpenClawService.allGeminiModels, [
+            "google/gemini-3.5-flash-lite",
             "google/gemini-3.1-flash-lite",
-            "google/gemini-2.5-flash",
-            "google/gemini-2.5-flash-lite"
+            "google/gemini-2.5-flash-lite",
+            "google/gemini-3.8-flash",
+            "google/gemini-3.7-flash",
+            "google/gemini-3.6-flash",
+            "google/gemini-3.5-flash",
+            "google/gemini-3-flash-preview",
+            "google/gemini-2.5-flash"
         ])
     }
 
