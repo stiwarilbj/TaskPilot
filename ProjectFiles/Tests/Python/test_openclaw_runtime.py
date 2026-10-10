@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import queue
 import sys
 import tempfile
 from unittest import mock
@@ -490,10 +491,10 @@ class OpenClawRuntimeTests(unittest.TestCase):
                 attempts.append(model)
                 raise runtime.ModelCapacityError("quota exhausted")
 
-            with self.assertRaisesRegex(RuntimeError, "All 7 Gemini models failed twice"):
+            with self.assertRaisesRegex(RuntimeError, "All 7 Gemini models failed after two full cycles"):
                 router.execute(always_fail)
-            self.assertEqual(attempts, [model for model in runtime.PRIMARY_MODELS for _ in range(2)] + list(runtime.FALLBACK_MODELS) * 2)
-            self.assertEqual(len(attempts), 14)
+            self.assertEqual(attempts, ([model for model in runtime.PRIMARY_MODELS for _ in range(2)] + list(runtime.FALLBACK_MODELS)) * 2)
+            self.assertEqual(len(attempts), 18)
 
     def test_primary_retry_can_recover_before_any_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -530,7 +531,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "router.json"
             router = runtime.RoundRobinModelRouter(state_path)
-            with self.assertRaisesRegex(RuntimeError, "All 7 Gemini models failed twice"):
+            with self.assertRaisesRegex(RuntimeError, "All 7 Gemini models failed after two full cycles"):
                 router.execute(lambda model: (_ for _ in ()).throw(RuntimeError("unavailable")))
             restarted = runtime.RoundRobinModelRouter(state_path)
             self.assertEqual(restarted.execute(lambda model: model), runtime.PRIMARY_MODELS[1])
@@ -539,11 +540,11 @@ class OpenClawRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             router = runtime.RoundRobinModelRouter(Path(directory) / "router.json")
             attempts = []
-            with self.assertRaisesRegex(RuntimeError, "All 7 Gemini models failed twice"):
+            with self.assertRaisesRegex(RuntimeError, "All 7 Gemini models failed after two full cycles"):
                 router.execute(lambda model: attempts.append(model) or (_ for _ in ()).throw(
                     RuntimeError("invalid credential")
                 ))
-            self.assertEqual(attempts, [model for model in runtime.PRIMARY_MODELS for _ in range(2)] + list(runtime.FALLBACK_MODELS) * 2)
+            self.assertEqual(attempts, ([model for model in runtime.PRIMARY_MODELS for _ in range(2)] + list(runtime.FALLBACK_MODELS)) * 2)
 
     def test_model_specific_permission_denial_moves_to_next_model(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -736,13 +737,61 @@ raise SystemExit(0)
             self.assertEqual(result["status"], "done")
             self.assertEqual(client.models, [runtime.PRIMARY_MODELS[0]] * 2)
 
+    def test_last_fallback_can_succeed_on_the_second_full_cycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            router = runtime.RoundRobinModelRouter(Path(directory) / "router.json")
+            attempts = []
+
+            def recover_on_last_attempt(model):
+                attempts.append(model)
+                if len(attempts) < 18:
+                    raise runtime.ModelCapacityError("temporarily unavailable")
+                return model
+
+            self.assertEqual(router.execute(recover_on_last_attempt), runtime.FALLBACK_MODELS[-1])
+            for model in runtime.PRIMARY_MODELS:
+                self.assertEqual(attempts.count(model), 4)
+            for model in runtime.FALLBACK_MODELS:
+                self.assertEqual(attempts.count(model), 2)
+
+    def test_pending_model_prompt_waits_through_silence_and_chunks_until_completion(self):
+        client = runtime.ACPClient.__new__(runtime.ACPClient)
+        client.process = mock.Mock()
+        client.process.poll.return_value = None
+        client.messages = mock.Mock()
+        client.messages.empty.return_value = True
+        client.next_request_id = 1
+        client.session_id = "test-session"
+        client.agent_chunks = []
+        client.turn_errors = []
+        update = {
+            "method": "session/update",
+            "params": {"update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": '{"status":"done"}'},
+            }},
+        }
+        client.messages.get.side_effect = [
+            queue.Empty(), update, queue.Empty(),
+            {"id": 1, "result": {"stopReason": "end_turn"}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            screenshot = Path(directory) / "screen.png"
+            screenshot.write_bytes(b"image")
+            with mock.patch.object(runtime.time, "monotonic", side_effect=AssertionError("Unexpected deadline")):
+                self.assertEqual(client.prompt("Return JSON", screenshot), '{"status":"done"}')
+        self.assertEqual(client.messages.get.call_count, 4)
+        self.assertEqual(client.process.stdin.write.call_count, 1)
+
     def test_acp_client_completes_image_prompt_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
             fake_openclaw = Path(directory) / "openclaw"
             fake_openclaw.write_text(
                 f"""#!{sys.executable}
 import json
+import os
 import sys
+assert os.environ["OPENCLAW_GOOGLE_GEMINI_FIRST_RESPONSE_RETRY_MS"] == "0"
 for line in sys.stdin:
     message = json.loads(line)
     method = message.get('method')

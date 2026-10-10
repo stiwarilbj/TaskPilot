@@ -45,11 +45,16 @@ There is a slightly deeper, still readable map in [ProjectFiles/Documentation/Ar
 Open Settings, add a Gemini key, install OpenClaw, connect an agent screen, and allow the macOS permissions. The Settings page keeps the setup in one place.
 
 TaskPilot 2.9.2 rotates new requests between Gemini 3.5 Flash-Lite and 3.1
-Flash-Lite. It tries the starting Flash-Lite model twice consecutively, then the other
-Flash-Lite model twice consecutively, before using any fallback model.
-If both Flash-Lite models fail twice, it tries Gemini 2.5 Flash-Lite, 3.8 Flash,
-3.5 Flash, 3 Flash Preview, and 2.5 Flash in that order, then repeats that
-fallback sequence once. A request ends after each model has failed twice.
+Flash-Lite. Each cycle tries the starting Flash-Lite model twice consecutively,
+then the other Flash-Lite model twice, followed by Gemini 2.5 Flash-Lite,
+3.8 Flash, 3.5 Flash, 3 Flash Preview, and 2.5 Flash once each. If no attempt
+succeeds, the entire cycle runs a second time. Model exhaustion is reported
+only after all 18 attempts: four per primary Flash-Lite model and two per
+fallback model. Successful responses end the retry cycle immediately.
+
+Model prompts wait for a completed response or an explicit provider/transport
+error. TaskPilot does not abandon a pending prompt because of silence or its
+former 75-second deadline. User cancellation still stops the task.
 
 ![TaskPilot Settings](ProjectFiles/Documentation/Images/taskpilot-settings.jpg)
 

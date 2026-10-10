@@ -30,7 +30,7 @@ from typing import Any
 
 MAX_STEPS = 100
 MAX_IDENTICAL_ACTIONS = 3
-PROMPT_TIMEOUT_SECONDS = 75
+PROMPT_TIMEOUT_SECONDS = None  # Wait for completion or an explicit provider/transport error.
 ACTION_SETTLE_SECONDS = 0.22
 PRODUCT_NAME = "TaskPilot"
 LEGACY_APPLICATION_SUPPORT_FOLDER = "Orbit Agent"
@@ -94,7 +94,7 @@ def default_model_router_state_path() -> Path:
 
 
 class RoundRobinModelRouter:
-    """Try each Flash-Lite primary twice consecutively before fallback models."""
+    """Run two full cycles, trying each Flash-Lite primary twice per cycle."""
 
     def __init__(self, state_path: Path | None = None) -> None:
         self.state_path = state_path or default_model_router_state_path()
@@ -143,7 +143,8 @@ class RoundRobinModelRouter:
         last_model_error: BaseException | None = None
         start = self._take_next_primary()
         primary_order = PRIMARY_MODELS[start:] + PRIMARY_MODELS[:start]
-        attempt_order = tuple(model for model in primary_order for _ in range(2)) + FALLBACK_MODELS * 2
+        cycle_order = tuple(model for model in primary_order for _ in range(2)) + FALLBACK_MODELS
+        attempt_order = cycle_order * 2
         for position, model in enumerate(attempt_order, start=1):
             emit(
                 "status",
@@ -158,10 +159,11 @@ class RoundRobinModelRouter:
                 last_model_error = error
                 emit(
                     "status",
-                    message=f"{model.split('/', 1)[-1]} failed; moving to the next model…",
+                    message=f"{model.split('/', 1)[-1]} returned an error or invalid output; continuing the retry cycle…",
                 )
         raise RuntimeError(
-            f"All {len(ALL_MODELS)} Gemini models failed twice for this request ({2 * len(ALL_MODELS)} attempts). "
+            f"All {len(ALL_MODELS)} Gemini models failed after two full cycles "
+            f"({len(attempt_order)} attempts; each Flash-Lite primary tried four times). "
             "Check model access and quota, then try again."
         ) from last_model_error
 
@@ -1134,10 +1136,8 @@ class ACPClient:
         environment = dict(os.environ)
         environment["OPENCLAW_HIDE_BANNER"] = "1"
         environment["OPENCLAW_SUPPRESS_NOTES"] = "1"
-        # OpenClaw otherwise waits 45 seconds before retrying Gemini 3 with a
-        # low-latency thinking profile. TaskPilot turns are bounded and visible,
-        # so use the same retry after 12 seconds instead.
-        environment["OPENCLAW_GOOGLE_GEMINI_FIRST_RESPONSE_RETRY_MS"] = "12000"
+        # Disable silence-based retries: wait for the called model to finish.
+        environment["OPENCLAW_GOOGLE_GEMINI_FIRST_RESPONSE_RETRY_MS"] = "0"
         self.process = subprocess.Popen(
             [openclaw_path, "acp", "--no-prefix-cwd"],
             stdin=subprocess.PIPE,
@@ -1253,20 +1253,20 @@ class ACPClient:
                     "error": {"code": -32601, "message": f"{PRODUCT_NAME} does not expose that client method"},
                 })
 
-    def request(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+    def request(self, method: str, params: dict[str, Any], timeout: float | None) -> dict[str, Any]:
         request_id = self.next_request_id
         self.next_request_id += 1
         self._send({
             "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
         })
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while deadline is None or time.monotonic() < deadline:
             if self.process.poll() is not None and self.messages.empty():
                 detail = self.stderr_tail[-1] if self.stderr_tail else "OpenClaw ACP exited"
                 raise RuntimeError(detail)
             try:
                 message = self.messages.get(
-                    timeout=min(0.25, max(0.01, deadline - time.monotonic()))
+                    timeout=0.25 if deadline is None else min(0.25, max(0.01, deadline - time.monotonic()))
                 )
             except queue.Empty:
                 continue
@@ -1279,7 +1279,7 @@ class ACPClient:
             self._handle_server_message(message)
         raise RuntimeError(f"OpenClaw timed out while handling {method}")
 
-    def _run_prompt(self, prompt: list[dict[str, Any]], timeout: float) -> tuple[dict[str, Any], str]:
+    def _run_prompt(self, prompt: list[dict[str, Any]], timeout: float | None) -> tuple[dict[str, Any], str]:
         self.agent_chunks = []
         self.turn_errors = []
         result = self.request(
