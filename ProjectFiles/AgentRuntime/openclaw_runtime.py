@@ -25,6 +25,9 @@ import sys
 import threading
 import time
 import uuid
+import tempfile
+import struct
+import zlib
 from typing import Any
 
 
@@ -34,18 +37,11 @@ PROMPT_TIMEOUT_SECONDS = None  # Wait for completion or an explicit provider/tra
 ACTION_SETTLE_SECONDS = 0.22
 PRODUCT_NAME = "TaskPilot"
 LEGACY_APPLICATION_SUPPORT_FOLDER = "Orbit Agent"
-PRIMARY_MODELS = (
-    "google/gemini-3.5-flash-lite",
-    "google/gemini-3.1-flash-lite",
+from request_policy import (
+    ALL_MODELS, PRIMARY_MODELS, FALLBACK_MODELS, CONFIG_VERSION,
+    AdaptiveModelRouter, ModelAttemptError, RuntimeState, classify_failure,
 )
-FALLBACK_MODELS = (
-    "google/gemini-2.5-flash-lite",
-    "google/gemini-3.8-flash",
-    "google/gemini-3-flash-preview",
-    "google/gemini-2.5-flash",
-)
-ALL_MODELS = PRIMARY_MODELS + FALLBACK_MODELS
-MODEL_ROUTER_STATE_VERSION = 4
+
 MAX_COMPACT_ELEMENTS = 360
 MAX_RECENT_ACTIONS = 8
 VALID_ACTIONS = {
@@ -85,100 +81,140 @@ def is_model_capacity_failure(error: BaseException | str) -> bool:
     return isinstance(error, ModelCapacityError) or any(marker in message for marker in markers)
 
 
-def default_model_router_state_path() -> Path:
-    override = os.environ.get("ORBIT_MODEL_ROUTER_STATE")
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / "Library" / "Application Support" / LEGACY_APPLICATION_SUPPORT_FOLDER / "model-router-state.json"
-
-
-class RoundRobinModelRouter:
-    """Run two full cycles, trying each Flash-Lite primary twice per cycle."""
-
-    def __init__(self, state_path: Path | None = None) -> None:
-        self.state_path = state_path or default_model_router_state_path()
-        self.state = self._load_state()
-
-    @staticmethod
-    def _default_state() -> dict[str, Any]:
-        return {
-            "version": MODEL_ROUTER_STATE_VERSION,
-            "next_primary": 0,
-        }
-
-    def _load_state(self) -> dict[str, Any]:
-        try:
-            value = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return self._default_state()
-        if not isinstance(value, dict) or value.get("version") != MODEL_ROUTER_STATE_VERSION:
-            return self._default_state()
-        next_primary = value.get("next_primary")
-        if not isinstance(next_primary, int) or not 0 <= next_primary < len(PRIMARY_MODELS):
-            return self._default_state()
-        return value
-
-    def _save_state(self) -> None:
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.state_path.with_name(f".{self.state_path.name}.{os.getpid()}.tmp")
-        try:
-            temporary.write_text(
-                json.dumps(self.state, separators=(",", ":")),
-                encoding="utf-8",
-            )
-            os.replace(temporary, self.state_path)
-        finally:
-            temporary.unlink(missing_ok=True)
-
-    def _take_next_primary(self) -> int:
-        index = int(self.state["next_primary"])
-        # Advance before starting the provider request. A cancelled task or app
-        # restart therefore cannot pin TaskPilot to the same model indefinitely.
-        self.state["next_primary"] = (index + 1) % len(PRIMARY_MODELS)
-        self._save_state()
-        return index
-
-    def execute(self, operation: Any) -> Any:
-        last_model_error: BaseException | None = None
-        start = self._take_next_primary()
-        primary_order = PRIMARY_MODELS[start:] + PRIMARY_MODELS[:start]
-        cycle_order = tuple(model for model in primary_order for _ in range(2)) + FALLBACK_MODELS
-        attempt_order = cycle_order * 2
-        for position, model in enumerate(attempt_order, start=1):
-            emit(
-                "status",
-                message=(f"OpenClaw is using {model.split('/', 1)[-1]} "
-                         f"(attempt {position} of {len(attempt_order)})…"),
-            )
-            try:
-                return operation(model)
-            except Exception as error:
-                if is_nonretryable_provider_failure(error):
-                    raise
-                last_model_error = error
-                emit(
-                    "status",
-                    message=f"{model.split('/', 1)[-1]} returned an error or invalid output; continuing the retry cycle…",
-                )
-        raise RuntimeError(
-            f"All {len(ALL_MODELS)} Gemini models failed after two full cycles "
-            f"({len(attempt_order)} attempts; each Flash-Lite primary tried four times). "
-            "Check model access and quota, then try again."
-        ) from last_model_error
-
-
-def is_nonretryable_provider_failure(error: BaseException | str) -> bool:
-    """Return true only when the ACP/controller cannot make another attempt."""
-    message = str(error).lower()
-    markers = (
-        "lost contact with the native orbit controller", "openclaw acp stopped",
-        "openclaw acp exited", "openclaw cancelled the orbit turn",
-    )
-    return any(marker in message for marker in markers)
+class TaskModelRouter(AdaptiveModelRouter):
+    def __init__(self, state: RuntimeState | None = None) -> None:
+        super().__init__(emit=emit, state=state)
 
 
 def emit(kind: str, **payload: Any) -> None:
     print(json.dumps({"kind": kind, **payload}, separators=(",", ":")), flush=True)
+
+
+def runtime_fingerprint(key: str) -> str:
+    if key:
+        return hashlib.sha256(key.encode()).hexdigest()
+    # A profile-file digest invalidates readiness after external credential edits
+    # without ever storing or emitting the credential itself.
+    profile = Path.home() / ".openclaw/agents/main/agent/auth-profiles.json"
+    try:
+        return hashlib.sha256(profile.read_bytes()).hexdigest()
+    except OSError:
+        return "unconfigured"
+
+
+def openclaw_version(path: str) -> str:
+    result = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=15)
+    if result.returncode:
+        raise RuntimeError("OpenClaw could not report its version. Repair the installation in Settings.")
+    return result.stdout.strip()
+
+
+def synchronize_model_configuration(path: str, state: RuntimeState) -> None:
+    if state.value.get("config_version") == CONFIG_VERSION:
+        return
+    removed = {f"google/gemini-{v}-flash" for v in ("3.5", "3.6", "3.7")}
+    def read(setting: str) -> Any:
+        result = subprocess.run([path, "config", "get", setting], capture_output=True, text=True, timeout=15)
+        if result.returncode:
+            return None
+        try:
+            return json.loads(result.stdout)
+        except ValueError:
+            return result.stdout.strip()
+    def write(setting: str, value: Any) -> None:
+        result = subprocess.run([path, "config", "set", setting, json.dumps(value), "--strict-json", "--replace"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        if result.returncode:
+            raise RuntimeError(f"TaskPilot could not update its {setting} model configuration. Reconfigure OpenClaw in Settings.")
+    allowed = read("agents.defaults.modelPolicy.allow") or []
+    extras = [m for m in allowed if isinstance(m, str) and m not in ALL_MODELS and m not in removed] if isinstance(allowed, list) else []
+    write("agents.defaults.modelPolicy.allow", list(ALL_MODELS) + extras)
+    model = read("agents.defaults.model")
+    current = model if isinstance(model, dict) else {}
+    extras = [m for m in current.get("fallbacks", []) if m not in ALL_MODELS and m not in removed]
+    write("agents.defaults.model", {**current, "primary": PRIMARY_MODELS[0], "fallbacks": list(ALL_MODELS[1:]) + extras})
+    image = read("agents.defaults.imageModel")
+    if isinstance(image, dict):
+        write("agents.defaults.imageModel", {**image, "primary": PRIMARY_MODELS[0], "fallbacks": [m for m in image.get("fallbacks", []) if m not in removed and m != PRIMARY_MODELS[0]]})
+    aliases = read("agents.defaults.models")
+    if isinstance(aliases, dict) and removed.intersection(aliases):
+        write("agents.defaults.models", {m: v for m, v in aliases.items() if m not in removed})
+    state.value["config_version"] = CONFIG_VERSION
+    state.invalidate()
+
+
+def model_configuration_fingerprint() -> str:
+    path = Path(os.environ.get("OPENCLAW_CONFIG_PATH", str(Path.home() / ".openclaw/openclaw.json")))
+    try:
+        defaults = json.loads(path.read_text()).get("agents", {}).get("defaults", {})
+        settings = {key: defaults.get(key) for key in ("model", "modelPolicy", "imageModel", "models")}
+        return hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
+    except (OSError, ValueError, AttributeError):
+        return "unconfigured"
+
+
+def prepare_runtime(path: str, key: str) -> RuntimeState:
+    fingerprint, version = runtime_fingerprint(key), openclaw_version(path)
+    state = RuntimeState(fingerprint, version, configuration=model_configuration_fingerprint())
+    synchronize_model_configuration(path, state)
+    state = RuntimeState(fingerprint, version, configuration=model_configuration_fingerprint())
+    if key:
+        sync_openclaw_google_key(path, key)
+    return state
+
+
+def synthetic_check_image(path: Path) -> None:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    pixels = b"".join(b"\0" + b"\xff\xff\xff" * 16 for _ in range(16))
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 16, 16, 8, 2, 0, 0, 0)) +
+                     chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b""))
+
+
+def check_models(path: str, key: str, read_only: bool = False) -> bool:
+    state = RuntimeState(runtime_fingerprint(key), openclaw_version(path), configuration=model_configuration_fingerprint()) if read_only else prepare_runtime(path, key)
+    checks = {m: {"model": m, "state": "configured", "detail": "Configured; not verified through TaskPilot"} for m in ALL_MODELS}
+    for model in ALL_MODELS:
+        checks[model].update(state.health(model))
+    cached = state.verified_model()
+    if cached:
+        checks[cached].update(state="verified", detail="Verified through TaskPilot within the last ten minutes")
+        emit("model_checks", checks=list(checks.values()), cached=True)
+        return True
+    if read_only:
+        emit("model_checks", checks=list(checks.values()), cached=False)
+        return False
+    try:
+        client = ACPClient(path)
+    except Exception as error:
+        state.record_failure(PRIMARY_MODELS[0], classify_failure(error, time.time()))
+        checks[PRIMARY_MODELS[0]].update(state="repair", detail=str(error))
+        emit("model_checks", checks=list(checks.values()), cached=False, prompt_calls=0)
+        return False
+    try:
+        with tempfile.TemporaryDirectory(prefix="taskpilot-check-") as directory:
+            image = Path(directory) / "check.png"
+            synthetic_check_image(image)
+            for model in ALL_MODELS:
+                try:
+                    client.select_model(model)
+                    response = extract_json_object(client.prompt('Do not call tools. Inspect this synthetic image and return exactly {"status":"done","check":"TASKPILOT_READY"}.', image))
+                    if response.get("status") != "done" or response.get("check") != "TASKPILOT_READY":
+                        raise ModelAttemptError("The model did not return the required TaskPilot JSON response")
+                except Exception as error:
+                    failure = classify_failure(error, time.time())
+                    state.record_failure(model, failure)
+                    checks[model].update(state="temporary" if failure.kind in {"temporary", "quota"} else "repair", detail=str(error))
+                    if failure.kind in {"credentials", "transport", "configuration", "cancelled"}:
+                        break
+                    continue
+                state.verify(model)
+                checks[model].update(state="verified", detail="Verified through TaskPilot with image input and structured output")
+                break
+    finally:
+        client.close()
+    emit("model_checks", checks=list(checks.values()), cached=False, prompt_calls=client.prompt_calls)
+    return any(c["state"] == "verified" for c in checks.values())
 
 
 def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
@@ -334,7 +370,22 @@ def sync_openclaw_google_key(
         temporary.unlink(missing_ok=True)
 
 
-def openclaw_session_error(session_id: str, sessions_root: Path | None = None) -> str:
+def session_transcript_cursor(session_id: str, sessions_root: Path | None = None) -> tuple[Path, int] | None:
+    root = sessions_root or Path.home() / ".openclaw/agents/main/sessions"
+    try:
+        registry = json.loads((root / "sessions.json").read_text())
+        for name, value in registry.items():
+            if name.endswith(f":{session_id}") and isinstance(value, dict):
+                path = Path(value.get("sessionFile", "")).expanduser().resolve()
+                if path.is_relative_to(root.resolve()) and path.is_file():
+                    return path, path.stat().st_size
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def openclaw_session_error(session_id: str, sessions_root: Path | None = None,
+                           after_cursor: tuple[Path, int] | None = None) -> str:
     """Recover provider failures that the current ACP bridge does not stream.
 
     OpenClaw records some Google capacity failures as a normal assistant
@@ -366,7 +417,8 @@ def openclaw_session_error(session_id: str, sessions_root: Path | None = None) -
             return ""
         with session_file.open("rb") as handle:
             size = handle.seek(0, os.SEEK_END)
-            handle.seek(max(0, size - 262_144), os.SEEK_SET)
+            offset = after_cursor[1] if after_cursor and after_cursor[0] == session_file else 0
+            handle.seek(max(offset, size - 262_144, 0), os.SEEK_SET)
             tail = handle.read().decode("utf-8", errors="ignore")
     except OSError:
         return ""
@@ -1150,51 +1202,73 @@ class ACPClient:
         self.messages: queue.Queue[dict[str, Any]] = queue.Queue()
         self.stderr_tail: deque[str] = deque(maxlen=12)
         self.next_request_id = 1
+        self.accepting_prompt_updates = False
         self.agent_chunks: list[str] = []
         self.turn_errors: list[str] = []
+        self.openclaw_path = openclaw_path
         self.selected_model: str | None = None
+        self.stdout_finished = threading.Event()
         threading.Thread(target=self._read_stdout, daemon=True).start()
         threading.Thread(target=self._read_stderr, daemon=True).start()
-        initialized = self.request(
-            "initialize",
-            {
-                "protocolVersion": 1,
-                "clientCapabilities": {
-                    "fs": {"readTextFile": False, "writeTextFile": False},
-                    "terminal": False,
+        try:
+            initialized = self.request(
+                "initialize",
+                {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {
+                        "fs": {"readTextFile": False, "writeTextFile": False},
+                        "terminal": False,
+                    },
+                    "clientInfo": {"name": PRODUCT_NAME, "version": "2.0"},
                 },
-                "clientInfo": {"name": PRODUCT_NAME, "version": "2.0"},
-            },
-            timeout=30,
-        )
-        protocol_version = initialized.get("protocolVersion")
-        if protocol_version not in (1, "1"):
-            raise RuntimeError(f"OpenClaw negotiated an unsupported ACP version: {protocol_version}")
-        session = self.request(
-            "session/new",
-            {
-                "cwd": str(Path.home()),
-                "mcpServers": [],
-            },
-            timeout=30,
-        )
-        session_id = session.get("sessionId")
-        if not isinstance(session_id, str) or not session_id:
-            raise RuntimeError(f"OpenClaw ACP did not create a {PRODUCT_NAME} session")
-        self.session_id = session_id
-        # Desktop actions are small structured decisions. Disable extended
-        # thinking for this private ACP session to avoid minute-long UI stalls.
-        self._run_prompt([{"type": "text", "text": "/think off"}], timeout=30)
+                timeout=30,
+            )
+            protocol_version = initialized.get("protocolVersion")
+            if protocol_version not in (1, "1"):
+                raise RuntimeError(f"OpenClaw negotiated an unsupported ACP version: {protocol_version}")
+            self.session_key = f"agent:main:taskpilot:{uuid.uuid4()}"
+            session = self.request(
+                "session/new",
+                {
+                    "cwd": str(Path.home()),
+                    "mcpServers": [],
+                    "_meta": {"sessionKey": self.session_key},
+                },
+                timeout=30,
+            )
+            session_id = session.get("sessionId")
+            if not isinstance(session_id, str) or not session_id:
+                raise RuntimeError(f"OpenClaw ACP did not create a {PRODUCT_NAME} session")
+            self.session_id = session_id
+            self.config_options = session.get("configOptions") or []
+            thought = next((o for o in self.config_options if o.get("category") == "thought_level" or o.get("id") == "thought_level"), None)
+            if thought and any(o.get("value") == "off" for o in thought.get("options", [])):
+                result = self.request("session/set_config_option", {"sessionId": self.session_id, "configId": thought["id"], "value": "off"}, timeout=30)
+                options = result.get("configOptions") or []
+                if not any(o.get("id") == thought["id"] and o.get("currentValue") == "off" for o in options):
+                    raise RuntimeError("OpenClaw did not acknowledge the thinking setting")
+                self.config_options = options
+            self.prompt_calls = 0
+            self.model_switches = 0
+            self.reconnects = 0
+            self.openclaw_path = openclaw_path
+        except Exception:
+            self.close()
+            raise
+
 
     def _read_stdout(self) -> None:
-        assert self.process.stdout is not None
-        for line in self.process.stdout:
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(message, dict):
-                self.messages.put(message)
+        try:
+            assert self.process.stdout is not None
+            for line in self.process.stdout:
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(message, dict):
+                    self.messages.put(message)
+        finally:
+            self.stdout_finished.set()
 
     def _read_stderr(self) -> None:
         assert self.process.stderr is not None
@@ -1205,8 +1279,8 @@ class ACPClient:
 
     def _send(self, message: dict[str, Any]) -> None:
         if self.process.poll() is not None:
-            detail = self.stderr_tail[-1] if self.stderr_tail else "OpenClaw ACP stopped"
-            raise RuntimeError(detail)
+            detail = self.stderr_tail[-1] if self.stderr_tail else "Process ended"
+            raise RuntimeError(f"OpenClaw ACP stopped: {detail}")
         assert self.process.stdin is not None
         self.process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
         self.process.stdin.flush()
@@ -1215,8 +1289,12 @@ class ACPClient:
         method = message.get("method")
         if method == "session/update":
             params = message.get("params") or {}
+            if params.get("sessionId") and params["sessionId"] != getattr(self, "session_id", params["sessionId"]):
+                return
             update = params.get("update") or {}
             update_kind = update.get("sessionUpdate")
+            if update_kind in {"agent_message_chunk", "agent_message", "message", "error", "session_error", "agent_error"} and not getattr(self, "accepting_prompt_updates", True):
+                return
             content = update.get("content") or {}
             if update_kind in {"agent_message_chunk", "agent_message", "message"}:
                 contents = content if isinstance(content, list) else [content]
@@ -1224,7 +1302,10 @@ class ACPClient:
                     if isinstance(part, dict):
                         text = part.get("text")
                         if isinstance(text, str):
-                            self.agent_chunks.append(text)
+                            if update_kind == "agent_message_chunk":
+                                self.agent_chunks.append(text)
+                            else:
+                                self.agent_chunks = [text]
             elif update_kind in {"error", "session_error", "agent_error"}:
                 detail = update.get("message") or update.get("error")
                 if isinstance(detail, dict):
@@ -1260,9 +1341,9 @@ class ACPClient:
         })
         deadline = None if timeout is None else time.monotonic() + timeout
         while deadline is None or time.monotonic() < deadline:
-            if self.process.poll() is not None and self.messages.empty():
-                detail = self.stderr_tail[-1] if self.stderr_tail else "OpenClaw ACP exited"
-                raise RuntimeError(detail)
+            if self.process.poll() is not None and self.messages.empty() and (not hasattr(self, "stdout_finished") or self.stdout_finished.is_set()):
+                detail = self.stderr_tail[-1] if self.stderr_tail else "Process ended"
+                raise RuntimeError(f"OpenClaw ACP exited: {detail}")
             try:
                 message = self.messages.get(
                     timeout=0.25 if deadline is None else min(0.25, max(0.01, deadline - time.monotonic()))
@@ -1279,31 +1360,56 @@ class ACPClient:
         raise RuntimeError(f"OpenClaw timed out while handling {method}")
 
     def _run_prompt(self, prompt: list[dict[str, Any]], timeout: float | None) -> tuple[dict[str, Any], str]:
+        # ACP notifications carry session identity; request responses carry the
+        # JSON-RPC request id. Drain earlier-turn updates before admitting a
+        # new prompt, and only collect output while its response is pending.
+        self.accepting_prompt_updates = False
+        while not self.messages.empty():
+            self._handle_server_message(self.messages.get_nowait())
         self.agent_chunks = []
         self.turn_errors = []
-        result = self.request(
-            "session/prompt",
-            {
-                "sessionId": self.session_id,
-                "prompt": prompt,
-            },
-            timeout=timeout,
-        )
+        self.accepting_prompt_updates = True
+        started_at = time.time() * 1000
+        cursor = session_transcript_cursor(self.session_id)
+        try:
+            result = self.request(
+                "session/prompt",
+                {
+                    "sessionId": self.session_id,
+                    "prompt": prompt,
+                },
+                timeout=timeout,
+            )
+        finally:
+            self.accepting_prompt_updates = False
         stop_reason = str(result.get("stopReason") or "")
         if stop_reason in {"cancelled", "error"}:
             if stop_reason == "cancelled":
                 raise RuntimeError(f"OpenClaw cancelled the {PRODUCT_NAME} turn")
-            detail = self.turn_errors[-1] if self.turn_errors else openclaw_session_error(self.session_id)
+            detail = self.turn_errors[-1] if self.turn_errors else openclaw_session_error(self.session_id, after_cursor=cursor)
             if detail:
                 raise RuntimeError(user_facing_openclaw_error(detail))
             raise RuntimeError(
                 "OpenClaw could not complete the Gemini request. Open Settings and click Reconfigure Gemini."
             )
         response = "".join(self.agent_chunks).strip()
+        if not response and hasattr(self, "session_key"):
+            recovered = self.gateway_configuration("sessions.get", {"key": self.session_key, "limit": 8})
+            for item in reversed(recovered.get("messages") or []):
+                message = item.get("message", item) if isinstance(item, dict) else {}
+                stamp = message.get("timestamp") or item.get("timestamp") or 0
+                if not isinstance(stamp, (int, float)) or stamp < started_at or message.get("role") != "assistant":
+                    continue
+                if message.get("stopReason") == "error":
+                    raise RuntimeError(user_facing_openclaw_error(str(message.get("errorMessage") or message.get("error") or "OpenClaw recovery exhausted")))
+                content = message.get("content") or []
+                if isinstance(content, list):
+                    response = "".join(str(part.get("text") or "") for part in content if isinstance(part, dict)).strip()
+                break
         if not response:
             response = str(result.get("message") or result.get("text") or "").strip()
         if not response:
-            detail = self.turn_errors[-1] if self.turn_errors else openclaw_session_error(self.session_id)
+            detail = self.turn_errors[-1] if self.turn_errors else openclaw_session_error(self.session_id, after_cursor=cursor)
             if detail:
                 raise RuntimeError(user_facing_openclaw_error(detail))
         return result, response
@@ -1311,20 +1417,59 @@ class ACPClient:
     def select_model(self, model: str) -> None:
         if model == self.selected_model:
             return
-        _, response = self._run_prompt(
-            [{"type": "text", "text": f"/model {model}"}],
-            timeout=30,
-        )
-        lowered = response.lower()
-        selection_failures = (
-            "unknown model", "model not found", "not allowed", "invalid model",
-            "failed to set", "no such model",
-        )
-        if any(marker in lowered for marker in selection_failures):
-            raise RuntimeError(f"OpenClaw could not select {model}")
+        option = next((o for o in self.config_options if o.get("category") == "model" or "model" in str(o.get("id", "")).lower()), None)
+        if option is None:
+            # OpenClaw 2026.9.5 bridge mode advertises thinking controls but no
+            # model control. Use the acknowledged session configuration RPC
+            # backing ACP controls; never send a prompt-based slash command.
+            result = self.gateway_configuration("sessions.patch", {"key": self.session_key, "model": model})
+            resolved = result.get("resolved") or {}
+            accepted = f"{resolved.get('modelProvider', '')}/{resolved.get('model', '')}"
+            if result.get("ok") is not True or accepted != model:
+                raise RuntimeError(f"OpenClaw could not select {model}: session configuration was not acknowledged")
+            self.selected_model = model
+            self.model_switches += 1
+            return
+        result = self.request("session/set_config_option", {
+            "sessionId": self.session_id, "configId": option["id"], "value": model,
+        }, timeout=30)
+        options = result.get("configOptions") or []
+        acknowledged = next((o for o in options if o.get("id") == option["id"]), None)
+        if acknowledged is None or acknowledged.get("currentValue") != model:
+            raise RuntimeError(f"OpenClaw could not select {model}: model control was not acknowledged")
+        self.config_options = options
         self.selected_model = model
+        self.model_switches += 1
+
+    def gateway_configuration(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        result = subprocess.run([self.openclaw_path, "gateway", "call", method, "--params", json.dumps(params), "--json"],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise RuntimeError(f"OpenClaw session configuration failed: {result.stderr.strip()[:500]}")
+        try:
+            return json.loads(result.stdout)
+        except ValueError as error:
+            raise RuntimeError("OpenClaw returned invalid session configuration") from error
+
+    def reconnect(self) -> None:
+        if self.reconnects >= 1:
+            raise RuntimeError("OpenClaw disconnected again after reconnecting. Check Gateway health in Settings.")
+        prompt_calls, switches = self.prompt_calls, self.model_switches
+        path = self.openclaw_path
+        session_key = self.session_key
+        self.close()  # First stop and wait for the disconnected ACP child.
+        # The Gateway owns inference independently of the stdio child. Its
+        # abort RPC waits for terminal persistence before acknowledging.
+        ended = self.gateway_configuration("sessions.abort", {"key": session_key})
+        if ended.get("ok") is not True or ended.get("status") not in {"aborted", "no-active-run"}:
+            raise RuntimeError("TaskPilot could not confirm the previous OpenClaw request ended. Repair the Gateway before retrying.")
+        self.__init__(path)
+        self.reconnects = 1
+        self.prompt_calls = prompt_calls
+        self.model_switches = switches
 
     def prompt(self, instruction: str, screenshot_path: Path) -> str:
+        self.prompt_calls = getattr(self, "prompt_calls", 0) + 1
         image_data = base64.b64encode(screenshot_path.read_bytes()).decode("ascii")
         mime_type = image_mime_type(screenshot_path)
         _, response = self._run_prompt(
@@ -1483,39 +1628,64 @@ def verification_instruction(
 
 
 def routed_json_prompt(
-    router: RoundRobinModelRouter,
+    router: TaskModelRouter,
     client: ACPClient,
     instruction: str,
     screenshot_path: Path,
+    purpose: str = "planning",
 ) -> dict[str, Any]:
+    key = hashlib.sha256(instruction.encode() + screenshot_path.read_bytes()).hexdigest()
+    cached = getattr(client, "decision_cache", {})
+    if cached.get("key") == key:
+        router.metrics["cache_hits"] += 1
+        return json.loads(json.dumps(cached["decision"]))
     def request_with_model(model: str) -> dict[str, Any]:
-        client.select_model(model)
-        response = client.prompt(instruction, screenshot_path)
         try:
-            return extract_json_object(response)
+            client.select_model(model)
+            response = client.prompt(instruction, screenshot_path)
+        except Exception as error:
+            if classify_failure(error, time.time()).kind != "transport" or getattr(client, "reconnects", 0) >= 1:
+                raise
+            client.reconnect()
+            router.metrics["reconnects"] += 1
+            client.select_model(model)
+            response = client.prompt(instruction, screenshot_path)
+        try:
+            value = extract_json_object(response)
+            if purpose == "verification":
+                if not isinstance(value.get("verified"), bool):
+                    raise ModelAttemptError("The verification response did not include a boolean verified result")
+            elif value.get("status") not in {"act", "done", "needs_user", "blocked"}:
+                raise ModelAttemptError("The model returned no valid desktop decision status")
+            elif value.get("status") == "act":
+                if not isinstance(value.get("action"), dict):
+                    raise ModelAttemptError("The desktop decision is missing its single action")
+                normalized_action(dict(value["action"]))
+            return value
         except RuntimeError as parse_error:
             if is_model_capacity_failure(response):
                 raise ModelCapacityError(response)
             # A truncated/non-JSON response cannot drive a safe desktop turn.
-            # Treat it like a failed model attempt so the requested rotation
+            # Treat it like a failed model attempt so adaptive recovery
             # can recover instead of ending the entire app task.
-            raise ModelCapacityError(
+            raise ModelAttemptError(
                 f"{model} returned an incomplete desktop decision"
             ) from parse_error
 
-    return router.execute(request_with_model)
+    result = router.execute(request_with_model, purpose=purpose)
+    action = result.get("action") or {}
+    if result.get("status") != "act" or action.get("type") in {"none", "wait"}:
+        client.decision_cache = {"key": key, "decision": result}
+    else:
+        client.decision_cache = {}
+    router.metrics["model_switches"] = getattr(client, "model_switches", 0)
+    emit("request_metrics", **router.metrics)
+    return result
 
 
 def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str) -> None:
     resolved_openclaw = find_openclaw(openclaw_path)
-    if api_key:
-        emit("status", message="Synchronizing the saved Gemini key with OpenClaw…")
-        sync_openclaw_google_key(resolved_openclaw, api_key)
-    else:
-        # OpenClaw's own credential store remains the runtime source of truth
-        # after an automated install, even if a locally rebuilt ad-hoc app can
-        # no longer read an older macOS Keychain ACL without prompting.
-        emit("status", message="Using OpenClaw’s configured Gemini credential…")
+    state = prepare_runtime(resolved_openclaw, api_key)
     api_key = ""
     if is_largest_downloads_file_task(task):
         # This is an objective local filesystem fact, not a visual judgment.
@@ -1532,10 +1702,29 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
             "output", show_output=True, title="Largest File in Downloads", content=message,
             decided_by_agent=True, output_kind="answer",
         )
+        emit("request_metrics", planning=0, verification=0, retries=0, model_switches=0, cache_hits=0, reconnects=0, provider_retries=None)
         emit("complete", message=message)
         return
-    client = ACPClient(resolved_openclaw)
-    model_router = RoundRobinModelRouter()
+    # A narrowly parsed, explicit file-content request needs no reasoning call.
+    read_request = re.fullmatch(r'\s*(?:read|show|print)\s+(?:the\s+)?(?:contents of\s+)?file\s+(["`\'])(/[^\n]+|~/[^\n]+)\1\s*[.!]?\s*', task, re.IGNORECASE)
+    if read_request:
+        result = bridge_call("act", display_id, action={"type": "read_file", "path": read_request.group(2), "max_bytes": 131072})
+        text = str(result.get("content") or "")
+        if result.get("encoding") == "base64":
+            text = "[Binary file; base64 encoded]\n" + text
+        if result.get("truncated"):
+            text += "\n\n[File output truncated at 128 KiB.]"
+        emit("output", show_output=True, title="File contents", content=text, decided_by_agent=False, output_kind="result")
+        emit("request_metrics", planning=0, verification=0, retries=0, model_switches=0, cache_hits=0, reconnects=0, provider_retries=None)
+        emit("complete", message=str(result.get("message") or "Read file"))
+        return
+    try:
+        client = ACPClient(resolved_openclaw)
+    except Exception as error:
+        state.record_failure(PRIMARY_MODELS[0], classify_failure(error, time.time()))
+        emit("model_health", model=PRIMARY_MODELS[0], state="repair", detail=str(error))
+        raise
+    model_router = TaskModelRouter(state=state)
     history: list[dict[str, Any]] = []
     last_action_signature = ""
     last_screen_digest = ""
@@ -1688,6 +1877,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                         client,
                         verification_instruction(task, decision, fresh_observation, history),
                         fresh_path,
+                        purpose="verification",
                     )
                 finally:
                     fresh_path.unlink(missing_ok=True)
@@ -1737,7 +1927,20 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
 
             if action_type == "wait":
                 seconds = min(15.0, max(0.2, float(action.get("seconds") or 2.0)))
-                time.sleep(seconds)
+                # Poll the native observation while loading, without another
+                # model request for every unchanged frame.
+                deadline = time.monotonic() + seconds
+                baseline = json.dumps(compact_observation(observation), sort_keys=True)
+                while time.monotonic() < deadline:
+                    time.sleep(min(1.0, max(0, deadline - time.monotonic())))
+                    polled = bridge_call("observe", display_id)
+                    polled_path = Path(str(polled.get("screenshot_path") or ""))
+                    try:
+                        if json.dumps(compact_observation(polled), sort_keys=True) != baseline:
+                            break
+                    finally:
+                        if polled_path.is_file():
+                            polled_path.unlink(missing_ok=True)
                 result_message = f"Waited {seconds:g} seconds"
             elif action_type == "none":
                 result_message = "No action was performed"
@@ -1784,7 +1987,13 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                 )
                 return
         raise RuntimeError(f"{PRODUCT_NAME} reached its {MAX_STEPS}-step safety limit")
+    except Exception:
+        state.invalidate()
+        raise
     finally:
+        model_router.metrics["prompt_calls"] = client.prompt_calls
+        model_router.metrics["model_switches"] = client.model_switches
+        emit("request_metrics", **model_router.metrics)
         client.close()
 
 
@@ -1796,9 +2005,11 @@ def _stop_handler(_signal_number: int, _frame: Any) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=f"{PRODUCT_NAME} OpenClaw runtime")
-    parser.add_argument("--task", required=True)
-    parser.add_argument("--display-id", required=True, type=int)
+    parser.add_argument("--task")
+    parser.add_argument("--display-id", type=int)
     parser.add_argument("--openclaw-path")
+    parser.add_argument("--check-models", action="store_true")
+    parser.add_argument("--read-readiness", action="store_true")
     return parser.parse_args()
 
 
@@ -1830,6 +2041,10 @@ def main() -> int:
     args = parse_args()
     try:
         api_key = read_runtime_configuration()
+        if args.check_models or args.read_readiness:
+            return 0 if check_models(find_openclaw(args.openclaw_path), api_key, read_only=args.read_readiness) else 1
+        if args.task is None or args.display_id is None:
+            raise RuntimeError("TaskPilot requires a task and target display")
         run_task(args.task, args.display_id, args.openclaw_path, api_key)
         return 0
     except KeyboardInterrupt:

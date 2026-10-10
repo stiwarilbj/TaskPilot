@@ -675,7 +675,7 @@ private struct TaskPilotSetupView: View {
                     setupRow(
                         icon: "key.fill",
                         title: "Gemini API key",
-                        detail: "Paste the key once. Save keeps it immediately in \(TaskPilotIdentity.displayName)’s private Application Support data without testing it. Check tests all nine models and saves the key only if at least one works. Saved keys return whenever the app opens, with no Keychain lookup.",
+                        detail: "Paste the key once. Save keeps it immediately in \(TaskPilotIdentity.displayName)’s private Application Support data without testing it. Check verifies image input and JSON output through TaskPilot, stops at the first working model, and saves the key after success. Saved keys return whenever the app opens, with no Keychain lookup.",
                         complete: model.hasWorkingGeminiModel,
                         iconTint: model.hasWorkingGeminiModel
                             ? Color.green
@@ -849,7 +849,7 @@ private struct TaskPilotSetupView: View {
                         detail: model.hasGeminiModelCheckFailure
                             ? "No Gemini model responded. Reconfigure Gemini before running \(TaskPilotIdentity.displayName) through OpenClaw."
                             : (model.openClawConfigured
-                                ? "Ready. \(TaskPilotIdentity.displayName) rotates the three Flash-Lite models for new requests. If they fail, it tries six backup models, then repeats the full list once before ending the request."
+                                ? model.openClawDetail
                                 : model.openClawDetail),
                         complete: model.openClawConfigured && !model.hasGeminiModelCheckFailure
                     ) {
@@ -1057,6 +1057,9 @@ private struct TaskPilotSetupView: View {
                 case .working:
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(.green)
+                case .temporary:
+                    Image(systemName: "clock.arrow.circlepath")
+                        .foregroundStyle(.orange)
                 case .failed:
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(.red)
@@ -1070,17 +1073,20 @@ private struct TaskPilotSetupView: View {
 
             switch check.state {
             case .waiting:
-                Text("Not checked")
+                Text("Configured; not verified")
                     .foregroundStyle(.secondary)
             case .checking:
                 Text("Sending request…")
                     .foregroundStyle(.secondary)
             case .working:
-                Text("Working")
+                Text("Verified through TaskPilot")
                     .foregroundStyle(.green)
             case let .failed(message):
-                Text(message)
+                Text("Needs repair: \(message)")
                     .foregroundStyle(.red)
+            case let .temporary(message):
+                Text("Temporarily unavailable: \(message)")
+                    .foregroundStyle(.orange)
             }
         }
         .font(.caption)
@@ -1263,7 +1269,7 @@ private struct AutomatedOpenClawSetupView: View {
             ForEach(Array(OpenClawService.fallbackGeminiModels.enumerated()), id: \.offset) { index, modelName in
                 modelLine(modelName, label: "Backup \(index + 1)")
             }
-            Text("Each new request starts with the next Flash-Lite model. If a model fails, TaskPilot tries the other two Flash-Lite models, then all six backups. It repeats that full sequence once and ends the request only if every model fails both times. Setup selects a responding model as OpenClaw’s default.")
+            Text("Tasks start with 3.5 Flash-Lite, then try 3.1 Flash-Lite if needed. The successful model stays selected for the task. Other models are tried once, with at most two additional Lite retries for recoverable errors. Check verifies the actual TaskPilot runtime; ordinary readiness refreshes make no model requests.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

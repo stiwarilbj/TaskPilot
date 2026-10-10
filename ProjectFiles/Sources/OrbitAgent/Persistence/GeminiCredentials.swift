@@ -70,115 +70,80 @@ private enum GeminiAPIKeyStoreError: LocalizedError {
     }
 }
 
-enum GeminiModelCheckState: Equatable {
+enum GeminiModelCheckState: Equatable, Sendable {
     case waiting
     case checking
     case working(String)
+    case temporary(String)
     case failed(String)
 }
 
-struct GeminiModelCheck: Identifiable, Equatable {
+struct GeminiModelCheck: Identifiable, Equatable, Sendable {
     let model: String
     var state: GeminiModelCheckState
 
     var id: String { model }
 }
 
-struct GeminiModelVerifier {
-    static let prompt = "Reply with exactly: OK"
+struct GeminiModelVerifier: Sendable {
+    var runtimeURL = BundledRuntimeLocator().executableURL
+    var openClawURL: URL? = OpenClawService.firstExecutable(from: OpenClawService.candidateExecutableURLs())
 
-    static func makeRequest(model: String, apiKey: String) throws -> URLRequest {
-        let apiModel = model.hasPrefix("google/") ? String(model.dropFirst("google/".count)) : model
-        guard let url = URL(
-            string: "https://generativelanguage.googleapis.com/v1beta/models/\(apiModel):generateContent"
-        ) else {
-            throw GeminiModelVerifierError.invalidModel(model)
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 60
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "contents": [[
-                "role": "user",
-                "parts": [["text": prompt]]
-            ]]
+    static func configurationData(apiKey: String) throws -> Data {
+        var data = try JSONSerialization.data(withJSONObject: [
+            "kind": "runtime_configuration", "gemini_api_key": apiKey
         ])
-        return request
+        data.append(0x0A)
+        return data
     }
 
-    func verify(apiKey: String, models: [String]) async -> [GeminiModelCheck] {
-        await withTaskGroup(of: (Int, GeminiModelCheck).self) { group in
-            for (index, model) in models.enumerated() {
-                group.addTask {
-                    let result = await verifyOne(apiKey: apiKey, model: model)
-                    return (index, result)
+    static func checks(from data: Data, models: [String]) -> [GeminiModelCheck] {
+        var result: [String: GeminiModelCheckState] = [:]
+        var error: String?
+        for line in data.split(separator: 0x0A) {
+            guard let message = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
+            if message["kind"] as? String == "error" { error = message["message"] as? String }
+            guard message["kind"] as? String == "model_checks",
+                  let checks = message["checks"] as? [[String: Any]] else { continue }
+            for check in checks {
+                guard let model = check["model"] as? String else { continue }
+                let detail = check["detail"] as? String ?? ""
+                switch check["state"] as? String {
+                case "verified": result[model] = .working(detail)
+                case "temporary": result[model] = .temporary(detail)
+                case "repair": result[model] = .failed(detail)
+                default: result[model] = .waiting
                 }
             }
-            var ordered = Array(
-                repeating: GeminiModelCheck(model: "", state: .waiting),
-                count: models.count
-            )
-            for await (index, result) in group {
-                ordered[index] = result
-            }
-            return ordered
         }
+        if result.isEmpty, let error, let first = models.first { result[first] = .failed(error) }
+        return models.map { GeminiModelCheck(model: $0, state: result[$0] ?? .waiting) }
     }
 
-    private func verifyOne(apiKey: String, model: String) async -> GeminiModelCheck {
-        do {
-            let request = try Self.makeRequest(model: model, apiKey: apiKey)
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse else {
-                throw GeminiModelVerifierError.invalidResponse
+    func verify(apiKey: String, models: [String], readOnly: Bool = false) async -> [GeminiModelCheck] {
+        await Task.detached {
+            let process = Process()
+            let input = Pipe()
+            let output = Pipe()
+            process.executableURL = runtimeURL
+            process.arguments = [readOnly ? "--read-readiness" : "--check-models"]
+            if let openClawURL { process.arguments?.append(contentsOf: ["--openclaw-path", openClawURL.path]) }
+            process.standardInput = input
+            process.standardOutput = output
+            process.standardError = FileHandle.nullDevice
+            do {
+                try process.run()
+                try input.fileHandleForWriting.write(contentsOf: Self.configurationData(apiKey: apiKey))
+                try input.fileHandleForWriting.close()
+                let data = output.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                return Self.checks(from: data, models: models)
+            } catch {
+                if process.isRunning { process.terminate(); process.waitUntilExit() }
+                return models.enumerated().map { index, model in
+                    GeminiModelCheck(model: model, state: index == 0 ? .failed("TaskPilot could not check its runtime: \(error.localizedDescription)") : .waiting)
+                }
             }
-            guard (200..<300).contains(httpResponse.statusCode) else {
-                let message = Self.apiErrorMessage(from: data) ?? "HTTP \(httpResponse.statusCode)"
-                return GeminiModelCheck(model: model, state: .failed(message))
-            }
-            guard let responseText = Self.responseText(from: data), !responseText.isEmpty else {
-                return GeminiModelCheck(model: model, state: .failed("The model returned no text."))
-            }
-            return GeminiModelCheck(model: model, state: .working(String(responseText.prefix(80))))
-        } catch {
-            return GeminiModelCheck(model: model, state: .failed(error.localizedDescription))
-        }
-    }
-
-    private static func responseText(from data: Data) -> String? {
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let candidates = root["candidates"] as? [[String: Any]],
-              let content = candidates.first?["content"] as? [String: Any],
-              let parts = content["parts"] as? [[String: Any]] else {
-            return nil
-        }
-        return parts.compactMap { $0["text"] as? String }
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func apiErrorMessage(from data: Data) -> String? {
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let error = root["error"] as? [String: Any],
-              let message = error["message"] as? String else {
-            return nil
-        }
-        return String(message.prefix(180))
-    }
-}
-
-private enum GeminiModelVerifierError: LocalizedError {
-    case invalidModel(String)
-    case invalidResponse
-
-    var errorDescription: String? {
-        switch self {
-        case let .invalidModel(model):
-            return "Invalid Gemini model name: \(model)"
-        case .invalidResponse:
-            return "Google returned an invalid response."
-        }
+        }.value
     }
 }

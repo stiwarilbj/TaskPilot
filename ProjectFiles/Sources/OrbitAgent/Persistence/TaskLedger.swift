@@ -1,5 +1,21 @@
 import Foundation
 
+struct AgentRequestMetrics: Codable, Equatable {
+    let planning: Int
+    let verification: Int
+    let retries: Int
+    let modelSwitches: Int
+    let cacheHits: Int
+    let reconnects: Int
+    let promptCalls: Int?
+    let providerRetries: Int?
+
+    var summary: String {
+        "\(promptCalls ?? planning + verification) TaskPilot calls · \(planning) planning · \(verification) verification · \(retries) retries · \(modelSwitches) switches · \(cacheHits) reused · \(reconnects) reconnects" +
+            (providerRetries.map { " · \($0) provider retries" } ?? " · provider retry count unavailable")
+    }
+}
+
 struct QueuedAgentTask: Codable, Equatable, Identifiable {
     let id: UUID
     let request: String
@@ -39,6 +55,7 @@ struct AgentTaskHistoryEntry: Codable, Equatable, Identifiable {
     let startedAt: Date
     let finishedAt: Date
     let wasQueued: Bool
+    let requestMetrics: AgentRequestMetrics?
 
     init(
         id: UUID = UUID(),
@@ -48,7 +65,8 @@ struct AgentTaskHistoryEntry: Codable, Equatable, Identifiable {
         outcome: AgentTaskHistoryOutcome,
         startedAt: Date,
         finishedAt: Date = Date(),
-        wasQueued: Bool
+        wasQueued: Bool,
+        requestMetrics: AgentRequestMetrics? = nil
     ) {
         self.id = id
         self.request = request
@@ -58,6 +76,7 @@ struct AgentTaskHistoryEntry: Codable, Equatable, Identifiable {
         self.startedAt = startedAt
         self.finishedAt = finishedAt
         self.wasQueued = wasQueued
+        self.requestMetrics = requestMetrics
     }
 }
 

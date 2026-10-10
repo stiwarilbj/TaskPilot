@@ -20,7 +20,7 @@ enum OpenClawAutomatedSetupEvent: Equatable {
 
 final class OpenClawService {
     static let setupArguments = ["agents", "list", "--json"]
-    static let modelReadinessArguments = ["models", "status", "--json", "--check"]
+    static let modelReadinessArguments = ["models", "status", "--json"]
     static let primaryModelArguments = ["config", "get", "agents.defaults.model.primary"]
     static let dashboardArguments = ["dashboard", "--yes"]
     static let installedWithoutKeyExitStatus: Int32 = 10
@@ -37,7 +37,7 @@ final class OpenClawService {
     ]
     static let allGeminiModels = primaryGeminiModels + fallbackGeminiModels
     // OpenClaw's base configuration still needs one default plus fallbacks;
-    // TaskPilot's runtime rotates request starts among the two newest Flash-Lite models.
+    // TaskPilot starts with the Lite pair and retains the first successful model.
     static let primaryGeminiModel = primaryGeminiModels[0]
 
     private let setupIOQueue = DispatchQueue(label: "com.orbitagent.openclaw-setup-io")
@@ -241,7 +241,7 @@ final class OpenClawService {
                 executableURL: executable,
                 version: version,
                 configured: true,
-                detail: "OpenClaw agent and model configuration are available"
+                detail: "Configured; click Check to verify a model through TaskPilot"
             )
         }
 

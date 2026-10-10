@@ -46,6 +46,8 @@ struct AgentUserInputRequest: Equatable, Identifiable {
 
 enum RuntimeEvent {
     case status(String)
+    case modelHealth(String, String, String)
+    case diagnostics(AgentRequestMetrics)
     case output(AgentTaskOutput)
     case userInputRequired(AgentUserInputRequest)
     case completed(String)
@@ -113,11 +115,7 @@ final class AgentRuntimeProcess {
         process.standardOutput = output
         process.standardError = error
 
-        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            self?.consumeOutput(data)
-        }
+        installOutputHandler(output.fileHandleForReading, for: process)
         error.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
@@ -137,6 +135,7 @@ final class AgentRuntimeProcess {
             self.ioQueue.async {
                 output.fileHandleForReading.readabilityHandler = nil
                 error.fileHandleForReading.readabilityHandler = nil
+                self.appendOutput(output.fileHandleForReading.readDataToEndOfFile(), flush: true)
                 self.process = nil
                 self.inputPipe = nil
                 if self.requestedStop {
@@ -220,17 +219,36 @@ final class AgentRuntimeProcess {
         }
     }
 
-    private func consumeOutput(_ data: Data) {
-        ioQueue.async { [weak self] in
-            guard let self else { return }
-            self.outputBuffer.append(data)
-            while let newline = self.outputBuffer.firstIndex(of: 0x0A) {
-                let lineData = self.outputBuffer[..<newline]
-                self.outputBuffer.removeSubrange(...newline)
-                guard !lineData.isEmpty else { continue }
-                self.processLine(Data(lineData))
+    private func installOutputHandler(_ handle: FileHandle, for process: Process) {
+        handle.readabilityHandler = { [weak self] handle in
+            // Admit one read at a time. Leaving the handler enabled while a
+            // read is queued can enqueue another blocking read ahead of a
+            // bridge response and deadlock the controller pipe.
+            handle.readabilityHandler = nil
+            self?.ioQueue.async { [weak self] in
+                guard let self, self.process === process else { return }
+                self.appendOutput(handle.availableData)
+                if process.isRunning { self.installOutputHandler(handle, for: process) }
             }
         }
+    }
+
+    // Also used after process exit; the final event need not end with a newline.
+    private func appendOutput(_ data: Data, flush: Bool = false) {
+        outputBuffer.append(data)
+        let lines = Self.extractOutputLines(from: &outputBuffer, flush: flush)
+        for line in lines { processLine(line) }
+    }
+
+    static func extractOutputLines(from buffer: inout Data, flush: Bool = false) -> [Data] {
+        var lines: [Data] = []
+        while let newline = buffer.firstIndex(of: 0x0A) {
+            let line = Data(buffer[..<newline])
+            buffer.removeSubrange(...newline)
+            if !line.isEmpty { lines.append(line) }
+        }
+        if flush, !buffer.isEmpty { lines.append(buffer); buffer.removeAll() }
+        return lines
     }
 
     private func processLine(_ data: Data) {
@@ -239,6 +257,12 @@ final class AgentRuntimeProcess {
               let kind = message["kind"] as? String else { return }
 
         switch kind {
+        case "model_health":
+            emit(.modelHealth(message["model"] as? String ?? "", message["state"] as? String ?? "repair", message["detail"] as? String ?? ""))
+        case "request_metrics":
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            if let metrics = try? decoder.decode(AgentRequestMetrics.self, from: data) { emit(.diagnostics(metrics)) }
         case "bridge_request":
             Task { [weak self] in
                 guard let self else { return }

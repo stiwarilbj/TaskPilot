@@ -250,6 +250,13 @@ struct TaskQueueHistoryView: View {
             }
             .frame(maxHeight: 150)
 
+            if let metrics = entry.requestMetrics {
+                Text(metrics.summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+
             HStack {
                 Button {
                     model.rerunHistoryEntry(id: entry.id)

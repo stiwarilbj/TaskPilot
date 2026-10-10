@@ -130,130 +130,45 @@ if [[ $has_gemini_api_key -eq 0 ]]; then
   exit 10
 fi
 
-emit "0.48" "Saving the Gemini credential in OpenClaw’s credential store…"
-if ! printf '%s\n' "$GEMINI_API_KEY" | \
-  "$openclaw_path" models auth paste-api-key \
-    --provider google --profile-id google:orbit >"$command_log" 2>&1; then
-  fail "OpenClaw rejected the Gemini API key. Check the key and try again."
+# The shared runtime synchronizes only TaskPilot-managed models and the
+# supplied credential once; setup does not maintain a second model policy.
+emit "0.78" "Installing and starting OpenClaw’s private loopback Gateway…"
+if ! "$openclaw_path" gateway install --force >"$command_log" 2>&1; then
+  fail "OpenClaw could not install its background Gateway service."
 fi
-model_candidates=(
-  "google/gemini-3.5-flash-lite"
-  "google/gemini-3.1-flash-lite"
-  "google/gemini-2.5-flash-lite"
-  "google/gemini-3.8-flash"
-  "google/gemini-3-flash-preview"
-  "google/gemini-2.5-flash"
-)
-model_allowlist="["
-for model in "${model_candidates[@]}"; do
-  if [[ "$model_allowlist" != "[" ]]; then
-    model_allowlist+=","
+"$openclaw_path" gateway restart >"$command_log" 2>&1 || true
+gateway_ready=0
+for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  if "$openclaw_path" health --json >"$command_log" 2>&1; then
+    gateway_ready=1
+    break
   fi
-  model_allowlist+="\"$model\""
+  sleep 1
 done
-model_allowlist+="]"
-if ! "$openclaw_path" config set agents.defaults.modelPolicy.allow \
-  "$model_allowlist" --strict-json --replace >"$command_log" 2>&1; then
-  fail "OpenClaw could not allow the requested Gemini models for TaskPilot."
+if [[ $gateway_ready -ne 1 ]]; then
+  fail "The OpenClaw Gateway did not become healthy. Open Terminal for recovery details."
 fi
-probe="${ORBIT_GEMINI_PROBE_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gemini-probe.py}"
-if ! command -v python3 >/dev/null 2>&1 || [[ ! -f "$probe" ]]; then
-  fail "Gemini verification needs Python 3 and the bundled model probe. Reinstall TaskPilot and try again."
+runtime="${ORBIT_RUNTIME_CHECK_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../AgentRuntime" && pwd)/orbit_openclaw_runtime}"
+if [[ ! -x "$runtime" ]]; then
+  fail "TaskPilot’s bundled ACP runtime is missing. Reinstall TaskPilot and retry."
 fi
-emit "0.54" "Checking which Gemini model actually responds with this key…"
-configure_model_chain() {
-  local candidate="$1" model
-  local fallbacks=()
-  for model in "${model_candidates[@]}"; do
-    if [[ "$model" != "$candidate" ]]; then
-      fallbacks+=("$model")
-    fi
-  done
-  if ! "$openclaw_path" models set "$candidate" >"$command_log" 2>&1; then
-    fail "OpenClaw could not select ${candidate#google/}."
-  fi
-  if ! "$openclaw_path" models fallbacks clear >"$command_log" 2>&1; then
-    fail "OpenClaw could not reset the text-model fallback list."
-  fi
-  for model in "${fallbacks[@]}"; do
-    if ! "$openclaw_path" models fallbacks add "$model" >"$command_log" 2>&1; then
-      fail "OpenClaw could not add ${model#google/} to the text fallback list."
-    fi
-  done
-  if ! "$openclaw_path" models set-image "$candidate" >"$command_log" 2>&1; then
-    fail "OpenClaw could not select the image-aware Gemini primary model."
-  fi
-  if ! "$openclaw_path" models image-fallbacks clear >"$command_log" 2>&1; then
-    fail "OpenClaw could not reset the image-model fallback list."
-  fi
-  for model in "${fallbacks[@]}"; do
-    if ! "$openclaw_path" models image-fallbacks add "$model" >"$command_log" 2>&1; then
-      fail "OpenClaw could not add ${model#google/} to the image fallback list."
-    fi
-  done
-}
-
-set -- # Positional parameters track models that failed Gateway verification.
-gateway_installed=0
-gateway_verified=0
-while [[ $# -lt ${#model_candidates[@]} ]]; do
-  if ! primary_model="$(printf '%s\n' "$GEMINI_API_KEY" | python3 "$probe" "$@")"; then
-    fail "$primary_model"
-  fi
-  emit "0.58" "Using ${primary_model#google/} as the responsive primary model…"
-  configure_model_chain "$primary_model"
-
-  if [[ $gateway_installed -eq 0 ]]; then
-    emit "0.78" "Installing and starting OpenClaw’s private loopback Gateway…"
-    if ! "$openclaw_path" gateway install --force >"$command_log" 2>&1; then
-      fail "OpenClaw could not install its background Gateway service."
-    fi
-    gateway_installed=1
-  fi
-  "$openclaw_path" gateway restart >"$command_log" 2>&1 || true
-  gateway_ready=0
-  for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    if "$openclaw_path" health --json >"$command_log" 2>&1; then
-      gateway_ready=1
-      break
-    fi
-    sleep 1
-  done
-  if [[ $gateway_ready -ne 1 ]]; then
-    fail "The OpenClaw Gateway did not become healthy. Open Terminal for recovery details."
-  fi
-
-  emit "0.90" "Verifying ${primary_model#google/} through OpenClaw’s Gateway…"
-  if "$openclaw_path" agent --agent main \
-    --model "$primary_model" \
-    --session-id "taskpilot-setup-$(date +%s)-$#" \
-    --message "Reply with exactly ORBIT_OPENCLAW_READY" \
-    --json --timeout 120 >"$command_log" 2>&1; then
-    if /usr/bin/grep -q "ORBIT_OPENCLAW_READY" "$command_log"; then
-      gateway_verified=1
-      break
-    fi
-    fail "OpenClaw returned a reply from ${primary_model#google/}, but it did not contain the expected verification text."
-  fi
-  if /usr/bin/grep -Eqi 'api key not valid|invalid api key|invalid credential' "$command_log"; then
-    fail "OpenClaw could not use the Gemini API key. Check the key and its permissions in Google AI Studio."
-  fi
-  if /usr/bin/grep -Eqi 'high demand|temporarily overloaded|RESOURCE_EXHAUSTED|quota|rate.limit|HTTP 429|HTTP 503|HTTP 403|permission denied|forbidden|unauthorized' "$command_log"; then
-    set -- "$@" "$primary_model"
-    emit "0.90" "${primary_model#google/} was unavailable through OpenClaw; trying another Gemini model…"
-    continue
-  fi
-  fail "Google answered the direct model check, but OpenClaw's Gateway request failed. Open Terminal to inspect the Gateway configuration, then retry."
-done
+emit "0.90" "Verifying image input and JSON output through TaskPilot’s ACP client…"
+# Gemini keys use base64url characters, so this JSON does not need shell interpolation escapes.
+if [[ "$GEMINI_API_KEY" == *[!a-zA-Z0-9_-]* ]]; then
+  fail "The Gemini API key contains unexpected characters. Check the saved key."
+fi
+if ! printf '{"kind":"runtime_configuration","gemini_api_key":"%s"}\n' "$GEMINI_API_KEY" | \
+  "$runtime" --check-models --openclaw-path "$openclaw_path" >"$command_log" 2>&1; then
+  # Emit the structured runtime result for the controller, without credentials.
+  cat "$command_log"
+  fail "TaskPilot’s ACP verification failed. Inspect the model error above and repair the key, configuration, or provider capacity."
+fi
 GEMINI_API_KEY=""
 unset GEMINI_API_KEY
-if [[ $gateway_verified -ne 1 ]]; then
-  fail "Every Gemini model tried through OpenClaw hit a demand or quota limit. Wait for capacity to recover, then run setup again."
-fi
 
 emit "0.97" "Confirming TaskPilot can discover the configured OpenClaw agent…"
 if ! "$openclaw_path" agents list --json >"$command_log" 2>&1; then
   fail "OpenClaw is installed, but its agent inventory is not ready yet."
 fi
 
-emit "1.00" "OpenClaw is installed, configured, running, and verified with Gemini."
+emit "1.00" "OpenClaw is configured and verified through TaskPilot with image input and JSON output."

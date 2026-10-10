@@ -148,7 +148,7 @@ final class TaskPilotTests: XCTestCase {
         XCTAssertEqual(OpenClawService.setupArguments, ["agents", "list", "--json"])
         XCTAssertEqual(
             OpenClawService.modelReadinessArguments,
-            ["models", "status", "--json", "--check"]
+            ["models", "status", "--json"]
         )
         XCTAssertEqual(
             OpenClawService.primaryModelArguments,
@@ -181,18 +181,30 @@ final class TaskPilotTests: XCTestCase {
         ])
     }
 
-    func testGeminiModelCheckKeepsTheAPIKeyOutOfTheURL() throws {
-        let request = try GeminiModelVerifier.makeRequest(
-            model: "google/gemini-3.8-flash",
-            apiKey: "AIzaSyUnitTestSecret"
-        )
-        XCTAssertEqual(
-            request.url?.absoluteString,
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
-        )
-        XCTAssertEqual(request.value(forHTTPHeaderField: "x-goog-api-key"), "AIzaSyUnitTestSecret")
-        XCTAssertFalse(request.url?.absoluteString.contains("AIzaSyUnitTestSecret") ?? true)
-        XCTAssertEqual(request.httpMethod, "POST")
+    func testGeminiCheckPassesCredentialsOnlyThroughPrivateStdin() throws {
+        let data = try GeminiModelVerifier.configurationData(apiKey: "example-private-key")
+        let value = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: String])
+        XCTAssertEqual(value["kind"], "runtime_configuration")
+        XCTAssertEqual(value["gemini_api_key"], "example-private-key")
+        XCTAssertEqual(data.last, 0x0A)
+    }
+
+    func testReadinessDoesNotMarkUntestedModelsVerified() {
+        let data = Data("{\"kind\":\"model_checks\",\"checks\":[{\"model\":\"a\",\"state\":\"verified\",\"detail\":\"ok\"},{\"model\":\"b\",\"state\":\"configured\"},{\"model\":\"c\",\"state\":\"temporary\",\"detail\":\"quota\"}]}\n".utf8)
+        let checks = GeminiModelVerifier.checks(from: data, models: ["a", "b", "c"])
+        XCTAssertEqual(checks[0].state, .working("ok"))
+        XCTAssertEqual(checks[1].state, .waiting)
+        XCTAssertEqual(checks[2].state, .temporary("quota"))
+    }
+
+    func testExitDrainPreservesTheLastCompletionLineWithoutANewline() {
+        var buffer = Data("{\"kind\":\"status\",\"message\":\"working\"}\n{\"kind\":\"comp".utf8)
+        XCTAssertEqual(AgentRuntimeProcess.extractOutputLines(from: &buffer).count, 1)
+        buffer.append(Data("lete\",\"message\":\"Done\"}".utf8))
+        let lines = AgentRuntimeProcess.extractOutputLines(from: &buffer, flush: true)
+        XCTAssertEqual(lines.count, 1)
+        XCTAssertTrue(String(data: lines[0], encoding: .utf8)!.contains("complete"))
+        XCTAssertTrue(buffer.isEmpty)
     }
 
     func testGeminiAPIKeyPersistsInPrivateApplicationSupportData() throws {
@@ -897,4 +909,63 @@ final class TaskPilotTests: XCTestCase {
             )
         )
     }
+    func testCompletionWrittenDuringProcessExitIsDrained() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("runtime")
+        let script = """
+        #!/bin/bash
+        IFS= read -r configuration
+        for index in {1..100}; do
+          printf '%s\\n' '{"kind":"status","message":"Streaming"}'
+        done
+        printf '%s\\n' '{"kind":"bridge_request","request_id":"fixture","method":"unsupported_fixture","params":{"display_id":1}}'
+        IFS= read -r response
+        printf '%s' '{"kind":"complete","message":"Late completion"}'
+        """
+        try script.write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        let runtime = AgentRuntimeProcess(bridge: AgentAutomationBridge(
+            displayService: DisplayService(), accessibility: AccessibilityController(), capture: ScreenCaptureService()
+        ))
+        let completed = expectation(description: "Final completion is delivered")
+        runtime.onEvent = { event in
+            switch event {
+            case .completed(let message):
+                XCTAssertEqual(message, "Late completion")
+                completed.fulfill()
+            case .failed(let message):
+                XCTFail("Completion was misreported: \(message)")
+                completed.fulfill()
+            default: break
+            }
+        }
+        try runtime.start(task: "test", display: DisplayDescriptor(id: 1, name: "fixture", x: 0, y: 0, width: 10, height: 10, isMain: false), runtimeURL: helper, openClawURL: helper, geminiAPIKey: "fixture")
+        wait(for: [completed], timeout: 5)
+    }
+
+    func testCancellingPendingRuntimeIsReportedAsStopped() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let helper = directory.appendingPathComponent("runtime")
+        try "#!/bin/bash\nIFS= read -r configuration\nprintf '%s\\n' '{\"kind\":\"status\",\"message\":\"Pending\"}'\nexec /bin/sleep 20\n".write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
+        let runtime = AgentRuntimeProcess(bridge: AgentAutomationBridge(
+            displayService: DisplayService(), accessibility: AccessibilityController(), capture: ScreenCaptureService()
+        ))
+        let stopped = expectation(description: "Cancellation stops the pending request")
+        runtime.onEvent = { event in
+            switch event {
+            case .status: runtime.stop()
+            case .stopped: stopped.fulfill()
+            case .failed(let message): XCTFail(message); stopped.fulfill()
+            default: break
+            }
+        }
+        try runtime.start(task: "test", display: DisplayDescriptor(id: 1, name: "fixture", x: 0, y: 0, width: 10, height: 10, isMain: false), runtimeURL: helper, openClawURL: helper, geminiAPIKey: "fixture")
+        wait(for: [stopped], timeout: 5)
+    }
+
 }

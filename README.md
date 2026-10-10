@@ -44,13 +44,19 @@ There is a slightly deeper, still readable map in [ProjectFiles/Documentation/Ar
 
 Open Settings, add a Gemini key, install OpenClaw, connect an agent screen, and allow the macOS permissions. The Settings page keeps the setup in one place.
 
-TaskPilot 2.9.2 rotates new requests between Gemini 3.5 Flash-Lite and 3.1
-Flash-Lite. Each cycle tries the starting Flash-Lite model twice consecutively,
-then the other Flash-Lite model twice, followed by Gemini 2.5 Flash-Lite,
-3.8 Flash, 3 Flash Preview, and 2.5 Flash once each. If no attempt
-succeeds, the entire cycle runs a second time. Model exhaustion is reported
-only after all 16 attempts: four per primary Flash-Lite model and two per
-fallback model. Successful responses end the retry cycle immediately.
+Tasks start with Gemini 3.5 Flash-Lite, then 3.1 Flash-Lite if needed, and
+keep the successful model for subsequent decisions. Recovery tries the remaining
+models once in order: 2.5 Flash-Lite, 3.8 Flash, 3 Flash Preview, and 2.5 Flash.
+At most two additional recoverable Lite retries are shared across each decision.
+Credential errors stop for repair; capacity errors respect provider cooldowns.
+OpenClaw’s exhausted internal recovery is not repeated in another full cycle.
+
+Settings distinguishes configured models from models verified through TaskPilot.
+Check uses the same ACP client, image input, and JSON output as real tasks,
+stops at the first success, and caches verification for ten minutes. Ordinary
+readiness refreshes make no generation requests. Runtime failures invalidate
+verification. Task history records planning, verification, retry, and switch
+counts; upstream provider retries are shown separately when available.
 
 Model prompts wait for a completed response or an explicit provider/transport
 error. TaskPilot does not abandon a pending prompt because of silence or its

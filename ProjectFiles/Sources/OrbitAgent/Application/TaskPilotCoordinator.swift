@@ -108,6 +108,7 @@ final class TaskPilotCoordinator: ObservableObject {
     @Published var userInputDraft = ""
     @Published private(set) var queuedTasks: [QueuedAgentTask] = []
     @Published private(set) var taskHistory: [AgentTaskHistoryEntry] = []
+    @Published private(set) var requestMetrics: AgentRequestMetrics?
     @Published private(set) var currentTaskRequest: String?
     @Published var showingSetup = false
     @Published private(set) var runsOnMainDisplay = UserDefaults.standard.bool(
@@ -159,7 +160,8 @@ final class TaskPilotCoordinator: ObservableObject {
 
     var isReady: Bool {
         agentDisplay != nil && hasAccessibilityPermission &&
-        captureAuthorization == .authorized && runtimeInstalled && openClawConfigured
+        captureAuthorization == .authorized && runtimeInstalled && openClawConfigured &&
+        !isCheckingGeminiModels && !isAutomatingOpenClawSetup
     }
 
     var canViewAgentScreen: Bool {
@@ -195,7 +197,7 @@ final class TaskPilotCoordinator: ObservableObject {
     }
 
     var canCheckGeminiModels: Bool {
-        geminiAPIKeyLooksComplete && !isCheckingGeminiModels
+        geminiAPIKeyLooksComplete && !isCheckingGeminiModels && !isActive && !isAutomatingOpenClawSetup
     }
 
     var geminiAPIKeyMatchesSavedKey: Bool {
@@ -233,7 +235,7 @@ final class TaskPilotCoordinator: ObservableObject {
 
     var hasGeminiModelCheckFailure: Bool {
         // One responsive model is enough because TaskPilot's runtime skips any
-        // failed entry and rotates through the configured model list.
+        // failed entry and keeps a successful model for the task.
         if hasWorkingGeminiModel { return false }
         let hasFailedModel = geminiModelChecks.contains {
             if case .failed = $0.state { return true }
@@ -242,7 +244,7 @@ final class TaskPilotCoordinator: ObservableObject {
         let checkFinished = geminiModelChecks.count == OpenClawService.allGeminiModels.count &&
             geminiModelChecks.allSatisfy {
                 switch $0.state {
-                case .working, .failed: return true
+                case .working, .failed, .temporary: return true
                 case .waiting, .checking: return false
                 }
             }
@@ -274,7 +276,7 @@ final class TaskPilotCoordinator: ObservableObject {
                 savedGeminiAPIKey = completeKey
                 geminiAPIKeyDraft = completeKey
                 hasSavedGeminiAPIKey = true
-                geminiAPIKeyStatus = "Loaded automatically from \(TaskPilotIdentity.displayName)'s private app data. Click Check to test the model rotation."
+                geminiAPIKeyStatus = "Loaded automatically from \(TaskPilotIdentity.displayName)'s private app data. Click Check to verify the TaskPilot runtime."
             }
         } catch {
             geminiAPIKeyStatus = "\(TaskPilotIdentity.displayName) could not load its saved Gemini API key: \(error.localizedDescription)"
@@ -341,6 +343,16 @@ final class TaskPilotCoordinator: ObservableObject {
             openClawConfigured = openClawProbe.configured
             openClawVersion = openClawProbe.version
             openClawDetail = openClawProbe.detail
+            if openClawProbe.installed, !isActive, !isCheckingGeminiModels,
+               geminiAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines) == savedGeminiAPIKey {
+                let cached = await geminiModelVerifier.verify(apiKey: savedGeminiAPIKey,
+                    models: OpenClawService.allGeminiModels, readOnly: true)
+                if !isActive, !isCheckingGeminiModels {
+                    geminiModelChecks = cached
+                    geminiAPIKeyVerified = Self.hasUsableGeminiModel(cached)
+                    if geminiAPIKeyVerified { openClawDetail = "Verified through TaskPilot within the last ten minutes" }
+                }
+            }
         }
         if betterDisplayInstalled != installedBetterDisplay {
             betterDisplayInstalled = installedBetterDisplay
@@ -456,7 +468,7 @@ final class TaskPilotCoordinator: ObservableObject {
     }
 
     func clearGeminiAPIKey() {
-        guard !isCheckingGeminiModels else { return }
+        guard !isCheckingGeminiModels, !isActive else { return }
         do {
             try geminiAPIKeyStore.delete()
             savedGeminiAPIKey = ""
@@ -475,7 +487,7 @@ final class TaskPilotCoordinator: ObservableObject {
     }
 
     func checkGeminiModels() {
-        guard !isCheckingGeminiModels else { return }
+        guard !isCheckingGeminiModels, !isActive else { return }
         let apiKey = geminiAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard apiKey.count >= 20 else {
             geminiAPIKeyStatus = "Enter a complete Gemini API key before clicking Check."
@@ -485,7 +497,7 @@ final class TaskPilotCoordinator: ObservableObject {
 
         isCheckingGeminiModels = true
         geminiAPIKeyVerified = false
-        geminiAPIKeyStatus = "Sending nine simple requests — one to each Gemini model…"
+        geminiAPIKeyStatus = "Checking the TaskPilot runtime, stopping after the first verified model…"
         geminiModelChecks = OpenClawService.allGeminiModels.map {
             GeminiModelCheck(model: $0, state: .checking)
         }
@@ -505,8 +517,8 @@ final class TaskPilotCoordinator: ObservableObject {
                     hasSavedGeminiAPIKey = true
                     geminiAPIKeyVerified = true
                     geminiAPIKeyStatus = workingCount == results.count
-                        ? "All nine Gemini models responded, so Check saved the API key in \(TaskPilotIdentity.displayName)."
-                        : "\(workingCount) of \(results.count) Gemini models responded, so Check saved the key. \(TaskPilotIdentity.displayName) will skip unavailable models automatically."
+                        ? "The TaskPilot runtime responded, so Check saved the API key in \(TaskPilotIdentity.displayName)."
+                        : "\(workingCount) of \(results.count) Gemini models responded, so Check saved the key. \(TaskPilotIdentity.displayName) verified a working model through its runtime."
                 } catch {
                     geminiAPIKeyVerified = false
                     geminiAPIKeyStatus = "At least one model responded, but the API key could not be saved: \(error.localizedDescription)"
@@ -514,15 +526,15 @@ final class TaskPilotCoordinator: ObservableObject {
             } else {
                 geminiAPIKeyVerified = false
                 geminiAPIKeyStatus = wasAlreadySaved
-                    ? "None of the nine models responded. The previously saved copy remains unchanged; review the results below."
-                    : "None of the nine models responded, so Check did not save this key. Review the results below or use Save to keep it without verification."
+                    ? "No model responded through TaskPilot. The previously saved copy remains unchanged; review the results below."
+                    : "No model responded through TaskPilot, so Check did not save this key. Review the results below or use Save to keep it without verification."
             }
             pinStatus(geminiAPIKeyStatus, for: 30)
         }
     }
 
     func startAutomatedOpenClawSetup() {
-        guard !isAutomatingOpenClawSetup else { return }
+        guard !isAutomatingOpenClawSetup, !isActive, !isCheckingGeminiModels else { return }
         let key = geminiAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard key.isEmpty || key.count >= 20 else {
             automatedOpenClawError = "Enter a complete Gemini API key from Google AI Studio."
@@ -546,7 +558,7 @@ final class TaskPilotCoordinator: ObservableObject {
                 // The guided installer and normal Run path must use the same
                 // app-owned credential. Saving it here also means the
                 // key remains available when installation finishes or the app
-                // is reopened; Check can validate all nine models afterward.
+                // is reopened; Check can verify the runtime afterward.
                 try geminiAPIKeyStore.save(key)
                 savedGeminiAPIKey = key
                 hasSavedGeminiAPIKey = true
@@ -1076,6 +1088,7 @@ final class TaskPilotCoordinator: ObservableObject {
         runState = .running
         status = "Looking at the agent screen…"
         taskOutput = nil
+        requestMetrics = nil
         userInputRequest = nil
         userInputDraft = ""
         accessibility.beginTaskResourceTracking(on: display)
@@ -1221,6 +1234,18 @@ final class TaskPilotCoordinator: ObservableObject {
 
     private func handleRuntimeEvent(_ event: RuntimeEvent) {
         switch event {
+        case let .modelHealth(model, state, detail):
+            if let index = geminiModelChecks.firstIndex(where: { $0.model == model }) {
+                switch state {
+                case "verified": geminiModelChecks[index].state = .working(detail)
+                case "temporary": geminiModelChecks[index].state = .temporary(detail)
+                case "configured": geminiModelChecks[index].state = .waiting
+                default: geminiModelChecks[index].state = .failed(detail)
+                }
+                geminiAPIKeyVerified = Self.hasUsableGeminiModel(geminiModelChecks)
+            }
+        case .diagnostics(let metrics):
+            requestMetrics = metrics
         case .status(let message):
             if runState == .running { status = message }
         case .output(let output):
@@ -1288,6 +1313,10 @@ final class TaskPilotCoordinator: ObservableObject {
             )
             advanceQueueAfterTerminalTask()
         case .failed(let message):
+            geminiAPIKeyVerified = false
+            for index in geminiModelChecks.indices {
+                if case .working = geminiModelChecks[index].state { geminiModelChecks[index].state = .waiting }
+            }
             agentCursor.hide()
             userInputRequest = nil
             userInputDraft = ""
@@ -1357,7 +1386,8 @@ final class TaskPilotCoordinator: ObservableObject {
             response: response,
             outcome: outcome,
             startedAt: startedAt,
-            wasQueued: wasQueued
+            wasQueued: wasQueued,
+            requestMetrics: requestMetrics
         )
         taskHistory.append(entry)
         taskHistory.sort { $0.finishedAt > $1.finishedAt }
