@@ -94,7 +94,7 @@ def default_model_router_state_path() -> Path:
 
 
 class RoundRobinModelRouter:
-    """Rotate request starts among Flash-Lite models; retry all seven twice."""
+    """Try and retry both Flash-Lite primaries before trying fallback models."""
 
     def __init__(self, state_path: Path | None = None) -> None:
         self.state_path = state_path or default_model_router_state_path()
@@ -143,24 +143,23 @@ class RoundRobinModelRouter:
         last_model_error: BaseException | None = None
         start = self._take_next_primary()
         primary_order = PRIMARY_MODELS[start:] + PRIMARY_MODELS[:start]
-        attempt_order = primary_order + FALLBACK_MODELS
-        for pass_number in (1, 2):
-            for position, model in enumerate(attempt_order, start=1):
+        attempt_order = primary_order * 2 + FALLBACK_MODELS * 2
+        for position, model in enumerate(attempt_order, start=1):
+            emit(
+                "status",
+                message=(f"OpenClaw is using {model.split('/', 1)[-1]} "
+                         f"(attempt {position} of {len(attempt_order)})…"),
+            )
+            try:
+                return operation(model)
+            except Exception as error:
+                if is_nonretryable_provider_failure(error):
+                    raise
+                last_model_error = error
                 emit(
                     "status",
-                    message=(f"OpenClaw is using {model.split('/', 1)[-1]} "
-                             f"({position} of {len(ALL_MODELS)}, pass {pass_number} of 2)…"),
+                    message=f"{model.split('/', 1)[-1]} failed; moving to the next model…",
                 )
-                try:
-                    return operation(model)
-                except Exception as error:
-                    if is_nonretryable_provider_failure(error):
-                        raise
-                    last_model_error = error
-                    emit(
-                        "status",
-                        message=f"{model.split('/', 1)[-1]} failed; moving to the next model…",
-                    )
         raise RuntimeError(
             f"All {len(ALL_MODELS)} Gemini models failed twice for this request ({2 * len(ALL_MODELS)} attempts). "
             "Check model access and quota, then try again."
