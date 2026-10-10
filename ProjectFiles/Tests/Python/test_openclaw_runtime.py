@@ -454,7 +454,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
                 selected.append(router.execute(lambda model: model))
             self.assertEqual(selected, [*runtime.PRIMARY_MODELS, runtime.PRIMARY_MODELS[0]])
 
-    def test_failed_model_moves_immediately_to_the_next_model(self):
+    def test_failed_model_retries_once_before_moving_to_the_next_model(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "router.json"
             router = runtime.RoundRobinModelRouter(state_path)
@@ -462,12 +462,12 @@ class OpenClawRuntimeTests(unittest.TestCase):
 
             def fail_first(model):
                 attempted.append(model)
-                if len(attempted) == 1:
+                if len(attempted) <= 2:
                     raise runtime.ModelCapacityError("429 quota exhausted")
                 return model
 
             self.assertEqual(router.execute(fail_first), runtime.ALL_MODELS[1])
-            self.assertEqual(attempted, list(runtime.ALL_MODELS[:2]))
+            self.assertEqual(attempted, [runtime.PRIMARY_MODELS[0]] * 2 + [runtime.PRIMARY_MODELS[1]])
             restarted = runtime.RoundRobinModelRouter(state_path)
             self.assertEqual(restarted.execute(lambda model: model), runtime.PRIMARY_MODELS[1])
 
@@ -481,7 +481,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
             router = runtime.RoundRobinModelRouter(state_path)
             self.assertEqual(router.execute(lambda model: model), runtime.ALL_MODELS[0])
 
-    def test_backups_follow_two_passes_through_both_primaries(self):
+    def test_backups_follow_two_consecutive_attempts_per_primary(self):
         with tempfile.TemporaryDirectory() as directory:
             router = runtime.RoundRobinModelRouter(Path(directory) / "router.json")
             attempts = []
@@ -492,7 +492,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "All 7 Gemini models failed twice"):
                 router.execute(always_fail)
-            self.assertEqual(attempts, list(runtime.PRIMARY_MODELS) * 2 + list(runtime.FALLBACK_MODELS) * 2)
+            self.assertEqual(attempts, [model for model in runtime.PRIMARY_MODELS for _ in range(2)] + list(runtime.FALLBACK_MODELS) * 2)
             self.assertEqual(len(attempts), 14)
 
     def test_primary_retry_can_recover_before_any_fallback(self):
@@ -500,14 +500,14 @@ class OpenClawRuntimeTests(unittest.TestCase):
             router = runtime.RoundRobinModelRouter(Path(directory) / "router.json")
             attempts = []
 
-            def recover_on_second_pass(model):
+            def recover_on_second_attempt(model):
                 attempts.append(model)
-                if len(attempts) <= len(runtime.PRIMARY_MODELS):
+                if len(attempts) == 1:
                     raise runtime.ModelCapacityError("temporarily unavailable")
                 return model
 
-            self.assertEqual(router.execute(recover_on_second_pass), runtime.PRIMARY_MODELS[0])
-            self.assertEqual(attempts, [*runtime.PRIMARY_MODELS, runtime.PRIMARY_MODELS[0]])
+            self.assertEqual(router.execute(recover_on_second_attempt), runtime.PRIMARY_MODELS[0])
+            self.assertEqual(attempts, [runtime.PRIMARY_MODELS[0]] * 2)
 
     def test_rotated_request_retries_both_primaries_before_fallbacks(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -517,14 +517,13 @@ class OpenClawRuntimeTests(unittest.TestCase):
 
             def recover_on_retry(model):
                 attempts.append(model)
-                if len(attempts) <= len(runtime.PRIMARY_MODELS):
+                if len(attempts) == 1:
                     raise runtime.ModelCapacityError("temporarily unavailable")
                 return model
 
             self.assertEqual(router.execute(recover_on_retry), runtime.PRIMARY_MODELS[1])
             self.assertEqual(attempts, [
-                runtime.PRIMARY_MODELS[1], runtime.PRIMARY_MODELS[0],
-                runtime.PRIMARY_MODELS[1],
+                runtime.PRIMARY_MODELS[1], runtime.PRIMARY_MODELS[1],
             ])
 
     def test_failed_request_advances_next_request_to_next_primary(self):
@@ -544,7 +543,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
                 router.execute(lambda model: attempts.append(model) or (_ for _ in ()).throw(
                     RuntimeError("invalid credential")
                 ))
-            self.assertEqual(attempts, list(runtime.PRIMARY_MODELS) * 2 + list(runtime.FALLBACK_MODELS) * 2)
+            self.assertEqual(attempts, [model for model in runtime.PRIMARY_MODELS for _ in range(2)] + list(runtime.FALLBACK_MODELS) * 2)
 
     def test_model_specific_permission_denial_moves_to_next_model(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -553,12 +552,12 @@ class OpenClawRuntimeTests(unittest.TestCase):
 
             def operation(model):
                 attempts.append(model)
-                if len(attempts) == 1:
+                if len(attempts) <= 2:
                     raise RuntimeError("Permission denied for this model")
                 return model
 
             self.assertEqual(router.execute(operation), runtime.PRIMARY_MODELS[1])
-            self.assertEqual(attempts, list(runtime.PRIMARY_MODELS[:2]))
+            self.assertEqual(attempts, [runtime.PRIMARY_MODELS[0]] * 2 + [runtime.PRIMARY_MODELS[1]])
 
     def test_noncredential_model_error_rotates_to_next_model(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -567,12 +566,12 @@ class OpenClawRuntimeTests(unittest.TestCase):
 
             def operation(model):
                 attempts.append(model)
-                if len(attempts) == 1:
+                if len(attempts) <= 2:
                     raise RuntimeError("model returned an empty response")
                 return model
 
             self.assertEqual(router.execute(operation), runtime.ALL_MODELS[1])
-            self.assertEqual(attempts, list(runtime.ALL_MODELS[:2]))
+            self.assertEqual(attempts, [runtime.PRIMARY_MODELS[0]] * 2 + [runtime.PRIMARY_MODELS[1]])
 
     def test_recognizes_google_quota_error_forms(self):
         self.assertTrue(runtime.is_model_capacity_failure("HTTP 429"))
@@ -715,7 +714,7 @@ raise SystemExit(0)
         with mock.patch.object(sys, "stdin", io.StringIO(payload)):
             self.assertEqual(runtime.read_runtime_configuration(), "")
 
-    def test_incomplete_json_rotates_to_the_next_model(self):
+    def test_incomplete_json_retries_the_same_model(self):
         class FakeClient:
             def __init__(self):
                 self.models = []
@@ -735,7 +734,7 @@ raise SystemExit(0)
                 router, client, "Return JSON", Path(directory) / "screen.png"
             )
             self.assertEqual(result["status"], "done")
-            self.assertEqual(client.models, list(runtime.ALL_MODELS[:2]))
+            self.assertEqual(client.models, [runtime.PRIMARY_MODELS[0]] * 2)
 
     def test_acp_client_completes_image_prompt_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:

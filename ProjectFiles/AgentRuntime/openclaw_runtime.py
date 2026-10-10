@@ -94,7 +94,7 @@ def default_model_router_state_path() -> Path:
 
 
 class RoundRobinModelRouter:
-    """Try and retry both Flash-Lite primaries before trying fallback models."""
+    """Try each Flash-Lite primary twice consecutively before fallback models."""
 
     def __init__(self, state_path: Path | None = None) -> None:
         self.state_path = state_path or default_model_router_state_path()
@@ -143,7 +143,7 @@ class RoundRobinModelRouter:
         last_model_error: BaseException | None = None
         start = self._take_next_primary()
         primary_order = PRIMARY_MODELS[start:] + PRIMARY_MODELS[:start]
-        attempt_order = primary_order * 2 + FALLBACK_MODELS * 2
+        attempt_order = tuple(model for model in primary_order for _ in range(2)) + FALLBACK_MODELS * 2
         for position, model in enumerate(attempt_order, start=1):
             emit(
                 "status",
