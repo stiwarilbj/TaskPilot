@@ -37,12 +37,10 @@ LEGACY_APPLICATION_SUPPORT_FOLDER = "Orbit Agent"
 PRIMARY_MODELS = (
     "google/gemini-3.5-flash-lite",
     "google/gemini-3.1-flash-lite",
-    "google/gemini-2.5-flash-lite",
 )
 FALLBACK_MODELS = (
+    "google/gemini-2.5-flash-lite",
     "google/gemini-3.8-flash",
-    "google/gemini-3.7-flash",
-    "google/gemini-3.6-flash",
     "google/gemini-3.5-flash",
     "google/gemini-3-flash-preview",
     "google/gemini-2.5-flash",
@@ -96,7 +94,7 @@ def default_model_router_state_path() -> Path:
 
 
 class RoundRobinModelRouter:
-    """Rotate request starts among Flash-Lite models; retry all nine twice."""
+    """Rotate request starts among Flash-Lite models; retry all seven twice."""
 
     def __init__(self, state_path: Path | None = None) -> None:
         self.state_path = state_path or default_model_router_state_path()
@@ -164,7 +162,7 @@ class RoundRobinModelRouter:
                         message=f"{model.split('/', 1)[-1]} failed; moving to the next model…",
                     )
         raise RuntimeError(
-            "All nine Gemini models failed twice for this request (18 attempts). "
+            f"All {len(ALL_MODELS)} Gemini models failed twice for this request ({2 * len(ALL_MODELS)} attempts). "
             "Check model access and quota, then try again."
         ) from last_model_error
 

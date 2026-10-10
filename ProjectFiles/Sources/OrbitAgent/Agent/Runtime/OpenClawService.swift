@@ -27,20 +27,18 @@ final class OpenClawService {
     static let installURL = URL(string: "https://docs.openclaw.ai/install")!
     static let primaryGeminiModels = [
         "google/gemini-3.5-flash-lite",
-        "google/gemini-3.1-flash-lite",
-        "google/gemini-2.5-flash-lite"
+        "google/gemini-3.1-flash-lite"
     ]
     static let fallbackGeminiModels = [
+        "google/gemini-2.5-flash-lite",
         "google/gemini-3.8-flash",
-        "google/gemini-3.7-flash",
-        "google/gemini-3.6-flash",
         "google/gemini-3.5-flash",
         "google/gemini-3-flash-preview",
         "google/gemini-2.5-flash"
     ]
     static let allGeminiModels = primaryGeminiModels + fallbackGeminiModels
     // OpenClaw's base configuration still needs one default plus fallbacks;
-    // TaskPilot's runtime rotates request starts among the three Flash-Lite models.
+    // TaskPilot's runtime rotates request starts among the two newest Flash-Lite models.
     static let primaryGeminiModel = primaryGeminiModels[0]
 
     private let setupIOQueue = DispatchQueue(label: "com.orbitagent.openclaw-setup-io")

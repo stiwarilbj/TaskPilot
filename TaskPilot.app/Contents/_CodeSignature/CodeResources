@@ -34,15 +34,15 @@
 		</data>
 		<key>Resources/AgentRuntime/_internal/base_library.zip</key>
 		<data>
-		7CRHpdRJNpTvAhiHroRnA0EWuos=
+		MtonLnHO8lO/Oma891MLzlQ9BLM=
 		</data>
 		<key>Resources/AgentRuntime/_internal/libcrypto.3.dylib</key>
 		<data>
-		HOp2F4ogKugAyexVwDiB/zZGgac=
+		8C+JTG+cki62qks8zCfi986pYEo=
 		</data>
 		<key>Resources/AgentRuntime/_internal/liblzma.5.dylib</key>
 		<data>
-		JNxJq1HimYukVHIlkF7PANv3MuM=
+		gYfeLcfTv7g9ED7hCT2uUuP9dnc=
 		</data>
 		<key>Resources/AgentRuntime/_internal/libmpdec.4.dylib</key>
 		<data>
@@ -50,7 +50,7 @@
 		</data>
 		<key>Resources/AgentRuntime/_internal/libssl.3.dylib</key>
 		<data>
-		ZAPVzNDq+b94J43ODgWLY3Fxtn8=
+		PS6jz0nq6Ui0D/rfvN7I4oo1+Qc=
 		</data>
 		<key>Resources/AgentRuntime/_internal/python3.11/lib-dynload/_bisect.cpython-311-darwin.so</key>
 		<data>
@@ -238,11 +238,15 @@
 		</data>
 		<key>Resources/AgentRuntime/orbit_openclaw_runtime</key>
 		<data>
-		rVvdFqaldPESKb/S018Ndb9IvFg=
+		3yWIwFF+wj9FOcSmyOqO+nyYTXQ=
+		</data>
+		<key>Resources/OpenClaw/__pycache__/gemini-probe.cpython-314.pyc</key>
+		<data>
+		ieiUEQ2xnFJ3QUSPDTsHI0D0r+U=
 		</data>
 		<key>Resources/OpenClaw/gemini-probe.py</key>
 		<data>
-		aFnWxLuYwuRLyxkBI9hIes/PrBI=
+		y6ROYNfhPJbsEJkyVvatHk8IReo=
 		</data>
 		<key>Resources/OpenClaw/openclaw-setup.command</key>
 		<data>
@@ -250,7 +254,7 @@
 		</data>
 		<key>Resources/OpenClaw/taskpilot-openclaw-bootstrap.sh</key>
 		<data>
-		PCcgQG7/QRhgwwN/8+qHszKSukE=
+		cnWxsgVs0zIe47+VEiu6PqVTs7Y=
 		</data>
 	</dict>
 	<key>files2</key>
@@ -308,21 +312,21 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			vZ0L+m6BL5bgAflXqK+nVJTgJd2EJbWc6RVECOl3B+A=
+			9yFLgyH3oX5yETwKMfWf7ZpPHFIj6CogDM2r45Liwxs=
 			</data>
 		</dict>
 		<key>Resources/AgentRuntime/_internal/libcrypto.3.dylib</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			8wXu1ODyBMktKB1xLFLmeYm/82rle0q8VRnLERSFtfM=
+			DF3n64TTnZP805YCiHg75egP161AXrH+bB4cyT6vETE=
 			</data>
 		</dict>
 		<key>Resources/AgentRuntime/_internal/liblzma.5.dylib</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			7EveNlz0K0NLg0mcpmirx1VXbQHgv3ULVM0iOBY/xOs=
+			rb6owRJXRC/y7PK6p3XcFyEljdJlJW7QzLgiuqpfXT0=
 			</data>
 		</dict>
 		<key>Resources/AgentRuntime/_internal/libmpdec.4.dylib</key>
@@ -336,7 +340,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			GzR+a5k39G3yJS0kxmhdOnUc3bpEpKVWlk9NDdfpLPo=
+			z8xmQeYo7ianCZ0mudyvu2XJWF5FOjG3T2VjNJX4llA=
 			</data>
 		</dict>
 		<key>Resources/AgentRuntime/_internal/python3.11/lib-dynload/_bisect.cpython-311-darwin.so</key>
@@ -665,14 +669,21 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			UIFv2f8FY3vcelSeRz+djxsSiSGoODF+nJob1Udp1Tk=
+			Yr+MhEcx3FODXhk8bTpd30ZXTVM5ZR4tO9xNVpKHXHE=
+			</data>
+		</dict>
+		<key>Resources/OpenClaw/__pycache__/gemini-probe.cpython-314.pyc</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			lCktqNOjxuKeRL1BA5iN48od1Mi+U+3WvRPL0CrN5FY=
 			</data>
 		</dict>
 		<key>Resources/OpenClaw/gemini-probe.py</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			4/kYOwOM7bv5143/8EYEzKoCvClLvpybdluLUKjKpE8=
+			6Rd6tYDVAu2EMTSZtyWBeXvDD/F3lk7CJXoz8bCoVPg=
 			</data>
 		</dict>
 		<key>Resources/OpenClaw/openclaw-setup.command</key>
@@ -686,7 +697,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			xkTfRIrzTZ4XHAudusm3UPMVJRfdG3IIZMBlsv0VWuk=
+			OT+Wa/W3JPYmPn4WMNpDMeabkX7BGZFbsqTpqOCOvJM=
 			</data>
 		</dict>
 	</dict>

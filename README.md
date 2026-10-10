@@ -45,9 +45,9 @@ There is a slightly deeper, still readable map in [ProjectFiles/Documentation/Ar
 Open Settings, add a Gemini key, install OpenClaw, connect an agent screen, and allow the macOS permissions. The Settings page keeps the setup in one place.
 
 TaskPilot 2.9.2 rotates new requests among Gemini 3.5 Flash-Lite, 3.1
-Flash-Lite, and 2.5 Flash-Lite. When all three fail, it tries Gemini 3.8 Flash,
-3.7 Flash, 3.6 Flash, 3.5 Flash, 3 Flash Preview, and 2.5 Flash in that order,
-then repeats the full nine-model sequence once. A request ends after each model
+Flash-Lite. When both fail, it tries Gemini 2.5 Flash-Lite, 3.8 Flash,
+3.5 Flash, 3 Flash Preview, and 2.5 Flash in that order,
+then repeats the full seven-model sequence once. A request ends after each model
 has failed twice.
 
 ![TaskPilot Settings](ProjectFiles/Documentation/Images/taskpilot-settings.jpg)

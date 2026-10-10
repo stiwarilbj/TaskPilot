@@ -163,13 +163,11 @@ final class TaskPilotTests: XCTestCase {
         XCTAssertEqual(OpenClawService.primaryGeminiModel, "google/gemini-3.5-flash-lite")
         XCTAssertEqual(OpenClawService.primaryGeminiModels, [
             "google/gemini-3.5-flash-lite",
-            "google/gemini-3.1-flash-lite",
-            "google/gemini-2.5-flash-lite"
+            "google/gemini-3.1-flash-lite"
         ])
         XCTAssertEqual(OpenClawService.fallbackGeminiModels, [
+            "google/gemini-2.5-flash-lite",
             "google/gemini-3.8-flash",
-            "google/gemini-3.7-flash",
-            "google/gemini-3.6-flash",
             "google/gemini-3.5-flash",
             "google/gemini-3-flash-preview",
             "google/gemini-2.5-flash"
@@ -179,8 +177,6 @@ final class TaskPilotTests: XCTestCase {
             "google/gemini-3.1-flash-lite",
             "google/gemini-2.5-flash-lite",
             "google/gemini-3.8-flash",
-            "google/gemini-3.7-flash",
-            "google/gemini-3.6-flash",
             "google/gemini-3.5-flash",
             "google/gemini-3-flash-preview",
             "google/gemini-2.5-flash"

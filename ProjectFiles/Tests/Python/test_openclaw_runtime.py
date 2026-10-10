@@ -445,11 +445,11 @@ class OpenClawRuntimeTests(unittest.TestCase):
     def test_taskpilot_screen_captures_use_png(self):
         self.assertEqual(runtime.image_mime_type(Path("screen-123.png")), "image/png")
 
-    def test_new_requests_rotate_only_the_three_primary_models_across_restarts(self):
+    def test_new_requests_rotate_only_the_two_primary_models_across_restarts(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "router.json"
             selected = []
-            for _ in range(4):
+            for _ in range(len(runtime.PRIMARY_MODELS) + 1):
                 router = runtime.RoundRobinModelRouter(state_path)
                 selected.append(router.execute(lambda model: model))
             self.assertEqual(selected, [*runtime.PRIMARY_MODELS, runtime.PRIMARY_MODELS[0]])
@@ -481,7 +481,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
             router = runtime.RoundRobinModelRouter(state_path)
             self.assertEqual(router.execute(lambda model: model), runtime.ALL_MODELS[0])
 
-    def test_backups_follow_all_three_primaries_and_second_pass_retries_every_model(self):
+    def test_backups_follow_all_two_primaries_and_second_pass_retries_every_model(self):
         with tempfile.TemporaryDirectory() as directory:
             router = runtime.RoundRobinModelRouter(Path(directory) / "router.json")
             attempts = []
@@ -490,10 +490,10 @@ class OpenClawRuntimeTests(unittest.TestCase):
                 attempts.append(model)
                 raise runtime.ModelCapacityError("quota exhausted")
 
-            with self.assertRaisesRegex(RuntimeError, "All nine Gemini models failed twice"):
+            with self.assertRaisesRegex(RuntimeError, "All 7 Gemini models failed twice"):
                 router.execute(always_fail)
             self.assertEqual(attempts, list(runtime.ALL_MODELS) * 2)
-            self.assertEqual(len(attempts), 18)
+            self.assertEqual(len(attempts), 14)
 
     def test_second_pass_can_recover_after_every_model_fails_once(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -513,7 +513,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "router.json"
             router = runtime.RoundRobinModelRouter(state_path)
-            with self.assertRaisesRegex(RuntimeError, "All nine Gemini models failed twice"):
+            with self.assertRaisesRegex(RuntimeError, "All 7 Gemini models failed twice"):
                 router.execute(lambda model: (_ for _ in ()).throw(RuntimeError("unavailable")))
             restarted = runtime.RoundRobinModelRouter(state_path)
             self.assertEqual(restarted.execute(lambda model: model), runtime.PRIMARY_MODELS[1])
@@ -522,7 +522,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             router = runtime.RoundRobinModelRouter(Path(directory) / "router.json")
             attempts = []
-            with self.assertRaisesRegex(RuntimeError, "All nine Gemini models failed twice"):
+            with self.assertRaisesRegex(RuntimeError, "All 7 Gemini models failed twice"):
                 router.execute(lambda model: attempts.append(model) or (_ for _ in ()).throw(
                     RuntimeError("invalid credential")
                 ))
