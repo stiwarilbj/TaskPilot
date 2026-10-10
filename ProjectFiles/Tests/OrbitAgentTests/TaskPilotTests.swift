@@ -168,7 +168,6 @@ final class TaskPilotTests: XCTestCase {
         XCTAssertEqual(OpenClawService.fallbackGeminiModels, [
             "google/gemini-2.5-flash-lite",
             "google/gemini-3.8-flash",
-            "google/gemini-3.5-flash",
             "google/gemini-3-flash-preview",
             "google/gemini-2.5-flash"
         ])
@@ -177,7 +176,6 @@ final class TaskPilotTests: XCTestCase {
             "google/gemini-3.1-flash-lite",
             "google/gemini-2.5-flash-lite",
             "google/gemini-3.8-flash",
-            "google/gemini-3.5-flash",
             "google/gemini-3-flash-preview",
             "google/gemini-2.5-flash"
         ])
@@ -185,12 +183,12 @@ final class TaskPilotTests: XCTestCase {
 
     func testGeminiModelCheckKeepsTheAPIKeyOutOfTheURL() throws {
         let request = try GeminiModelVerifier.makeRequest(
-            model: "google/gemini-3.5-flash",
+            model: "google/gemini-3.8-flash",
             apiKey: "AIzaSyUnitTestSecret"
         )
         XCTAssertEqual(
             request.url?.absoluteString,
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
         )
         XCTAssertEqual(request.value(forHTTPHeaderField: "x-goog-api-key"), "AIzaSyUnitTestSecret")
         XCTAssertFalse(request.url?.absoluteString.contains("AIzaSyUnitTestSecret") ?? true)

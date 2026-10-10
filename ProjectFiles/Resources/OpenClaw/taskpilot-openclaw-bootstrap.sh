@@ -141,7 +141,6 @@ model_candidates=(
   "google/gemini-3.1-flash-lite"
   "google/gemini-2.5-flash-lite"
   "google/gemini-3.8-flash"
-  "google/gemini-3.5-flash"
   "google/gemini-3-flash-preview"
   "google/gemini-2.5-flash"
 )

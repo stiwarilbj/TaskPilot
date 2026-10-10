@@ -23,7 +23,7 @@ class GeminiProbeTests(unittest.TestCase):
             return io.BytesIO(b'{"candidates":[{"content":{"parts":[{"text":"OK"}]}}]}')
 
         model, error = probe.choose_model(
-            "private-key", ("google/gemini-3.5-flash", "google/gemini-3.1-flash-lite"), opener
+            "private-key", ("google/gemini-3.8-flash", "google/gemini-3.1-flash-lite"), opener
         )
         self.assertEqual(model, "google/gemini-3.1-flash-lite")
         self.assertEqual(error, "")

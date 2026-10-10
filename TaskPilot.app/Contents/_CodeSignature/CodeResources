@@ -34,7 +34,7 @@
 		</data>
 		<key>Resources/AgentRuntime/_internal/base_library.zip</key>
 		<data>
-		fk7MW06qWbriK6M77JIrq6vzDqw=
+		Mg1wIkcaAapCohCyEcwVT4qjRAg=
 		</data>
 		<key>Resources/AgentRuntime/_internal/libcrypto.3.dylib</key>
 		<data>
@@ -238,15 +238,15 @@
 		</data>
 		<key>Resources/AgentRuntime/orbit_openclaw_runtime</key>
 		<data>
-		79Gyr4z3X8j5+/DWvBcvnQPtSGw=
+		41xu9Hrs+NnGtycqR6Pnvty7mLQ=
 		</data>
 		<key>Resources/OpenClaw/__pycache__/gemini-probe.cpython-314.pyc</key>
 		<data>
-		ieiUEQ2xnFJ3QUSPDTsHI0D0r+U=
+		rJqDQk1r34MC1P6VGuVzvGTnmac=
 		</data>
 		<key>Resources/OpenClaw/gemini-probe.py</key>
 		<data>
-		y6ROYNfhPJbsEJkyVvatHk8IReo=
+		D/Gazrh2OjMwLjIY98god/iTTWc=
 		</data>
 		<key>Resources/OpenClaw/openclaw-setup.command</key>
 		<data>
@@ -254,7 +254,7 @@
 		</data>
 		<key>Resources/OpenClaw/taskpilot-openclaw-bootstrap.sh</key>
 		<data>
-		cnWxsgVs0zIe47+VEiu6PqVTs7Y=
+		rL40ecDtr1JEZ/RL0caTg1pRDsE=
 		</data>
 	</dict>
 	<key>files2</key>
@@ -312,7 +312,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			dTVdrSb+AxF0srW56h6n8rmYJASUK1rG7S30ZfJiv/A=
+			+WhiDpg0gkTFYywcd++MqmeD8A6yiMzQfb2IqGGZPH0=
 			</data>
 		</dict>
 		<key>Resources/AgentRuntime/_internal/libcrypto.3.dylib</key>
@@ -669,21 +669,21 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			M96fMYDSC6U/DFB2yonuKEINB7iwwyLTSy5GT8R9vxQ=
+			qyTB2kSDp+LH9mdulMMNzl5puPfHDe2/lW/Je+SwVzk=
 			</data>
 		</dict>
 		<key>Resources/OpenClaw/__pycache__/gemini-probe.cpython-314.pyc</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			lCktqNOjxuKeRL1BA5iN48od1Mi+U+3WvRPL0CrN5FY=
+			WJ0yYCx3+bpzpiWoqXhrotodZ7WCMO1yOttNidgh5NY=
 			</data>
 		</dict>
 		<key>Resources/OpenClaw/gemini-probe.py</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			6Rd6tYDVAu2EMTSZtyWBeXvDD/F3lk7CJXoz8bCoVPg=
+			gy54dLba0s1su5awA8Q9TmtF82lZDawm5FPWxLOPcqE=
 			</data>
 		</dict>
 		<key>Resources/OpenClaw/openclaw-setup.command</key>
@@ -697,7 +697,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			OT+Wa/W3JPYmPn4WMNpDMeabkX7BGZFbsqTpqOCOvJM=
+			znpr5vKZwfDocPNX9VTGDUYQEJZGfHv2gRowxdYCx9o=
 			</data>
 		</dict>
 	</dict>

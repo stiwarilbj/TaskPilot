@@ -47,9 +47,9 @@ Open Settings, add a Gemini key, install OpenClaw, connect an agent screen, and 
 TaskPilot 2.9.2 rotates new requests between Gemini 3.5 Flash-Lite and 3.1
 Flash-Lite. Each cycle tries the starting Flash-Lite model twice consecutively,
 then the other Flash-Lite model twice, followed by Gemini 2.5 Flash-Lite,
-3.8 Flash, 3.5 Flash, 3 Flash Preview, and 2.5 Flash once each. If no attempt
+3.8 Flash, 3 Flash Preview, and 2.5 Flash once each. If no attempt
 succeeds, the entire cycle runs a second time. Model exhaustion is reported
-only after all 18 attempts: four per primary Flash-Lite model and two per
+only after all 16 attempts: four per primary Flash-Lite model and two per
 fallback model. Successful responses end the retry cycle immediately.
 
 Model prompts wait for a completed response or an explicit provider/transport

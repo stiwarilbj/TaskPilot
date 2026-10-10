@@ -491,10 +491,10 @@ class OpenClawRuntimeTests(unittest.TestCase):
                 attempts.append(model)
                 raise runtime.ModelCapacityError("quota exhausted")
 
-            with self.assertRaisesRegex(RuntimeError, "All 7 Gemini models failed after two full cycles"):
+            with self.assertRaisesRegex(RuntimeError, "All 6 Gemini models failed after two full cycles"):
                 router.execute(always_fail)
             self.assertEqual(attempts, ([model for model in runtime.PRIMARY_MODELS for _ in range(2)] + list(runtime.FALLBACK_MODELS)) * 2)
-            self.assertEqual(len(attempts), 18)
+            self.assertEqual(len(attempts), 16)
 
     def test_primary_retry_can_recover_before_any_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -531,7 +531,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "router.json"
             router = runtime.RoundRobinModelRouter(state_path)
-            with self.assertRaisesRegex(RuntimeError, "All 7 Gemini models failed after two full cycles"):
+            with self.assertRaisesRegex(RuntimeError, "All 6 Gemini models failed after two full cycles"):
                 router.execute(lambda model: (_ for _ in ()).throw(RuntimeError("unavailable")))
             restarted = runtime.RoundRobinModelRouter(state_path)
             self.assertEqual(restarted.execute(lambda model: model), runtime.PRIMARY_MODELS[1])
@@ -540,7 +540,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             router = runtime.RoundRobinModelRouter(Path(directory) / "router.json")
             attempts = []
-            with self.assertRaisesRegex(RuntimeError, "All 7 Gemini models failed after two full cycles"):
+            with self.assertRaisesRegex(RuntimeError, "All 6 Gemini models failed after two full cycles"):
                 router.execute(lambda model: attempts.append(model) or (_ for _ in ()).throw(
                     RuntimeError("invalid credential")
                 ))
@@ -744,7 +744,7 @@ raise SystemExit(0)
 
             def recover_on_last_attempt(model):
                 attempts.append(model)
-                if len(attempts) < 18:
+                if len(attempts) < 16:
                     raise runtime.ModelCapacityError("temporarily unavailable")
                 return model
 
