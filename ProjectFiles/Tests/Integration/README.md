@@ -89,3 +89,29 @@ diagnostics store only action/outcome/recovery codes, without commands or values
 Automated fixtures cover these paths, cancellation, transport stops, unchanged
 targets, delayed effects, and query counts. No Chrome interaction or live-control
 tester was run; live compatibility and accuracy validation remain incomplete.
+
+Command execution validates the working directory, executable, argument types,
+timeouts, and requested outcome checks before launching. Single programs use
+literal `argv` arrays; shell source runs through a bounded `zsh -f -n` syntax
+preflight before execution, without user startup scripts. The validated directory
+also supplies `PWD`. Literal shell quoting preserves spaces, apostrophes, and
+metacharacters. Existing pause, cancellation, output limits, and mutation replay
+guards apply to both syntax checking and execution.
+
+`run_command` accepts exactly one of `argv` or `command`, plus optional `checks`:
+`file_exists`, `directory_exists`, and `path_absent` require an absolute or `~/`
+path; `file_contents` also requires exact content (UTF-8 or base64);
+`stdout_equals` requires exact text. Checks are read-only and run locally after
+the process ends. Exit zero alone reports execution, not verified task effects.
+Missing checks, mismatches, timeouts, and nonzero exits cannot enable native fast
+completion. Unconfirmed commands cannot be replayed by changing timeout, checks,
+or equivalent literal command/argv representations. Prompts and format repair use
+the same validated contract; no extra generation calls are made for local checks.
+
+Swift fixtures execute disposable local commands and files to test quoting,
+literal paths, syntax rejection before effects, invalid directories/parameters,
+exact/binary/empty file contents, directory/removal checks, dangling links,
+truncated output, cancellation, and zero-exit false positives. Python fixtures
+cover precise validation errors, one same-model repair, completion evidence,
+replay protection, and the 4,000-character prompt bound. No Chrome interaction,
+live-control tester, or live ACP task was used; live accuracy remains unverified.

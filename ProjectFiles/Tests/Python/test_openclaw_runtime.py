@@ -300,8 +300,9 @@ class OpenClawRuntimeTests(unittest.TestCase):
         self.assertTrue(runtime.native_action_can_finish(
             "Run the shell command touch /tmp/taskpilot-marker",
             decision,
-            {"type": "run_command"},
-            {"exit_code": 0, "timed_out": False},
+            {"type": "run_command", "checks": [{"type": "file_exists", "path": "/tmp/taskpilot-marker"}]},
+            {"exit_code": 0, "timed_out": False, "verified": True, "verification_scope": "requested_outcomes",
+             "checks": [{"type": "file_exists", "path": "/tmp/taskpilot-marker", "verified": True}]},
             {},
         ))
         self.assertFalse(runtime.native_action_can_finish(

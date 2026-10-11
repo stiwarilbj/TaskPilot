@@ -173,6 +173,19 @@ class RepairTests(unittest.TestCase):
             self.assertEqual(self.client.prompt_calls, 1)
             self.assertEqual(self.router.metrics['repairs'], 0)
 
+    def test_command_argument_error_uses_shared_same_model_repair(self):
+        invalid = '{"status":"act","action":{"type":"run_command","argv":["touch",12]}}'
+        valid = '{"status":"act","action":{"type":"run_command","argv":["touch","/tmp/marker"],"checks":[{"type":"file_exists","path":"/tmp/marker"}]}}'
+        with mock.patch.object(runtime, 'bridge_call') as bridge:
+            response = self.run_response([invalid, valid])
+        self.assertEqual(response['action']['argv'], ['touch', '/tmp/marker'])
+        self.assertEqual(self.client.prompt_calls, 2)
+        self.assertEqual(self.router.metrics['planning'], 2)
+        self.assertEqual(self.router.metrics['repairs'], 1)
+        self.assertEqual(self.client.calls[0][0], self.client.calls[1][0])
+        self.assertIn('action.argv[1] must be a string', self.client.calls[1][1])
+        bridge.assert_not_called()
+
     def test_same_model_repair_reuses_evidence_without_actions(self):
         invalid = '{"status":"act","action":{"type":"type_text","text":12,"pid":42}}'
         with mock.patch.object(runtime, 'bridge_call') as bridge:
@@ -287,7 +300,7 @@ class RepairTests(unittest.TestCase):
                                      ('verification', dict(OBSERVATION, revision='new'))]:
             runtime.routed_json_prompt(self.router, client, 'same', self.image, purpose, observation)
         self.assertEqual(client.prompt_calls, 3)
-        with mock.patch.object(runtime, 'VALIDATION_VERSION', 2):
+        with mock.patch.object(runtime, 'VALIDATION_VERSION', runtime.VALIDATION_VERSION + 1):
             runtime.routed_json_prompt(self.router, client, 'same', self.image, 'verification', dict(OBSERVATION, revision='new'))
         self.assertEqual(client.prompt_calls, 4)
 

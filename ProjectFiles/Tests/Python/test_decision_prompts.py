@@ -50,7 +50,7 @@ class DecisionPromptTests(unittest.TestCase):
     def test_native_examples_are_relevant_and_minimal(self):
         cases = [('Read /tmp/report.txt', 'read_file', {'type', 'path'}),
                  ('Write /tmp/report.txt saying hello', 'write_file', {'type', 'path', 'content'}),
-                 ('Run git status in ~/project', 'run_command', {'type', 'command'}),
+                 ('Run git status in ~/project', 'run_command', {'type', 'argv'}),
                  ('Search the web for documentation', 'navigate_browser', {'type', 'url'})]
         for task, kind, fields in cases:
             with self.subTest(task=task):

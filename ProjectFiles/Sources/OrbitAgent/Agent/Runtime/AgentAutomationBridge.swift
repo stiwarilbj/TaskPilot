@@ -60,7 +60,7 @@ final class AgentAutomationBridge {
                     "agent_tools": [
                         "read_file": "Read a text or binary file by path; binary content is returned as base64.",
                         "write_file": "Create, overwrite, or append a file by path.",
-                        "run_command": "Run a zsh command with a working directory, timeout, exit code, stdout, and stderr.",
+                        "run_command": "Run literal argv or syntax-checked zsh source in a validated working directory; verify requested file/output checks. Exit zero alone proves execution only.",
                         "browser_control": "Navigate Safari, Chrome, or another browser to a URL/search, then control the rendered page through visible Accessibility actions.",
                         "app_automation": "Launch and control installed apps through visible Accessibility actions."
                     ],
@@ -92,7 +92,8 @@ final class AgentAutomationBridge {
                 "result": result
             ]
         } catch {
-            let code = (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? "action_rejected"
+            let code = error is CancellationError ? "cancelled" :
+                (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? "action_rejected"
             return [
                 "kind": "bridge_response",
                 "request_id": requestID,

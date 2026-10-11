@@ -37,8 +37,11 @@ final class TaskToolExecutor {
     static let maximumCommandTimeout: TimeInterval = 900
     private let commandLock = NSLock()
     private var activeCommand: Process?
+    private var commandCancelled = false
+    private var commandPaused = false
 
     func perform(action: [String: Any]) async throws -> [String: Any] {
+        try Task.checkCancellation()
         guard let type = action["type"] as? String else {
             throw TaskToolError.invalidAction("The tool action has no type")
         }
@@ -55,14 +58,17 @@ final class TaskToolExecutor {
     }
 
     func pauseActiveCommand() {
+        commandLock.lock(); commandPaused = true; commandLock.unlock()
         signalActiveCommand(SIGSTOP)
     }
 
     func resumeActiveCommand() {
+        commandLock.lock(); commandPaused = false; commandLock.unlock()
         signalActiveCommand(SIGCONT)
     }
 
     func cancelActiveCommand() {
+        commandLock.lock(); commandCancelled = true; commandLock.unlock()
         signalActiveCommand(SIGCONT)
         signalActiveCommand(SIGTERM)
     }
@@ -213,131 +219,127 @@ final class TaskToolExecutor {
     }
 
     private func runCommand(_ action: [String: Any]) throws -> [String: Any] {
-        guard let rawCommand = action["command"] as? String else {
-            throw TaskToolError.invalidAction("run_command requires command")
-        }
-        let command = rawCommand.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !command.isEmpty else {
-            throw TaskToolError.invalidAction("run_command requires a non-empty command")
-        }
-        guard command.utf8.count <= Self.maximumCommandLength else {
-            throw TaskToolError.invalidAction(
-                "run_command is limited to \(Self.maximumCommandLength) command bytes"
-            )
-        }
-
-        let workingDirectory: URL
-        if let path = action["working_directory"] as? String, !path.isEmpty {
-            workingDirectory = Self.expandedFileURL(path)
-        } else {
-            workingDirectory = FileManager.default.homeDirectoryForCurrentUser
-        }
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(
-            atPath: workingDirectory.path,
-            isDirectory: &isDirectory
-        ), isDirectory.boolValue else {
-            throw TaskToolError.invalidAction(
-                "The command working directory does not exist: \(workingDirectory.path)"
-            )
-        }
-
-        let requestedTimeout = Self.doubleValue(action["timeout_seconds"]) ?? 120
-        let timeout = min(Self.maximumCommandTimeout, max(0.2, requestedTimeout))
+        commandLock.lock(); commandCancelled = false; commandLock.unlock()
+        try Task.checkCancellation()
+        var environment = ProcessInfo.processInfo.environment
+        let fallbackPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        environment["PATH"] = [environment["PATH"], fallbackPath].compactMap { $0 }.joined(separator: ":")
+        environment["TERM"] = "dumb"
+        let policy = try CommandExecutionPolicy(action: action, environment: environment)
+        environment["PWD"] = policy.workingDirectory.path
         let temporaryDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("orbit-command-\(UUID().uuidString)", isDirectory: true)
-        let stdoutURL = temporaryDirectory.appendingPathComponent("stdout")
-        let stderrURL = temporaryDirectory.appendingPathComponent("stderr")
-        try FileManager.default.createDirectory(
-            at: temporaryDirectory,
-            withIntermediateDirectories: false
-        )
+        try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        if let source = policy.shellSource {
+            // -n parses the complete source without executing substitutions or
+            // earlier statements. -f avoids user startup scripts in both phases.
+            let syntax = try executeProcess(executable: policy.executable, arguments: ["-f", "-n", "-c", source],
+                                            policy: policy, environment: environment,
+                                            directory: temporaryDirectory, prefix: "syntax", timeout: min(5, policy.timeout))
+            guard !syntax.timedOut, syntax.status == 0 else {
+                throw TaskToolError.invalidAction("Shell syntax check failed before execution: " + syntax.stderr.text)
+            }
+        }
+        let execution = try executeProcess(executable: policy.executable, arguments: policy.arguments,
+                                           policy: policy, environment: environment,
+                                           directory: temporaryDirectory, prefix: "command", timeout: policy.timeout)
+        let checks = policy.checks.map { $0.evaluate(stdout: execution.stdout.text, stdoutTruncated: execution.stdout.truncated) }
+        let executed = !execution.timedOut && execution.status == 0
+        let verified = executed && !checks.isEmpty && checks.allSatisfy { $0["verified"] as? Bool == true }
+        return [
+            "message": execution.timedOut
+                ? "Command timed out; inspect its effects before retrying"
+                : verified ? "Command finished and its requested outcome checks passed"
+                : "Command finished with exit code \(execution.status); its requested outcome is not verified",
+            "command": policy.displayCommand,
+            "working_directory": policy.workingDirectory.path,
+            "execution_method": policy.shellSource == nil ? "argument_array" : "shell",
+            "syntax_checked": policy.shellSource != nil,
+            "exit_code": Int(execution.status),
+            "timed_out": execution.timedOut,
+            "executed": executed,
+            "verified": verified,
+            "outcome": verified ? "verified" : "delivered_unconfirmed",
+            "verification_scope": checks.isEmpty ? "execution_only" : "requested_outcomes",
+            "checks": checks,
+            "stdout": execution.stdout.text,
+            "stderr": execution.stderr.text,
+            "stdout_truncated": execution.stdout.truncated,
+            "stderr_truncated": execution.stderr.truncated
+        ]
+    }
+
+    private func executeProcess(executable: URL, arguments: [String], policy: CommandExecutionPolicy,
+                                environment: [String: String], directory: URL, prefix: String, timeout: TimeInterval)
+        throws -> (status: Int32, timedOut: Bool, stdout: (text: String, truncated: Bool), stderr: (text: String, truncated: Bool)) {
+        let stdoutURL = directory.appendingPathComponent(prefix + "-stdout")
+        let stderrURL = directory.appendingPathComponent(prefix + "-stderr")
         FileManager.default.createFile(atPath: stdoutURL.path, contents: nil)
         FileManager.default.createFile(atPath: stderrURL.path, contents: nil)
         let stdoutHandle = try FileHandle(forWritingTo: stdoutURL)
         let stderrHandle = try FileHandle(forWritingTo: stderrURL)
-        defer {
-            try? stdoutHandle.close()
-            try? stderrHandle.close()
-        }
-
+        defer { try? stdoutHandle.close(); try? stderrHandle.close() }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-lc", command]
-        process.currentDirectoryURL = workingDirectory
-        var environment = ProcessInfo.processInfo.environment
-        let fallbackPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        environment["PATH"] = [environment["PATH"], fallbackPath]
-            .compactMap { $0 }
-            .joined(separator: ":")
-        environment["TERM"] = "dumb"
+        process.executableURL = executable
+        process.arguments = arguments
+        process.currentDirectoryURL = policy.workingDirectory
         process.environment = environment
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = stdoutHandle
         process.standardError = stderrHandle
 
-        do {
-            try process.run()
-        } catch {
-            throw TaskToolError.operationFailed(
-                "\(TaskPilotIdentity.displayName) could not start the command: \(error.localizedDescription)"
-            )
-        }
-        // Keep the shell and any child processes in one task-owned group so
-        // TaskPilot's Pause and Stop controls apply to the entire command tree.
-        _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
+        // Serialize launching with Stop, including the gap after preflight.
         commandLock.lock()
+        if commandCancelled { commandLock.unlock(); throw CancellationError() }
+        do { try process.run() }
+        catch {
+            commandLock.unlock()
+            throw TaskToolError.operationFailed("Could not start the command: \(error.localizedDescription)")
+        }
+        _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
         activeCommand = process
+        if commandPaused, Darwin.kill(-process.processIdentifier, SIGSTOP) != 0 {
+            Darwin.kill(process.processIdentifier, SIGSTOP)
+        }
         commandLock.unlock()
         defer {
             commandLock.lock()
             if activeCommand === process { activeCommand = nil }
             commandLock.unlock()
         }
-
         let deadline = Date().addingTimeInterval(timeout)
         while process.isRunning && Date() < deadline {
+            if Task.isCancelled { cancelActiveCommand() }
+            commandLock.lock(); let cancelled = commandCancelled; commandLock.unlock()
+            if cancelled { break }
             Thread.sleep(forTimeInterval: 0.025)
         }
         let timedOut = process.isRunning
         if timedOut {
-            process.terminate()
+            signalActiveCommand(SIGCONT)
+            signalActiveCommand(SIGTERM)
             let terminationDeadline = Date().addingTimeInterval(1)
-            while process.isRunning && Date() < terminationDeadline {
-                Thread.sleep(forTimeInterval: 0.025)
-            }
-            if process.isRunning {
+            while process.isRunning && Date() < terminationDeadline { Thread.sleep(forTimeInterval: 0.025) }
+            // Also kill children that outlive their shell.
+            if Darwin.kill(-process.processIdentifier, SIGKILL) != 0, process.isRunning {
                 Darwin.kill(process.processIdentifier, SIGKILL)
             }
         }
         process.waitUntilExit()
-        try? stdoutHandle.synchronize()
-        try? stderrHandle.synchronize()
-
-        let stdout: (text: String, truncated: Bool)
-        let stderr: (text: String, truncated: Bool)
+        commandLock.lock(); let cancelled = commandCancelled; commandLock.unlock()
+        if cancelled || Task.isCancelled {
+            Darwin.kill(-process.processIdentifier, SIGKILL)
+            throw CancellationError()
+        }
+        try? stdoutHandle.synchronize(); try? stderrHandle.synchronize()
         do {
-            stdout = try Self.boundedText(from: stdoutURL)
-            stderr = try Self.boundedText(from: stderrURL)
+            return (process.terminationStatus, timedOut, try Self.boundedText(from: stdoutURL), try Self.boundedText(from: stderrURL))
         } catch {
+            if prefix == "syntax" { throw TaskToolError.operationFailed("Shell syntax-check output could not be read; the command was not executed") }
             throw TaskToolError.uncertainDelivery("The command ended, but its output could not be read; inspect its effects before running it again")
         }
-        return [
-            "message": timedOut
-                ? "Command timed out after \(String(format: "%.1f", timeout)) seconds"
-                : "Command finished with exit code \(process.terminationStatus)",
-            "command": command,
-            "working_directory": workingDirectory.path,
-            "exit_code": Int(process.terminationStatus),
-            "timed_out": timedOut,
-            "outcome": !timedOut && process.terminationStatus == 0 ? "verified" : "delivered_unconfirmed",
-            "verification_scope": "command_exit_status",
-            "stdout": stdout.text,
-            "stderr": stderr.text,
-            "stdout_truncated": stdout.truncated,
-            "stderr_truncated": stderr.truncated
-        ]
     }
 
     private static func fileURL(from action: [String: Any]) throws -> URL {
@@ -394,9 +396,4 @@ final class TaskToolExecutor {
         return nil
     }
 
-    private static func doubleValue(_ value: Any?) -> Double? {
-        if let number = value as? NSNumber { return number.doubleValue }
-        if let text = value as? String { return Double(text) }
-        return nil
-    }
 }

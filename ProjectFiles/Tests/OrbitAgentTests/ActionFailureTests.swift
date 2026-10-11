@@ -10,7 +10,7 @@ final class ActionFailureTests: XCTestCase {
 
     func testCommandExitStatusPreservesOutputAndClassifiesEffects() async throws {
         let executor = TaskToolExecutor()
-        for (command, outcome, code) in [("printf fixture", "verified", 0), ("printf partial; exit 2", "delivered_unconfirmed", 2)] {
+        for (command, outcome, code) in [("printf fixture", "delivered_unconfirmed", 0), ("printf partial; exit 2", "delivered_unconfirmed", 2)] {
             let result = try await executor.perform(action: ["type": "run_command", "command": command])
             XCTAssertEqual(result["exit_code"] as? Int, code)
             XCTAssertEqual(result["outcome"] as? String, outcome)
