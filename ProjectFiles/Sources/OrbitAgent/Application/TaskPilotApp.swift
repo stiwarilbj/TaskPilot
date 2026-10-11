@@ -16,7 +16,6 @@ enum ControllerWindowLayout {
     static let supportsHorizontalAndVerticalResizing = true
 }
 
-@main
 struct TaskPilotApp: App {
     @NSApplicationDelegateAdaptor(TaskPilotAppDelegate.self) private var appDelegate
     @StateObject private var model = TaskPilotCoordinator()

@@ -25,6 +25,7 @@ final class AgentAutomationBridge {
     }
 
     func cancelActiveTool() {
+        accessibility.cancelInputDelivery()
         taskTools.cancelActiveCommand()
     }
 
@@ -44,10 +45,12 @@ final class AgentAutomationBridge {
                 // before every screenshot so an idle cursor never obscures
                 // page text or becomes part of the model's visual context.
                 accessibility.hideAgentCursor()
-                async let screenshotURLTask = capture.capture(display: display)
+                // Capture first, then bind element IDs to the immediately
+                // following tree instead of racing an older tree with pixels.
+                let screenshotURL = try await capture.capture(display: display)
                 let snapshot = accessibility.snapshot(on: display)
-                let screenshotURL = try await screenshotURLTask
                 result = [
+                    "observation_revision": snapshot.revision,
                     "screenshot_path": screenshotURL.path,
                     "display": displayDictionary(display),
                     "applications": snapshot.applications,
@@ -74,8 +77,8 @@ final class AgentAutomationBridge {
                    TaskToolExecutor.supportedActions.contains(type) {
                     result = try await taskTools.perform(action: action)
                 } else {
-                    let message = try await accessibility.perform(action: action, on: display)
-                    result = ["message": message]
+                    try accessibility.validateObservation(params["observation_revision"] as? String)
+                    result = try await accessibility.performStructured(action: action, on: display)
                 }
 
             default:
@@ -92,7 +95,9 @@ final class AgentAutomationBridge {
                 "kind": "bridge_response",
                 "request_id": requestID,
                 "ok": false,
-                "error": error.localizedDescription
+                "error": error.localizedDescription,
+                "error_code": (error as? AccessibilityActionError)?.code ?? "action_rejected",
+                "outcome": "rejected"
             ]
         }
     }

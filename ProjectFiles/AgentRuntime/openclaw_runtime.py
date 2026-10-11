@@ -62,6 +62,13 @@ STANDARD_LOCATIONS = {
 TRUSTED_NATIVE_ACTIONS = {"read_file", "write_file", "run_command"}
 
 _active_acp_process: subprocess.Popen[str] | None = None
+_bridge_observation_revision: str | None = None
+
+
+class ActionRejected(RuntimeError):
+    def __init__(self, message: str, code: str = "action_rejected") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class ModelCapacityError(RuntimeError):
@@ -218,6 +225,9 @@ def check_models(path: str, key: str, read_only: bool = False) -> bool:
 
 
 def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
+    global _bridge_observation_revision
+    if method == "act" and _bridge_observation_revision:
+        params.setdefault("observation_revision", _bridge_observation_revision)
     request_id = str(uuid.uuid4())
     emit(
         "bridge_request",
@@ -235,8 +245,11 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
         if response.get("request_id") != request_id:
             continue
         if not response.get("ok"):
-            raise RuntimeError(str(response.get("error") or f"{PRODUCT_NAME} rejected the request"))
+            raise ActionRejected(str(response.get("error") or f"{PRODUCT_NAME} rejected the request"),
+                                 str(response.get("error_code") or "action_rejected"))
         result = response.get("result")
+        if method == "observe" and isinstance(result, dict):
+            _bridge_observation_revision = result.get("observation_revision")
         return result if isinstance(result, dict) else {}
     raise RuntimeError(f"Lost contact with the native {PRODUCT_NAME} controller")
 
@@ -501,8 +514,23 @@ def normalized_action(value: Any) -> dict[str, Any]:
         # Native macOS semantic controls use AXPress. Models naturally call
         # that intent "click", so translate an element-only click before it
         # reaches the coordinate-only native click path.
-        if action_type == "click" and "element_id" in action and not {"x", "y"}.issubset(action):
+        if action_type == "click" and action.get("element_id"):
             action["type"] = "press"
+            action.pop("x", None)
+            action.pop("y", None)
+    if ("x" in action) != ("y" in action):
+        raise RuntimeError("Coordinates require both x and y")
+    if action_type in {"press", "focus", "set_value"} and not action.get("element_id"):
+        raise RuntimeError(f"{action_type} requires element_id")
+    if action_type == "scroll":
+        try:
+            deltas = [float(action.get(k) or 0) for k in ("delta_x", "delta_y")]
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("scroll deltas must be numbers") from error
+        if not any(deltas):
+            raise RuntimeError("scroll requires a nonzero delta")
+        if any(not -2000 <= delta <= 2000 for delta in deltas):
+            raise RuntimeError("scroll deltas must be between -2000 and 2000")
     if action_type in {"type_text", "set_value"} and "text" not in action:
         raise RuntimeError(f"{action_type} requires text")
     if action_type == "key" and "key" not in action:
@@ -521,7 +549,10 @@ def normalized_action(value: Any) -> dict[str, Any]:
         raise RuntimeError("navigate_browser requires url or query")
     for coordinate in ("x", "y"):
         if coordinate in action:
-            number = float(action[coordinate])
+            try:
+                number = float(action[coordinate])
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(f"{coordinate} must be a number") from error
             if not 0 <= number <= 1000:
                 raise RuntimeError(f"{coordinate} must be between 0 and 1000")
             action[coordinate] = number
@@ -543,6 +574,79 @@ def effective_decision_status(decision: dict[str, Any]) -> str:
         if action_type in VALID_ACTIONS - {"none"}:
             return "act"
     return status
+
+
+def action_identity(action: dict[str, Any], observation: dict[str, Any]) -> str:
+    """Identify an action independently of per-observation element IDs."""
+    identity = {k: v for k, v in action.items() if k not in {"element_id", "observation_revision"}}
+    element = next((e for e in observation.get("elements", [])
+                    if isinstance(e, dict) and action.get("element_id") and e.get("id") == action.get("element_id")), None)
+    if element:
+        identity["target"] = {k: element.get(k) for k in ("pid", "role", "title")}
+    return json.dumps(identity, sort_keys=True, separators=(",", ":"))
+
+
+def action_may_mutate(action: dict[str, Any], observation: dict[str, Any]) -> bool:
+    kind = action.get("type")
+    if kind in {"type_text", "write_file", "run_command"}:
+        return True
+    if kind == "key":
+        return str(action.get("key")).lower() in {"return", "enter", "delete", "backspace"}
+    if kind not in {"press", "click", "double_click"}:
+        return False
+    element = next((e for e in observation.get("elements", [])
+                    if isinstance(e, dict) and action.get("element_id") and e.get("id") == action.get("element_id")), {})
+    label = str(element.get("title") or "")
+    # Treat unknown controls as mutations. Only explicit navigation affordances
+    # may be repeated after verified nonexecution; labels alone cannot prove
+    # that a button such as "Increment" or "Continue" is harmless.
+    if element.get("role") == "AXMenuBarItem":
+        return False
+    return label.strip().casefold() not in {"back", "forward", "next page", "previous page"}
+
+
+
+def blocked_recovery_action(task: str, observation: dict[str, Any], history: list[dict[str, Any]]) -> dict[str, Any] | None:
+    named = task_capability_context(task, observation)["explicitly_named_apps"]
+    installed = observation.get("installed_applications", [])
+    visible = {str(a.get("name", "")).casefold() for a in observation.get("applications", []) if isinstance(a, dict)}
+    for name in named:
+        matching = [a for a in installed if isinstance(a, dict) and str(a.get("name", "")).casefold() == name.casefold()]
+        attempted = any(isinstance(e.get("action"), dict) and e["action"].get("type") == "launch_app"
+                        and str(e["action"].get("app", "")).casefold() == name.casefold() for e in history)
+        if len(matching) == 1 and name.casefold() not in visible and not attempted:
+            return {"type": "launch_app", "app": matching[0]["name"], "bundle_id": matching[0].get("bundle_id", "")}
+    return None
+
+
+def record_action_diagnostic(action: dict[str, Any], result: dict[str, Any]) -> None:
+    """Private bounded diagnostics omit text, paths, commands and screen data."""
+    try:
+        folder = Path.home() / "Library/Application Support" / LEGACY_APPLICATION_SUPPORT_FOLDER
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / "automation-diagnostics.jsonl"
+        if path.exists() and path.stat().st_size > 1_000_000:
+            path.unlink()
+        entry = {"timestamp": time.time(), "runtime_pid": os.getpid(), "action": action.get("type"),
+                 **{k: result[k] for k in ("outcome", "delivery_method", "error_code", "verification_scope") if k in result}}
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "a") as output:
+            output.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
+
+def observation_progress_signature(observation: dict[str, Any]) -> str:
+    """Revision changes alone are not evidence that a loading app progressed."""
+    evidence = {
+        "display": observation.get("display"),
+        "applications": observation.get("applications"),
+        "elements": [{key: element[key] for key in
+            ("pid", "role", "subrole", "title", "value", "focused", "enabled", "frame") if key in element}
+            for element in observation.get("elements", []) if isinstance(element, dict)],
+    }
+    return json.dumps(evidence, sort_keys=True)
 
 
 def action_settle_seconds(action_type: str) -> float:
@@ -806,7 +910,24 @@ def compact_observation(observation: dict[str, Any]) -> dict[str, Any]:
                 }
             )
         ]
-        compact["elements"] = meaningful[:MAX_COMPACT_ELEMENTS]
+        # Keep focused controls, menus and actionable controls before static
+        # text. Preserve their ancestor labels even in large browser trees.
+        ranked = sorted(enumerate(meaningful), key=lambda pair: (
+            0 if pair[1].get("focused") else
+            1 if pair[1].get("role") in {"AXMenu", "AXMenuItem", "AXMenuBarItem", "AXSheet"} else
+            2 if pair[1].get("actions") and pair[1].get("enabled", True) else 3,
+            pair[0],
+        ))
+        by_id = {e.get("id"): e for e in meaningful if e.get("id")}
+        chosen: set[str] = set()
+        for _, element in ranked:
+            chain, cursor = [], element
+            while cursor and cursor.get("id") not in chosen:
+                chain.append(cursor)
+                cursor = by_id.get(cursor.get("parent_id"))
+            if len(chosen) + len(chain) <= MAX_COMPACT_ELEMENTS:
+                chosen.update(e["id"] for e in chain if e.get("id"))
+        compact["elements"] = [e for e in meaningful if e.get("id") in chosen]
     return compact
 
 
@@ -1520,6 +1641,8 @@ def desktop_instruction(
         "context_used": "short explanation of the user wording, live app, path, or prior result used for this step",
         "summary": "short present-tense status",
         "visual_evidence": "what the current image proves",
+        "intended_target": "app and uniquely identified control, or exact native path/command",
+        "expected_result": "specific observable change or native result expected from this one action",
         "completed_requirements": ["only visibly proven items"],
         "remaining_requirements": ["unfinished task requirements"],
         "finish_after_action": "true only for a single write_file or explicitly requested run_command that fully completes the task if its verified result succeeds",
@@ -1585,7 +1708,24 @@ def desktop_instruction(
         "only when the current screenshot or a successful validated native tool result proves every requested "
         "requirement; attempted actions are not proof. Choose blocked only when no allowed action can make progress, and never pair blocked with "
         "an action. A required app, folder, page, or control not being open yet normally requires status act. "
-        "For questions, output the exact answer. For changes, output a concise verified confirmation.\n\n"
+        "For questions, output the exact answer. For changes, output a concise verified confirmation. "
+        "Include only the fields needed by the chosen action; never fill unused coordinates with zero. "
+        "Name the intended_target and expected_result for each action. Copy the complete element_id exactly, "
+        "including its observation revision prefix. Match the requested control label and surrounding context; "
+        "do not choose a similarly named menu command when the requested button is visible. A supplied element_id takes precedence "
+        "over coordinates. Use double_click with an element_id to open a visible file or row. Scroll may use "
+        "an element_id, x/y and pid, or only pid to use that app's visible scroll area. "
+        "Missing Accessibility controls do not mean an app is unusable: inspect the screenshot and the "
+        "Core Graphics window metadata, then use visible coordinates with that app's pid. "
+        "A delivered_unconfirmed result proves only that input was sent. Inspect a fresh screen before "
+        "claiming progress; never repeat a send, submit, purchase, delete, or text insertion whose outcome "
+        "is uncertain. For stale_target refresh and select the current control; for disabled_target wait "
+        "or choose an enabled route; after delivery_rejected choose another valid method rather than "
+        "repeating the same rejected action. Exhaust these applicable routes before choosing blocked.\n"
+        'Minimal action examples: {"type":"press","element_id":"current-id"}; '
+        '{"type":"double_click","element_id":"current-id"}; '
+        '{"type":"scroll","pid":123,"delta_y":-300}; '
+        '{"type":"set_value","element_id":"current-field","text":"exact value"}.\n\n'
     )
     if task_guidance:
         introduction += f"{task_guidance}\n\n"
@@ -1662,7 +1802,7 @@ def routed_json_prompt(
                     raise ModelAttemptError("The desktop decision is missing its single action")
                 normalized_action(dict(value["action"]))
             return value
-        except RuntimeError as parse_error:
+        except (RuntimeError, ValueError, TypeError, OverflowError) as parse_error:
             if is_model_capacity_failure(response):
                 raise ModelCapacityError(response)
             # A truncated/non-JSON response cannot drive a safe desktop turn.
@@ -1730,6 +1870,9 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
     last_screen_digest = ""
     identical_action_count = 0
     consecutive_action_failures = 0
+    blocked_recoveries = 0
+    uncertain_mutations: set[str] = set()
+    suppressed_mutations: set[str] = set()
     try:
         emit("status", message=f"OpenClaw is connecting to the {PRODUCT_NAME} screen…")
         for step in range(1, MAX_STEPS + 1):
@@ -1829,7 +1972,21 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                 continue
 
             if status == "blocked":
-                raise RuntimeError(str(decision.get("reason") or summary or "OpenClaw is blocked"))
+                reason = str(decision.get("reason") or summary or "OpenClaw is blocked")
+                if re.search(r"credential|password|verification code|permission denied|not authorized|cancelled|destructive|irreversible", reason, re.I):
+                    raise RuntimeError(reason)
+                recovery = blocked_recovery_action(task, observation, history)
+                if recovery:
+                    decision = {"status": "act", "action": recovery, "summary": "Opening the requested installed app"}
+                    status = "act"
+                elif blocked_recoveries < 1:
+                    blocked_recoveries += 1
+                    history.append({"step": step, "action": "blocked_recovery", "result": {
+                        "message": "Reconsider on a fresh screen: check app launch, visible coordinate targets, menus, and prior rejection codes before declaring this task blocked.",
+                        "previous_reason": reason}})
+                    continue
+                else:
+                    raise RuntimeError(reason)
 
             if status == "done":
                 if trusted_native_history(task, observation, history):
@@ -1911,7 +2068,14 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
 
             action = normalized_action(decision.get("action"))
             action_type = str(action["type"])
-            action_signature = json.dumps(action, sort_keys=True, separators=(",", ":"))
+            action_signature = action_identity(action, observation)
+            if action_signature in uncertain_mutations:
+                if action_signature in suppressed_mutations:
+                    raise RuntimeError("The previous input may already have changed the app. TaskPilot stopped rather than repeat an uncertain mutation.")
+                suppressed_mutations.add(action_signature)
+                history.append({"step": step, "action": "repeat_suppressed", "result": {
+                    "message": "Do not replay this uncertain mutation. Inspect its outcome, choose a read-only verification action, or report the unresolved result."}})
+                continue
             if action_type == "wait":
                 identical_action_count = 0
             elif action_signature == last_action_signature and screenshot_digest == last_screen_digest:
@@ -1930,13 +2094,13 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                 # Poll the native observation while loading, without another
                 # model request for every unchanged frame.
                 deadline = time.monotonic() + seconds
-                baseline = json.dumps(compact_observation(observation), sort_keys=True)
+                baseline = observation_progress_signature(observation)
                 while time.monotonic() < deadline:
                     time.sleep(min(1.0, max(0, deadline - time.monotonic())))
                     polled = bridge_call("observe", display_id)
                     polled_path = Path(str(polled.get("screenshot_path") or ""))
                     try:
-                        if json.dumps(compact_observation(polled), sort_keys=True) != baseline:
+                        if observation_progress_signature(polled) != baseline:
                             break
                     finally:
                         if polled_path.is_file():
@@ -1948,12 +2112,20 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                 try:
                     result = bridge_call("act", display_id, action=action)
                 except RuntimeError as action_error:
+                    code = getattr(action_error, "code", "action_rejected")
+                    if code in {"cancelled", "permission_denied", "protected_target", "secure_input"}:
+                        raise
                     consecutive_action_failures += 1
+                    model_router.metrics["action_rejections"] += 1
+                    failure_result = {"message": str(action_error), "outcome": "rejected", "error_code": code}
+                    record_action_diagnostic(action, failure_result)
+                    if code == "delivery_uncertain" and action_may_mutate(action, observation):
+                        uncertain_mutations.add(action_signature)
                     history.append({
                         "step": step,
                         "visual_evidence": str(decision.get("visual_evidence") or ""),
                         "action": action,
-                        "result": f"{PRODUCT_NAME} rejected this action: {action_error}",
+                        "result": failure_result,
                         "completed_requirements": decision.get("completed_requirements") or [],
                         "remaining_requirements": decision.get("remaining_requirements") or [],
                     })
@@ -1965,6 +2137,12 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                     continue
                 consecutive_action_failures = 0
                 result_message = result
+                model_router.metrics["action_deliveries"] += 1
+                if result.get("outcome") == "delivered_unconfirmed":
+                    model_router.metrics["unconfirmed_actions"] += 1
+                    if action_may_mutate(action, observation):
+                        uncertain_mutations.add(action_signature)
+                record_action_diagnostic(action, result)
                 settle_seconds = action_settle_seconds(action_type)
                 if settle_seconds > 0:
                     time.sleep(settle_seconds)

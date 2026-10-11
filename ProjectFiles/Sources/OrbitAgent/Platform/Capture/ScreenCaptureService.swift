@@ -103,6 +103,9 @@ actor ScreenCaptureService {
     }
 
     func capture(display: DisplayDescriptor) async throws -> URL {
+        guard Self.preflightAuthorizationStatus() == .authorized else {
+            throw ScreenCaptureError.permissionDenied("Screen capture is not authorized for this TaskPilot process")
+        }
         let content: SCShareableContent
         do {
             content = try await shareableContent()

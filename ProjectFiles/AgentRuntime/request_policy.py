@@ -93,7 +93,8 @@ class AdaptiveModelRouter:
                 if health.get("state") == "temporary":
                     self.cooldowns[model] = health.get("retry_at") or float("inf")
         self.metrics = {"planning": 0, "verification": 0, "retries": 0, "model_switches": 0,
-                        "cache_hits": 0, "reconnects": 0, "provider_retries": None}
+                        "cache_hits": 0, "reconnects": 0, "provider_retries": None,
+                        "action_deliveries": 0, "action_rejections": 0, "unconfirmed_actions": 0}
 
     def execute(self, operation: Callable[[str], Any], purpose: str = "planning") -> Any:
         order = ([self.active_model] if self.active_model else []) + [m for m in ALL_MODELS if m != self.active_model]

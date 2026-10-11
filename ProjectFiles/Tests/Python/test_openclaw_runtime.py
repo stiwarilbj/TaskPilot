@@ -16,6 +16,79 @@ import openclaw_runtime as runtime
 
 
 class OpenClawRuntimeTests(unittest.TestCase):
+    def test_element_double_click_and_coordinate_free_scroll(self):
+        self.assertEqual(runtime.normalized_action({"type": "double_click", "element_id": "current:e1"}),
+                         {"type": "double_click", "element_id": "current:e1"})
+        self.assertEqual(runtime.normalized_action({"type": "scroll", "pid": 42, "delta_y": -300})["delta_y"], -300)
+        with self.assertRaises(RuntimeError):
+            runtime.normalized_action({"type": "scroll", "pid": 42, "x": 10, "delta_y": -300})
+        with self.assertRaises(RuntimeError):
+            runtime.normalized_action({"type": "scroll", "delta_y": "invalid"})
+
+    def test_element_click_ignores_incidental_coordinates(self):
+        action = runtime.normalized_action({"type": "click", "element_id": "current:e1", "x": 0, "y": 0})
+        self.assertEqual(action, {"type": "press", "element_id": "current:e1"})
+
+    def test_bridge_forwards_revision_and_structured_rejection(self):
+        response = {"kind": "bridge_response", "request_id": "fixture", "ok": False,
+                    "error": "Target changed", "error_code": "stale_target"}
+        with mock.patch.object(runtime, "_bridge_observation_revision", "revision-1"), \
+             mock.patch.object(runtime.uuid, "uuid4", return_value="fixture"), \
+             mock.patch.object(runtime, "emit") as emitted, \
+             mock.patch.object(sys, "stdin", io.StringIO(json.dumps(response) + "\n")):
+            with self.assertRaises(runtime.ActionRejected) as error:
+                runtime.bridge_call("act", 1, action={"type": "press", "element_id": "revision-1:e1"})
+            self.assertEqual(error.exception.code, "stale_target")
+            self.assertEqual(emitted.call_args.kwargs["params"]["observation_revision"], "revision-1")
+
+    def test_action_identity_survives_revision_changes_without_replaying_send(self):
+        first = {"elements": [{"id": "first:e1", "pid": 42, "role": "AXButton", "title": "Send"}]}
+        second = {"elements": [{"id": "second:e5", "pid": 42, "role": "AXButton", "title": "Send"}]}
+        a, b = {"type": "press", "element_id": "first:e1"}, {"type": "press", "element_id": "second:e5"}
+        self.assertEqual(runtime.action_identity(a, first), runtime.action_identity(b, second))
+        self.assertTrue(runtime.action_may_mutate(a, first))
+        second["elements"][0]["title"] = "Next page"
+        self.assertFalse(runtime.action_may_mutate(b, second))
+
+    def test_unknown_buttons_are_not_replayed_after_uncertain_delivery(self):
+        observation = {"elements": [{"id": "a", "role": "AXButton", "title": "Increment"}]}
+        self.assertTrue(runtime.action_may_mutate({"type": "press", "element_id": "a"}, observation))
+        observation["elements"][0]["role"] = "AXMenuBarItem"
+        self.assertFalse(runtime.action_may_mutate({"type": "press", "element_id": "a"}, observation))
+
+    def test_local_wait_ignores_revision_churn_but_detects_real_progress(self):
+        first = {"observation_revision": "one", "elements": [{"id": "one:e1", "value": "loading", "role": "AXStaticText"}]}
+        second = {"observation_revision": "two", "elements": [{"id": "two:e1", "value": "loading", "role": "AXStaticText"}]}
+        self.assertEqual(runtime.observation_progress_signature(first), runtime.observation_progress_signature(second))
+        second["elements"][0]["value"] = "ready"
+        self.assertNotEqual(runtime.observation_progress_signature(first), runtime.observation_progress_signature(second))
+
+    def test_private_diagnostics_omit_action_content_and_results(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(runtime.Path, "home", return_value=Path(directory)):
+            runtime.record_action_diagnostic({"type": "type_text", "text": "private secret"},
+                {"outcome": "delivered_unconfirmed", "delivery_method": "process_event", "message": "private secret"})
+            path = next(Path(directory).rglob("automation-diagnostics.jsonl"))
+            self.assertNotIn("private secret", path.read_text())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(path.read_text())["outcome"], "delivered_unconfirmed")
+
+    def test_blocker_can_launch_the_requested_app_once(self):
+        observation = {"installed_applications": [{"name": "Google Chrome", "bundle_id": "com.google.Chrome"}],
+                       "applications": []}
+        action = runtime.blocked_recovery_action("Open Google Chrome", observation, [])
+        self.assertEqual(action["type"], "launch_app")
+        self.assertIsNone(runtime.blocked_recovery_action("Open Google Chrome", observation, [{"action": action}]))
+
+    def test_compaction_preserves_late_menu_and_its_labels(self):
+        elements = [{"id": f"e{i}", "role": "AXStaticText", "title": "text"} for i in range(400)]
+        elements += [{"id": "menu", "role": "AXMenu", "title": "File"},
+                     {"id": "item", "role": "AXMenuItem", "parent_id": "menu", "title": "New", "actions": ["AXPress"]}]
+        compact = runtime.compact_observation({"elements": elements})["elements"]
+        ids = {e["id"] for e in compact}
+        self.assertIn("menu", ids)
+        self.assertIn("item", ids)
+        self.assertLessEqual(len(compact), runtime.MAX_COMPACT_ELEMENTS)
+
     def test_extracts_plain_json(self):
         self.assertEqual(runtime.extract_json_object('{"status":"done"}')["status"], "done")
 

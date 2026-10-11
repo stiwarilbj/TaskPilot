@@ -10,6 +10,7 @@ struct WindowPlacement {
 }
 
 struct AccessibilitySnapshot {
+    let revision: String
     let elements: [[String: Any]]
     let applications: [[String: Any]]
     let installedApplications: [[String: Any]]
@@ -66,12 +67,38 @@ enum AccessibilityActionError: LocalizedError {
     case elementUnavailable
     case invalidAction(String)
     case operationFailed(String)
+    case staleObservation
+    case disabledElement
+    case activationFailed
+    case cancelled
+    case permissionDenied
+    case uncertainDelivery(String)
+
+    var code: String {
+        switch self {
+        case .staleObservation, .elementUnavailable: return "stale_target"
+        case .disabledElement: return "disabled_target"
+        case .activationFailed: return "activation_failed"
+        case .cancelled: return "cancelled"
+        case .permissionDenied: return "permission_denied"
+        case .uncertainDelivery: return "delivery_uncertain"
+        case .controllerProtected: return "protected_target"
+        case .invalidAction: return "invalid_action"
+        case .operationFailed: return "delivery_rejected"
+        }
+    }
 
     var errorDescription: String? {
         switch self {
         case .controllerProtected: return "\(TaskPilotIdentity.displayName) is protected from agent control"
         case .elementUnavailable: return "That interface element is no longer available; observe the screen again"
         case .invalidAction(let message), .operationFailed(let message): return message
+        case .staleObservation: return "The target changed since this observation; observe again before acting"
+        case .disabledElement: return "The requested control is disabled; wait or choose an enabled control"
+        case .activationFailed: return "The target app did not become active within two seconds; observe again"
+        case .cancelled: return "Task cancelled before input delivery"
+        case .permissionDenied: return "Accessibility permission is unavailable; restore TaskPilot’s existing macOS permission before continuing"
+        case .uncertainDelivery(let message): return message
         }
     }
 }
@@ -105,6 +132,10 @@ final class AccessibilityController {
     private struct ElementRecord {
         let element: AXUIElement
         let pid: pid_t
+        let role: String
+        let title: String
+        let window: AXUIElement?
+        let observedBounds: CGRect?
     }
 
     private struct TaskApplicationBaseline {
@@ -122,6 +153,13 @@ final class AccessibilityController {
     private let lock = NSLock()
     private let agentCursor: AgentCursorOverlayController?
     private var elementMap: [String: ElementRecord] = [:]
+    private var observationRevision = ""
+    private var observedWindowFrames: [pid_t: [CGRect]] = [:]
+    private var inputGeneration = 0
+    private var inputCancelled = false
+    private var restoreWorkItem: DispatchWorkItem?
+    private var previousInputApplication: NSRunningApplication?
+    private var inputTargetPID: pid_t?
     private var manualTargetPID: pid_t?
     private var taskApplicationBaseline: TaskApplicationBaseline?
     private var taskDisplayOverrideID: CGDirectDisplayID?
@@ -146,6 +184,7 @@ final class AccessibilityController {
     // MARK: - Task resource tracking
 
     func beginTaskResourceTracking(on display: DisplayDescriptor) {
+        resetInputCancellation()
         let applications = controllableRunningApplications()
         var windowsByPID: [pid_t: [AXUIElement]] = [:]
         for application in applications {
@@ -174,6 +213,7 @@ final class AccessibilityController {
     func finishTaskResourceTracking(
         closeOpenedResources: Bool
     ) -> TaskApplicationCleanupSummary {
+        cancelInputDelivery()
         lock.lock()
         let baseline = taskApplicationBaseline
         taskApplicationBaseline = nil
@@ -286,8 +326,11 @@ final class AccessibilityController {
         var elementRows: [[String: Any]] = []
         var applicationRows: [[String: Any]] = []
         var nextID = 1
+        let revision = UUID().uuidString
+        var observedFrames: [pid_t: [CGRect]] = [:]
 
         let apps = orderedApplicationsForSnapshot(on: display)
+
 
         for app in apps {
             let pid = app.processIdentifier
@@ -297,13 +340,17 @@ final class AccessibilityController {
                 guard let frame = frame(of: window) else { return false }
                 return frame.intersects(display.frame)
             }
-            guard !visibleWindows.isEmpty else { continue }
+            let cgFrames = cgWindowFrames(of: pid).filter { $0.intersects(display.frame) }
+            guard Self.hasObservableWindow(accessibilityCount: visibleWindows.count, graphicsCount: cgFrames.count) else { continue }
+            observedFrames[pid] = cgFrames.isEmpty ? visibleWindows.compactMap { frame(of: $0) } : cgFrames
 
             applicationRows.append([
                 "name": app.localizedName ?? "Unknown app",
                 "bundle_id": app.bundleIdentifier ?? "",
                 "pid": Int(pid),
-                "window_count": visibleWindows.count,
+                "window_count": max(visibleWindows.count, cgFrames.count),
+                "accessibility_available": !visibleWindows.isEmpty,
+                "active": app.isActive,
                 "topmost_on_agent_screen": applicationRows.isEmpty,
                 "windows": visibleWindows.compactMap { window -> [String: Any]? in
                     guard let windowFrame = frame(of: window) else { return nil }
@@ -316,8 +363,27 @@ final class AccessibilityController {
                             "height": Int(windowFrame.height.rounded())
                         ]
                     ]
-                }
+                } + (visibleWindows.isEmpty ? cgFrames.compactMap { rectangle -> [String: Any]? in
+                    guard let serialized = serializedAccessibilityFrame(rectangle) else { return nil }
+                    return ["frame": serialized, "source": "core_graphics"]
+                } : [])
             ])
+
+            // Menu bars and focused fields are not necessarily descendants of
+            // AXWindows. Collect them first so large web trees cannot hide them.
+            var roots: [AXUIElement] = []
+            if let focused = accessibilityElement(appElement, kAXFocusedUIElementAttribute),
+               ["AXTextField", "AXTextArea", "AXSecureTextField"].contains(stringAttribute(focused, kAXRoleAttribute) ?? ""),
+               frame(of: focused)?.intersects(display.frame) == true { roots.append(focused) }
+            if let menu = accessibilityElement(appElement, kAXMenuBarAttribute) { roots.append(menu) }
+            roots += (attribute(appElement, kAXChildrenAttribute) as? [AXUIElement] ?? []).filter {
+                ["AXMenu", "AXSheet"].contains(stringAttribute($0, kAXRoleAttribute) ?? "")
+            }
+            for root in roots {
+                walk(element: root, pid: pid, appName: app.localizedName ?? "Unknown app",
+                     depth: 0, nextID: &nextID, map: &newMap, rows: &elementRows,
+                     revision: revision, parentID: nil, ownerWindow: nil)
+            }
 
             for window in visibleWindows {
                 walk(
@@ -327,17 +393,20 @@ final class AccessibilityController {
                     depth: 0,
                     nextID: &nextID,
                     map: &newMap,
-                    rows: &elementRows
+                    rows: &elementRows,
+                    revision: revision, parentID: nil, ownerWindow: window
                 )
                 if elementRows.count >= maxElements { break }
             }
-            if elementRows.count >= maxElements { break }
         }
 
         lock.lock()
         elementMap = newMap
+        observationRevision = revision
+        observedWindowFrames = observedFrames
         lock.unlock()
         return AccessibilitySnapshot(
+            revision: revision,
             elements: elementRows,
             applications: applicationRows,
             installedApplications: installedApplicationEntries.map { entry in
@@ -363,23 +432,31 @@ final class AccessibilityController {
         depth: Int,
         nextID: inout Int,
         map: inout [String: ElementRecord],
-        rows: inout [[String: Any]]
+        rows: inout [[String: Any]],
+        revision: String,
+        parentID: String?,
+        ownerWindow: AXUIElement?
     ) {
-        guard depth <= 10, rows.count < maxElements else { return }
-        let id = "e\(nextID)"
+        guard depth <= 14, rows.count < maxElements else { return }
+        let alreadyVisited = map.values.contains(where: { CFEqual($0.element, element) })
+        let id = "\(revision):e\(nextID)"
         nextID += 1
-        map[id] = ElementRecord(element: element, pid: pid)
 
         let role = stringAttribute(element, kAXRoleAttribute) ?? "unknown"
+        // Closed menu trees expose commands with zero bounds. They consume the
+        // observation budget and can be mistaken for currently usable controls.
+        if role == "AXMenu" {
+            guard let bounds = frame(of: element), bounds.width > 0, bounds.height > 0 else { return }
+        }
         let subrole = stringAttribute(element, kAXSubroleAttribute) ?? ""
-        let title = stringAttribute(element, kAXTitleAttribute)
-            ?? stringAttribute(element, kAXDescriptionAttribute)
-            ?? stringAttribute(element, kAXHelpAttribute)
-            ?? ""
+        let title = elementTitle(element)
         let rawValue = role == "AXSecureTextField"
             ? "[secure]"
             : printableValue(attribute(element, kAXValueAttribute))
         let actions = actionNames(element)
+        map[id] = ElementRecord(element: element, pid: pid, role: role, title: title,
+                                window: ownerWindow ?? accessibilityElement(element, kAXWindowAttribute),
+                                observedBounds: frame(of: element))
         var row: [String: Any] = [
             "id": id,
             "pid": Int(pid),
@@ -388,6 +465,8 @@ final class AccessibilityController {
             "depth": depth,
             "enabled": boolAttribute(element, kAXEnabledAttribute) ?? true
         ]
+        row["focused"] = boolAttribute(element, kAXFocusedAttribute) ?? false
+        if let parentID { row["parent_id"] = parentID }
         if !subrole.isEmpty { row["subrole"] = subrole }
         if !title.isEmpty { row["title"] = clipped(title) }
         if !rawValue.isEmpty { row["value"] = clipped(rawValue) }
@@ -401,9 +480,12 @@ final class AccessibilityController {
             row["frame"] = serializedFrame
         }
         rows.append(row)
+        // A focused-field alias still appears in its window hierarchy, but
+        // never traverse the same subtree twice or follow Accessibility cycles.
+        if alreadyVisited { return }
 
         let children = attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? []
-        for child in children.prefix(80) {
+        for child in children.prefix(160) {
             walk(
                 element: child,
                 pid: pid,
@@ -411,10 +493,213 @@ final class AccessibilityController {
                 depth: depth + 1,
                 nextID: &nextID,
                 map: &map,
-                rows: &rows
+                rows: &rows, revision: revision, parentID: id, ownerWindow: ownerWindow
             )
             if rows.count >= maxElements { break }
         }
+    }
+
+    static func hasObservableWindow(accessibilityCount: Int, graphicsCount: Int) -> Bool {
+        accessibilityCount > 0 || graphicsCount > 0
+    }
+
+    func validateObservation(_ revision: String?) throws {
+        lock.lock()
+        let current = observationRevision
+        lock.unlock()
+        guard let revision, !revision.isEmpty, revision == current else {
+            throw AccessibilityActionError.staleObservation
+        }
+    }
+
+    func resetInputCancellation() {
+        lock.lock()
+        inputCancelled = false
+        inputGeneration += 1
+        restoreWorkItem?.cancel()
+        restoreWorkItem = nil
+        lock.unlock()
+    }
+
+    func cancelInputDelivery() {
+        lock.lock()
+        inputCancelled = true
+        inputGeneration += 1
+        restoreWorkItem?.cancel()
+        let previous = previousInputApplication
+        let target = inputTargetPID
+        let generation = inputGeneration
+        previousInputApplication = nil
+        inputTargetPID = nil
+        lock.unlock()
+        if let previous, let target, NSWorkspace.shared.frontmostApplication?.processIdentifier == target {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.lock.withLock({ self.inputGeneration == generation }),
+                      NSWorkspace.shared.frontmostApplication?.processIdentifier == target else { return }
+                _ = previous.activate(options: [.activateAllWindows])
+            }
+        }
+    }
+
+    private func inputIsCancelled() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return inputCancelled
+    }
+
+    private func prepareInputTarget(_ pid: pid_t) {
+        lock.lock()
+        inputGeneration += 1
+        restoreWorkItem?.cancel()
+        restoreWorkItem = nil
+        if let current = NSWorkspace.shared.frontmostApplication, current.processIdentifier != pid,
+           current.processIdentifier != inputTargetPID {
+            previousInputApplication = current
+        }
+        inputTargetPID = pid
+        lock.unlock()
+    }
+
+    private func beginVerifiedInput(to pid: pid_t) async throws {
+        prepareInputTarget(pid)
+        guard let target = NSRunningApplication(processIdentifier: pid), !target.isTerminated else {
+            throw AccessibilityActionError.elementUnavailable
+        }
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
+            let allowed = await MainActor.run { target.activate(options: [.activateAllWindows]) }
+            guard allowed else { throw AccessibilityActionError.activationFailed }
+        }
+        try await AutomationInputPolicy.waitUntilReady(
+            ready: { NSWorkspace.shared.frontmostApplication?.processIdentifier == pid },
+            cancelled: { self.inputIsCancelled() }
+        )
+    }
+
+    private func hasOpenMenu(_ pid: pid_t) -> Bool {
+        let root = AXUIElementCreateApplication(pid)
+        var budget = 160
+        func containsMenu(_ element: AXUIElement, _ depth: Int) -> Bool {
+            guard depth < 8, budget > 0 else { return false }
+            budget -= 1
+            if stringAttribute(element, kAXRoleAttribute) == "AXMenu",
+               let rectangle = frame(of: element), rectangle.width > 0, rectangle.height > 0 { return true }
+            return (attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? []).contains {
+                containsMenu($0, depth + 1)
+            }
+        }
+        return containsMenu(root, 0)
+    }
+
+    private func scheduleInputRestoration(_ pid: pid_t) {
+        lock.lock()
+        let generation = inputGeneration
+        let previous = previousInputApplication
+        lock.unlock()
+        guard let previous else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let currentGeneration = self.inputGeneration
+            self.lock.unlock()
+            guard !previous.isTerminated, AutomationInputPolicy.shouldRestore(
+                scheduledGeneration: generation, currentGeneration: currentGeneration,
+                targetPID: pid, currentPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+                previousPID: previous.processIdentifier
+            ) else { return }
+            if self.hasOpenMenu(pid) {
+                self.scheduleInputRestoration(pid)
+                return
+            }
+            _ = previous.activate(options: [.activateAllWindows])
+            self.lock.lock()
+            if generation == self.inputGeneration {
+                self.previousInputApplication = nil
+                self.inputTargetPID = nil
+            }
+            self.lock.unlock()
+        }
+        lock.lock()
+        restoreWorkItem?.cancel()
+        restoreWorkItem = work
+        lock.unlock()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+    }
+
+    private func actionState(_ pid: pid_t) -> [String] {
+        var states: [String] = ["menu_open|\(hasOpenMenu(pid))"]
+        var budget = 640
+        func collect(_ element: AXUIElement, depth: Int) {
+            guard depth < 14, budget > 0 else { return }
+            budget -= 1
+            let role = stringAttribute(element, kAXRoleAttribute) ?? ""
+            if role != "AXSecureTextField" {
+                states.append("\(role)|\(stringAttribute(element, kAXTitleAttribute) ?? "")|\(printableValue(attribute(element, kAXValueAttribute)))|\(boolAttribute(element, kAXSelectedAttribute) ?? false)")
+            }
+            for child in (attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? []).prefix(160) {
+                collect(child, depth: depth + 1)
+            }
+        }
+        let root = AXUIElementCreateApplication(pid)
+        for window in windows(of: pid) { collect(window, depth: 0) }
+        if let menu = accessibilityElement(root, kAXMenuBarAttribute) { collect(menu, depth: 0) }
+        if let focused = accessibilityElement(root, kAXFocusedUIElementAttribute) {
+            states.append("focused|\(stringAttribute(focused, kAXRoleAttribute) ?? "")|\(stringAttribute(focused, kAXTitleAttribute) ?? "")")
+        }
+        return states
+    }
+
+    func performStructured(action: [String: Any], on display: DisplayDescriptor) async throws -> [String: Any] {
+        guard !inputIsCancelled() else { throw AccessibilityActionError.cancelled }
+        let type = action["type"] as? String ?? ""
+        if ["launch_app", "open_route", "navigate_browser"].contains(type) {
+            let message = try await perform(action: action, on: display)
+            return ["message": message, "delivery_method": "workspace", "outcome": type == "launch_app" ? "verified" : "delivered_unconfirmed", "verification_scope": "window_visible"]
+        }
+        guard AXIsProcessTrusted() else { throw AccessibilityActionError.permissionDenied }
+        let record = action["element_id"] == nil ? nil : try self.record(for: action)
+        let pid = try record?.pid ?? actionPID(action, on: display,
+            fallbackPoint: (action["x"] != nil && action["y"] != nil) ? point(from: action, display: display) : nil)
+        try ensureAllowedOnDisplay(pid, display: display)
+        try await beginVerifiedInput(to: pid)
+        defer { scheduleInputRestoration(pid) }
+        if let record { try validateRecord(record, action: action, on: display) }
+        else if ["click", "double_click", "scroll"].contains(type) {
+            let expected = lock.withLock { observedWindowFrames[pid] ?? [] }
+            let current = cgWindowFrames(of: pid).filter { $0.intersects(display.frame) }
+            guard !expected.isEmpty, expected.count == current.count,
+                  expected.allSatisfy({ old in current.contains { $0 == old } }) else {
+                throw AccessibilityActionError.staleObservation
+            }
+        }
+        if ["click", "double_click", "scroll"].contains(type), let record,
+           let rectangle = frame(of: record.element) {
+            let targetPoint = CGPoint(x: rectangle.midX, y: rectangle.midY)
+            if !pointerTargetIsVisible(pid, at: targetPoint, display: display) {
+                if let window = record.window { _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString) }
+                try await AutomationInputPolicy.waitUntilReady(
+                    ready: { self.pointerTargetIsVisible(pid, at: targetPoint, display: display) && NSWorkspace.shared.frontmostApplication?.processIdentifier == pid },
+                    cancelled: { self.inputIsCancelled() })
+            }
+        }
+        let before = actionState(pid)
+        let message = try await perform(action: action, on: display)
+        let method = ["focus", "set_value", "press"].contains(type) && !message.hasPrefix("Clicked")
+            ? "accessibility" : (requiresHIDFallback(pid) ? "hid" : (["click", "double_click", "scroll"].contains(type) ? "session_event" : "process_event"))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        var verified = false
+        repeat {
+            guard !inputIsCancelled() else { throw AccessibilityActionError.cancelled }
+            try Task.checkCancellation()
+            if type == "set_value", let record, record.role != "AXSecureTextField" {
+                verified = printableValue(attribute(record.element, kAXValueAttribute)) == action["text"] as? String
+            } else if type == "focus", let record {
+                verified = boolAttribute(record.element, kAXFocusedAttribute) == true
+            } else { verified = actionState(pid) != before }
+            if verified { break }
+            try await Task.sleep(for: .milliseconds(80))
+        } while ContinuousClock.now < deadline
+        return ["message": verified ? "\(message); observed the action effect" : "\(message); delivery acknowledged, effect not confirmed",
+                "delivery_method": method, "outcome": verified ? "verified" : "delivered_unconfirmed",
+                "verification_scope": "action_effect", "pid": Int(pid)]
     }
 
     func perform(action: [String: Any], on display: DisplayDescriptor) async throws -> String {
@@ -442,6 +727,14 @@ final class AccessibilityController {
             }
             let result = AXUIElementPerformAction(record.element, kAXPressAction as CFString)
             if result != .success {
+                // cannotComplete is ambiguous: the application may already
+                // have handled a submit/send. Only unsupported delivery can
+                // safely fall back to a second input method.
+                guard result == .actionUnsupported || result == .notImplemented else {
+                    throw AccessibilityActionError.uncertainDelivery(
+                        "Accessibility press returned \(result.rawValue); delivery is uncertain, inspect before another action"
+                    )
+                }
                 // Some macOS apps advertise a semantic control but reject
                 // AXPress. Fall back to a targeted click at that element's
                 // center without moving the user's physical pointer.
@@ -496,8 +789,20 @@ final class AccessibilityController {
             return "Entered text"
 
         case "click", "double_click":
-            let point = try point(from: action, display: display)
-            let pid = try actionPID(action, on: display, fallbackPoint: point)
+            let record = action["element_id"] == nil ? nil : try self.record(for: action)
+            let point: CGPoint
+            let pid: pid_t
+            if let record {
+                try validateRecord(record, action: action, on: display)
+                guard let rectangle = frame(of: record.element), rectangle.width > 0, rectangle.height > 0 else {
+                    throw AccessibilityActionError.elementUnavailable
+                }
+                point = CGPoint(x: rectangle.midX, y: rectangle.midY)
+                pid = record.pid
+            } else {
+                point = try self.point(from: action, display: display)
+                pid = try actionPID(action, on: display, fallbackPoint: point)
+            }
             try ensureAllowedOnDisplay(pid, display: display)
             rememberManualTarget(pid)
             try postClick(
@@ -530,8 +835,26 @@ final class AccessibilityController {
             return "Sent the \(key) key"
 
         case "scroll":
-            let point = try point(from: action, display: display)
-            let pid = try actionPID(action, on: display, fallbackPoint: point)
+            let record = action["element_id"] == nil ? nil : try self.record(for: action)
+            let pid = try record?.pid ?? actionPID(action, on: display)
+            let point: CGPoint
+            if let record {
+                try validateRecord(record, action: action, on: display)
+                guard let rectangle = frame(of: record.element) else { throw AccessibilityActionError.elementUnavailable }
+                point = CGPoint(x: rectangle.midX, y: rectangle.midY)
+            } else if action["x"] != nil, action["y"] != nil {
+                point = try self.point(from: action, display: display)
+            } else {
+                let scrollFrames = lock.withLock {
+                    elementMap.values.filter { $0.pid == pid && $0.role == "AXScrollArea" }
+                        .compactMap { frame(of: $0.element) }.filter { $0.intersects(display.frame) }
+                        .sorted { $0.width * $0.height > $1.width * $1.height }
+                }
+                guard let rectangle = scrollFrames.first ?? targetWindowFrames(of: pid).first(where: { $0.intersects(display.frame) }) else {
+                    throw AccessibilityActionError.elementUnavailable
+                }
+                point = CGPoint(x: rectangle.midX, y: rectangle.midY)
+            }
             try ensureAllowedOnDisplay(pid, display: display)
             rememberManualTarget(pid)
             let deltaX = intValue(action["delta_x"]) ?? 0
@@ -562,6 +885,14 @@ final class AccessibilityController {
     }
 
     // MARK: - Window and display management
+
+    func captureWindowPlacements() -> [WindowPlacement] {
+        controllableRunningApplications().flatMap { app in
+            windows(of: app.processIdentifier).compactMap { window in
+                pointAttribute(window, kAXPositionAttribute).map { WindowPlacement(element: window, position: $0) }
+            }
+        }
+    }
 
     func moveWindowsForTakeover(from source: DisplayDescriptor) -> [WindowPlacement] {
         guard let main = DisplayService().mainDisplay() else { return [] }
@@ -845,6 +1176,8 @@ final class AccessibilityController {
         }
         try ensureAllowedOnDisplay(browserPID, display: display)
         rememberManualTarget(browserPID)
+        try await beginVerifiedInput(to: browserPID)
+        defer { scheduleInputRestoration(browserPID) }
         try postKey("l", modifiers: ["command"], to: browserPID)
         try? await Task.sleep(for: .milliseconds(80))
         try postUnicode(navigationText, to: browserPID)
@@ -930,7 +1263,11 @@ final class AccessibilityController {
         let workspace = NSWorkspace.shared
         let url: URL?
         if let requestedBundleID, !requestedBundleID.isEmpty {
-            url = workspace.urlForApplication(withBundleIdentifier: requestedBundleID)
+            url = workspace.runningApplications.first(where: {
+                    $0.bundleIdentifier == requestedBundleID && !$0.isTerminated
+                })?.bundleURL
+                ?? workspace.urlForApplication(withBundleIdentifier: requestedBundleID)
+                ?? installedApplicationEntries.first(where: { $0.bundleID == requestedBundleID })?.url
         } else if let requestedName, !requestedName.isEmpty {
             url = applicationURL(named: requestedName)
         } else {
@@ -1614,6 +1951,34 @@ final class AccessibilityController {
         return value
     }
 
+    private func validateRecord(_ record: ElementRecord, action: [String: Any], on display: DisplayDescriptor) throws {
+        guard NSRunningApplication(processIdentifier: record.pid)?.isTerminated == false,
+              stringAttribute(record.element, kAXRoleAttribute) == record.role else {
+            throw AccessibilityActionError.staleObservation
+        }
+        if let pid = intValue(action["pid"]), pid != Int(record.pid) {
+            throw AccessibilityActionError.staleObservation
+        }
+        let title = elementTitle(record.element)
+        guard title == record.title else { throw AccessibilityActionError.staleObservation }
+        guard boolAttribute(record.element, kAXEnabledAttribute) != false else {
+            throw AccessibilityActionError.disabledElement
+        }
+        if let expected = record.window {
+            let current = accessibilityElement(record.element, kAXWindowAttribute)
+            if record.role != "AXWindow", current == nil || !CFEqual(current!, expected) {
+                throw AccessibilityActionError.staleObservation
+            }
+        }
+        guard let rectangle = frame(of: record.element),
+              serializedAccessibilityFrame(rectangle) != nil,
+              rectangle.width > 0, rectangle.height > 0,
+              rectangle.intersects(display.frame),
+              rectangle == record.observedBounds else {
+            throw AccessibilityActionError.staleObservation
+        }
+    }
+
     static func resolvedTargetPID(
         explicitPID: Int?,
         rememberedPID: pid_t?,
@@ -1732,6 +2097,7 @@ final class AccessibilityController {
             }
         }
 
+
         agentCursor?.hide()
         throw AccessibilityActionError.operationFailed(
             "The requested pointer location is not visibly on that app in the assigned agent screen; observe again before clicking"
@@ -1760,9 +2126,19 @@ final class AccessibilityController {
         at point: CGPoint,
         display: DisplayDescriptor
     ) -> Bool {
-        display.frame.insetBy(dx: -0.5, dy: -0.5).contains(point) &&
+        if ownedMenuContains(pid, point: point, display: display) { return true }
+        return display.frame.insetBy(dx: -0.5, dy: -0.5).contains(point) &&
         hasWindow(of: pid, containing: point) &&
         topmostWindowOwnerPID(at: point) == pid
+    }
+
+    private func ownedMenuContains(_ pid: pid_t, point: CGPoint, display: DisplayDescriptor) -> Bool {
+        guard display.frame.contains(point),
+              NSRunningApplication(processIdentifier: pid)?.ownsMenuBar == true else { return false }
+        lock.lock()
+        let records = elementMap.values.filter { $0.pid == pid && $0.role.hasPrefix("AXMenu") }
+        lock.unlock()
+        return records.contains { frame(of: $0.element)?.contains(point) == true }
     }
 
     static func clampedPointerPoint(
@@ -1836,17 +2212,9 @@ final class AccessibilityController {
                   ),
                   bounds.contains(point) else { continue }
             let pid = pid_t(owner.intValue)
-            // ScreenCaptureKit deliberately removes TaskPilot's own windows from
-            // the model image. When a target app is locked to the main display,
-            // the real controller window can still sit above those revealed
-            // pixels. Ignore every controller process here so validation uses
-            // the same effective z-order as the screenshot; the target is
-            // activated before input is actually delivered.
-            if pid == controllerPID { continue }
-            if NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ==
-                Bundle.main.bundleIdentifier {
-                continue
-            }
+            // Event delivery must use the real z-order, including controller
+            // windows that capture omits. Otherwise a foreground event could
+            // hit an occluding controller instead of the validated app.
             return pid
         }
         return nil
@@ -1872,11 +2240,14 @@ final class AccessibilityController {
         on display: DisplayDescriptor
     ) throws {
         let previouslyActiveApp = activateForTargetedInput(pid)
-        defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.10) }
+        defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.10, targetPID: pid) }
         // Bring the intended app forward before validating z-order. Validating
         // first rejected correct coordinates whenever the previous foreground
         // app temporarily covered a window that TaskPilot was about to target.
         try ensurePointerTarget(pid, at: point, display: display)
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
+            throw AccessibilityActionError.activationFailed
+        }
         agentCursor?.move(to: point, on: display, clicking: true)
 
         // iOS-on-Mac wrappers (including BASEBALL 9) discard events delivered
@@ -1887,31 +2258,10 @@ final class AccessibilityController {
             return
         }
 
-        guard let source = CGEventSource(stateID: .privateState),
-              let move = CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
-                                 mouseCursorPosition: point, mouseButton: .left),
-              let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown,
-                                 mouseCursorPosition: point, mouseButton: .left),
-              let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp,
-                               mouseCursorPosition: point, mouseButton: .left) else {
-            throw AccessibilityActionError.operationFailed("Could not create a mouse event")
-        }
-        source.localEventsSuppressionInterval = 0
-        move.postToPid(pid)
-        Thread.sleep(forTimeInterval: 0.008)
-        down.setIntegerValueField(.mouseEventClickState, value: 1)
-        up.setIntegerValueField(.mouseEventClickState, value: 1)
-        down.postToPid(pid)
-        Thread.sleep(forTimeInterval: 0.025)
-        up.postToPid(pid)
-        if double {
-            Thread.sleep(forTimeInterval: 0.040)
-            down.setIntegerValueField(.mouseEventClickState, value: 2)
-            up.setIntegerValueField(.mouseEventClickState, value: 2)
-            down.postToPid(pid)
-            Thread.sleep(forTimeInterval: 0.025)
-            up.postToPid(pid)
-        }
+        // The WindowServer session route performs AppKit's hit testing. A
+        // process queue accepts mouse events without delivering them to views.
+        // Use exactly one route, after verifying the foreground and target.
+        try postSessionClick(at: point, double: double)
         // Catalyst/iOS-on-Mac apps can discard an instantaneous background
         // mouse sequence. Give their event loop one frame to consume the
         // targeted events before restoring whatever app the user was using.
@@ -1927,6 +2277,10 @@ final class AccessibilityController {
     }
 
     private func postHIDClick(at point: CGPoint, double: Bool) throws {
+        try postSessionClick(at: point, double: double, tap: .cghidEventTap)
+    }
+
+    private func postSessionClick(at point: CGPoint, double: Bool, tap: CGEventTapLocation = .cgSessionEventTap) throws {
         let originalPointer = CGEvent(source: nil)?.location
         defer {
             if let originalPointer {
@@ -1943,20 +2297,20 @@ final class AccessibilityController {
             throw AccessibilityActionError.operationFailed("Could not create a HID mouse event")
         }
         source.localEventsSuppressionInterval = 0
-        move.post(tap: .cghidEventTap)
+        move.post(tap: tap)
         Thread.sleep(forTimeInterval: 0.008)
         down.setIntegerValueField(.mouseEventClickState, value: 1)
         up.setIntegerValueField(.mouseEventClickState, value: 1)
-        down.post(tap: .cghidEventTap)
+        down.post(tap: tap)
         Thread.sleep(forTimeInterval: Self.hidClickPressDuration)
-        up.post(tap: .cghidEventTap)
+        up.post(tap: tap)
         if double {
             Thread.sleep(forTimeInterval: 0.060)
             down.setIntegerValueField(.mouseEventClickState, value: 2)
             up.setIntegerValueField(.mouseEventClickState, value: 2)
-            down.post(tap: .cghidEventTap)
+            down.post(tap: tap)
             Thread.sleep(forTimeInterval: Self.hidClickPressDuration)
-            up.post(tap: .cghidEventTap)
+            up.post(tap: tap)
         }
         // iOS game result screens sometimes process the tap on the next run
         // loop turn. Keep the pointer over the target briefly before restoring
@@ -1971,7 +2325,7 @@ final class AccessibilityController {
         on display: DisplayDescriptor
     ) throws {
         let previouslyActiveApp = activateForTargetedInput(pid)
-        defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.05) }
+        defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.05, targetPID: pid) }
         try ensurePointerTarget(pid, at: start, display: display)
         guard display.frame.insetBy(dx: -0.5, dy: -0.5).contains(end) else {
             throw AccessibilityActionError.operationFailed(
@@ -2007,7 +2361,7 @@ final class AccessibilityController {
 
     private func postUnicode(_ text: String, to pid: pid_t) throws {
         let previouslyActiveApp = activateForTargetedInput(pid)
-        defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.05) }
+        defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.05, targetPID: pid) }
         guard let source = CGEventSource(stateID: .privateState),
               let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
@@ -2028,7 +2382,7 @@ final class AccessibilityController {
 
     private func postKey(_ key: String, modifiers: [String], to pid: pid_t) throws {
         let previouslyActiveApp = activateForTargetedInput(pid)
-        defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.05) }
+        defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.05, targetPID: pid) }
         guard let code = Self.supportedKeyCodes[key.lowercased()],
               let source = CGEventSource(stateID: .privateState),
               let down = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true),
@@ -2059,7 +2413,7 @@ final class AccessibilityController {
         to pid: pid_t
     ) throws {
         let previouslyActiveApp = activateForTargetedInput(pid)
-        defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.04) }
+        defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.04, targetPID: pid) }
         guard let source = CGEventSource(stateID: .privateState),
               let down = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) else {
@@ -2086,7 +2440,7 @@ final class AccessibilityController {
         on display: DisplayDescriptor
     ) throws -> Bool {
         let previouslyActiveApp = activateForTargetedInput(pid)
-        defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.05) }
+        defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.05, targetPID: pid) }
         let resolvedPoint = try resolvedScrollPoint(
             for: pid,
             preferred: point,
@@ -2104,8 +2458,17 @@ final class AccessibilityController {
               ) else {
             throw AccessibilityActionError.operationFailed("Could not create a scroll event")
         }
+        let originalPointer = CGEvent(source: nil)?.location
+        defer { if let originalPointer { CGWarpMouseCursorPosition(originalPointer) } }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
+            throw AccessibilityActionError.activationFailed
+        }
+        let move = CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
+                           mouseCursorPosition: resolvedPoint, mouseButton: .left)
+        move?.post(tap: .cgSessionEventTap)
+        Thread.sleep(forTimeInterval: 0.025)
         event.location = resolvedPoint
-        event.postToPid(pid)
+        event.post(tap: .cgSessionEventTap)
         Thread.sleep(forTimeInterval: 0.05)
         return resolvedPoint != point
     }
@@ -2160,6 +2523,10 @@ final class AccessibilityController {
                     $1.localizedName ?? ""
                 ) == .orderedAscending
             })
+        let remembered = lock.withLock { manualTargetPID }
+        if let remembered, let index = ordered.firstIndex(where: { $0.processIdentifier == remembered }) {
+            ordered.insert(ordered.remove(at: index), at: 0)
+        }
         return ordered
     }
 
@@ -2212,22 +2579,31 @@ final class AccessibilityController {
 
         let previous = NSWorkspace.shared.frontmostApplication
         target.activate(options: [.activateAllWindows])
-        let deadline = Date().addingTimeInterval(0.20)
-        while !target.isActive, Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.01)
-        }
+        // Agent actions have already awaited confirmed activation in
+        // beginVerifiedInput. Viewer input must never block the main run loop.
         return previous?.processIdentifier == pid ? nil : previous
     }
 
     private func restoreFrontmostApplication(
         _ application: NSRunningApplication?,
-        after delay: TimeInterval
+        after delay: TimeInterval,
+        targetPID: pid_t
     ) {
         guard let application,
               application.processIdentifier != controllerPID,
               !application.isTerminated else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-            guard !application.isTerminated else { return }
+        lock.lock()
+        let generation = inputGeneration
+        lock.unlock()
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let currentGeneration = self.inputGeneration
+            self.lock.unlock()
+            guard !application.isTerminated,
+                  AutomationInputPolicy.shouldRestore(scheduledGeneration: generation, currentGeneration: currentGeneration,
+                    targetPID: targetPID, currentPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+                    previousPID: application.processIdentifier), !self.hasOpenMenu(targetPID) else { return }
             application.activate(options: [.activateAllWindows])
         }
     }
@@ -2238,6 +2614,16 @@ final class AccessibilityController {
             return nil
         }
         return value
+    }
+
+    private func accessibilityElement(_ element: AXUIElement, _ name: String) -> AXUIElement? {
+        guard let value = attribute(element, name), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return (value as! AXUIElement)
+    }
+
+    private func elementTitle(_ element: AXUIElement) -> String {
+        [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute]
+            .compactMap { stringAttribute(element, $0) }.first { !$0.isEmpty } ?? ""
     }
 
     private func stringAttribute(_ element: AXUIElement, _ name: String) -> String? {
