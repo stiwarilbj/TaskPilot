@@ -31,3 +31,9 @@ budget, same-model retention, fallback, provider errors, cache identity, and req
 counts. The Swift suite also checks compatibility with older diagnostic records.
 No live-control tester, Chrome interaction, or live ACP check was run for this change;
 live validation remains incomplete.
+
+Screen settling now polls local observations after desktop actions and model-requested
+waits. Mock fixtures cover stable dialogs, loading indicators, field readiness,
+revision and foreground churn, screenshot-only changes, bounded waits, cancellation,
+cleanup, and reuse of the final observation without duplicate actions or model calls.
+Live-control validation remains incomplete; no Chrome or live fixture was used.

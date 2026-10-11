@@ -34,7 +34,8 @@ from typing import Any
 MAX_STEPS = 100
 MAX_IDENTICAL_ACTIONS = 3
 PROMPT_TIMEOUT_SECONDS = None  # Wait for completion or an explicit provider/transport error.
-ACTION_SETTLE_SECONDS = 0.22
+SCREEN_POLL_SECONDS = 0.15
+SCREEN_STABLE_SECONDS = 0.3
 PRODUCT_NAME = "TaskPilot"
 LEGACY_APPLICATION_SUPPORT_FOLDER = "Orbit Agent"
 from request_policy import (
@@ -556,24 +557,104 @@ def record_action_diagnostic(action: dict[str, Any], result: dict[str, Any]) -> 
         pass
 
 
-def observation_progress_signature(observation: dict[str, Any]) -> str:
-    """Revision changes alone are not evidence that a loading app progressed."""
-    evidence = {
-        "display": observation.get("display"),
-        "applications": observation.get("applications"),
-        "elements": [{key: element[key] for key in
-            ("pid", "role", "subrole", "title", "value", "focused", "enabled", "frame") if key in element}
-            for element in observation.get("elements", []) if isinstance(element, dict)],
-    }
-    return json.dumps(evidence, sort_keys=True)
+def observation_progress_signature(observation: dict[str, Any], pid: int | None = None) -> str:
+    """Ignore revision churn, foreground restoration and tree enumeration order."""
+    apps = [{key: app[key] for key in ("pid", "name", "window_count", "windows") if key in app}
+            for app in observation.get("applications", []) if isinstance(app, dict)
+            and (pid is None or app.get("pid") == pid)]
+    elements = [{key: element[key] for key in
+                ("pid", "role", "subrole", "title", "value", "focused", "enabled", "busy", "frame", "sort_direction")
+                if key in element}
+                for element in observation.get("elements", []) if isinstance(element, dict)
+                and (pid is None or element.get("pid") == pid)]
+    return json.dumps({"applications": sorted(apps, key=lambda item: json.dumps(item, sort_keys=True)),
+                       "elements": sorted(elements, key=lambda item: json.dumps(item, sort_keys=True))}, sort_keys=True)
 
 
-def action_settle_seconds(action_type: str) -> float:
-    if action_type in TRUSTED_NATIVE_ACTIONS:
+def observation_image_digest(observation: dict[str, Any]) -> str | None:
+    path = Path(str(observation.get("screenshot_path") or ""))
+    return hashlib.blake2b(path.read_bytes(), digest_size=16).hexdigest() if path.is_file() else None
+
+
+def discard_observation_image(observation: dict[str, Any] | None) -> None:
+    if observation:
+        path = Path(str(observation.get("screenshot_path") or ""))
+        if path.is_file():
+            path.unlink(missing_ok=True)
+
+
+def screen_wait_limit(action_type: str) -> float:
+    if action_type in TRUSTED_NATIVE_ACTIONS or action_type == "none":
         return 0.0
-    if action_type == "navigate_browser":
-        return 0.35
-    return 0.12
+    return 5.0 if action_type == "navigate_browser" else 3.0 if action_type in {"launch_app", "open_route"} else 2.0
+
+
+def wait_for_screen_change(display_id: int, before: dict[str, Any], action: dict[str, Any],
+                           baseline_image: str | None = None, timeout: float | None = None,
+                           target_pid: int | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Observe only; never replay an action or ask a model during settling.
+
+    Retain the final screenshot and its revision for the next decision. A stable
+    screen change is evidence to inspect, not proof of task/action completion.
+    """
+    pid = target_pid or action.get("pid")
+    if pid is None and action.get("element_id"):
+        pid = next((e.get("pid") for e in before.get("elements", [])
+                    if isinstance(e, dict) and e.get("id") == action["element_id"]), None)
+    baseline = observation_progress_signature(before, pid)
+    baseline_image = baseline_image or observation_image_digest(before)
+    limit = screen_wait_limit(str(action.get("type"))) if timeout is None else timeout
+    start = time.monotonic()
+    deadline = start + limit
+    latest = None
+    stable_signature = None
+    stable_since = start
+    changed = False
+    polls = 0
+    try:
+        while True:
+            current = bridge_call("observe", display_id)
+            discard_observation_image(latest)
+            latest = current
+            polls += 1
+            semantic = observation_progress_signature(current, pid)
+            image = observation_image_digest(current)
+            signature = (semantic, image)
+            now = time.monotonic()
+            changed = semantic != baseline or (baseline_image is not None and image is not None and image != baseline_image)
+            elements = [e for e in current.get("elements", []) if isinstance(e, dict)
+                        and (pid is None or e.get("pid") == pid)]
+            loading = any(e.get("busy") is True or e.get("role") == "AXProgressIndicator"
+                          or str(e.get("title") or e.get("value") or "").strip().casefold()
+                          in {"loading", "loading…", "loading..."} for e in elements)
+            if loading and timeout is None:
+                deadline = max(deadline, start + 5.0)
+            if signature != stable_signature or loading:
+                stable_signature, stable_since = signature, now
+            if changed and not loading and now - stable_since >= SCREEN_STABLE_SECONDS:
+                # Describe locally observed readiness without guessing what a
+                # free-form expected_result means or claiming a mutation worked.
+                reason = "screen_changed"
+                old = [e for e in before.get("elements", []) if isinstance(e, dict)
+                       and (pid is None or e.get("pid") == pid)]
+                dialogs = {"AXSheet", "AXMenu", "AXDialog"}
+                if any(e.get("role") in dialogs or e.get("subrole") == "AXDialog" for e in elements) and not any(
+                        e.get("role") in dialogs or e.get("subrole") == "AXDialog" for e in old):
+                    reason = "dialog_opened"
+                elif any(e.get("focused") is True and e.get("enabled", True) is True
+                         and e.get("role") in {"AXTextField", "AXTextArea", "AXComboBox", "AXSecureTextField"}
+                         for e in elements):
+                    reason = "field_ready"
+                break
+            if now >= deadline:
+                reason = "bounded_wait_elapsed"
+                break
+            time.sleep(min(SCREEN_POLL_SECONDS, deadline - now))
+        return latest, {"reason": reason, "changed": changed, "polls": polls,
+                        "elapsed_seconds": round(time.monotonic() - start, 3)}
+    except BaseException:
+        discard_observation_image(latest)
+        raise
 
 
 def trusted_native_history(
@@ -1634,6 +1715,9 @@ def desktop_instruction(
         "an element_id, x/y and pid, or only pid to use that app's visible scroll area. "
         "Missing Accessibility controls do not mean an app is unusable: inspect the screenshot and the "
         "Core Graphics window metadata, then use visible coordinates with that app's pid. "
+        "TaskPilot polls locally after desktop actions and supplies the settled observation. "
+        "A settling reason of bounded_wait_elapsed means readiness is still uncertain, not that an action failed. "
+        "Inspect the current evidence; use wait when loading continues and never replay an uncertain mutation. "
         "A delivered_unconfirmed result proves only that input was sent. Inspect a fresh screen before "
         "claiming progress; never repeat a send, submit, purchase, delete, or text insertion whose outcome "
         "is uncertain. For stale_target refresh and select the current control; for disabled_target wait "
@@ -1839,12 +1923,14 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
     identical_action_count = 0
     consecutive_action_failures = 0
     blocked_recoveries = 0
+    pending_observation: dict[str, Any] | None = None
     uncertain_mutations: set[str] = set()
     suppressed_mutations: set[str] = set()
     try:
         emit("status", message=f"OpenClaw is connecting to the {PRODUCT_NAME} screen…")
         for step in range(1, MAX_STEPS + 1):
-            observation = bridge_call("observe", display_id)
+            observation = pending_observation if pending_observation is not None else bridge_call("observe", display_id)
+            pending_observation = None
             screenshot_path = Path(str(observation.get("screenshot_path") or ""))
             if not screenshot_path.is_file():
                 raise RuntimeError(f"{PRODUCT_NAME} did not provide a readable screen image")
@@ -1867,7 +1953,8 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                     "completed_requirements": [],
                     "remaining_requirements": [],
                 })
-                time.sleep(0.1)
+                pending_observation, _ = wait_for_screen_change(
+                    display_id, observation, {"type": "type_text", "pid": automatic_input_target["pid"]})
                 continue
 
             # Let OpenClaw navigate the first visible step. Once Finder is in
@@ -1906,7 +1993,8 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                         "completed_requirements": ["Opened Downloads in Finder"],
                         "remaining_requirements": ["Prove descending Size order and read the first file"],
                     })
-                    time.sleep(max(ACTION_SETTLE_SECONDS, 0.45))
+                    pending_observation, settling = wait_for_screen_change(display_id, observation, accuracy_action)
+                    history[-1]["settling"] = settling
                     continue
             try:
                 screenshot_bytes = screenshot_path.read_bytes()
@@ -1937,7 +2025,8 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                     "completed_requirements": decision.get("completed_requirements") or [],
                     "remaining_requirements": decision.get("remaining_requirements") or [],
                 })
-                time.sleep(0.1)
+                pending_observation, _ = wait_for_screen_change(
+                    display_id, observation, {"type": "type_text", "pid": input_target["pid"]})
                 continue
 
             if status == "blocked":
@@ -2060,22 +2149,10 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                     )
 
             if action_type == "wait":
-                seconds = min(15.0, max(0.2, float(action.get("seconds") or 2.0)))
-                # Poll the native observation while loading, without another
-                # model request for every unchanged frame.
-                deadline = time.monotonic() + seconds
-                baseline = observation_progress_signature(observation)
-                while time.monotonic() < deadline:
-                    time.sleep(min(1.0, max(0, deadline - time.monotonic())))
-                    polled = bridge_call("observe", display_id)
-                    polled_path = Path(str(polled.get("screenshot_path") or ""))
-                    try:
-                        if observation_progress_signature(polled) != baseline:
-                            break
-                    finally:
-                        if polled_path.is_file():
-                            polled_path.unlink(missing_ok=True)
-                result_message = f"Waited {seconds:g} seconds"
+                seconds = float(action.get("seconds") or 2.0)
+                pending_observation, settling = wait_for_screen_change(
+                    display_id, observation, action, screenshot_digest, timeout=seconds)
+                result_message = {"message": "Observed locally while waiting", "settling": settling}
             elif action_type == "none":
                 result_message = "No action was performed"
             else:
@@ -2113,9 +2190,10 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                     if action_may_mutate(action, observation):
                         uncertain_mutations.add(action_signature)
                 record_action_diagnostic(action, result)
-                settle_seconds = action_settle_seconds(action_type)
-                if settle_seconds > 0:
-                    time.sleep(settle_seconds)
+                if screen_wait_limit(action_type) > 0:
+                    pending_observation, settling = wait_for_screen_change(
+                        display_id, observation, action, screenshot_digest, target_pid=result.get("pid"))
+                    result_message = {**result, "settling": settling}
 
             history.append({
                 "step": step,
@@ -2139,6 +2217,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
         state.invalidate()
         raise
     finally:
+        discard_observation_image(pending_observation)
         model_router.metrics["prompt_calls"] = client.prompt_calls
         model_router.metrics["model_switches"] = client.model_switches
         emit("request_metrics", **model_router.metrics)

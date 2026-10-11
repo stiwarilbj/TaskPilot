@@ -228,12 +228,12 @@ class OpenClawRuntimeTests(unittest.TestCase):
         self.assertIn("without sending it to you", prompt)
         self.assertIn("finish_after_action", prompt)
 
-    def test_action_settle_time_is_adaptive(self):
-        self.assertEqual(runtime.action_settle_seconds("read_file"), 0)
-        self.assertEqual(runtime.action_settle_seconds("write_file"), 0)
-        self.assertEqual(runtime.action_settle_seconds("run_command"), 0)
-        self.assertEqual(runtime.action_settle_seconds("navigate_browser"), 0.35)
-        self.assertLess(runtime.action_settle_seconds("press"), runtime.ACTION_SETTLE_SECONDS)
+    def test_local_screen_wait_limits_preserve_native_fast_paths(self):
+        self.assertEqual(runtime.screen_wait_limit("read_file"), 0)
+        self.assertEqual(runtime.screen_wait_limit("write_file"), 0)
+        self.assertEqual(runtime.screen_wait_limit("run_command"), 0)
+        self.assertEqual(runtime.screen_wait_limit("navigate_browser"), 5.0)
+        self.assertEqual(runtime.screen_wait_limit("press"), 2.0)
 
     def test_structured_native_history_can_skip_only_redundant_visual_verification(self):
         self.assertTrue(runtime.trusted_native_history(
