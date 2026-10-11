@@ -92,13 +92,14 @@ final class AgentAutomationBridge {
                 "result": result
             ]
         } catch {
+            let code = (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? "action_rejected"
             return [
                 "kind": "bridge_response",
                 "request_id": requestID,
                 "ok": false,
                 "error": error.localizedDescription,
-                "error_code": (error as? AccessibilityActionError)?.code ?? "action_rejected",
-                "outcome": "rejected"
+                "error_code": code,
+                "outcome": code == "delivery_uncertain" ? "delivered_unconfirmed" : "rejected"
             ]
         }
     }

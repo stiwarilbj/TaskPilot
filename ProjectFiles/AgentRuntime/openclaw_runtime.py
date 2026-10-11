@@ -511,7 +511,11 @@ def action_may_mutate(action: dict[str, Any], observation: dict[str, Any]) -> bo
     if kind in {"type_text", "set_value", "write_file", "run_command"}:
         return True
     if kind == "key":
-        return str(action.get("key")).lower() in {"return", "enter", "delete", "backspace"}
+        key = str(action.get("key")).lower()
+        modifiers = {str(m).lower() for m in action.get("modifiers", [])}
+        if key in {"tab", "escape", "left", "right", "up", "down", "home", "end", "page_up", "page_down"}:
+            return False
+        return not (key in {"a", "c", "f", "l"} and modifiers in ({"command"}, {"cmd"}))
     if kind not in {"press", "click", "double_click"}:
         return False
     element = next((e for e in observation.get("elements", [])
@@ -524,6 +528,139 @@ def action_may_mutate(action: dict[str, Any], observation: dict[str, Any]) -> bo
         return False
     return label.strip().casefold() not in {"back", "forward", "next page", "previous page"}
 
+
+
+def action_target(action: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any] | None:
+    elements = [e for e in observation.get("elements", []) if isinstance(e, dict)]
+    if action.get("element_id"):
+        return next((e for e in elements if e.get("id") == action["element_id"]), None)
+    pid = action.get("pid")
+    if action.get("type") in {"type_text", "key"}:
+        fields = [e for e in elements if e.get("pid") == pid and e.get("focused") is True
+                  and e.get("role") in {"AXTextField", "AXTextArea", "AXComboBox", "AXSecureTextField"}]
+        return fields[0] if len(fields) == 1 else None
+    if "x" not in action or "y" not in action:
+        return None
+    display = observation.get("display", {})
+    if not all(type(display.get(k)) in {int, float} for k in ("x", "y", "width", "height")):
+        return None
+    x = display["x"] + action["x"] / 1000 * display["width"]
+    y = display["y"] + action["y"] / 1000 * display["height"]
+    containers = {"AXApplication", "AXWindow", "AXGroup", "AXScrollArea", "AXSplitGroup", "AXWebArea", "AXLayoutArea", "AXMenuBar", "unknown"}
+    targets = []
+    for element in elements:
+        frame = element.get("frame", {})
+        if element.get("pid") != pid or element.get("role") in containers:
+            continue
+        if all(type(frame.get(k)) in {int, float} for k in ("x", "y", "width", "height")) \
+                and frame["width"] > 0 and frame["height"] > 0 \
+                and frame["x"] <= x <= frame["x"] + frame["width"] \
+                and frame["y"] <= y <= frame["y"] + frame["height"]:
+            targets.append(element)
+    targets.sort(key=lambda e: ("AXPress" not in e.get("actions", []),
+                               e["frame"]["width"] * e["frame"]["height"], -e.get("depth", 0)))
+    return targets[0] if targets else None
+
+
+def action_target_pid(action: dict[str, Any], observation: dict[str, Any]) -> int | None:
+    target = action_target(action, observation)
+    return target.get("pid") if target else action.get("pid")
+
+
+def target_identity(target: dict[str, Any] | None) -> dict[str, Any] | None:
+    # Role changes do not establish that a mutation is safe to send again.
+    return {k: target.get(k) for k in ("pid", "title", "window_title")} if target else None
+
+
+def action_failure_recovery(code: str) -> str:
+    return {"stale_target": "observe_again", "disabled_target": "wait_or_choose_enabled",
+            "focus_mismatch": "observe_and_refocus", "activation_failed": "observe_and_activate",
+            "unsupported_action": "choose_supported_method", "delivery_uncertain": "inspect_effect"}.get(code, "choose_different_action")
+
+
+class ActionRecovery:
+    """Task-local bounds and effect checks; never execute a replacement action."""
+    def __init__(self) -> None:
+        self.failures: dict[str, int] = {}
+        self.uncertain: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        self.suppressed: set[str] = set()
+
+    def failure_key(self, action: dict[str, Any], observation: dict[str, Any]) -> str:
+        target = action_target(action, observation)
+        pid = action_target_pid(action, observation)
+        parameters = {k: v for k, v in action.items() if k not in {"element_id", "observation_revision"}
+                      and not (target and k in {"pid", "x", "y"})}
+        context = {"action": parameters,
+                   "target": {k: v for k, v in (target or {}).items() if k not in {"id", "parent_id"}},
+                   "windows": sorted([w for a in observation.get("applications", [])
+                                      if isinstance(a, dict) and a.get("pid") == pid
+                                      for w in a.get("windows", [])], key=lambda w: json.dumps(w, sort_keys=True))}
+        return json.dumps(context, sort_keys=True)
+
+    def rejected(self, action: dict[str, Any], observation: dict[str, Any], code: str) -> None:
+        key = self.failure_key(action, observation)
+        self.failures[key] = self.failures.get(key, 0) + 1
+        if code == "delivery_uncertain":
+            self.unconfirmed(action, observation)
+
+    def unconfirmed(self, action: dict[str, Any], observation: dict[str, Any]) -> None:
+        if action_may_mutate(action, observation):
+            self.uncertain.append((action.copy(), observation))
+
+    def succeeded(self, action: dict[str, Any], observation: dict[str, Any]) -> None:
+        self.failures.pop(self.failure_key(action, observation), None)
+
+    def overlaps(self, previous: dict[str, Any], before: dict[str, Any],
+                 action: dict[str, Any], observation: dict[str, Any]) -> bool:
+        if previous.get("type") in TRUSTED_NATIVE_ACTIONS or action.get("type") in TRUSTED_NATIVE_ACTIONS:
+            if previous.get("type") == action.get("type") == "run_command":
+                return previous.get("command") == action.get("command") \
+                    and previous.get("working_directory") == action.get("working_directory")
+            if previous.get("type") == action.get("type") == "write_file":
+                return os.path.normpath(os.path.expanduser(previous["path"])) == os.path.normpath(os.path.expanduser(action["path"]))
+            return action_identity(previous, before) == action_identity(action, observation)
+        pid = action_target_pid(previous, before)
+        if pid is None or pid != action_target_pid(action, observation):
+            return False
+        if any(a.get("type") in {"click", "double_click"} and not a.get("element_id") for a in (previous, action)):
+            return True  # Screenshot-only coordinates cannot prove a different control.
+        # Enter can submit a form whose button has a different label/role.
+        if any(a.get("type") == "key" and str(a.get("key", "")).lower() in {"return", "enter"}
+               for a in (previous, action)):
+            return True
+        first, second = target_identity(action_target(previous, before)), target_identity(action_target(action, observation))
+        return first is None or second is None or first == second
+
+    def check(self, action: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any] | None:
+        if action_may_mutate(action, observation):
+            for previous, before in self.uncertain:
+                if not self.overlaps(previous, before, action, observation):
+                    continue
+                target = action_target(action, observation)
+                # Only a complete, nonsecure field value proves a replacement
+                # succeeded. A changed screenshot or unchanged screen does not.
+                if previous.get("type") == action.get("type") == "set_value" \
+                        and previous.get("text") == action.get("text") and target \
+                        and target.get("value_complete") is True \
+                        and "securetextfield" not in (str(target.get("role", "")) + str(target.get("subrole", ""))).lower() \
+                        and target.get("value", "") == action["text"]:
+                    return {"message": "The fresh field value matches the earlier replacement; no input was repeated",
+                            "outcome": "verified", "delivery_method": "local_check", "verification_scope": "text_value",
+                            "recovery": "effect_already_present"}
+                key = "uncertain:" + str(action_target_pid(action, observation)) + ":" + action_identity(previous, before)
+                if key in self.suppressed:
+                    raise RuntimeError("The previous input may already have changed the app. TaskPilot stopped rather than repeat an uncertain mutation.")
+                self.suppressed.add(key)
+                return {"message": "Do not replay or switch delivery methods for this uncertain mutation. Inspect fresh evidence of its effect, use a read-only check, or report the unresolved result.",
+                        "outcome": "suppressed", "recovery": "inspect_effect"}
+        key = self.failure_key(action, observation)
+        if self.failures.get(key, 0) >= 2:
+            if key in self.suppressed:
+                raise RuntimeError("TaskPilot stopped after the same rejected action was proposed again without a changed target or recovery method.")
+            self.suppressed.add(key)
+            return {"message": "This action already failed twice in the same target state. Choose a different valid method or report exhausted recovery; do not send it again.",
+                    "outcome": "suppressed", "recovery": "choose_different_action"}
+        return None
 
 
 def blocked_recovery_action(task: str, observation: dict[str, Any], history: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -548,7 +685,7 @@ def record_action_diagnostic(action: dict[str, Any], result: dict[str, Any]) -> 
         if path.exists() and path.stat().st_size > 1_000_000:
             path.unlink()
         entry = {"timestamp": time.time(), "runtime_pid": os.getpid(), "action": action.get("type"),
-                 **{k: result[k] for k in ("outcome", "delivery_method", "error_code", "verification_scope") if k in result}}
+                 **{k: result[k] for k in ("outcome", "delivery_method", "error_code", "verification_scope", "recovery") if k in result}}
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "a") as output:
@@ -563,7 +700,7 @@ def observation_progress_signature(observation: dict[str, Any], pid: int | None 
             for app in observation.get("applications", []) if isinstance(app, dict)
             and (pid is None or app.get("pid") == pid)]
     elements = [{key: element[key] for key in
-                ("pid", "role", "subrole", "title", "value", "focused", "selection_range", "enabled", "busy", "frame", "sort_direction")
+                ("pid", "role", "subrole", "title", "window_title", "value", "value_complete", "focused", "selection_range", "enabled", "busy", "frame", "sort_direction")
                 if key in element}
                 for element in observation.get("elements", []) if isinstance(element, dict)
                 and (pid is None or element.get("pid") == pid)]
@@ -587,6 +724,13 @@ def screen_wait_limit(action_type: str) -> float:
     if action_type in TRUSTED_NATIVE_ACTIONS or action_type == "none":
         return 0.0
     return 5.0 if action_type == "navigate_browser" else 3.0 if action_type in {"launch_app", "open_route"} else 2.0
+
+
+def observation_is_loading(observation: dict[str, Any], pid: int | None) -> bool:
+    return any(e.get("busy") is True or e.get("role") == "AXProgressIndicator"
+               or str(e.get("title") or e.get("value") or "").strip().casefold()
+               in {"loading", "loading…", "loading..."}
+               for e in observation.get("elements", []) if isinstance(e, dict) and (pid is None or e.get("pid") == pid))
 
 
 def wait_for_screen_change(display_id: int, before: dict[str, Any], action: dict[str, Any],
@@ -624,9 +768,7 @@ def wait_for_screen_change(display_id: int, before: dict[str, Any], action: dict
             changed = semantic != baseline or (baseline_image is not None and image is not None and image != baseline_image)
             elements = [e for e in current.get("elements", []) if isinstance(e, dict)
                         and (pid is None or e.get("pid") == pid)]
-            loading = any(e.get("busy") is True or e.get("role") == "AXProgressIndicator"
-                          or str(e.get("title") or e.get("value") or "").strip().casefold()
-                          in {"loading", "loading…", "loading..."} for e in elements)
+            loading = observation_is_loading(current, pid)
             if loading and timeout is None:
                 deadline = max(deadline, start + 5.0)
             if signature != stable_signature or loading:
@@ -1710,9 +1852,10 @@ def desktop_instruction(
         "Secrets and destructive/irreversible operations require explicit user authorization.\n"
         "Credentials stay local; never guess, retrieve, or type a credential. Use needs_user with the observed input field and PID; "
         "TaskPilot enters it locally, without sending it to you.\n"
-        "For stale_target choose a current target; for disabled_target wait or choose an enabled route; for delivery_rejected choose another valid method. "
+        "stale_target: fresh evidence; disabled_target: wait/enabled route; delivery_rejected/unsupported_action: change method; focus_mismatch: refocus. "
+        "Do not repeat rejected actions on unchanged targets. "
         "delivered_unconfirmed and bounded_wait_elapsed are inconclusive. Wait if loading continues. "
-        "Never replay uncertain sends, submissions, deletions, or text insertions. Launch unopened apps; use only supplied route IDs. "
+        "Never replay uncertain sends, submissions, deletions, or text insertions by any method. Inspect effects first. Launch unopened apps; use supplied route IDs. "
         "blocked requires exhausted applicable recovery; omit action.\n"
         "Response fields by status: act: action, intended_target, expected_result; done: output, visual_evidence; "
         "needs_user: user_input with kind (password, verification_code, secret), action with type focus, element_id, pid; blocked: reason. "
@@ -1738,7 +1881,7 @@ def desktop_instruction(
     if "navigate_browser" in types:
         bounds.append("navigate_browser: http/https url OR query; optional browser name (default Safari).")
     if types & {"write_file", "run_command"}:
-        bounds.append("finish_after_action: true only for one write_file or explicitly requested run_command completing ALL requirements upon a verified result.")
+        bounds.append("finish_after_action: true only when one verified write_file or requested run_command completes ALL requirements.")
     reference = (
         "All actions remain available (examples are advisory): "
         "press/focus/double_click(element_id); set_value(element_id,text); click/double_click(pid,x,y); "
@@ -1753,7 +1896,7 @@ def desktop_instruction(
         "\nRELEVANT ACTION EXAMPLES:\n"
         "Illustrations only, not actions to execute. Use task/evidence values; "
         "element IDs are placeholders and PID 1 is illustrative. Do not copy example targets, paths, commands, or text. "
-        "Objects with status are decisions; others are actions.\n"
+        "\n"
         + "\n".join(json.dumps(example, separators=(',', ':')) for example in illustrated) + "\n"
         + " ".join(bounds) + "\n" + reference +
         "\nORIGINAL TASK AND OBSERVATION:\nORIGINAL USER TASK:\n" + task +
@@ -1948,8 +2091,9 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
     consecutive_action_failures = 0
     blocked_recoveries = 0
     pending_observation: dict[str, Any] | None = None
-    uncertain_mutations: set[str] = set()
-    suppressed_mutations: set[str] = set()
+    recovery = ActionRecovery()
+    loading_pid: int | None = None
+    loading_waits = 0
     try:
         emit("status", message=f"OpenClaw is connecting to the {PRODUCT_NAME} screen…")
         for step in range(1, MAX_STEPS + 1):
@@ -1979,7 +2123,24 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                 })
                 pending_observation, _ = wait_for_screen_change(
                     display_id, observation, {"type": "type_text", "pid": automatic_input_target["pid"]})
+                loading_pid, loading_waits = None, 0
                 continue
+
+            if loading_pid is not None:
+                if observation_is_loading(observation, loading_pid):
+                    if loading_waits >= 2:
+                        discard_observation_image(observation)
+                        raise RuntimeError("The target app is still loading after bounded local recovery; no action was repeated while it was busy.")
+                    loading_waits += 1
+                    try:
+                        pending_observation, settling = wait_for_screen_change(
+                            display_id, observation, {"type": "wait", "pid": loading_pid}, timeout=5.0)
+                    finally:
+                        discard_observation_image(observation)
+                    history.append({"step": step, "action": {"type": "wait", "seconds": 5},
+                                    "result": {"message": "Waited locally for the loading app", "recovery": "wait_for_loading", "settling": settling}})
+                    continue
+                loading_pid, loading_waits = None, 0
 
             # Let OpenClaw navigate the first visible step. Once Finder is in
             # Downloads (or after any OpenClaw action), finish this exact
@@ -2057,9 +2218,9 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                 reason = str(decision.get("reason") or summary or "OpenClaw is blocked")
                 if re.search(r"credential|password|verification code|permission denied|not authorized|cancelled|destructive|irreversible", reason, re.I):
                     raise RuntimeError(reason)
-                recovery = blocked_recovery_action(task, observation, history)
-                if recovery:
-                    decision = {"status": "act", "action": recovery, "summary": "Opening the requested installed app"}
+                launch_recovery = blocked_recovery_action(task, observation, history)
+                if launch_recovery:
+                    decision = {"status": "act", "action": launch_recovery, "summary": "Opening the requested installed app"}
                     status = "act"
                 elif blocked_recoveries < 1:
                     blocked_recoveries += 1
@@ -2152,12 +2313,21 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
             action = normalized_action(decision.get("action"))
             action_type = str(action["type"])
             action_signature = action_identity(action, observation)
-            if action_signature in uncertain_mutations:
-                if action_signature in suppressed_mutations:
-                    raise RuntimeError("The previous input may already have changed the app. TaskPilot stopped rather than repeat an uncertain mutation.")
-                suppressed_mutations.add(action_signature)
-                history.append({"step": step, "action": "repeat_suppressed", "result": {
-                    "message": "Do not replay this uncertain mutation. Inspect its outcome, choose a read-only verification action, or report the unresolved result."}})
+            recovered_result = recovery.check(action, observation)
+            if recovered_result and recovered_result["outcome"] == "suppressed":
+                history.append({"step": step, "action": "repeat_suppressed", "result": recovered_result})
+                continue
+            target_pid = action_target_pid(action, observation)
+            if action_type in {"press", "focus", "set_value", "type_text", "click", "double_click", "key", "scroll"} \
+                    and target_pid is not None and observation_is_loading(observation, target_pid):
+                # The decision was made while its target was busy. Discard it;
+                # never deliver its old target after local polling changes IDs.
+                loading_pid, loading_waits = target_pid, 1
+                pending_observation, settling = wait_for_screen_change(
+                    display_id, observation, action, screenshot_digest, timeout=5.0, target_pid=target_pid)
+                history.append({"step": step, "action": {"type": "wait", "seconds": 5},
+                                "result": {"message": "Discarded the busy-target action and waited locally; select a fresh target",
+                                           "recovery": "wait_for_loading", "settling": settling}})
                 continue
             if action_type == "wait":
                 identical_action_count = 0
@@ -2172,7 +2342,10 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                         f"OpenClaw repeated the same desktop action on an unchanged screen; {PRODUCT_NAME} stopped the loop safely"
                     )
 
-            if action_type == "wait":
+            if recovered_result:
+                result_message = recovered_result
+                consecutive_action_failures = 0
+            elif action_type == "wait":
                 seconds = float(action.get("seconds") or 2.0)
                 pending_observation, settling = wait_for_screen_change(
                     display_id, observation, action, screenshot_digest, timeout=seconds)
@@ -2183,15 +2356,22 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                 try:
                     result = bridge_call("act", display_id, action=action)
                 except RuntimeError as action_error:
+                    # A lost native reply cannot prove that input was rejected.
+                    # Stop rather than wrap transport failure in action retries.
+                    if not isinstance(action_error, ActionRejected):
+                        raise
                     code = getattr(action_error, "code", "action_rejected")
                     if code in {"cancelled", "permission_denied", "protected_target", "secure_input"}:
                         raise
                     consecutive_action_failures += 1
                     model_router.metrics["action_rejections"] += 1
-                    failure_result = {"message": str(action_error), "outcome": "rejected", "error_code": code}
+                    failure_result = {"message": str(action_error),
+                                      "outcome": "delivered_unconfirmed" if code == "delivery_uncertain" else "rejected",
+                                      "error_code": code, "recovery": action_failure_recovery(code)}
+                    recovery.rejected(action, observation, code)
                     record_action_diagnostic(action, failure_result)
-                    if code == "delivery_uncertain" and action_may_mutate(action, observation):
-                        uncertain_mutations.add(action_signature)
+                    if code == "delivery_uncertain":
+                        model_router.metrics["unconfirmed_actions"] += 1
                     history.append({
                         "step": step,
                         "visual_evidence": str(decision.get("visual_evidence") or ""),
@@ -2204,20 +2384,35 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                         raise RuntimeError(
                             "OpenClaw could not produce a valid action after three fresh screen checks"
                         ) from action_error
-                    emit("status", message="That action needed adjustment — checking the fresh screen again…")
+                    pending_observation = bridge_call("observe", display_id)
+                    if target_pid is not None and (code == "delivery_uncertain" or observation_is_loading(pending_observation, target_pid)):
+                        fresh = pending_observation
+                        pending_observation = None
+                        try:
+                            pending_observation, settling = wait_for_screen_change(
+                                display_id, fresh, action, timeout=5.0 if observation_is_loading(fresh, target_pid) else 2.0,
+                                target_pid=target_pid)
+                            failure_result["settling"] = settling
+                        finally:
+                            discard_observation_image(fresh)
+                        if observation_is_loading(pending_observation, target_pid):
+                            loading_pid, loading_waits = target_pid, 1
+                    emit("status", message="Checking fresh evidence and the action failure before continuing…")
                     continue
                 consecutive_action_failures = 0
                 result_message = result
                 model_router.metrics["action_deliveries"] += 1
+                if result.get("outcome") == "verified":
+                    recovery.succeeded(action, observation)
                 if result.get("outcome") == "delivered_unconfirmed":
                     model_router.metrics["unconfirmed_actions"] += 1
-                    if action_may_mutate(action, observation):
-                        uncertain_mutations.add(action_signature)
-                record_action_diagnostic(action, result)
+                    recovery.unconfirmed(action, observation)
+                    result_message = {**result, "recovery": "inspect_effect"}
+                record_action_diagnostic(action, result_message)
                 if screen_wait_limit(action_type) > 0:
                     pending_observation, settling = wait_for_screen_change(
                         display_id, observation, action, screenshot_digest, target_pid=result.get("pid"))
-                    result_message = {**result, "settling": settling}
+                    result_message = {**result_message, "settling": settling}
 
             history.append({
                 "step": step,

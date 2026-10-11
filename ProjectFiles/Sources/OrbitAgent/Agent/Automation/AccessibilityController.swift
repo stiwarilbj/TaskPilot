@@ -74,6 +74,7 @@ enum AccessibilityActionError: LocalizedError {
     case permissionDenied
     case uncertainDelivery(String)
     case focusMismatch
+    case unsupportedAction
 
     var code: String {
         switch self {
@@ -84,6 +85,7 @@ enum AccessibilityActionError: LocalizedError {
         case .permissionDenied: return "permission_denied"
         case .uncertainDelivery: return "delivery_uncertain"
         case .focusMismatch: return "focus_mismatch"
+        case .unsupportedAction: return "unsupported_action"
         case .controllerProtected: return "protected_target"
         case .invalidAction: return "invalid_action"
         case .operationFailed: return "delivery_rejected"
@@ -102,6 +104,7 @@ enum AccessibilityActionError: LocalizedError {
         case .permissionDenied: return "Accessibility permission is unavailable; restore TaskPilot’s existing macOS permission before continuing"
         case .uncertainDelivery(let message): return message
         case .focusMismatch: return "The intended field does not have confirmed focus; observe and focus the correct field before typing"
+        case .unsupportedAction: return "Accessibility press is unsupported and no verified coordinate fallback is available; observe and choose another supported method"
         }
     }
 }
@@ -500,11 +503,15 @@ final class AccessibilityController {
             "enabled": boolAttribute(element, kAXEnabledAttribute) ?? true
         ]
         row["focused"] = focused
+        if let title = map[id]?.identity.windowTitle { row["window_title"] = clipped(title) }
         if let selection { row["selection_range"] = ["location": selection.location, "length": selection.length] }
         if let parentID { row["parent_id"] = parentID }
         if !subrole.isEmpty { row["subrole"] = subrole }
         if !title.isEmpty { row["title"] = clipped(title) }
         if !rawValue.isEmpty { row["value"] = clipped(rawValue) }
+        if AutomationTextEntryPolicy.inputRoles.contains(role) {
+            row["value_complete"] = !secure && value is String && rawValue == clipped(rawValue)
+        }
         let sortDirection = printableValue(
             attribute(element, kAXSortDirectionAttribute)
         )
@@ -761,20 +768,11 @@ final class AccessibilityController {
                     )
                 }
             }
-            let result = try AutomationTargetPolicy.deliver(preflight: {
+            let method = try AutomationPressPolicy.deliver(preflight: {
                 try self.validateRecord(record, action: action, on: display)
-            }, event: {
+            }, press: {
                 AXUIElementPerformAction(record.element, kAXPressAction as CFString)
-            })
-            if result != .success {
-                // cannotComplete is ambiguous: the application may already
-                // have handled a submit/send. Only unsupported delivery can
-                // safely fall back to a second input method.
-                guard result == .actionUnsupported || result == .notImplemented else {
-                    throw AccessibilityActionError.uncertainDelivery(
-                        "Accessibility press returned \(result.rawValue); delivery is uncertain, inspect before another action"
-                    )
-                }
+            }, fallback: {
                 // Some macOS apps advertise a semantic control but reject
                 // AXPress. Fall back to a targeted click at that element's
                 // center without moving the user's physical pointer.
@@ -782,9 +780,7 @@ final class AccessibilityController {
                       elementFrame.width > 0,
                       elementFrame.height > 0,
                       elementFrame.intersects(display.frame) else {
-                    throw AccessibilityActionError.operationFailed(
-                        "Press failed with Accessibility error \(result.rawValue)"
-                    )
+                    throw AccessibilityActionError.unsupportedAction
                 }
                 try postClick(
                     to: record.pid,
@@ -796,9 +792,8 @@ final class AccessibilityController {
                         try self.validatePointerHit(record, at: CGPoint(x: elementFrame.midX, y: elementFrame.midY))
                     }
                 )
-                return "Clicked the requested control"
-            }
-            return "Pressed the requested control"
+            })
+            return method == "coordinate" ? "Clicked the requested control" : "Pressed the requested control"
 
         case "focus":
             let record = try record(for: action)

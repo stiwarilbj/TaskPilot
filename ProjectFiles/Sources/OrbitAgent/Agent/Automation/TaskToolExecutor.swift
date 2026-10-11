@@ -4,10 +4,19 @@ import Foundation
 enum TaskToolError: LocalizedError {
     case invalidAction(String)
     case operationFailed(String)
+    case uncertainDelivery(String)
+
+    var code: String {
+        switch self {
+        case .invalidAction: return "invalid_action"
+        case .operationFailed: return "delivery_rejected"
+        case .uncertainDelivery: return "delivery_uncertain"
+        }
+    }
 
     var errorDescription: String? {
         switch self {
-        case .invalidAction(let message), .operationFailed(let message):
+        case .invalidAction(let message), .operationFailed(let message), .uncertainDelivery(let message):
             return message
         }
     }
@@ -170,7 +179,7 @@ final class TaskToolExecutor {
                 try data.write(to: url, options: .atomic)
             }
         } catch {
-            throw TaskToolError.operationFailed(
+            throw TaskToolError.uncertainDelivery(
                 "\(TaskPilotIdentity.displayName) could not write \(url.lastPathComponent): \(error.localizedDescription)"
             )
         }
@@ -182,12 +191,12 @@ final class TaskToolExecutor {
             finalSize = written.count
             verified = mode == "append" ? written.suffix(data.count) == data : written == data
         } catch {
-            throw TaskToolError.operationFailed(
+            throw TaskToolError.uncertainDelivery(
                 "\(TaskPilotIdentity.displayName) wrote \(url.lastPathComponent), but could not verify it: \(error.localizedDescription)"
             )
         }
         guard verified else {
-            throw TaskToolError.operationFailed(
+            throw TaskToolError.uncertainDelivery(
                 "\(TaskPilotIdentity.displayName) wrote \(url.lastPathComponent), but its contents did not verify"
             )
         }
@@ -198,7 +207,8 @@ final class TaskToolExecutor {
             "bytes_written": data.count,
             "file_size": finalSize,
             "mode": mode,
-            "verified": true
+            "verified": true,
+            "outcome": "verified"
         ]
     }
 
@@ -305,8 +315,14 @@ final class TaskToolExecutor {
         try? stdoutHandle.synchronize()
         try? stderrHandle.synchronize()
 
-        let stdout = try Self.boundedText(from: stdoutURL)
-        let stderr = try Self.boundedText(from: stderrURL)
+        let stdout: (text: String, truncated: Bool)
+        let stderr: (text: String, truncated: Bool)
+        do {
+            stdout = try Self.boundedText(from: stdoutURL)
+            stderr = try Self.boundedText(from: stderrURL)
+        } catch {
+            throw TaskToolError.uncertainDelivery("The command ended, but its output could not be read; inspect its effects before running it again")
+        }
         return [
             "message": timedOut
                 ? "Command timed out after \(String(format: "%.1f", timeout)) seconds"
@@ -315,6 +331,8 @@ final class TaskToolExecutor {
             "working_directory": workingDirectory.path,
             "exit_code": Int(process.terminationStatus),
             "timed_out": timedOut,
+            "outcome": !timedOut && process.terminationStatus == 0 ? "verified" : "delivered_unconfirmed",
+            "verification_scope": "command_exit_status",
             "stdout": stdout.text,
             "stderr": stderr.text,
             "stdout_truncated": stdout.truncated,

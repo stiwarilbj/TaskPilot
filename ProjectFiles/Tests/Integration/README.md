@@ -71,3 +71,21 @@ insertion, Unicode boundaries, delayed/ignored/partial/duplicate entry, safe fal
 unreadable and secure values, cancellation, and zero replay. Local focus/read-back
 checks make no model requests. No Chrome interaction or live-control tester was run;
 live compatibility validation remains incomplete.
+
+Action recovery now uses classified failures: stale targets refresh observations,
+focus/activation failures require current target evidence, and a busy target waits
+locally before a new decision. Loading recovery permits two five-second waits;
+unchanged rejected inputs permit one recovery attempt, then suppress further
+delivery. Three consecutive native rejections remain a task safety bound.
+Unsupported Accessibility presses permit one coordinate fallback only after
+revalidating the intended control and pointer hit. Ambiguous presses never fall
+back. Uncertain mutations are checked on fresh evidence and cannot be replayed
+by changing press/click, keyboard, or text-entry methods. Complete nonsecure
+field read-back can prove a previous replacement without entering text again;
+clipped values and generic screen changes cannot. Failed file verification and
+timed-out/nonzero commands retain uncertainty and require inspection rather
+than repeating a write or command. Recovery state is private and task-local;
+diagnostics store only action/outcome/recovery codes, without commands or values.
+Automated fixtures cover these paths, cancellation, transport stops, unchanged
+targets, delayed effects, and query counts. No Chrome interaction or live-control
+tester was run; live compatibility and accuracy validation remain incomplete.
