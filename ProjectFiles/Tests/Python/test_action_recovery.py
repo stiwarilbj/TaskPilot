@@ -101,6 +101,23 @@ class ActionRecoveryTests(unittest.TestCase):
         self.assertIsNone(recovery.check(self.action(changed), changed))
         self.assertIsNone(recovery.check(self.action(fresh, 'click'), fresh))
 
+    def test_window_scope_churn_does_not_reset_the_rejection_budget(self):
+        recovery = runtime.ActionRecovery()
+        def observe(focused, x=10):
+            observation = self.observation(window_id=f'revision:{len(self.frames)}:window')
+            observation['applications'][0]['windows'] = [
+                {'title': 'Draft', 'window_id': observation['elements'][0]['window_id'],
+                 'focused': focused, 'topmost_on_agent_screen': focused,
+                 'frame': {'x': x, 'y': 10, 'width': 500, 'height': 400}}]
+            return observation
+        for focused in [True, False]:
+            current = observe(focused)
+            recovery.rejected(self.action(current), current, 'stale_target')
+        fresh = observe(True)
+        self.assertEqual(recovery.check(self.action(fresh), fresh)['outcome'], 'suppressed')
+        moved = observe(True, x=400)
+        self.assertIsNone(recovery.check(self.action(moved), moved))
+
     def test_uncertain_press_cannot_be_replayed_as_click_or_coordinates(self):
         for kind, parameters in [('click', {}), ('double_click', {}),
                                  ('click', {'pid': 42, 'x': 140, 'y': 140})]:

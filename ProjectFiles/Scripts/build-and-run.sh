@@ -41,6 +41,7 @@ BUILD_BINARY="$(swift build --package-path "$PACKAGE_ROOT" --disable-sandbox --s
 if [[ ! -x "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/openclaw_runtime.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/response_validation.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
+      || "$PROJECT_FILES_DIR/AgentRuntime/observation_context.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/request_policy.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/requirements.txt" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" ]]; then
   "$PROJECT_FILES_DIR/Scripts/build-openclaw-runtime.sh"

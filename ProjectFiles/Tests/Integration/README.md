@@ -115,3 +115,30 @@ truncated output, cancellation, and zero-exit false positives. Python fixtures
 cover precise validation errors, one same-model repair, completion evidence,
 replay protection, and the 4,000-character prompt bound. No Chrome interaction,
 live-control tester, or live ACP task was used; live accuracy remains unverified.
+
+Observation compaction now ranks the existing candidate controls by task wording,
+the active window on the task display, focus, menus, and nearby row/section labels.
+Selected controls retain structural ancestors and their own surrounding labels
+within the 360-element prompt budget. Native capture visits focused/topmost
+visible windows first and supplies observation-scoped window IDs, distinguishing
+same-title windows without guessing from titles. Capture remains bounded; missing
+controls still require inspection of the current screenshot. Revision-scoped IDs,
+window activation flags, and enumeration order do not count as screen changes or
+reset the unchanged-target rejection budget.
+
+Both planning and completion verification retain confirmed earlier events in the
+current task beyond the recent eight actions. The bounded historical memory keeps
+native file evidence, verified requested command checks, and confirmed action
+effects. It excludes stale control IDs, command source, unverified model completion
+claims, and private/secure input. Long values are explicitly excerpted, binary
+reads retain a byte digest, and mutable state still requires fresh evidence.
+Nothing is persisted or reused across tasks; action execution and mutation guards
+continue using the original validated history.
+
+Automated fixtures cover late relevant controls, active versus inactive windows,
+duplicate button labels, app/window isolation, Unicode matching, ancestor cycles,
+unchanged IDs, long tasks, evidence budgets, private input exclusion, and window
+metadata churn during settling. Ranking and progress memory make no model or
+native-action calls; healthy decisions still use one planning request. No Chrome
+interaction, live-control tester, or live ACP task was run for this change; live
+accuracy validation remains incomplete.

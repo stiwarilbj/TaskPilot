@@ -150,6 +150,14 @@ final class AccessibilityController {
         var observedBounds: CGRect? { identity.bounds }
     }
 
+    private struct SnapshotWindowRecord {
+        let element: AXUIElement
+        let id: String
+        let focused: Bool
+        let topmost: Bool
+        let frame: CGRect
+    }
+
     private struct TaskApplicationBaseline {
         let display: DisplayDescriptor
         let runningPIDs: Set<pid_t>
@@ -356,6 +364,18 @@ final class AccessibilityController {
             }
             let graphics = graphicsWindows(of: pid).filter { $0.frame.intersects(display.frame) }
             let cgFrames = graphics.map(\.frame)
+            let focusedWindow = accessibilityElement(appElement, kAXFocusedWindowAttribute)
+            let windowFrames = visibleWindows.enumerated().compactMap { index, window -> (index: Int, frame: CGRect)? in
+                frame(of: window).map { (index, $0) }
+            }
+            let match = AutomationObservationPolicy.matchingWindowIndex(frames: windowFrames.map(\.frame), topmostFrame: cgFrames.first)
+            let topmostIndex = match.map { windowFrames[$0].index }
+            let focusedIndex = visibleWindows.firstIndex { window in focusedWindow.map { CFEqual(window, $0) } == true }
+            let windowRecords = visibleWindows.enumerated().compactMap { index, window -> SnapshotWindowRecord? in
+                guard let rectangle = windowFrames.first(where: { $0.index == index })?.frame else { return nil }
+                return SnapshotWindowRecord(element: window, id: "\(revision):p\(pid):w\(index)",
+                    focused: index == focusedIndex, topmost: index == topmostIndex, frame: rectangle)
+            }
             guard Self.hasObservableWindow(accessibilityCount: visibleWindows.count, graphicsCount: cgFrames.count) else { continue }
             observedGraphics[pid] = graphics
             let appIdentity = applicationIdentity(app)
@@ -369,17 +389,11 @@ final class AccessibilityController {
                 "accessibility_available": !visibleWindows.isEmpty,
                 "active": app.isActive,
                 "topmost_on_agent_screen": applicationRows.isEmpty,
-                "windows": visibleWindows.compactMap { window -> [String: Any]? in
-                    guard let windowFrame = frame(of: window) else { return nil }
-                    return [
-                        "title": stringAttribute(window, kAXTitleAttribute) ?? "",
-                        "frame": [
-                            "x": Int(windowFrame.minX.rounded()),
-                            "y": Int(windowFrame.minY.rounded()),
-                            "width": Int(windowFrame.width.rounded()),
-                            "height": Int(windowFrame.height.rounded())
-                        ]
-                    ]
+                "windows": windowRecords.compactMap { record -> [String: Any]? in
+                    guard let serialized = serializedAccessibilityFrame(record.frame) else { return nil }
+                    return ["title": stringAttribute(record.element, kAXTitleAttribute) ?? "",
+                            "window_id": record.id, "focused": record.focused,
+                            "topmost_on_agent_screen": record.topmost, "frame": serialized]
                 } + (visibleWindows.isEmpty ? cgFrames.compactMap { rectangle -> [String: Any]? in
                     guard let serialized = serializedAccessibilityFrame(rectangle) else { return nil }
                     return ["frame": serialized, "source": "core_graphics"]
@@ -402,10 +416,11 @@ final class AccessibilityController {
                      application: appIdentity,
                      focusedElement: focusedElement,
                      depth: 0, nextID: &nextID, map: &newMap, rows: &elementRows,
-                     revision: revision, parentID: nil, ownerWindow: nil)
+                     revision: revision, parentID: nil, ownerWindow: nil, windowRecords: windowRecords)
             }
 
-            for window in visibleWindows {
+            for index in AutomationObservationPolicy.windowOrder(count: visibleWindows.count, focusedIndex: focusedIndex, topmostIndex: topmostIndex) {
+                let window = visibleWindows[index]
                 walk(
                     element: window,
                     pid: pid,
@@ -416,7 +431,7 @@ final class AccessibilityController {
                     nextID: &nextID,
                     map: &newMap,
                     rows: &elementRows,
-                    revision: revision, parentID: nil, ownerWindow: window
+                    revision: revision, parentID: nil, ownerWindow: window, windowRecords: windowRecords
                 )
                 if elementRows.count >= maxElements { break }
             }
@@ -460,7 +475,8 @@ final class AccessibilityController {
         rows: inout [[String: Any]],
         revision: String,
         parentID: String?,
-        ownerWindow: AXUIElement?
+        ownerWindow: AXUIElement?,
+        windowRecords: [SnapshotWindowRecord]
     ) {
         guard depth <= 14, rows.count < maxElements else { return }
         let alreadyVisited = map.values.contains(where: { CFEqual($0.element, element) })
@@ -504,6 +520,9 @@ final class AccessibilityController {
         ]
         row["focused"] = focused
         if let title = map[id]?.identity.windowTitle { row["window_title"] = clipped(title) }
+        if let window, let windowRecord = windowRecords.first(where: { CFEqual($0.element, window) }) {
+            row["window_id"] = windowRecord.id
+        }
         if let selection { row["selection_range"] = ["location": selection.location, "length": selection.length] }
         if let parentID { row["parent_id"] = parentID }
         if !subrole.isEmpty { row["subrole"] = subrole }
@@ -537,7 +556,7 @@ final class AccessibilityController {
                 depth: depth + 1,
                 nextID: &nextID,
                 map: &map,
-                rows: &rows, revision: revision, parentID: id, ownerWindow: ownerWindow
+                rows: &rows, revision: revision, parentID: id, ownerWindow: ownerWindow, windowRecords: windowRecords
             )
             if rows.count >= maxElements { break }
         }

@@ -120,6 +120,29 @@ class ScreenSettlingTests(unittest.TestCase):
                  'elements': [{'id': 'new:b', 'pid': 42, 'title': 'B'}, {'id': 'new:a', 'pid': 42, 'title': 'A'}]}
         self.assertEqual(runtime.observation_progress_signature(baseline), runtime.observation_progress_signature(after))
 
+    def test_window_scope_ids_and_activation_metadata_do_not_reset_settling(self):
+        import copy
+        baseline = {'applications': [{'pid': 42, 'window_count': 2, 'windows': [
+            {'window_id': 'old:w1', 'title': 'First', 'focused': True, 'topmost_on_agent_screen': True,
+             'frame': {'x': 10, 'y': 10, 'width': 500, 'height': 400}},
+            {'window_id': 'old:w2', 'title': 'Second', 'focused': False}]}], 'elements': []}
+        after = copy.deepcopy(baseline)
+        after['applications'][0]['windows'].reverse()
+        for index, window in enumerate(after['applications'][0]['windows']):
+            window.update(window_id=f'new:w{index}', focused=False, topmost_on_agent_screen=False)
+        self.assertEqual(runtime.observation_progress_signature(baseline), runtime.observation_progress_signature(after))
+        after['applications'][0]['windows'][0]['title'] = 'New dialog'
+        self.assertNotEqual(runtime.observation_progress_signature(baseline), runtime.observation_progress_signature(after))
+
+    def test_window_metadata_churn_alone_waits_to_bound_without_a_model_call(self):
+        frames = [self.observation() for _ in range(15)]
+        for observation in [self.baseline, *frames]:
+            observation['applications'][0]['windows'] = [
+                {'window_id': observation['observation_revision'] + ':w1', 'title': 'Budget', 'focused': True}]
+        _, result = self.run_wait(frames)
+        self.assertEqual(result['reason'], 'bounded_wait_elapsed')
+        self.assertFalse(result['changed'])
+
     def test_intermediate_screenshots_are_removed_and_final_revision_retained(self):
         frames = [self.observation('ready') for _ in range(3)]
         latest, result = self.run_wait(frames)
