@@ -29,6 +29,7 @@ import uuid
 import tempfile
 import struct
 import zlib
+from datetime import datetime
 from typing import Any
 
 
@@ -41,8 +42,9 @@ PRODUCT_NAME = "TaskPilot"
 LEGACY_APPLICATION_SUPPORT_FOLDER = "Orbit Agent"
 from request_policy import (
     ALL_MODELS, PRIMARY_MODELS, FALLBACK_MODELS, CONFIG_VERSION,
-    AdaptiveModelRouter, ModelAttemptError, RuntimeState, classify_failure,
+    AdaptiveModelRouter, Failure, ModelAttemptError, RecoveryExhaustedError, RuntimeState, classify_failure, model_route,
 )
+from provider_errors import ProviderRequestError, facts as provider_error_facts, message_text, response_error
 
 from observation_context import select_elements, historical_progress
 
@@ -200,11 +202,23 @@ def check_models(path: str, key: str, read_only: bool = False) -> bool:
     if read_only:
         emit("model_checks", checks=list(checks.values()), cached=False)
         return False
+    # A reported reset suppresses premature checks. With no reset, an explicit
+    # Check may probe the owning model once to detect repaired billing/quota.
+    unresolved = next((m for m in ALL_MODELS if state.credential_health(m).get("state") == "temporary" and
+                       state.credential_health(m).get("retry_at") is None), None)
+    probes = {m for m in ALL_MODELS if state.health(m).get("state") == "temporary" and state.health(m).get("retry_at") is None}
+    if unresolved:
+        owner = model_route(Failure.from_health(state.credential_health(unresolved)), unresolved)
+        unresolved = owner if owner in ALL_MODELS else unresolved
+        probes = {unresolved}
+    if all(state.health(m).get("state") == "temporary" for m in ALL_MODELS) and not probes:
+        emit("model_checks", checks=list(checks.values()), cached=False, prompt_calls=0, repairs=0)
+        return False
     try:
         client = ACPClient(path)
     except Exception as error:
-        state.record_failure(PRIMARY_MODELS[0], classify_failure(error, time.time()))
-        checks[PRIMARY_MODELS[0]].update(state="repair", detail=str(error))
+        state.record_failure(PRIMARY_MODELS[0], classify_failure(error, time.time(), PRIMARY_MODELS[0]))
+        checks[PRIMARY_MODELS[0]].update(state.health(PRIMARY_MODELS[0]))
         emit("model_checks", checks=list(checks.values()), cached=False, prompt_calls=0)
         return False
     try:
@@ -212,18 +226,40 @@ def check_models(path: str, key: str, read_only: bool = False) -> bool:
             image = Path(directory) / "check.png"
             synthetic_check_image(image)
             budget = ResponseRepairBudget()
+            exhausted: set[str] = set()
             for model in ALL_MODELS:
+                if model in exhausted or (model not in probes and state.health(model).get("state") == "temporary"):
+                    continue
                 try:
                     client.select_model(model)
                     validated_prompt(client, 'Do not call tools. Inspect this synthetic image and return exactly {"status":"done","check":"TASKPILOT_READY"}.', image, "readiness", budget)
                 except Exception as error:
-                    failure = classify_failure(error, time.time())
+                    failure = classify_failure(error, time.time(), model)
                     state.record_failure(model, failure)
-                    checks[model].update(state="temporary" if failure.kind in {"temporary", "quota"} else "repair", detail=str(error))
-                    if failure.kind in {"credentials", "transport", "configuration", "cancelled"}:
+                    probes.discard(model)
+                    if failure.scope == "credential":
+                        probes.difference_update(m for m in ALL_MODELS if m.startswith((failure.provider or model.split('/', 1)[0]) + '/'))
+                    stop = failure.kind in {"credentials", "transport", "configuration", "cancelled"}
+                    for item in failure.attempts:
+                        prior = Failure.from_health(item)
+                        prior.recovered_upstream = True
+                        if not prior.model and not (prior.scope == "credential" and prior.provider == model.split('/', 1)[0]):
+                            continue
+                        route = model_route(prior, model)
+                        if route in ALL_MODELS:
+                            state.record_failure(route, prior)
+                            if prior.scope == "credential":
+                                probes.difference_update(m for m in ALL_MODELS if m.startswith((prior.provider or model.split('/', 1)[0]) + '/'))
+                            exhausted.add(route)
+                            stop = stop or prior.kind in {"credentials", "transport", "configuration", "cancelled"}
+                    for other in ALL_MODELS:
+                        checks[other].update(state.health(other))
+                    if stop:
                         break
                     continue
                 state.verify(model)
+                for other in ALL_MODELS:
+                    checks[other] = {"model": other, "state": "configured", "detail": "Configured; not verified through TaskPilot", **state.health(other)}
                 checks[model].update(state="verified", detail="Verified through TaskPilot with image input and structured output")
                 break
     finally:
@@ -406,7 +442,8 @@ def session_transcript_cursor(session_id: str, sessions_root: Path | None = None
 
 
 def openclaw_session_error(session_id: str, sessions_root: Path | None = None,
-                           after_cursor: tuple[Path, int] | None = None) -> str:
+                           after_cursor: tuple[Path, int] | None = None, *,
+                           structured: bool = False, started_at: float | None = None) -> Any:
     """Recover provider failures that the current ACP bridge does not stream.
 
     OpenClaw records some Google capacity failures as a normal assistant
@@ -451,9 +488,11 @@ def openclaw_session_error(session_id: str, sessions_root: Path | None = None,
         message = item.get("message") if isinstance(item, dict) else None
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
+        if started_at is not None and after_cursor is None and not current_transcript_message(message, item, started_at):
+            return ""
         if message.get("stopReason") == "error":
             detail = message.get("errorMessage") or message.get("error")
-            return str(detail or "").strip()[:500]
+            return message if structured else message_text(detail, "").strip()[:500]
         content = message.get("content")
         parts = content if isinstance(content, list) else [content]
         assistant_text = " ".join(
@@ -467,10 +506,18 @@ def openclaw_session_error(session_id: str, sessions_root: Path | None = None,
             "permission denied", "forbidden", "unauthorized",
         ))
         if assistant_text and (is_model_capacity_failure(assistant_text) or credential_failure):
-            return assistant_text[:500]
+            return assistant_text if structured else assistant_text[:500]
         # Do not walk into an older turn and accidentally report a stale error.
         return ""
     return ""
+
+
+def current_transcript_message(message: dict[str, Any], item: dict[str, Any], started_at: float) -> bool:
+    stamp = message.get("timestamp") or item.get("timestamp")
+    if isinstance(stamp, str):
+        try: stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() * 1000
+        except (ValueError, OverflowError): return False
+    return type(stamp) in {int, float} and stamp >= started_at
 
 
 def user_facing_openclaw_error(detail: str) -> str:
@@ -1493,7 +1540,7 @@ class ACPClient:
         self.next_request_id = 1
         self.accepting_prompt_updates = False
         self.agent_chunks: list[str] = []
-        self.turn_errors: list[str] = []
+        self.turn_errors: list[Any] = []
         self.openclaw_path = openclaw_path
         self.selected_model: str | None = None
         self.stdout_finished = threading.Event()
@@ -1538,6 +1585,7 @@ class ACPClient:
                     raise RuntimeError("OpenClaw did not acknowledge the thinking setting")
                 self.config_options = options
             self.prompt_calls = 0
+            self.successful_provider_retries: int | None = None
             self.model_switches = 0
             self.reconnects = 0
             self.openclaw_path = openclaw_path
@@ -1580,6 +1628,9 @@ class ACPClient:
             params = message.get("params") or {}
             if params.get("sessionId") and params["sessionId"] != getattr(self, "session_id", params["sessionId"]):
                 return
+            request_id = params.get("requestId")
+            if request_id is not None and request_id != getattr(self, "pending_prompt_request_id", request_id):
+                return
             update = params.get("update") or {}
             update_kind = update.get("sessionUpdate")
             if update_kind in {"agent_message_chunk", "agent_message", "message", "error", "session_error", "agent_error"} and not getattr(self, "accepting_prompt_updates", True):
@@ -1596,11 +1647,8 @@ class ACPClient:
                             else:
                                 self.agent_chunks = [text]
             elif update_kind in {"error", "session_error", "agent_error"}:
-                detail = update.get("message") or update.get("error")
-                if isinstance(detail, dict):
-                    detail = detail.get("message")
-                if isinstance(detail, str) and detail.strip():
-                    self.turn_errors.append(detail.strip())
+                if update.get("message") or update.get("error") or update.get("code"):
+                    self.turn_errors.append(update)
             elif update_kind == "tool_call":
                 title = update.get("title") or "OpenClaw tool"
                 emit("status", message=f"OpenClaw is checking {title}…")
@@ -1625,6 +1673,8 @@ class ACPClient:
     def request(self, method: str, params: dict[str, Any], timeout: float | None) -> dict[str, Any]:
         request_id = self.next_request_id
         self.next_request_id += 1
+        if method == "session/prompt":
+            self.pending_prompt_request_id = request_id
         self._send({
             "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
         })
@@ -1642,7 +1692,7 @@ class ACPClient:
             if message.get("id") == request_id and ("result" in message or "error" in message):
                 if "error" in message:
                     error = message.get("error") or {}
-                    raise RuntimeError(str(error.get("message") or "OpenClaw ACP request failed"))
+                    raise ProviderRequestError(error, getattr(self, "selected_model", None), "OpenClaw ACP request failed")
                 result = message.get("result")
                 return result if isinstance(result, dict) else {}
             self._handle_server_message(message)
@@ -1672,12 +1722,14 @@ class ACPClient:
         finally:
             self.accepting_prompt_updates = False
         stop_reason = str(result.get("stopReason") or "")
+        selected = getattr(self, "selected_model", None)
         if stop_reason in {"cancelled", "error"}:
             if stop_reason == "cancelled":
                 raise RuntimeError(f"OpenClaw cancelled the {PRODUCT_NAME} turn")
-            detail = self.turn_errors[-1] if self.turn_errors else openclaw_session_error(self.session_id, after_cursor=cursor)
+            detail = result if any(result.get(k) for k in ("error", "code", "data", "errorMessage", "errorDetails")) else self.turn_errors[-1] if self.turn_errors else openclaw_session_error(
+                self.session_id, after_cursor=cursor, structured=True, started_at=started_at)
             if detail:
-                raise RuntimeError(user_facing_openclaw_error(detail))
+                raise ProviderRequestError(detail, selected)
             raise RuntimeError(
                 "OpenClaw could not complete the Gemini request. Open Settings and click Reconfigure Gemini."
             )
@@ -1686,11 +1738,10 @@ class ACPClient:
             recovered = self.gateway_configuration("sessions.get", {"key": self.session_key, "limit": 8})
             for item in reversed(recovered.get("messages") or []):
                 message = item.get("message", item) if isinstance(item, dict) else {}
-                stamp = message.get("timestamp") or item.get("timestamp") or 0
-                if not isinstance(stamp, (int, float)) or stamp < started_at or message.get("role") != "assistant":
+                if not current_transcript_message(message, item, started_at) or message.get("role") != "assistant":
                     continue
                 if message.get("stopReason") == "error":
-                    raise RuntimeError(user_facing_openclaw_error(str(message.get("errorMessage") or message.get("error") or "OpenClaw recovery exhausted")))
+                    raise ProviderRequestError(message, selected, "OpenClaw recovery exhausted")
                 content = message.get("content") or []
                 if isinstance(content, list):
                     response = "".join(str(part.get("text") or "") for part in content if isinstance(part, dict)).strip()
@@ -1698,9 +1749,16 @@ class ACPClient:
         if not response:
             response = str(result.get("message") or result.get("text") or "").strip()
         if not response:
-            detail = self.turn_errors[-1] if self.turn_errors else openclaw_session_error(self.session_id, after_cursor=cursor)
+            detail = self.turn_errors[-1] if self.turn_errors else openclaw_session_error(
+                self.session_id, after_cursor=cursor, structured=True, started_at=started_at)
             if detail:
-                raise RuntimeError(user_facing_openclaw_error(detail))
+                raise ProviderRequestError(detail, selected)
+        elif self.turn_errors:
+            # A complete response can follow successful internal recovery. Partial
+            # output plus an explicit provider error must not trigger format repair.
+            try: extract_json_object(response)
+            except ResponseValidationError:
+                raise ProviderRequestError(self.turn_errors[-1], selected)
         return result, response
 
     def select_model(self, model: str) -> None:
@@ -1734,9 +1792,12 @@ class ACPClient:
         result = subprocess.run([self.openclaw_path, "gateway", "call", method, "--params", json.dumps(params), "--json"],
                                 capture_output=True, text=True, timeout=30)
         if result.returncode:
-            raise RuntimeError(f"OpenClaw session configuration failed: {result.stderr.strip()[:500]}")
+            raise ProviderRequestError(result.stdout.strip() or result.stderr.strip(), getattr(self, "selected_model", None), "OpenClaw session configuration failed")
         try:
-            return json.loads(result.stdout)
+            value = json.loads(result.stdout)
+            if response_error(value):
+                raise ProviderRequestError(value, getattr(self, "selected_model", None))
+            return value
         except ValueError as error:
             raise RuntimeError("OpenClaw returned invalid session configuration") from error
 
@@ -1744,6 +1805,7 @@ class ACPClient:
         if self.reconnects >= 1:
             raise RuntimeError("OpenClaw disconnected again after reconnecting. Check Gateway health in Settings.")
         prompt_calls, switches = self.prompt_calls, self.model_switches
+        provider_retries = getattr(self, "successful_provider_retries", None)
         path = self.openclaw_path
         session_key = self.session_key
         self.close()  # First stop and wait for the disconnected ACP child.
@@ -1756,12 +1818,13 @@ class ACPClient:
         self.reconnects = 1
         self.prompt_calls = prompt_calls
         self.model_switches = switches
+        self.successful_provider_retries = provider_retries
 
     def prompt(self, instruction: str, screenshot_path: Path) -> str:
         self.prompt_calls = getattr(self, "prompt_calls", 0) + 1
         image_data = base64.b64encode(screenshot_path.read_bytes()).decode("ascii")
         mime_type = image_mime_type(screenshot_path)
-        _, response = self._run_prompt(
+        result, response = self._run_prompt(
             [
                 {"type": "text", "text": instruction},
                 {"type": "image", "data": image_data, "mimeType": mime_type},
@@ -1770,6 +1833,10 @@ class ACPClient:
         )
         # _run_prompt has reached a terminal result and already surfaced any
         # provider error. Empty terminal output belongs to format recovery.
+        retries = provider_error_facts(result).get("provider_retries")
+        self.last_prompt_provider_retries = retries
+        if retries is not None:
+            self.successful_provider_retries = (getattr(self, "successful_provider_retries", None) or 0) + retries
         return response
 
     def close(self) -> None:
@@ -1977,6 +2044,7 @@ def validated_prompt(client: ACPClient, instruction: str, screenshot_path: Path,
                      observation: dict[str, Any] | None = None,
                      metrics: dict[str, Any] | None = None) -> dict[str, Any]:
     def prompt(text: str) -> str:
+        before = getattr(client, "successful_provider_retries", None)
         try:
             return client.prompt(text, screenshot_path)
         except Exception as error:
@@ -1989,6 +2057,10 @@ def validated_prompt(client: ACPClient, instruction: str, screenshot_path: Path,
                 metrics[purpose] += 1
             client.select_model(selected)
             return client.prompt(text, screenshot_path)
+        finally:
+            after = getattr(client, "successful_provider_retries", None)
+            if metrics is not None and type(after) is int:
+                metrics["provider_retries"] = (metrics["provider_retries"] or 0) + after - (before if type(before) is int else 0)
 
     def validate(response: str) -> dict[str, Any]:
         try:
@@ -2008,10 +2080,13 @@ def validated_prompt(client: ACPClient, instruction: str, screenshot_path: Path,
                 "cancelled": "OpenClaw cancelled the TaskPilot turn.",
             }
             if failure.kind in details:
-                # Retain recovery metadata without persisting raw model output.
-                raise ModelAttemptError(details[failure.kind], failure.kind,
-                                        failure.retry_at, failure.recovered_upstream)
+                raise ModelAttemptError.from_failure(failure)
             raise
+        envelope = response_error(value)
+        if envelope is not None:
+            failure = classify_failure(ProviderRequestError(envelope, getattr(client, "selected_model", None)), time.time())
+            failure.provider_retries_counted = metrics is not None and type(getattr(client, "last_prompt_provider_retries", None)) is int
+            raise ModelAttemptError.from_failure(failure)
         return validate_response(value, purpose, observation)
 
     response = prompt(instruction)
@@ -2530,7 +2605,12 @@ def main() -> int:
     except KeyboardInterrupt:
         return 130
     except Exception as error:
-        emit("error", message=str(error))
+        failure = classify_failure(error, time.time())
+        fields = failure.metadata()
+        if isinstance(error, RecoveryExhaustedError):
+            fields["model_failures"] = [{"model": model, **f.metadata()} for model, f in error.failures]
+        message = failure.summary() if isinstance(error, ProviderRequestError) else str(error)
+        emit("error", message=message, **fields)
         return 1
 
 

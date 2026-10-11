@@ -50,6 +50,17 @@ models once in order: 2.5 Flash-Lite, 3.8 Flash, 3 Flash Preview, and 2.5 Flash.
 At most two additional recoverable Lite retries are shared across each decision.
 Credential errors stop for repair; capacity errors respect provider cooldowns.
 OpenClaw’s exhausted internal recovery is not repeated in another full cycle.
+Recovery preserves reported provider codes, HTTP status, quota scope, and reset
+timing through ACP and transcript recovery. Confirmed account/project limits
+block sibling models using the same credential; model-specific limits allow
+fallback. A generic quota message does not prove that every model is blocked.
+Models already exhausted in structured OpenClaw attempts are skipped. Cached
+shared limits also suppress premature readiness checks; when no reset was
+reported, an explicit Check may probe one model to detect repaired quota.
+These decisions follow [OpenClaw’s failover distinctions](https://docs.openclaw.ai/concepts/model-failover)
+and [Gemini’s project and model quota scopes](https://ai.google.dev/gemini-api/docs/rate-limits).
+Private diagnostics store normalized codes and policy facts, never raw error
+payloads. Fields omitted by the installed OpenClaw bridge remain unknown.
 
 Settings distinguishes configured models from models verified through TaskPilot.
 Check uses the same ACP client, image input, and JSON output as real tasks,

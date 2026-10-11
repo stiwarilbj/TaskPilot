@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 from response_validation import VALIDATION_VERSION
+from provider_errors import ProviderRequestError, facts, retry_time
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 import hashlib
-from datetime import datetime
-from email.utils import parsedate_to_datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -21,6 +22,7 @@ FALLBACK_MODELS = (
 )
 ALL_MODELS = PRIMARY_MODELS + FALLBACK_MODELS
 CONFIG_VERSION = 5
+ERROR_POLICY_VERSION = 1
 
 
 @dataclass
@@ -29,59 +31,157 @@ class Failure:
     detail: str
     retry_at: float = 0
     recovered_upstream: bool = False
+    code: str | int | None = None
+    codes: tuple[str | int, ...] = ()
+    http_status: int | None = None
+    provider_status: str | None = None
+    rpc_code: int | None = None
+    reason: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    scope: str = "unknown"
+    attempts: tuple[dict[str, Any], ...] = ()
+    provider_retries: int | None = None
+    provider_retries_counted: bool = False
+
+    def metadata(self) -> dict[str, Any]:
+        """Only machine identifiers and normalized policy facts may leave memory."""
+        return {"failure_kind": self.kind, "error_code": self.code, "error_codes": list(self.codes),
+                "http_status": self.http_status, "provider_status": self.provider_status,
+                "rpc_code": self.rpc_code, "failure_reason": self.reason, "provider": self.provider,
+                "provider_model": self.model, "failure_scope": self.scope, "upstream_attempts": list(self.attempts),
+                "recovered_upstream": self.recovered_upstream, "provider_retries": self.provider_retries,
+                "retry_at": self.retry_at if math.isfinite(self.retry_at) else None}
+
+    def summary(self) -> str:
+        explanation = {
+            "credentials": "OpenClaw rejected an invalid API key or credential. Repair credentials in Settings.",
+            "quota": "Provider quota is exhausted.",
+            "temporary": "Provider capacity or service is temporarily unavailable.",
+            "unavailable": "The selected model is unavailable or not permitted.",
+            "transport": "The OpenClaw connection failed.",
+            "cancelled": "OpenClaw cancelled the TaskPilot turn.",
+            "invalid_output": "The response did not satisfy the required JSON contract.",
+            "configuration": "OpenClaw or provider configuration needs repair.",
+        }.get(self.kind, "Provider request failed.")
+        codes = list(dict.fromkeys(str(c) for c in (*self.codes, self.code, self.provider_status, self.reason) if c is not None))
+        if self.http_status is not None: codes.append(f"HTTP {self.http_status}")
+        if self.rpc_code is not None: codes.append(f"ACP {self.rpc_code}")
+        if codes: explanation += " [" + ", ".join(codes) + "]"
+        if self.scope == "credential": explanation += " This failure affects models sharing this credential."
+        elif self.scope == "model": explanation += " This failure is specific to this model."
+        if self.kind in {"quota", "temporary"}:
+            if math.isfinite(self.retry_at):
+                try: reset = datetime.fromtimestamp(self.retry_at, timezone.utc).isoformat()
+                except (ValueError, OverflowError, OSError): reset = str(self.retry_at)
+                explanation += f" Retry after {reset}."
+            else:
+                explanation += " No reset was reported; use Check after provider quota or billing is repaired."
+        return explanation
+
+    @classmethod
+    def from_health(cls, value: dict[str, Any]) -> Failure:
+        return cls(value.get("failure_kind", "temporary"), value.get("detail", "Provider cooldown is active"),
+                   value.get("retry_at") if isinstance(value.get("retry_at"), (float, int)) else float("inf"),
+                   value.get("recovered_upstream") is True, code=value.get("error_code"),
+                   codes=tuple(value.get("error_codes") or []), http_status=value.get("http_status"),
+                   provider_status=value.get("provider_status"), rpc_code=value.get("rpc_code"),
+                   reason=value.get("failure_reason"), provider=value.get("provider"), model=value.get("provider_model"),
+                   scope=value.get("failure_scope", "unknown"), attempts=tuple(value.get("upstream_attempts") or []),
+                   provider_retries=value.get("provider_retries"))
 
 
 class ModelAttemptError(RuntimeError):
     def __init__(self, detail: str, kind: str = "invalid_output", retry_at: float = 0,
-                 recovered_upstream: bool = False) -> None:
+                 recovered_upstream: bool = False, *, failure: Failure | None = None) -> None:
         super().__init__(detail)
-        self.kind = kind
-        self.retry_at = retry_at
-        self.recovered_upstream = recovered_upstream
+        self.failure = failure or Failure(kind, detail, retry_at, recovered_upstream)
+        self.kind = self.failure.kind
+        self.retry_at = self.failure.retry_at
+        self.recovered_upstream = self.failure.recovered_upstream
+
+    @classmethod
+    def from_failure(cls, failure: Failure) -> ModelAttemptError:
+        return cls(failure.summary(), failure=failure)
 
 
-def classify_failure(error: BaseException, now: float) -> Failure:
+class RecoveryExhaustedError(ModelAttemptError):
+    def __init__(self, failures: list[tuple[str, Failure]]) -> None:
+        self.failures = tuple(failures)
+        details = "; ".join(f"{m.split('/', 1)[-1]}: {f.summary()}" for m, f in failures)
+        super().__init__("No eligible Gemini model completed this decision. " + (details or
+                         "Models are unavailable for this task. Wait for capacity or use Check in Settings."),
+                         failure=failures[-1][1] if failures else Failure("unavailable", "No eligible model"))
+
+
+def model_route(failure: Failure, default: str) -> str:
+    model = failure.model or default.split('/', 1)[-1]
+    return model if '/' in model else f"{failure.provider or default.split('/', 1)[0]}/{model}"
+
+
+def classify_failure(error: BaseException, now: float, model: str | None = None, *, _attempt: bool = False) -> Failure:
+    if isinstance(error, ModelAttemptError):
+        return replace(error.failure, provider=error.failure.provider or (model.split('/', 1)[0] if model else None),
+                       model=error.failure.model or (model.split('/', 1)[-1] if model else None))
     message = str(error)
     lowered = message.lower()
-    if isinstance(error, ModelAttemptError):
-        return Failure(error.kind, message, error.retry_at, error.recovered_upstream)
-    upstream = any(s in lowered for s in ("all models failed", "recovery exhausted", "retry budget exhausted"))
-    if any(s in lowered for s in ("invalid api key", "api key not valid", "api_key_invalid", "api key expired", "invalid credential", "unauthorized", "http 401")):
-        return Failure("credentials", message)
-    if any(s in lowered for s in ("cancelled the", "canceled the", "lost contact with the native", "task cancelled")):
-        return Failure("cancelled", message)
-    if any(s in lowered for s in ("acp exited", "acp stopped", "broken pipe", "gateway disconnected", "connection closed", "connection refused", "econnreset", "econnrefused", "socket closed", "transport closed")):
-        return Failure("transport", message)
-    if any(s in lowered for s in ("unknown model", "model not found", "model_not_found", "model is unavailable", "model unavailable", "unsupported model", "not allowed", "could not select", "no such model", "permission denied", "forbidden", "http 403", "http 404")):
-        return Failure("unavailable", message)
-    retry = re.search(r"(?:retry[- _]?after[\"\']?\s*[:=]?\s*[\"\']?|retrydelay[\"\']?\s*[:=]?\s*[\"\']?|retry in\s+|ready in\s*~?)(\d+(?:\.\d+)?)", lowered)
-    delay = float(retry.group(1)) if retry else 30.0
-    has_delay = retry is not None
-    if retry is None:
-        date_header = re.search(r"retry-after\s*:\s*([^\n]+)", message, re.IGNORECASE)
-        if date_header:
-            try:
-                delay = max(0, parsedate_to_datetime(date_header.group(1).strip()).timestamp() - now)
-                has_delay = True
-            except (ValueError, TypeError, OverflowError):
-                pass
-    reset = re.search(r"(?:reset(?:s)?(?:[ _]?at)?\s*[:=]?\s*)(\d{10}(?:\.\d+)?)", lowered)
-    reset_at = float(reset.group(1)) if reset else None
-    if reset_at is None:
-        iso_reset = re.search(r"reset(?:s)?(?:[ _]?at)?[\"\']?\s*[:=]?\s*[\"\']?(\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:?\d{2}))", message, re.IGNORECASE)
-        if iso_reset:
-            try:
-                reset_at = datetime.fromisoformat(iso_reset.group(1).replace("Z", "+00:00")).timestamp()
-            except ValueError:
-                pass
-    periodic = any(s in lowered for s in ("daily", "weekly", "monthly", "billing", "insufficient credits", "quota exhausted"))
-    if periodic and any(s in lowered for s in ("quota", "limit", "credits", "billing")):
-        return Failure("quota", message, reset_at if reset_at is not None else (now + delay if has_delay else float("inf")), upstream)
-    if any(s in lowered for s in ("429", "503", "rate limit", "rate-limit", "rate_limit", "resource_exhausted", "resource exhausted", "overloaded", "temporarily unavailable", "high demand", "quota", "model request timed out", "model timed out")):
-        return Failure("temporary", message, now + delay, upstream)
-    if any(s in lowered for s in ("empty response", "incomplete desktop decision", "returned no desktop decision")):
-        return Failure("invalid_output", message)
-    return Failure("configuration", message, recovered_upstream=upstream)
+    payload = error.payload if isinstance(error, ProviderRequestError) else message
+    fields = facts(payload, getattr(error, "model", None) or model)
+    code, status, reason = fields.get("code"), fields.get("status"), fields.get("reason")
+    tokens = {str(t).lower().replace('-', '_') for t in (*fields.get("codes", []), status, reason) if t is not None}
+    http = fields.get("http_status")
+    if http is None:
+        match = re.search(r'\bHTTP\s*[:=]?\s*([45]\d\d)\b', message, re.I)
+        if match:
+            http = int(match.group(1))
+    upstream = fields["recovered_upstream"] or any(s in lowered for s in ("all models failed", "recovery exhausted", "retry budget exhausted"))
+    reset = retry_time(payload, message, now)
+    scope = fields["scope"]
+
+    if http == 401 or tokens & {"auth", "auth_permanent", "authentication_error", "unauthenticated", "invalid_api_key", "api_key_invalid", "invalid_credentials", "authentication_failed"} or any(s in lowered for s in ("invalid api key", "api key not valid", "api_key_invalid", "api key expired", "invalid credential", "unauthorized", "http 401")):
+        kind, scope = "credentials", "credential"
+    elif "cancelled" in tokens or "canceled" in tokens or any(s in lowered for s in ("cancelled the", "canceled the", "lost contact with the native", "task cancelled")):
+        kind = "cancelled"
+    elif tokens & {"transport", "econnreset", "econnrefused", "epipe", "socket_closed"} or any(s in lowered for s in ("acp exited", "acp stopped", "broken pipe", "gateway disconnected", "connection closed", "connection refused", "econnreset", "econnrefused", "socket closed", "transport closed")):
+        kind = "transport"
+    elif tokens & {"model_not_found", "unknown_model", "unsupported_model", "model_not_allowed"} or any(s in lowered for s in ("unknown model", "model not found", "model_not_found", "model is unavailable", "model unavailable", "unsupported model", "no such model")):
+        kind, scope = "unavailable", "model"
+    elif tokens & {"format", "configuration", "invalid_request", "invalid_argument", "unsupported_parameter", "context_length_exceeded", "context_window_exceeded"}:
+        kind = "configuration"
+    elif http == 402 or fields.get("periodic_quota") or tokens & {"billing", "insufficient_quota", "insufficient_credits", "billing_hard_limit_reached", "quota_exhausted", "quota_exceeded", "daily_quota_exceeded"} or (any(s in lowered for s in ("daily", "weekly", "monthly", "billing", "insufficient credits", "quota exhausted")) and any(s in lowered for s in ("quota", "limit", "credits", "billing"))):
+        kind = "quota"
+        if (http == 402 or tokens & {"billing", "insufficient_quota", "insufficient_credits", "billing_hard_limit_reached"}) and scope != "model": scope = "credential"
+    elif (http is not None and http >= 500) or http in {408, 429, 499} or tokens & {"rate_limit", "rate_limit_exceeded", "resource_exhausted", "overloaded", "capacity", "server_error", "timeout", "unavailable"} or any(s in lowered for s in ("429", "503", "rate limit", "rate-limit", "rate_limit", "resource_exhausted", "resource exhausted", "overloaded", "temporarily unavailable", "high demand", "quota", "model request timed out", "model timed out")):
+        kind = "temporary"
+    elif any(s in lowered for s in ("empty response", "incomplete desktop decision", "returned no desktop decision")):
+        kind = "invalid_output"
+    else:
+        kind = "configuration"
+    if reason is None and http is not None:
+        if http in {503, 529}: reason = "overloaded"
+        elif http in {408, 499, 504, 522, 524}: reason = "timeout"
+        elif http >= 500: reason = "server_error"
+        elif http == 429: reason = "rate_limit"
+    deadline = 0
+    if kind == "quota": deadline = reset if reset is not None else float("inf")
+    elif kind == "temporary": deadline = reset if reset is not None else now + 30
+    attempts = []
+    if not _attempt:
+        for item in fields["attempts"]:
+            # Do not invent provider/model identity for upstream attempts.
+            failure = classify_failure(ProviderRequestError(item), now, _attempt=True)
+            attempts.append(failure.metadata())
+    if kind == "configuration" and attempts and http is None and not tokens:
+        kinds = {a["failure_kind"] for a in attempts}
+        # A generic exhausted wrapper must not hide classified inner failures.
+        kind = next((k for k in ("credentials", "cancelled", "transport", "configuration") if k in kinds),
+                    "quota" if kinds == {"quota"} else "unavailable" if kinds == {"unavailable"} else "temporary")
+        deadlines = [Failure.from_health(a).retry_at for a in attempts if a["failure_kind"] in {"quota", "temporary"}]
+        deadline = min(deadlines) if deadlines else 0
+    return Failure(kind, message, deadline, upstream, code=code, codes=tuple(fields.get("codes", [])),
+                   http_status=http, provider_status=status, rpc_code=fields.get("rpc_code"), reason=reason,
+                   provider=fields.get("provider"), model=fields.get("model"), scope=scope,
+                   attempts=tuple(attempts), provider_retries=fields.get("provider_retries"))
 
 
 class AdaptiveModelRouter:
@@ -92,11 +192,18 @@ class AdaptiveModelRouter:
         self.active_model: str | None = None
         self.unavailable: set[str] = set()
         self.cooldowns: dict[str, float] = {}
+        self.model_failures: dict[str, Failure] = {}
+        self.credential_failures: dict[str, Failure] = {}
         if state:
             for model in ALL_MODELS:
                 health = state.health(model)
                 if health.get("state") == "temporary":
-                    self.cooldowns[model] = health.get("retry_at") or float("inf")
+                    failure = Failure.from_health(health)
+                    if failure.scope == "credential":
+                        self.credential_failures[model.split('/', 1)[0]] = failure
+                    else:
+                        self.cooldowns[model] = failure.retry_at
+                        self.model_failures[model] = failure
         self.metrics = {"planning": 0, "verification": 0, "retries": 0, "model_switches": 0,
                         "cache_hits": 0, "reconnects": 0, "repairs": 0, "provider_retries": None,
                         "action_deliveries": 0, "action_rejections": 0, "unconfirmed_actions": 0}
@@ -104,13 +211,30 @@ class AdaptiveModelRouter:
     def execute(self, operation: Callable[[str], Any], purpose: str = "planning") -> Any:
         order = ([self.active_model] if self.active_model else []) + [m for m in ALL_MODELS if m != self.active_model]
         delayed: list[tuple[str, Failure]] = []
-        for model in PRIMARY_MODELS:
-            reset = self.cooldowns.get(model, 0)
-            health = self.cache.health(model) if self.cache else {}
-            if self.clock() < reset < float("inf") and not health.get("recovered_upstream"):
-                delayed.append((model, Failure("temporary", "Provider cooldown is still active", reset)))
         failures: list[tuple[str, Failure]] = []
+        attempted: set[str] = set()
+        exhausted: set[str] = set()
         retries = 0
+
+        def shared(model: str) -> Failure | None:
+            failure = self.credential_failures.get(model.split('/', 1)[0])
+            return failure if failure and failure.retry_at > self.clock() else None
+
+        def recoverable(failure: Failure) -> bool:
+            return failure.kind in {"quota", "temporary"} and math.isfinite(failure.retry_at) and not failure.recovered_upstream
+
+        def schedule(model: str, failure: Failure) -> None:
+            if model in PRIMARY_MODELS and recoverable(failure):
+                delayed.append((model, failure))
+
+        for model in PRIMARY_MODELS:
+            failure = self.model_failures.get(model)
+            if failure and failure.retry_at > self.clock(): schedule(model, failure)
+        for provider, failure in self.credential_failures.items():
+            if failure.retry_at > self.clock():
+                owner = model_route(failure, PRIMARY_MODELS[0])
+                failures.append((owner, failure))
+                schedule(owner if owner in PRIMARY_MODELS else next((m for m in PRIMARY_MODELS if m.startswith(provider + '/')), owner), failure)
 
         def attempt(model: str, retry: bool = False) -> Any:
             self.metrics[purpose] += 1
@@ -119,73 +243,102 @@ class AdaptiveModelRouter:
             self.emit("status", message=f"Waiting for {model.split('/', 1)[-1]} to finish…")
             return operation(model)
 
-        for model in order:
-            if model in self.unavailable or self.cooldowns.get(model, 0) > self.clock():
-                continue
-            try:
-                result = attempt(model)
-            except Exception as error:
-                failure = classify_failure(error, self.clock())
-                if self.cache:
-                    self.cache.record_failure(model, failure)
-                if failure.kind in {"credentials", "cancelled", "transport", "configuration"}:
-                    for other in ALL_MODELS:
-                        if other != model:
-                            self.emit("model_health", model=other, state="configured", detail="Runtime verification invalidated")
-                    self.emit("model_health", model=model, state="repair", detail=failure.detail)
-                    raise
-                failures.append((model, failure))
-                if failure.kind == "unavailable":
-                    self.unavailable.add(model)
-                elif failure.kind in {"quota", "temporary"}:
-                    self.cooldowns[model] = failure.retry_at
-                if model in PRIMARY_MODELS and (failure.kind == "temporary" or (failure.kind == "quota" and failure.retry_at != float("inf"))) and not failure.recovered_upstream:
-                    delayed.append((model, failure))
-                self.emit("model_health", model=model,
-                          state="temporary" if failure.kind in {"quota", "temporary"} else "repair",
-                          detail=failure.detail, retry_at=failure.retry_at if failure.retry_at != float("inf") else None)
-                continue
+        def accept(model: str, result: Any) -> Any:
             self.active_model = model
             self.cooldowns.pop(model, None)
+            self.model_failures.pop(model, None)
+            # A terminal successful response proves this credential can run again.
+            self.credential_failures.pop(model.split('/', 1)[0], None)
             if self.cache:
                 self.cache.verify(model)
             self.emit("model_health", model=model, state="verified", detail="Verified through TaskPilot")
             return result
 
-        # Only retry primaries after other eligible candidates have been tried.
-        for model, failure in delayed:
-            if retries >= 2:
-                break
-            delay = max(0, failure.retry_at - self.clock())
-            if delay:
-                self.emit("status", message=f"Waiting {delay:g}s for {model.split('/', 1)[-1]} capacity…")
-                self.sleep(delay)
-            retries += 1
+        def remember(model: str, failure: Failure, upstream: bool = False) -> None:
+            if self.cache: self.cache.record_failure(model, failure)
+            failures.append((model, failure))
+            if upstream or failure.recovered_upstream: exhausted.add(model)
+            if failure.kind == "unavailable": self.unavailable.add(model)
+            if failure.kind in {"quota", "temporary"}:
+                if failure.scope == "credential":
+                    provider = failure.provider or model.split('/', 1)[0]
+                    current = self.credential_failures.get(provider)
+                    if not current or current.retry_at < failure.retry_at:
+                        self.credential_failures[provider] = failure
+                    # One retry of the owning Lite model can reopen this credential;
+                    # sibling requests cannot bypass its shared limit.
+                    delayed[:] = [(m, f) for m, f in delayed if not m.startswith(provider + '/')]
+                else:
+                    self.cooldowns[model] = failure.retry_at
+                    self.model_failures[model] = failure
+            if not upstream: schedule(model, failure)
+            affected = [m for m in ALL_MODELS if m.startswith((failure.provider or model.split('/', 1)[0]) + '/')] if failure.scope == "credential" and failure.kind in {"quota", "temporary"} else [model]
+            for other in affected:
+                self.emit("model_health", model=other,
+                          state="temporary" if failure.kind in {"quota", "temporary"} else "repair",
+                          detail=failure.summary(), **failure.metadata())
+
+        def run(model: str, retry: bool = False) -> tuple[bool, Any]:
+            attempted.add(model)
             try:
-                result = attempt(model, retry=True)
+                return True, accept(model, attempt(model, retry))
             except Exception as error:
-                next_failure = classify_failure(error, self.clock())
-                if self.cache:
-                    self.cache.record_failure(model, next_failure)
-                self.emit("model_health", model=model, state="temporary" if next_failure.kind in {"quota", "temporary"} else "repair", detail=next_failure.detail)
-                if next_failure.kind in {"credentials", "cancelled", "transport", "configuration"}:
+                failure = classify_failure(error, self.clock(), model)
+                if failure.provider_retries is not None and not failure.provider_retries_counted:
+                    self.metrics["provider_retries"] = (self.metrics["provider_retries"] or 0) + failure.provider_retries
+                if failure.kind in {"credentials", "cancelled", "transport", "configuration"}:
+                    if self.cache: self.cache.record_failure(model, failure)
+                    for other in ALL_MODELS:
+                        if other != model: self.emit("model_health", model=other, state="configured", detail="Runtime verification invalidated")
+                    self.emit("model_health", model=model, state="repair", detail=failure.summary(), **failure.metadata())
                     raise
-                failures.append((model, next_failure))
-                if next_failure.kind in {"quota", "temporary"}:
-                    self.cooldowns[model] = next_failure.retry_at
-                elif next_failure.kind == "unavailable":
-                    self.unavailable.add(model)
-                continue
-            self.active_model = model
-            self.cooldowns.pop(model, None)
-            if self.cache:
-                self.cache.verify(model)
-            self.emit("model_health", model=model, state="verified", detail="Verified through TaskPilot")
-            return result
-        details = "; ".join(f"{m.split('/', 1)[-1]}: {f.detail[:180]}" for m, f in failures)
-        if not details:
-            details = "Models are still in cooldown or unavailable for this task. Wait for capacity or use Check in Settings."
-        raise RuntimeError(f"No eligible Gemini model completed this decision. {details}")
+                remember(model, failure)
+                for item in failure.attempts:
+                    prior = Failure.from_health(item)
+                    prior.recovered_upstream = True
+                    if not prior.model and not (prior.scope == "credential" and prior.provider == model.split('/', 1)[0]):
+                        continue
+                    route = model_route(prior, model)
+                    if route in ALL_MODELS:
+                        remember(route, prior, upstream=True)
+                        if prior.kind in {"credentials", "cancelled", "transport", "configuration"}:
+                            raise ModelAttemptError.from_failure(prior) from error
+                return False, None
+
+        def first_pass() -> tuple[bool, Any]:
+            for model in order:
+                if model in attempted or model in exhausted or model in self.unavailable or shared(model) or self.cooldowns.get(model, 0) > self.clock():
+                    continue
+                success, result = run(model)
+                if success: return True, result
+            return False, None
+
+        success, result = first_pass()
+        if success: return result
+        # All eligible candidates get one attempt; two shared Lite retries remain.
+        while delayed and retries < 2:
+            model, failure = delayed.pop(0)
+            if model in self.unavailable or model in exhausted: continue
+            block = shared(model)
+            if block and block is not failure: continue
+            deadline = max(failure.retry_at, self.cooldowns.get(model, 0), block.retry_at if block else 0)
+            if not math.isfinite(deadline): continue
+            delay = max(0, deadline - self.clock())
+            if delay:
+                self.emit("status", message=f"Waiting {delay:g}s for the reported provider cooldown…")
+                self.sleep(delay)
+                if self.clock() < deadline: break  # An interrupted wait must not bypass the cooldown.
+            retries += 1
+            success, result = run(model, retry=True)
+            if success: return result
+            # A shared limit may have expired and become a model-specific error.
+            # Try previously blocked siblings only after that shared block ends.
+            success, result = first_pass()
+            if success: return result
+        for model in order:
+            if not failures and self.cooldowns.get(model, 0) > self.clock():
+                failures.append((model, self.model_failures.get(model, Failure("temporary", "Provider cooldown is active", self.cooldowns[model]))))
+        raise RecoveryExhaustedError(failures)
 
 
 class RuntimeState:
@@ -193,11 +346,11 @@ class RuntimeState:
     def __init__(self, fingerprint: str, version: str, root: Path | None = None, configuration: str = "") -> None:
         self.root = root or Path(os.environ.get("ORBIT_RUNTIME_STATE_DIRECTORY", str(Path.home() / "Library/Application Support/Orbit Agent")))
         self.path = self.root / "runtime-readiness.json"
-        self.identity = hashlib.sha256(json.dumps([fingerprint, version, CONFIG_VERSION, ALL_MODELS, configuration, VALIDATION_VERSION]).encode()).hexdigest()
+        self.identity = hashlib.sha256(json.dumps([fingerprint, version, CONFIG_VERSION, ALL_MODELS, configuration, VALIDATION_VERSION, ERROR_POLICY_VERSION]).encode()).hexdigest()
         try:
             value = json.loads(self.path.read_text())
             self.value = value if isinstance(value, dict) and value.get("identity") == self.identity else ({"config_version": value.get("config_version")} if isinstance(value, dict) else {})
-            for field in ("verified", "health"):
+            for field in ("verified", "health", "credential_health"):
                 if not isinstance(self.value.get(field, {}), dict):
                     self.value[field] = {}
         except (OSError, ValueError, AttributeError):
@@ -213,6 +366,7 @@ class RuntimeState:
 
     def verify(self, model: str) -> None:
         self.value.setdefault("health", {}).pop(model, None)
+        self.value.setdefault("credential_health", {}).pop(model.split('/', 1)[0], None)
         self.value.setdefault("verified", {})[model] = time.time()
         self.save()
 
@@ -228,22 +382,36 @@ class RuntimeState:
             self.value["verified"] = {}
         else:
             self.value.setdefault("verified", {}).pop(model, None)
-        self.value.setdefault("health", {})[model] = {
+        health = {
             "state": "temporary" if failure.kind in {"quota", "temporary"} else "repair",
-            "detail": failure.detail[:500],
-            "retry_at": failure.retry_at if failure.retry_at != float("inf") else None,
-            "recovered_upstream": failure.recovered_upstream,
+            "detail": failure.summary(), **failure.metadata(),
         }
+        if failure.scope == "credential" and failure.kind in {"quota", "temporary"}:
+            provider = failure.provider or model.split('/', 1)[0]
+            current = self.credential_health(model)
+            if not current or Failure.from_health(current).retry_at <= failure.retry_at:
+                self.value.setdefault("credential_health", {})[provider] = health
+            for other in ALL_MODELS:
+                if other.startswith(provider + '/'):
+                    self.value.setdefault("verified", {}).pop(other, None)
+        else:
+            self.value.setdefault("health", {})[model] = health
         self.save()
 
-    def health(self, model: str) -> dict[str, Any]:
-        result = self.value.get("health", {}).get(model, {})
+    @staticmethod
+    def current_health(result: Any) -> dict[str, Any]:
         if not isinstance(result, dict):
             return {}
         if result.get("state") == "temporary" and result.get("retry_at") and result["retry_at"] <= time.time():
             return {}
         return result
 
+    def credential_health(self, model: str) -> dict[str, Any]:
+        return self.current_health(self.value.get("credential_health", {}).get(model.split('/', 1)[0], {}))
+
+    def health(self, model: str) -> dict[str, Any]:
+        return self.credential_health(model) or self.current_health(self.value.get("health", {}).get(model, {}))
+
     def verified_model(self) -> str | None:
         now = time.time()
-        return next((m for m in ALL_MODELS if isinstance(self.value.get("verified", {}).get(m), (int, float)) and 0 <= now - self.value["verified"][m] < 600), None)
+        return next((m for m in ALL_MODELS if not self.health(m) and isinstance(self.value.get("verified", {}).get(m), (int, float)) and 0 <= now - self.value["verified"][m] < 600), None)
