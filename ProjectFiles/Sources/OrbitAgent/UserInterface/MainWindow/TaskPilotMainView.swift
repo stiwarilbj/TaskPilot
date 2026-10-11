@@ -882,30 +882,6 @@ private struct TaskPilotSetupView: View {
                     }
 
                     setupRow(
-                        icon: "rectangle.on.rectangle",
-                        title: "Background agent screen",
-                        detail: model.betterDisplayInstalled
-                            ? "Uses BetterDisplay’s free virtual-screen feature, or any connected second display."
-                            : "Install BetterDisplay once so \(TaskPilotIdentity.displayName) can create a real virtual macOS display.",
-                        complete: model.backgroundAgentDisplay != nil || model.runsOnMainDisplay
-                    ) {
-                        HStack {
-                            Button(model.betterDisplayInstalled ? "Create Agent Screen" : "Get BetterDisplay") {
-                                model.createAgentDisplay()
-                            }
-                            .disabled(model.backgroundAgentDisplay != nil || model.isCreatingDisplay)
-                            Button("Refresh") {
-                                Task { await model.refreshReadiness() }
-                            }
-                            Button("Reset", role: .destructive) {
-                                dismissWindow(id: "agent-viewer")
-                                model.resetAgentDisplay()
-                            }
-                            .disabled(model.backgroundAgentDisplay == nil || model.isResettingDisplay)
-                        }
-                    }
-
-                    setupRow(
                         icon: "lock.shield.fill",
                         title: "macOS permissions",
                         detail: model.hasAccessibilityPermission && model.hasScreenRecordingPermission
