@@ -91,7 +91,9 @@ struct GeminiModelVerifier: Sendable {
 
     static func configurationData(apiKey: String) throws -> Data {
         var data = try JSONSerialization.data(withJSONObject: [
-            "kind": "runtime_configuration", "gemini_api_key": apiKey
+            "kind": "runtime_configuration", "gemini_api_key": apiKey,
+            "action_contract_hash": ActionContract.fingerprint,
+            "action_contract_version": ActionContract.version
         ])
         data.append(0x0A)
         return data

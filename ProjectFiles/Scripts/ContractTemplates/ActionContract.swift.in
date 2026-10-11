@@ -1,0 +1,154 @@
+    struct ValidationError: LocalizedError {
+        let path: String
+        let expectation: String
+        var errorDescription: String? { "\(path) \(expectation)" }
+    }
+
+    static var keyCodes: [String: UInt16] {
+        (definition["key_codes"] as! [String: NSNumber]).mapValues { $0.uint16Value }
+    }
+    static var modifierFlags: [String: UInt64] {
+        (definition["modifier_flags"] as! [String: NSNumber]).mapValues { $0.uint64Value }
+    }
+    static var modifierAliases: [String: String] { definition["modifier_aliases"] as! [String: String] }
+    static func limit(_ name: String) -> Int { (definition["limits"] as! [String: NSNumber])[name]!.intValue }
+    static func defaultValue(_ kind: ActionKind, _ field: String) -> Any {
+        ((definition["actions"] as! [String: [String: Any]])[kind.rawValue]!["defaults"] as! [String: Any])[field]!
+    }
+
+    private static func fail(_ path: String, _ expectation: String) throws -> Never {
+        throw ValidationError(path: path, expectation: expectation)
+    }
+    private static func truthy(_ value: Any?) -> Bool {
+        guard let value, !(value is NSNull) else { return false }
+        if let text = value as? String { return !text.isEmpty }
+        if let number = value as? NSNumber { return number.doubleValue != 0 }
+        if let items = value as? [Any] { return !items.isEmpty }
+        if let items = value as? [String: Any] { return !items.isEmpty }
+        return true
+    }
+    private static func condition(_ test: [String: Any], _ value: [String: Any]) -> Bool {
+        if let key = test["has"] as? String { return value[key] != nil }
+        if let key = test["truthy"] as? String { return truthy(value[key]) }
+        if let inner = test["not"] as? [String: Any] { return !condition(inner, value) }
+        if let items = test["all"] as? [[String: Any]] { return items.allSatisfy { condition($0, value) } }
+        if let items = test["any"] as? [[String: Any]] { return items.contains { condition($0, value) } }
+        if let pair = test["same_presence"] as? [String] { return (value[pair[0]] != nil) == (value[pair[1]] != nil) }
+        preconditionFailure("Unsupported generated contract condition")
+    }
+    private static func rules(_ rules: [[String: Any]], _ value: [String: Any], _ path: String) throws {
+        for rule in rules {
+            if let when = rule["when"] as? [String: Any], !condition(when, value) { continue }
+            if let field = rule["payload"] as? String {
+                let text = value[field] as! String
+                let encoding = value[rule["encoding"] as! String] as? String ?? rule["default_encoding"] as! String
+                let bytes: Data
+                if encoding == "base64" {
+                    let raw = Array(text.utf8)
+                    let padding = raw.reversed().prefix(while: { $0 == 61 }).count
+                    let letters = raw.prefix(raw.count - padding)
+                    guard raw.count % 4 == 0, padding <= 2,
+                          letters.allSatisfy({ (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || $0 == 43 || $0 == 47 }),
+                          let decoded = Data(base64Encoded: text) else {
+                        try fail(path + "." + field, "must be valid base64 for this encoding")
+                    }
+                    bytes = decoded
+                } else { bytes = Data(text.utf8) }
+                if bytes.count > (rule["max_bytes"] as! NSNumber).intValue {
+                    try fail(path + "." + field, rule["size_error"] as! String)
+                }
+            } else if !condition(rule["assert"] as! [String: Any], value) {
+                let suffix = rule["path"] as? String ?? ""
+                try fail(path + (suffix.isEmpty ? "" : "." + suffix), rule["error"] as! String)
+            }
+        }
+    }
+    private static func field(_ value: Any, _ spec: [String: Any], _ path: String) throws {
+        switch spec["type"] as! String {
+        case "string":
+            guard let text = value as? String else { try fail(path, "must be a string") }
+            if spec["nonempty"] as? Bool == true, text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                try fail(path, "must be a nonempty string")
+            }
+            if spec["format"] as? String == "path", (!(text.hasPrefix("/") || text.hasPrefix("~/")) || text.contains("\0")) {
+                try fail(path, "must be an absolute or ~/ path without NUL bytes")
+            }
+            if spec["format"] as? String == "http_url" {
+                guard let url = URLComponents(string: text), ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+                      !(url.host ?? "").isEmpty, text.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else {
+                    try fail(path, "must be an http/https URL")
+                }
+            }
+            if (spec["no_nul"] as? Bool == true && text.contains("\0")) || text.utf8.count > ((spec["max_bytes"] as? NSNumber)?.intValue ?? Int.max) {
+                try fail(path, spec["bytes_error"] as? String ?? "must contain no NUL bytes")
+            }
+            let candidate = spec["casefold"] as? Bool == true ? text.lowercased() : text
+            if let choices = spec["choices"] as? [String], !choices.contains(candidate) {
+                try fail(path, spec["choices_error"] as? String ?? "must be a supported value")
+            }
+        case "number", "integer":
+            let integer = spec["type"] as! String == "integer"
+            guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  !integer || !["f", "d"].contains(String(cString: number.objCType)) else {
+                try fail(path, integer ? "must be an integer" : "must be a number")
+            }
+            let low = (spec["min"] as! NSNumber).doubleValue, high = (spec["max"] as! NSNumber).doubleValue
+            if !number.doubleValue.isFinite || number.doubleValue < low || number.doubleValue > high {
+                try fail(path, "must be finite and between \(String(format: "%g", low)) and \(String(format: "%g", high))")
+            }
+        case "boolean":
+            guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else { try fail(path, "must be a boolean") }
+        case "array":
+            guard let items = value as? [Any], items.count >= ((spec["min_items"] as? NSNumber)?.intValue ?? 0),
+                  items.count <= ((spec["max_items"] as? NSNumber)?.intValue ?? Int.max) else {
+                try fail(path, spec["error"] as? String ?? "must be a list")
+            }
+            for (index, item) in items.enumerated() {
+                var itemSpec = spec["items"] as! [String: Any]
+                if index == 0, spec["first_nonempty"] as? Bool == true { itemSpec["nonempty"] = true }
+                do { try field(item, itemSpec, "\(path)[\(index)]") }
+                catch {
+                    if let error = spec["error"] as? String, spec["min_items"] == nil { try fail(path, error) }
+                    throw error
+                }
+            }
+            if let max = spec["max_bytes"] as? NSNumber {
+                let size = items.reduce(0) { $0 + ($1 as! String).utf8.count + ((spec["separator_bytes"] as? NSNumber)?.intValue ?? 0) }
+                if size > max.intValue { try fail(path, spec["bytes_error"] as! String) }
+            }
+        case "variant":
+            guard let object = value as? [String: Any] else { try fail(path, "must be an object") }
+            let tag = spec["tag"] as! String, variants = spec["variants"] as! [String: [String: Any]]
+            guard let selected = object[tag] as? String, let variant = variants[selected] else { try fail(path + "." + tag, "must be a supported outcome check") }
+            let fields = variant["fields"] as! [String: [String: Any]]
+            if variant["reject_unknown"] as? Bool == true, !Set(object.keys).isSubset(of: Set(fields.keys).union([tag])) {
+                try fail(path, "contains unsupported parameters")
+            }
+            try validateObject(object, fields, variant["field_order"] as! [String], variant["required"] as! [String], path)
+            try rules(variant["rules"] as! [[String: Any]], object, path)
+        default: preconditionFailure("Unsupported generated contract field")
+        }
+    }
+    private static func validateObject(_ value: [String: Any], _ fields: [String: [String: Any]], _ order: [String], _ required: [String], _ path: String) throws {
+        for key in order { if let value = value[key] { try field(value, fields[key]!, path + "." + key) } }
+        for key in required { if value[key] == nil { try fail(path + "." + key, "is required") } }
+    }
+    static func validateParameters(_ action: [String: Any], kind: ActionKind) throws {
+        let selected = (definition["actions"] as! [String: [String: Any]])[kind.rawValue]!
+        try validateObject(action, definition["fields"] as! [String: [String: Any]], definition["field_order"] as! [String], selected["required"] as! [String], "action")
+        try rules(definition["common_rules"] as! [[String: Any]], action, "action")
+        try rules(selected["rules"] as! [[String: Any]], action, "action")
+    }
+    static func validate(_ input: [String: Any]) throws -> [String: Any] {
+        var action = input
+        guard let type = action["type"] as? String, var kind = ActionKind(rawValue: type) else { try fail("action.type", "must be a supported action") }
+        for rule in definition["normalizations"] as! [[String: Any]] {
+            if kind.rawValue == rule["type"] as! String, truthy(action[rule["when_truthy"] as! String]) {
+                kind = ActionKind(rawValue: rule["replace_type"] as! String)!
+                action["type"] = kind.rawValue
+                for key in rule["remove"] as! [String] { action.removeValue(forKey: key) }
+            }
+        }
+        try validateParameters(action, kind: kind)
+        return action
+    }

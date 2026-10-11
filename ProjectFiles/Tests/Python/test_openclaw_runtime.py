@@ -654,6 +654,8 @@ raise SystemExit(0)
         api_key = "AIzaSyExampleSecretThatIsLongEnough"
         payload = json.dumps({
             "kind": "runtime_configuration",
+            "action_contract_hash": runtime.CONTRACT_HASH,
+            "action_contract_version": runtime.CONTRACT_VERSION,
             "gemini_api_key": api_key,
         }) + "\n"
         with mock.patch.object(sys, "stdin", io.StringIO(payload)):
@@ -662,6 +664,8 @@ raise SystemExit(0)
     def test_runtime_can_reuse_openclaws_configured_credential(self):
         payload = json.dumps({
             "kind": "runtime_configuration",
+            "action_contract_hash": runtime.CONTRACT_HASH,
+            "action_contract_version": runtime.CONTRACT_VERSION,
             "gemini_api_key": "",
         }) + "\n"
         with mock.patch.object(sys, "stdin", io.StringIO(payload)):

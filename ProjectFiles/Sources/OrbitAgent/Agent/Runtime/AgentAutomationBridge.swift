@@ -70,13 +70,18 @@ final class AgentAutomationBridge {
                 ]
 
             case "act":
-                guard let action = params["action"] as? [String: Any] else {
+                guard let inputAction = params["action"] as? [String: Any] else {
                     throw BridgeError.invalidRequest("Missing action payload")
                 }
-                if let type = action["type"] as? String,
-                   TaskToolExecutor.supportedActions.contains(type) {
+                let action: [String: Any]
+                action = try ActionContract.validate(inputAction)
+                let kind = ActionKind(rawValue: action["type"] as! String)!
+                if kind.owner == .task_tool {
                     result = try await taskTools.perform(action: action)
                 } else {
+                    guard kind.owner == .desktop else {
+                        throw BridgeError.invalidRequest("Runtime-local actions cannot be dispatched to the native bridge")
+                    }
                     try accessibility.validateObservation(params["observation_revision"] as? String)
                     result = try await accessibility.performStructured(action: action, on: display,
                         privateInput: params["private_input"] as? Bool == true)
@@ -92,7 +97,7 @@ final class AgentAutomationBridge {
                 "result": result
             ]
         } catch {
-            let code = error is CancellationError ? "cancelled" :
+            let code = error is CancellationError ? "cancelled" : error is ActionContract.ValidationError ? "invalid_action" :
                 (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? "action_rejected"
             return [
                 "kind": "bridge_response",

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from response_validation import VALIDATION_VERSION
+from action_contract_generated import CONTRACT_HASH
 from provider_errors import ProviderRequestError, facts, retry_time
 
 from dataclasses import dataclass, replace
@@ -346,7 +347,7 @@ class RuntimeState:
     def __init__(self, fingerprint: str, version: str, root: Path | None = None, configuration: str = "") -> None:
         self.root = root or Path(os.environ.get("ORBIT_RUNTIME_STATE_DIRECTORY", str(Path.home() / "Library/Application Support/Orbit Agent")))
         self.path = self.root / "runtime-readiness.json"
-        self.identity = hashlib.sha256(json.dumps([fingerprint, version, CONFIG_VERSION, ALL_MODELS, configuration, VALIDATION_VERSION, ERROR_POLICY_VERSION]).encode()).hexdigest()
+        self.identity = hashlib.sha256(json.dumps([fingerprint, version, CONFIG_VERSION, ALL_MODELS, configuration, VALIDATION_VERSION, CONTRACT_HASH, ERROR_POLICY_VERSION]).encode()).hexdigest()
         try:
             value = json.loads(self.path.read_text())
             self.value = value if isinstance(value, dict) and value.get("identity") == self.identity else ({"config_version": value.get("config_version")} if isinstance(value, dict) else {})

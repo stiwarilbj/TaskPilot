@@ -1,0 +1,1079 @@
+{
+  "version": 1,
+  "fields": {
+    "element_id": {
+      "type": "string",
+      "nonempty": true
+    },
+    "text": {
+      "type": "string",
+      "nonempty": false
+    },
+    "key": {
+      "type": "string",
+      "nonempty": true,
+      "casefold": true,
+      "choices_error": "must be a supported key name",
+      "choices_source": "key_codes"
+    },
+    "app": {
+      "type": "string",
+      "nonempty": true
+    },
+    "bundle_id": {
+      "type": "string",
+      "nonempty": true
+    },
+    "route_id": {
+      "type": "string",
+      "nonempty": true
+    },
+    "path": {
+      "type": "string",
+      "nonempty": true,
+      "format": "path"
+    },
+    "content": {
+      "type": "string",
+      "nonempty": false
+    },
+    "encoding": {
+      "type": "string",
+      "nonempty": true,
+      "choices": [
+        "utf-8",
+        "utf8",
+        "base64"
+      ],
+      "choices_error": "must be utf-8 or base64"
+    },
+    "mode": {
+      "type": "string",
+      "nonempty": true,
+      "choices": [
+        "overwrite",
+        "append"
+      ],
+      "choices_error": "must be overwrite or append"
+    },
+    "command": {
+      "type": "string",
+      "nonempty": true,
+      "no_nul": true,
+      "max_bytes": {
+        "limit": "command_bytes"
+      },
+      "bytes_error": "must contain no NUL bytes and at most 16384 bytes"
+    },
+    "working_directory": {
+      "type": "string",
+      "nonempty": true,
+      "format": "path"
+    },
+    "url": {
+      "type": "string",
+      "nonempty": true,
+      "format": "http_url"
+    },
+    "query": {
+      "type": "string",
+      "nonempty": true
+    },
+    "browser": {
+      "type": "string",
+      "nonempty": true
+    },
+    "pid": {
+      "type": "integer",
+      "min": 1,
+      "max": 2147483647
+    },
+    "x": {
+      "type": "number",
+      "min": 0,
+      "max": 1000
+    },
+    "y": {
+      "type": "number",
+      "min": 0,
+      "max": 1000
+    },
+    "delta_x": {
+      "type": "integer",
+      "min": -2000,
+      "max": 2000
+    },
+    "delta_y": {
+      "type": "integer",
+      "min": -2000,
+      "max": 2000
+    },
+    "seconds": {
+      "type": "number",
+      "min": 0.2,
+      "max": 15
+    },
+    "timeout_seconds": {
+      "type": "number",
+      "min": 0.2,
+      "max": {
+        "limit": "command_timeout"
+      }
+    },
+    "max_bytes": {
+      "type": "integer",
+      "min": 1,
+      "max": {
+        "limit": "read_bytes"
+      }
+    },
+    "create_parents": {
+      "type": "boolean"
+    },
+    "modifiers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "casefold": true,
+        "choices_source": "modifier_aliases"
+      },
+      "error": "must be a list of supported modifier names"
+    },
+    "argv": {
+      "type": "array",
+      "min_items": 1,
+      "max_items": 256,
+      "items": {
+        "type": "string",
+        "no_nul": true
+      },
+      "first_nonempty": true,
+      "max_bytes": {
+        "limit": "command_bytes"
+      },
+      "separator_bytes": 1,
+      "error": "must be a list of 1 to 256 strings",
+      "bytes_error": "must contain at most 16384 bytes"
+    },
+    "checks": {
+      "type": "array",
+      "min_items": 1,
+      "max_items": 16,
+      "error": "must be a list of 1 to 16 outcome checks",
+      "items": {
+        "type": "variant",
+        "tag": "type",
+        "variants": {
+          "file_exists": {
+            "fields": {
+              "path": {
+                "field": "path"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "reject_unknown": true,
+            "rules": []
+          },
+          "directory_exists": {
+            "fields": {
+              "path": {
+                "field": "path"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "reject_unknown": true,
+            "rules": []
+          },
+          "path_absent": {
+            "fields": {
+              "path": {
+                "field": "path"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "reject_unknown": true,
+            "rules": []
+          },
+          "file_contents": {
+            "fields": {
+              "path": {
+                "field": "path"
+              },
+              "content": {
+                "field": "content"
+              },
+              "encoding": {
+                "field": "encoding"
+              }
+            },
+            "required": [
+              "path",
+              "content"
+            ],
+            "reject_unknown": true,
+            "rules": [
+              {
+                "payload": "content",
+                "encoding": "encoding",
+                "max_bytes": {
+                  "limit": "write_bytes"
+                },
+                "size_error": "must contain at most 2 MiB",
+                "default_encoding": {
+                  "default": [
+                    "write_file",
+                    "encoding"
+                  ]
+                }
+              }
+            ]
+          },
+          "stdout_equals": {
+            "fields": {
+              "text": {
+                "type": "string",
+                "no_nul": true,
+                "max_bytes": {
+                  "limit": "command_output_bytes"
+                },
+                "bytes_error": "must contain no NUL bytes and at most 65536 bytes"
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "reject_unknown": true,
+            "rules": []
+          }
+        }
+      }
+    }
+  },
+  "actions": {
+    "none": {
+      "owner": "runtime",
+      "parameters": [],
+      "required": [],
+      "rules": [
+        {
+          "assert": {
+            "not": {
+              "any": [
+                {
+                  "has": "argv"
+                },
+                {
+                  "has": "checks"
+                }
+              ]
+            }
+          },
+          "error": "argv and checks are only supported for run_command",
+          "path": ""
+        }
+      ],
+      "example": {
+        "type": "none"
+      },
+      "reference": "none()",
+      "defaults": {},
+      "capability": null
+    },
+    "press": {
+      "owner": "desktop",
+      "parameters": [
+        "element_id",
+        "pid"
+      ],
+      "required": [
+        "element_id"
+      ],
+      "rules": [
+        {
+          "assert": {
+            "not": {
+              "any": [
+                {
+                  "has": "argv"
+                },
+                {
+                  "has": "checks"
+                }
+              ]
+            }
+          },
+          "error": "argv and checks are only supported for run_command",
+          "path": ""
+        }
+      ],
+      "example": {
+        "type": "press",
+        "element_id": "<current element_id>"
+      },
+      "reference": "press(element_id)",
+      "defaults": {},
+      "capability": "app_automation"
+    },
+    "focus": {
+      "owner": "desktop",
+      "parameters": [
+        "element_id",
+        "pid"
+      ],
+      "required": [
+        "element_id"
+      ],
+      "rules": [
+        {
+          "assert": {
+            "not": {
+              "any": [
+                {
+                  "has": "argv"
+                },
+                {
+                  "has": "checks"
+                }
+              ]
+            }
+          },
+          "error": "argv and checks are only supported for run_command",
+          "path": ""
+        }
+      ],
+      "example": {
+        "type": "focus",
+        "element_id": "<current field_id>"
+      },
+      "reference": "focus(element_id)",
+      "defaults": {},
+      "capability": "app_automation"
+    },
+    "set_value": {
+      "owner": "desktop",
+      "parameters": [
+        "element_id",
+        "pid",
+        "text"
+      ],
+      "required": [
+        "element_id",
+        "text"
+      ],
+      "rules": [
+        {
+          "assert": {
+            "not": {
+              "any": [
+                {
+                  "has": "argv"
+                },
+                {
+                  "has": "checks"
+                }
+              ]
+            }
+          },
+          "error": "argv and checks are only supported for run_command",
+          "path": ""
+        }
+      ],
+      "example": {
+        "type": "set_value",
+        "element_id": "<current field_id>",
+        "text": "Example text"
+      },
+      "reference": "set_value(element_id,text)",
+      "defaults": {},
+      "capability": "app_automation"
+    },
+    "click": {
+      "owner": "desktop",
+      "parameters": [
+        "element_id",
+        "pid",
+        "x",
+        "y"
+      ],
+      "required": [],
+      "rules": [
+        {
+          "assert": {
+            "not": {
+              "any": [
+                {
+                  "has": "argv"
+                },
+                {
+                  "has": "checks"
+                }
+              ]
+            }
+          },
+          "error": "argv and checks are only supported for run_command",
+          "path": ""
+        },
+        {
+          "assert": {
+            "any": [
+              {
+                "truthy": "element_id"
+              },
+              {
+                "has": "x"
+              }
+            ]
+          },
+          "error": "click requires an element id or visible coordinates",
+          "path": ""
+        },
+        {
+          "when": {
+            "not": {
+              "truthy": "element_id"
+            }
+          },
+          "assert": {
+            "has": "pid"
+          },
+          "error": "is required for coordinate clicks",
+          "path": "pid"
+        }
+      ],
+      "example": {
+        "type": "click",
+        "pid": 1,
+        "x": 500,
+        "y": 500
+      },
+      "reference": "click(pid,x,y)",
+      "defaults": {},
+      "capability": "app_automation"
+    },
+    "double_click": {
+      "owner": "desktop",
+      "parameters": [
+        "element_id",
+        "pid",
+        "x",
+        "y"
+      ],
+      "required": [],
+      "rules": [
+        {
+          "assert": {
+            "not": {
+              "any": [
+                {
+                  "has": "argv"
+                },
+                {
+                  "has": "checks"
+                }
+              ]
+            }
+          },
+          "error": "argv and checks are only supported for run_command",
+          "path": ""
+        },
+        {
+          "assert": {
+            "any": [
+              {
+                "truthy": "element_id"
+              },
+              {
+                "has": "x"
+              }
+            ]
+          },
+          "error": "double_click requires an element id or visible coordinates",
+          "path": ""
+        },
+        {
+          "when": {
+            "not": {
+              "truthy": "element_id"
+            }
+          },
+          "assert": {
+            "has": "pid"
+          },
+          "error": "is required for coordinate clicks",
+          "path": "pid"
+        }
+      ],
+      "example": {
+        "type": "double_click",
+        "element_id": "<current element_id>"
+      },
+      "reference": "double_click(element_id or pid,x,y)",
+      "defaults": {},
+      "capability": "app_automation"
+    },
+    "type_text": {
+      "owner": "desktop",
+      "parameters": [
+        "element_id",
+        "pid",
+        "text"
+      ],
+      "required": [
+        "text"
+      ],
+      "rules": [
+        {
+          "assert": {
+            "not": {
+              "any": [
+                {
+                  "has": "argv"
+                },
+                {
+                  "has": "checks"
+                }
+              ]
+            }
+          },
+          "error": "argv and checks are only supported for run_command",
+          "path": ""
+        },
+        {
+          "assert": {
+            "truthy": "text"
+          },
+          "error": "must be a nonempty string",
+          "path": "text"
+        }
+      ],
+      "example": {
+        "type": "type_text",
+        "element_id": "<current field_id>",
+        "text": "Example text"
+      },
+      "reference": "type_text(element_id or focused pid,text)",
+      "defaults": {},
+      "capability": "app_automation"
+    },
+    "key": {
+      "owner": "desktop",
+      "parameters": [
+        "pid",
+        "key",
+        "modifiers"
+      ],
+      "required": [
+        "key"
+      ],
+      "rules": [
+        {
+          "assert": {
+            "not": {
+              "any": [
+                {
+                  "has": "argv"
+                },
+                {
+                  "has": "checks"
+                }
+              ]
+            }
+          },
+          "error": "argv and checks are only supported for run_command",
+          "path": ""
+        }
+      ],
+      "example": {
+        "type": "key",
+        "pid": 1,
+        "key": "return"
+      },
+      "reference": "key(pid,key[,modifiers])",
+      "defaults": {},
+      "capability": "app_automation"
+    },
+    "scroll": {
+      "owner": "desktop",
+      "parameters": [
+        "element_id",
+        "pid",
+        "x",
+        "y",
+        "delta_x",
+        "delta_y"
+      ],
+      "required": [],
+      "rules": [
+        {
+          "assert": {
+            "not": {
+              "any": [
+                {
+                  "has": "argv"
+                },
+                {
+                  "has": "checks"
+                }
+              ]
+            }
+          },
+          "error": "argv and checks are only supported for run_command",
+          "path": ""
+        },
+        {
+          "assert": {
+            "any": [
+              {
+                "truthy": "delta_x"
+              },
+              {
+                "truthy": "delta_y"
+              }
+            ]
+          },
+          "error": "scroll requires a nonzero delta",
+          "path": ""
+        }
+      ],
+      "example": {
+        "type": "scroll",
+        "pid": 1,
+        "delta_y": -300
+      },
+      "reference": "scroll(element_id or pid,delta_x or delta_y)",
+      "defaults": {},
+      "capability": "app_automation"
+    },
+    "launch_app": {
+      "owner": "desktop",
+      "parameters": [
+        "app",
+        "bundle_id"
+      ],
+      "required": [],
+      "rules": [
+        {
+          "assert": {
+            "not": {
+              "any": [
+                {
+                  "has": "argv"
+                },
+                {
+                  "has": "checks"
+                }
+              ]
+            }
+          },
+          "error": "argv and checks are only supported for run_command",
+          "path": ""
+        },
+        {
+          "assert": {
+            "any": [
+              {
+                "truthy": "app"
+              },
+              {
+                "truthy": "bundle_id"
+              }
+            ]
+          },
+          "error": "launch_app requires an app name or bundle id",
+          "path": ""
+        }
+      ],
+      "example": {
+        "type": "launch_app",
+        "app": "Example App"
+      },
+      "reference": "launch_app(app or bundle_id)",
+      "defaults": {},
+      "capability": "app_automation"
+    },
+    "open_route": {
+      "owner": "desktop",
+      "parameters": [
+        "route_id"
+      ],
+      "required": [
+        "route_id"
+      ],
+      "rules": [
+        {
+          "assert": {
+            "not": {
+              "any": [
+                {
+                  "has": "argv"
+                },
+                {
+                  "has": "checks"
+                }
+              ]
+            }
+          },
+          "error": "argv and checks are only supported for run_command",
+          "path": ""
+        }
+      ],
+      "example": {
+        "type": "open_route",
+        "route_id": "<supplied route_id>"
+      },
+      "reference": "open_route(route_id)",
+      "defaults": {},
+      "capability": "app_automation"
+    },
+    "wait": {
+      "owner": "runtime",
+      "parameters": [
+        "seconds"
+      ],
+      "required": [],
+      "rules": [
+        {
+          "assert": {
+            "not": {
+              "any": [
+                {
+                  "has": "argv"
+                },
+                {
+                  "has": "checks"
+                }
+              ]
+            }
+          },
+          "error": "argv and checks are only supported for run_command",
+          "path": ""
+        }
+      ],
+      "example": {
+        "type": "wait",
+        "seconds": 1
+      },
+      "reference": "wait(seconds)",
+      "defaults": {
+        "seconds": 2.0
+      },
+      "capability": null
+    },
+    "read_file": {
+      "owner": "task_tool",
+      "parameters": [
+        "path",
+        "max_bytes"
+      ],
+      "required": [
+        "path"
+      ],
+      "rules": [
+        {
+          "assert": {
+            "not": {
+              "any": [
+                {
+                  "has": "argv"
+                },
+                {
+                  "has": "checks"
+                }
+              ]
+            }
+          },
+          "error": "argv and checks are only supported for run_command",
+          "path": ""
+        }
+      ],
+      "example": {
+        "type": "read_file",
+        "path": "/example/report.txt"
+      },
+      "reference": "read_file(path)",
+      "defaults": {
+        "max_bytes": {
+          "limit": "read_bytes"
+        }
+      },
+      "capability": "file_read"
+    },
+    "write_file": {
+      "owner": "task_tool",
+      "parameters": [
+        "path",
+        "content",
+        "encoding",
+        "mode",
+        "create_parents"
+      ],
+      "required": [
+        "path",
+        "content"
+      ],
+      "rules": [
+        {
+          "assert": {
+            "not": {
+              "any": [
+                {
+                  "has": "argv"
+                },
+                {
+                  "has": "checks"
+                }
+              ]
+            }
+          },
+          "error": "argv and checks are only supported for run_command",
+          "path": ""
+        },
+        {
+          "payload": "content",
+          "encoding": "encoding",
+          "max_bytes": {
+            "limit": "write_bytes"
+          },
+          "size_error": "must contain at most 2 MiB",
+          "default_encoding": {
+            "default": [
+              "write_file",
+              "encoding"
+            ]
+          }
+        }
+      ],
+      "example": {
+        "type": "write_file",
+        "path": "/example/note.txt",
+        "content": "Example text"
+      },
+      "reference": "write_file(path,content)",
+      "defaults": {
+        "encoding": "utf-8",
+        "mode": "overwrite",
+        "create_parents": true
+      },
+      "capability": "file_write"
+    },
+    "run_command": {
+      "owner": "task_tool",
+      "parameters": [
+        "argv",
+        "command",
+        "working_directory",
+        "timeout_seconds",
+        "checks"
+      ],
+      "required": [],
+      "rules": [
+        {
+          "when": {
+            "not": {
+              "has": "argv"
+            }
+          },
+          "assert": {
+            "has": "command"
+          },
+          "path": "command",
+          "error": "is required when argv is absent"
+        },
+        {
+          "assert": {
+            "not": {
+              "all": [
+                {
+                  "has": "command"
+                },
+                {
+                  "has": "argv"
+                }
+              ]
+            }
+          },
+          "error": "requires exactly one of command or argv",
+          "path": ""
+        }
+      ],
+      "example": {
+        "type": "run_command",
+        "argv": [
+          "/bin/pwd"
+        ]
+      },
+      "reference": "run_command(argv or command[,checks])",
+      "defaults": {
+        "timeout_seconds": 120
+      },
+      "capability": "shell"
+    },
+    "navigate_browser": {
+      "owner": "desktop",
+      "parameters": [
+        "url",
+        "query",
+        "browser"
+      ],
+      "required": [],
+      "rules": [
+        {
+          "assert": {
+            "not": {
+              "any": [
+                {
+                  "has": "argv"
+                },
+                {
+                  "has": "checks"
+                }
+              ]
+            }
+          },
+          "error": "argv and checks are only supported for run_command",
+          "path": ""
+        },
+        {
+          "assert": {
+            "any": [
+              {
+                "truthy": "url"
+              },
+              {
+                "truthy": "query"
+              }
+            ]
+          },
+          "error": "navigate_browser requires url or query",
+          "path": ""
+        }
+      ],
+      "example": {
+        "type": "navigate_browser",
+        "url": "https://example.com"
+      },
+      "reference": "navigate_browser(url or query)",
+      "defaults": {
+        "browser": "Safari"
+      },
+      "capability": "browser"
+    }
+  },
+  "normalizations": [
+    {
+      "type": "click",
+      "when_truthy": "element_id",
+      "replace_type": "press",
+      "remove": [
+        "x",
+        "y"
+      ]
+    }
+  ],
+  "common_rules": [
+    {
+      "assert": {
+        "same_presence": [
+          "x",
+          "y"
+        ]
+      },
+      "error": "coordinates require both x and y",
+      "path": ""
+    },
+    {
+      "when": {
+        "all": [
+          {
+            "has": "x"
+          },
+          {
+            "not": {
+              "truthy": "element_id"
+            }
+          }
+        ]
+      },
+      "assert": {
+        "has": "pid"
+      },
+      "path": "pid",
+      "error": "is required for coordinate targets"
+    }
+  ],
+  "key_codes": {
+    "return": 36,
+    "enter": 36,
+    "tab": 48,
+    "space": 49,
+    "delete": 51,
+    "backspace": 51,
+    "escape": 53,
+    "left": 123,
+    "right": 124,
+    "down": 125,
+    "up": 126,
+    "home": 115,
+    "end": 119,
+    "page_up": 116,
+    "page_down": 121,
+    "a": 0,
+    "c": 8,
+    "v": 9,
+    "x": 7,
+    "z": 6,
+    "f": 3,
+    "l": 37,
+    "w": 13,
+    "q": 12,
+    "n": 45,
+    "s": 1,
+    "r": 15,
+    "0": 29,
+    "1": 18,
+    "2": 19,
+    "3": 20,
+    "4": 21,
+    "5": 23,
+    "6": 22,
+    "7": 26,
+    "8": 28,
+    "9": 25
+  },
+  "modifier_aliases": {
+    "command": "command",
+    "cmd": "command",
+    "shift": "shift",
+    "option": "option",
+    "alt": "option",
+    "control": "control",
+    "ctrl": "control"
+  },
+  "limits": {
+    "read_bytes": 131072,
+    "write_bytes": 2097152,
+    "command_output_bytes": 65536,
+    "command_bytes": 16384,
+    "command_timeout": 900
+  },
+  "prompt_bounds": {
+    "wait": "wait seconds: number {seconds.min}..{seconds.max}.",
+    "desktop": "PID: positive integer from observation; x/y: paired numbers {x.min}..{x.max}; scroll deltas: integers {delta_y.min}..{delta_y.max} (negative y scrolls down).",
+    "read_file": "read_file max_bytes: optional integer {max_bytes.min}..{max_bytes.max}.",
+    "write_file": "write_file options: encoding utf-8/base64, mode overwrite/append, create_parents boolean; defaults {defaults.write_file.encoding}, {defaults.write_file.mode}, {defaults.write_file.create_parents}.",
+    "run_command": "run_command: prefer literal argv. Pipelines use command; single-quote paths. working_directory: absolute/~ existing folder; timeout_seconds: {timeout_seconds.min}..{timeout_seconds.max}. Exit zero proves execution only. checks: file_exists/directory_exists/path_absent(path), file_contents(path,content[,encoding]), stdout_equals(text); check requested outcomes only.",
+    "navigate_browser": "navigate_browser: http/https url OR query; optional browser name (default {defaults.navigate_browser.browser})."
+  },
+  "modifier_flags": {
+    "command": 1048576,
+    "shift": 131072,
+    "option": 524288,
+    "control": 262144
+  }
+}

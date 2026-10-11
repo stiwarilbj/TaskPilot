@@ -198,9 +198,9 @@ final class TaskPilotTests: XCTestCase {
 
     func testGeminiCheckPassesCredentialsOnlyThroughPrivateStdin() throws {
         let data = try GeminiModelVerifier.configurationData(apiKey: "example-private-key")
-        let value = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: String])
-        XCTAssertEqual(value["kind"], "runtime_configuration")
-        XCTAssertEqual(value["gemini_api_key"], "example-private-key")
+        let value = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(value["kind"] as? String, "runtime_configuration")
+        XCTAssertEqual(value["gemini_api_key"] as? String, "example-private-key")
         XCTAssertEqual(data.last, 0x0A)
     }
 

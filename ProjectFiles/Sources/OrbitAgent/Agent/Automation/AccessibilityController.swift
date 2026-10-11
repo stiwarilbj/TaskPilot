@@ -114,16 +114,7 @@ final class AccessibilityController {
 
     static let hidClickPressDuration: TimeInterval = 0.055
     static let hidClickReleaseSettleDuration: TimeInterval = 0.10
-    static let supportedKeyCodes: [String: CGKeyCode] = [
-        "return": 36, "enter": 36, "tab": 48, "space": 49,
-        "delete": 51, "backspace": 51, "escape": 53,
-        "left": 123, "right": 124, "down": 125, "up": 126,
-        "home": 115, "end": 119, "page_up": 116, "page_down": 121,
-        "a": 0, "c": 8, "v": 9, "x": 7, "z": 6, "f": 3, "l": 37,
-        "w": 13, "q": 12, "n": 45, "s": 1, "r": 15,
-        "0": 29, "1": 18, "2": 19, "3": 20, "4": 21,
-        "5": 23, "6": 22, "7": 26, "8": 28, "9": 25
-    ]
+    static let supportedKeyCodes: [String: CGKeyCode] = ActionContract.keyCodes
 
     private struct InstalledApplication {
         let name: String
@@ -710,7 +701,20 @@ final class AccessibilityController {
         return states
     }
 
+    private func validatedDesktopAction(_ input: [String: Any]) throws -> [String: Any] {
+        do {
+            let action = try ActionContract.validate(input)
+            guard ActionKind(rawValue: action["type"] as! String)!.owner == .desktop else {
+                throw AccessibilityActionError.invalidAction("This action does not belong to the desktop executor")
+            }
+            return action
+        } catch let error as ActionContract.ValidationError {
+            throw AccessibilityActionError.invalidAction(error.localizedDescription)
+        }
+    }
+
     func performStructured(action: [String: Any], on display: DisplayDescriptor, privateInput: Bool = false) async throws -> [String: Any] {
+        let action = try validatedDesktopAction(action)
         guard !inputIsCancelled() else { throw AccessibilityActionError.cancelled }
         let planningRevision = lock.withLock { observationRevision }
         let type = action["type"] as? String ?? ""
@@ -765,14 +769,14 @@ final class AccessibilityController {
     }
 
     func perform(action: [String: Any], on display: DisplayDescriptor, planningRevision: String? = nil) async throws -> String {
-        guard let type = action["type"] as? String else {
-            throw AccessibilityActionError.invalidAction("The action has no type")
-        }
+        let action = try validatedDesktopAction(action)
+        let kind = ActionKind(rawValue: action["type"] as! String)!
+        let type = kind.rawValue
         // Observation, planning, typing, and app launch are idle states for the
         // visual pointer. A pointer action below will briefly reveal it again.
         agentCursor?.hide()
-        switch type {
-        case "press":
+        switch kind {
+        case .press:
             let record = try record(for: action)
             try ensureAllowedOnDisplay(record.pid, display: display)
             rememberManualTarget(record.pid)
@@ -814,19 +818,19 @@ final class AccessibilityController {
             })
             return method == "coordinate" ? "Clicked the requested control" : "Pressed the requested control"
 
-        case "focus":
+        case .focus:
             let record = try record(for: action)
             try ensureAllowedOnDisplay(record.pid, display: display)
             rememberManualTarget(record.pid)
             try await ensureElementFocus(record, action: action, on: display)
             return "Focused the requested control"
 
-        case "set_value", "type_text":
+        case .set_value, .type_text:
             let target = try action["element_id"] == nil
                 ? observedFocusedInput(pid: actionPID(action, on: display)) : record(for: action)
             return try await performTextEntry(action: action, record: target, on: display).message
 
-        case "click", "double_click":
+        case .click, .double_click:
             let record = action["element_id"] == nil ? nil : try self.record(for: action)
             let point: CGPoint
             let pid: pid_t
@@ -867,7 +871,7 @@ final class AccessibilityController {
             )
             return type == "double_click" ? "Double-clicked" : "Clicked"
 
-        case "key":
+        case .key:
             let pid = try actionPID(action, on: display)
             try ensureAllowedOnDisplay(pid, display: display)
             rememberManualTarget(pid)
@@ -878,7 +882,7 @@ final class AccessibilityController {
             try postKey(key, modifiers: modifiers, to: pid)
             return "Sent the \(key) key"
 
-        case "scroll":
+        case .scroll:
             let record = action["element_id"] == nil ? nil : try self.record(for: action)
             let pid = try record?.pid ?? actionPID(action, on: display)
             let point: CGPoint
@@ -914,16 +918,16 @@ final class AccessibilityController {
                 ? "Scrolled the target app after safely retargeting inside its visible window"
                 : "Scrolled the target app"
 
-        case "launch_app":
+        case .launch_app:
             return try await launchApp(action, on: display)
 
-        case "open_route":
+        case .open_route:
             return try await openRoute(action, on: display)
 
-        case "navigate_browser":
+        case .navigate_browser:
             return try await navigateBrowser(action, on: display)
 
-        default:
+        case .none, .wait, .read_file, .write_file, .run_command:
             throw AccessibilityActionError.invalidAction("Unsupported action: \(type)")
         }
     }
@@ -1202,7 +1206,7 @@ final class AccessibilityController {
         let requestedBrowser = (action["browser"] as? String)?.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
-        let browserName = requestedBrowser?.isEmpty == false ? requestedBrowser! : "Safari"
+        let browserName = requestedBrowser?.isEmpty == false ? requestedBrowser! : ActionContract.defaultValue(.navigate_browser, "browser") as! String
         var launchAction: [String: Any] = [
             "type": "launch_app",
             "app": browserName
@@ -2671,13 +2675,10 @@ final class AccessibilityController {
             throw AccessibilityActionError.invalidAction("Unsupported key: \(key)")
         }
         var flags: CGEventFlags = []
-        for modifier in modifiers.map({ $0.lowercased() }) {
-            switch modifier {
-            case "command", "cmd": flags.insert(.maskCommand)
-            case "shift": flags.insert(.maskShift)
-            case "option", "alt": flags.insert(.maskAlternate)
-            case "control", "ctrl": flags.insert(.maskControl)
-            default: break
+        for modifier in modifiers {
+            if let canonical = ActionContract.modifierAliases[modifier.lowercased()],
+               let raw = ActionContract.modifierFlags[canonical] {
+                flags.formUnion(CGEventFlags(rawValue: raw))
             }
         }
         down.flags = flags

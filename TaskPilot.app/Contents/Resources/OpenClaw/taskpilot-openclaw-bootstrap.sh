@@ -157,7 +157,10 @@ emit "0.90" "Verifying image input and JSON output through TaskPilot’s ACP cli
 if [[ "$GEMINI_API_KEY" == *[!a-zA-Z0-9_-]* ]]; then
   fail "The Gemini API key contains unexpected characters. Check the saved key."
 fi
-if ! printf '{"kind":"runtime_configuration","gemini_api_key":"%s"}\n' "$GEMINI_API_KEY" | \
+contract_metadata="$(dirname "${BASH_SOURCE[0]}")/action-contract.sh"
+[[ -f "$contract_metadata" ]] || fail "TaskPilot’s bundled action contract is missing. Reinstall TaskPilot and retry."
+source "$contract_metadata"
+if ! printf '{"kind":"runtime_configuration","gemini_api_key":"%s","action_contract_hash":"%s","action_contract_version":%s}\n' "$GEMINI_API_KEY" "$TASKPILOT_ACTION_CONTRACT_HASH" "$TASKPILOT_ACTION_CONTRACT_VERSION" | \
   "$runtime" --check-models --openclaw-path "$openclaw_path" >"$command_log" 2>&1; then
   # Emit the structured runtime result for the controller, without credentials.
   cat "$command_log"

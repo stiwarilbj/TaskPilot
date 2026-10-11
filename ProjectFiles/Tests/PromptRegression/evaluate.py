@@ -28,6 +28,7 @@ import openclaw_runtime as runtime
 import request_policy as policy
 from provider_errors import ProviderRequestError
 from response_validation import extract_json_object, ResponseValidationError
+from action_contract_generated import CONTRACT_HASH
 from fixtures import seed_cases
 
 VERSION = 1
@@ -48,8 +49,11 @@ def digest(value):
 
 
 def runtime_revision():
-    return digest({p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-                   for p in sorted((REPO / "ProjectFiles/AgentRuntime").glob("*.py"))})
+    sources = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+               for p in sorted((REPO / "ProjectFiles/AgentRuntime").glob("*.py"))}
+    sources["action_contract_hash"] = CONTRACT_HASH
+    sources["action-contract.json"] = hashlib.sha256((REPO / "ProjectFiles/Contracts/action-contract.json").read_bytes()).hexdigest()
+    return digest(sources)
 
 
 def checked_slug(value):

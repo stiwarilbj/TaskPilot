@@ -21,6 +21,8 @@ cat >"$mock_runtime" <<'PROBE'
 IFS= read -r configuration
 printf 'runtime-check %s\n' "$*" >>"$ORBIT_MOCK_OPENCLAW_LOG"
 [[ "$configuration" == *'"kind":"runtime_configuration"'* ]] || exit 1
+[[ "$configuration" == *'"action_contract_hash":"'* ]] || exit 1
+[[ "$configuration" == *'"action_contract_version":1'* ]] || exit 1
 key="${configuration##*gemini_api_key\":\"}"
 key="${key%%\"*}"
 printf 'credential-bytes=%s\n' "${#key}" >>"$ORBIT_MOCK_OPENCLAW_LOG"

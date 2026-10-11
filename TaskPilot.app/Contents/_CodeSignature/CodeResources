@@ -34,7 +34,7 @@
 		</data>
 		<key>Resources/AgentRuntime/_internal/base_library.zip</key>
 		<data>
-		mAsOkEd4cUq+mjNuIEMGCAy7T8g=
+		sdmLzdwX8uuxQpHP8T6+DsoFYaQ=
 		</data>
 		<key>Resources/AgentRuntime/_internal/libcrypto.3.dylib</key>
 		<data>
@@ -238,11 +238,19 @@
 		</data>
 		<key>Resources/AgentRuntime/orbit_openclaw_runtime</key>
 		<data>
-		i8yYklRz1Is2Ra5u5JzbH1XCJ40=
+		9A5AmQ01jvfpCVzallV/zbX4pYw=
+		</data>
+		<key>Resources/OpenClaw/__pycache__/gemini-probe.cpython-311.pyc</key>
+		<data>
+		7IzdADusNkV+ACSk6TkVOwOOVPQ=
 		</data>
 		<key>Resources/OpenClaw/__pycache__/gemini-probe.cpython-314.pyc</key>
 		<data>
 		rJqDQk1r34MC1P6VGuVzvGTnmac=
+		</data>
+		<key>Resources/OpenClaw/action-contract.sh</key>
+		<data>
+		iDg8g1zFBy5Mi7QRdc1W86ee7k8=
 		</data>
 		<key>Resources/OpenClaw/gemini-probe.py</key>
 		<data>
@@ -254,7 +262,7 @@
 		</data>
 		<key>Resources/OpenClaw/taskpilot-openclaw-bootstrap.sh</key>
 		<data>
-		6jK+BWpLq1UkszHxITUhYS7swaw=
+		1m2j4ttF2YG67UuFSS1jsJhI44c=
 		</data>
 	</dict>
 	<key>files2</key>
@@ -312,7 +320,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			UgxbkgB38r7JjW0h7W39PSPcsXHsTysUlvkCwJZVCPw=
+			e9afuef+mWEP3wLI5chY/fq99eL/7+W/dZTkWCh+pg4=
 			</data>
 		</dict>
 		<key>Resources/AgentRuntime/_internal/libcrypto.3.dylib</key>
@@ -669,7 +677,14 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			Fz2Pa82lUTLQbc7nSxMYCDYqogX3CP6NnOf/i9Cgo84=
+			dfhQVJqABIGCHrd4Y3Tzto2PfSHZ3/ESccLb3UerGMk=
+			</data>
+		</dict>
+		<key>Resources/OpenClaw/__pycache__/gemini-probe.cpython-311.pyc</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			U3ikko616uw15lLSRJ+1niILPn7pay/TKrtAclkPe7w=
 			</data>
 		</dict>
 		<key>Resources/OpenClaw/__pycache__/gemini-probe.cpython-314.pyc</key>
@@ -677,6 +692,13 @@
 			<key>hash2</key>
 			<data>
 			WJ0yYCx3+bpzpiWoqXhrotodZ7WCMO1yOttNidgh5NY=
+			</data>
+		</dict>
+		<key>Resources/OpenClaw/action-contract.sh</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			jl87OW/nKnzfg7QIXDPcWAMIkmyNixdDmUAefdI/i0Y=
 			</data>
 		</dict>
 		<key>Resources/OpenClaw/gemini-probe.py</key>
@@ -697,7 +719,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			q9+NuEWe+Y5IsORXZ4ELeVf92W9w57h05CVSCMsrywc=
+			azmwLtwyxcezGv4KV1Bsyuui73V/wJJc4tUKae2h2tI=
 			</data>
 		</dict>
 	</dict>

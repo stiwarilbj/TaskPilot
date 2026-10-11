@@ -1,0 +1,136 @@
+import base64
+import copy
+import math
+from urllib.parse import urlsplit
+
+
+class ActionContractError(RuntimeError):
+    pass
+
+
+def _fail(path, error):
+    raise ActionContractError(f"{path} {error}")
+
+
+def _condition(test, value):
+    if 'has' in test: return test['has'] in value
+    if 'truthy' in test: return bool(value.get(test['truthy']))
+    if 'not' in test: return not _condition(test['not'], value)
+    if 'all' in test: return all(_condition(t, value) for t in test['all'])
+    if 'any' in test: return any(_condition(t, value) for t in test['any'])
+    if 'same_presence' in test:
+        a, b = test['same_presence']
+        return (a in value) == (b in value)
+    raise RuntimeError('Unsupported generated contract condition')
+
+
+def _rules(rules, value, path):
+    for rule in rules:
+        if 'when' in rule and not _condition(rule['when'], value): continue
+        if 'payload' in rule:
+            field = rule['payload']
+            text = value[field]
+            if value.get(rule['encoding'], rule['default_encoding']) == 'base64':
+                try:
+                    if len(text) % 4 or len(text) - len(text.rstrip('=')) > 2:
+                        raise ValueError('Invalid padding')
+                    data = base64.b64decode(text, validate=True)
+                except (ValueError, UnicodeEncodeError):
+                    _fail(path + '.' + field, 'must be valid base64 for this encoding')
+            else: data = text.encode('utf-8')
+            if len(data) > rule['max_bytes']: _fail(path + '.' + field, rule['size_error'])
+        elif not _condition(rule['assert'], value):
+            _fail(path + ('.' + rule['path'] if rule.get('path') else ''), rule['error'])
+
+
+def _field(value, spec, path):
+    kind = spec['type']
+    if kind == 'string':
+        if not isinstance(value, str): _fail(path, 'must be a string')
+        if spec.get('nonempty') and not value.strip(): _fail(path, 'must be a nonempty string')
+        try: encoded = value.encode('utf-8')
+        except UnicodeEncodeError: _fail(path, 'must contain valid UTF-8 text')
+        if spec.get('format') == 'path' and (not value.startswith(('/', '~/')) or '\0' in value):
+            _fail(path, 'must be an absolute or ~/ path without NUL bytes')
+        if spec.get('format') == 'http_url':
+            try:
+                parsed = urlsplit(value)
+                valid = parsed.scheme in {'http', 'https'} and bool(parsed.hostname) and not any(c.isspace() for c in value)
+            except ValueError: valid = False
+            if not valid: _fail(path, 'must be an http/https URL')
+        if (spec.get('no_nul') and '\0' in value) or len(encoded) > spec.get('max_bytes', math.inf):
+            _fail(path, spec.get('bytes_error', 'must contain no NUL bytes'))
+        candidate = value.lower() if spec.get('casefold') else value
+        if 'choices' in spec and candidate not in spec['choices']:
+            _fail(path, spec.get('choices_error', 'must be a supported value'))
+    elif kind in {'number', 'integer'}:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or (kind == 'integer' and not isinstance(value, int)):
+            _fail(path, 'must be an integer' if kind == 'integer' else 'must be a number')
+        if not spec['min'] <= value <= spec['max'] or (isinstance(value, float) and not math.isfinite(value)):
+            _fail(path, f"must be finite and between {spec['min']:g} and {spec['max']:g}")
+    elif kind == 'boolean':
+        if type(value) is not bool: _fail(path, 'must be a boolean')
+    elif kind == 'array':
+        if not isinstance(value, list) or not spec.get('min_items', 0) <= len(value) <= spec.get('max_items', math.inf):
+            _fail(path, spec.get('error', 'must be a list'))
+        for i, item in enumerate(value):
+            item_spec = dict(spec['items'])
+            if i == 0 and spec.get('first_nonempty'): item_spec['nonempty'] = True
+            try: _field(item, item_spec, f'{path}[{i}]')
+            except ActionContractError:
+                if spec.get('error') and 'min_items' not in spec: _fail(path, spec['error'])
+                raise
+        if 'max_bytes' in spec and sum(len(v.encode('utf-8')) + spec.get('separator_bytes', 0) for v in value) > spec['max_bytes']:
+            _fail(path, spec['bytes_error'])
+    elif kind == 'variant':
+        if not isinstance(value, dict): _fail(path, 'must be an object')
+        tag = spec['tag']
+        selected = value.get(tag)
+        if not isinstance(selected, str) or selected not in spec['variants']:
+            _fail(path + '.' + tag, 'must be a supported outcome check')
+        definition = spec['variants'][selected]
+        if definition.get('reject_unknown') and set(value) - {tag, *definition['fields']}:
+            _fail(path, 'contains unsupported parameters')
+        _object(value, definition['fields'], definition['required'], path)
+        _rules(definition['rules'], value, path)
+    else: raise RuntimeError('Unsupported generated contract field')
+
+
+def _object(value, fields, required, path):
+    for field, spec in fields.items():
+        if field in value: _field(value[field], spec, path + '.' + field)
+    for field in required:
+        if field not in value: _fail(path + '.' + field, 'is required')
+
+
+def validate_action(value):
+    if not isinstance(value, dict): _fail('action', 'must be an object')
+    action = dict(value)
+    kind = action.get('type')
+    if not isinstance(kind, str) or kind not in CONTRACT['actions']:
+        _fail('action.type', 'must be a supported action')
+    for rule in CONTRACT['normalizations']:
+        if kind == rule['type'] and action.get(rule['when_truthy']):
+            kind = action['type'] = rule['replace_type']
+            for key in rule['remove']: action.pop(key, None)
+    definition = CONTRACT['actions'][kind]
+    _object(action, CONTRACT['fields'], definition['required'], 'action')
+    _rules(CONTRACT['common_rules'], action, 'action')
+    _rules(definition['rules'], action, 'action')
+    return action
+
+
+def action_example(kind):
+    return copy.deepcopy(CONTRACT['actions'][kind]['example'])
+
+
+def action_default(kind, field):
+    return CONTRACT['actions'][kind]['defaults'][field]
+
+
+VALID_ACTIONS = frozenset(CONTRACT['actions'])
+TRUSTED_NATIVE_ACTIONS = frozenset(k for k, v in CONTRACT['actions'].items() if v['owner'] == 'task_tool')
+KEYS = frozenset(CONTRACT['key_codes'])
+ACTION_CAPABILITIES = {k: v['capability'] for k, v in CONTRACT['actions'].items() if v.get('capability')}
+ACTION_REFERENCE = 'All actions remain available (examples are advisory): ' + '; '.join(v['reference'] for v in CONTRACT['actions'].values()) + '. Keys: ' + ', '.join(CONTRACT['key_codes']) + '; modifiers: ' + ', '.join(CONTRACT['modifier_flags']) + '.\n'
+PROMPT_BOUNDS = CONTRACT['prompt_bounds']

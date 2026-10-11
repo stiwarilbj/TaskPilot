@@ -161,7 +161,9 @@ final class AgentRuntimeProcess {
             // runtime consumes this first line before it begins bridge calls.
             var configuration = try JSONSerialization.data(withJSONObject: [
                 "kind": "runtime_configuration",
-                "gemini_api_key": geminiAPIKey
+                "gemini_api_key": geminiAPIKey,
+                "action_contract_hash": ActionContract.fingerprint,
+                "action_contract_version": ActionContract.version
             ])
             configuration.append(0x0A)
             try input.fileHandleForWriting.write(contentsOf: configuration)

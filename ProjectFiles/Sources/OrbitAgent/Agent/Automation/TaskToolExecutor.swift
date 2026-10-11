@@ -27,33 +27,28 @@ enum TaskToolError: LocalizedError {
 /// actions, so OpenClaw receives bounded, structured evidence instead of a
 /// second unobserved agent channel.
 final class TaskToolExecutor {
-    static let supportedActions: Set<String> = [
-        "read_file", "write_file", "run_command"
-    ]
-    static let maximumReadBytes = 128 * 1024
-    static let maximumWriteBytes = 2 * 1024 * 1024
-    static let maximumCommandOutputBytes = 64 * 1024
-    static let maximumCommandLength = 16 * 1024
-    static let maximumCommandTimeout: TimeInterval = 900
+    static let supportedActions = Set(ActionKind.allCases.filter { $0.owner == .task_tool }.map(\.rawValue))
+    static let maximumReadBytes = ActionContract.limit("read_bytes")
+    static let maximumWriteBytes = ActionContract.limit("write_bytes")
+    static let maximumCommandOutputBytes = ActionContract.limit("command_output_bytes")
+    static let maximumCommandLength = ActionContract.limit("command_bytes")
+    static let maximumCommandTimeout = TimeInterval(ActionContract.limit("command_timeout"))
     private let commandLock = NSLock()
     private var activeCommand: Process?
     private var commandCancelled = false
     private var commandPaused = false
 
-    func perform(action: [String: Any]) async throws -> [String: Any] {
+    func perform(action input: [String: Any]) async throws -> [String: Any] {
         try Task.checkCancellation()
-        guard let type = action["type"] as? String else {
-            throw TaskToolError.invalidAction("The tool action has no type")
-        }
-        switch type {
-        case "read_file":
-            return try readFile(action)
-        case "write_file":
-            return try writeFile(action)
-        case "run_command":
-            return try runCommand(action)
-        default:
-            throw TaskToolError.invalidAction("Unsupported task tool: \(type)")
+        let action: [String: Any]
+        do { action = try ActionContract.validate(input) }
+        catch { throw TaskToolError.invalidAction(error.localizedDescription) }
+        switch ActionKind(rawValue: action["type"] as! String)! {
+        case .read_file: return try readFile(action)
+        case .write_file: return try writeFile(action)
+        case .run_command: return try runCommand(action)
+        case .none, .press, .focus, .set_value, .click, .double_click, .type_text, .key, .scroll, .launch_app, .open_route, .wait, .navigate_browser:
+            throw TaskToolError.invalidAction("Unsupported task tool: \(action["type"]!)")
         }
     }
 
@@ -81,7 +76,7 @@ final class TaskToolExecutor {
             throw TaskToolError.operationFailed("No readable file exists at \(url.path)")
         }
 
-        let requestedLimit = Self.intValue(action["max_bytes"]) ?? Self.maximumReadBytes
+        let requestedLimit = (action["max_bytes"] as? NSNumber)?.intValue ?? (ActionContract.defaultValue(.read_file, "max_bytes") as! NSNumber).intValue
         let limit = min(Self.maximumReadBytes, max(1, requestedLimit))
         let handle: FileHandle
         do {
@@ -128,7 +123,7 @@ final class TaskToolExecutor {
         guard let content = action["content"] as? String else {
             throw TaskToolError.invalidAction("write_file requires content")
         }
-        let encoding = (action["encoding"] as? String ?? "utf-8").lowercased()
+        let encoding = (action["encoding"] as? String ?? ActionContract.defaultValue(.write_file, "encoding") as! String).lowercased()
         let data: Data
         switch encoding {
         case "utf-8", "utf8":
@@ -147,7 +142,7 @@ final class TaskToolExecutor {
             )
         }
 
-        let mode = (action["mode"] as? String ?? "overwrite").lowercased()
+        let mode = (action["mode"] as? String ?? ActionContract.defaultValue(.write_file, "mode") as! String).lowercased()
         guard mode == "overwrite" || mode == "append" else {
             throw TaskToolError.invalidAction("write_file mode must be overwrite or append")
         }
@@ -160,7 +155,7 @@ final class TaskToolExecutor {
             throw TaskToolError.invalidAction("write_file will not overwrite a symbolic link")
         }
 
-        let createParents = action["create_parents"] as? Bool ?? true
+        let createParents = action["create_parents"] as? Bool ?? ActionContract.defaultValue(.write_file, "create_parents") as! Bool
         let parent = url.deletingLastPathComponent()
         if createParents {
             do {
@@ -390,10 +385,5 @@ final class TaskToolExecutor {
         }
     }
 
-    private static func intValue(_ value: Any?) -> Int? {
-        if let number = value as? NSNumber { return number.intValue }
-        if let text = value as? String { return Int(text) }
-        return nil
-    }
 
 }

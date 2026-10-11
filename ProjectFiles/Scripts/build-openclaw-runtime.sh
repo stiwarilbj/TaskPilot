@@ -10,6 +10,8 @@ SPEC_DIR="$BUILD_SUPPORT_DIR/pyinstaller-spec"
 CONFIG_DIR="$BUILD_SUPPORT_DIR/pyinstaller-config"
 PYTHON="${ORBIT_BUILD_PYTHON:-/opt/homebrew/bin/python3.11}"
 
+python3 "$PROJECT_FILES_DIR/Scripts/generate-action-contract.py" --check
+
 mkdir -p "$CONFIG_DIR"
 export PYINSTALLER_CONFIG_DIR="$CONFIG_DIR"
 

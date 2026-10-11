@@ -1,0 +1,1000 @@
+{
+  "cases": [
+    {
+      "name": "none",
+      "action": {
+        "type": "none"
+      },
+      "normalized": {
+        "type": "none"
+      }
+    },
+    {
+      "name": "press",
+      "action": {
+        "type": "press",
+        "element_id": "current:e2"
+      },
+      "normalized": {
+        "type": "press",
+        "element_id": "current:e2"
+      }
+    },
+    {
+      "name": "press-missing-element_id",
+      "action": {
+        "type": "press"
+      },
+      "error": "action.element_id is required"
+    },
+    {
+      "name": "focus",
+      "action": {
+        "type": "focus",
+        "element_id": "current:e1"
+      },
+      "normalized": {
+        "type": "focus",
+        "element_id": "current:e1"
+      }
+    },
+    {
+      "name": "focus-missing-element_id",
+      "action": {
+        "type": "focus"
+      },
+      "error": "action.element_id is required"
+    },
+    {
+      "name": "set_value",
+      "action": {
+        "type": "set_value",
+        "element_id": "current:e1",
+        "text": "Example text"
+      },
+      "normalized": {
+        "type": "set_value",
+        "element_id": "current:e1",
+        "text": "Example text"
+      }
+    },
+    {
+      "name": "set_value-missing-element_id",
+      "action": {
+        "type": "set_value",
+        "text": "Example text"
+      },
+      "error": "action.element_id is required"
+    },
+    {
+      "name": "set_value-missing-text",
+      "action": {
+        "type": "set_value",
+        "element_id": "current:e1"
+      },
+      "error": "action.text is required"
+    },
+    {
+      "name": "click",
+      "action": {
+        "type": "click",
+        "pid": 42,
+        "x": 500,
+        "y": 500
+      },
+      "normalized": {
+        "type": "click",
+        "pid": 42,
+        "x": 500,
+        "y": 500
+      }
+    },
+    {
+      "name": "double_click",
+      "action": {
+        "type": "double_click",
+        "element_id": "current:e2"
+      },
+      "normalized": {
+        "type": "double_click",
+        "element_id": "current:e2"
+      }
+    },
+    {
+      "name": "type_text",
+      "action": {
+        "type": "type_text",
+        "element_id": "current:e1",
+        "text": "Example text"
+      },
+      "normalized": {
+        "type": "type_text",
+        "element_id": "current:e1",
+        "text": "Example text"
+      }
+    },
+    {
+      "name": "type_text-missing-text",
+      "action": {
+        "type": "type_text",
+        "element_id": "current:e1"
+      },
+      "error": "action.text is required"
+    },
+    {
+      "name": "key",
+      "action": {
+        "type": "key",
+        "pid": 42,
+        "key": "return"
+      },
+      "normalized": {
+        "type": "key",
+        "pid": 42,
+        "key": "return"
+      }
+    },
+    {
+      "name": "key-missing-key",
+      "action": {
+        "type": "key",
+        "pid": 42
+      },
+      "error": "action.key is required"
+    },
+    {
+      "name": "scroll",
+      "action": {
+        "type": "scroll",
+        "pid": 42,
+        "delta_y": -300
+      },
+      "normalized": {
+        "type": "scroll",
+        "pid": 42,
+        "delta_y": -300
+      }
+    },
+    {
+      "name": "launch_app",
+      "action": {
+        "type": "launch_app",
+        "app": "Example App"
+      },
+      "normalized": {
+        "type": "launch_app",
+        "app": "Example App"
+      }
+    },
+    {
+      "name": "open_route",
+      "action": {
+        "type": "open_route",
+        "route_id": "finder"
+      },
+      "normalized": {
+        "type": "open_route",
+        "route_id": "finder"
+      }
+    },
+    {
+      "name": "open_route-missing-route_id",
+      "action": {
+        "type": "open_route"
+      },
+      "error": "action.route_id is required"
+    },
+    {
+      "name": "wait",
+      "action": {
+        "type": "wait",
+        "seconds": 1
+      },
+      "normalized": {
+        "type": "wait",
+        "seconds": 1
+      }
+    },
+    {
+      "name": "read_file",
+      "action": {
+        "type": "read_file",
+        "path": "/example/report.txt"
+      },
+      "normalized": {
+        "type": "read_file",
+        "path": "/example/report.txt"
+      }
+    },
+    {
+      "name": "read_file-missing-path",
+      "action": {
+        "type": "read_file"
+      },
+      "error": "action.path is required"
+    },
+    {
+      "name": "write_file",
+      "action": {
+        "type": "write_file",
+        "path": "/example/note.txt",
+        "content": "Example text"
+      },
+      "normalized": {
+        "type": "write_file",
+        "path": "/example/note.txt",
+        "content": "Example text"
+      }
+    },
+    {
+      "name": "write_file-missing-path",
+      "action": {
+        "type": "write_file",
+        "content": "Example text"
+      },
+      "error": "action.path is required"
+    },
+    {
+      "name": "write_file-missing-content",
+      "action": {
+        "type": "write_file",
+        "path": "/example/note.txt"
+      },
+      "error": "action.content is required"
+    },
+    {
+      "name": "run_command",
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "/bin/pwd"
+        ]
+      },
+      "normalized": {
+        "type": "run_command",
+        "argv": [
+          "/bin/pwd"
+        ]
+      }
+    },
+    {
+      "name": "navigate_browser",
+      "action": {
+        "type": "navigate_browser",
+        "url": "https://example.com"
+      },
+      "normalized": {
+        "type": "navigate_browser",
+        "url": "https://example.com"
+      }
+    },
+    {
+      "name": "element-click-precedence",
+      "action": {
+        "type": "click",
+        "element_id": "current:e2",
+        "x": true,
+        "y": "ignored",
+        "pid": 42,
+        "extra_metadata": "accepted"
+      },
+      "normalized": {
+        "type": "press",
+        "element_id": "current:e2",
+        "pid": 42,
+        "extra_metadata": "accepted"
+      }
+    },
+    {
+      "name": "coordinate-double-click",
+      "action": {
+        "type": "double_click",
+        "pid": 42,
+        "x": 0,
+        "y": 1000
+      },
+      "normalized": {
+        "type": "double_click",
+        "pid": 42,
+        "x": 0,
+        "y": 1000
+      }
+    },
+    {
+      "name": "remembered-scroll",
+      "action": {
+        "type": "scroll",
+        "delta_y": -300
+      },
+      "normalized": {
+        "type": "scroll",
+        "delta_y": -300
+      }
+    },
+    {
+      "name": "element-scroll",
+      "action": {
+        "type": "scroll",
+        "element_id": "current:e2",
+        "delta_x": 30
+      },
+      "normalized": {
+        "type": "scroll",
+        "element_id": "current:e2",
+        "delta_x": 30
+      }
+    },
+    {
+      "name": "implicit-focused-typing",
+      "action": {
+        "type": "type_text",
+        "text": "a"
+      },
+      "normalized": {
+        "type": "type_text",
+        "text": "a"
+      }
+    },
+    {
+      "name": "default-wait",
+      "action": {
+        "type": "wait"
+      },
+      "normalized": {
+        "type": "wait"
+      }
+    },
+    {
+      "name": "default-read",
+      "action": {
+        "type": "read_file",
+        "path": "~/example"
+      },
+      "normalized": {
+        "type": "read_file",
+        "path": "~/example"
+      }
+    },
+    {
+      "name": "empty-replacement",
+      "action": {
+        "type": "set_value",
+        "element_id": "current:e1",
+        "text": ""
+      },
+      "normalized": {
+        "type": "set_value",
+        "element_id": "current:e1",
+        "text": ""
+      }
+    },
+    {
+      "name": "binary-write",
+      "action": {
+        "type": "write_file",
+        "path": "/example/a",
+        "content": "AP8B",
+        "encoding": "base64"
+      },
+      "normalized": {
+        "type": "write_file",
+        "path": "/example/a",
+        "content": "AP8B",
+        "encoding": "base64"
+      }
+    },
+    {
+      "name": "modifier-aliases",
+      "action": {
+        "type": "key",
+        "key": "RETURN",
+        "modifiers": [
+          "CMD",
+          "alt",
+          "ctrl"
+        ]
+      },
+      "normalized": {
+        "type": "key",
+        "key": "RETURN",
+        "modifiers": [
+          "CMD",
+          "alt",
+          "ctrl"
+        ]
+      }
+    },
+    {
+      "name": "check-file_exists",
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "/bin/echo",
+          ""
+        ],
+        "checks": [
+          {
+            "type": "file_exists",
+            "path": "/example/file"
+          }
+        ]
+      },
+      "normalized": {
+        "type": "run_command",
+        "argv": [
+          "/bin/echo",
+          ""
+        ],
+        "checks": [
+          {
+            "type": "file_exists",
+            "path": "/example/file"
+          }
+        ]
+      }
+    },
+    {
+      "name": "check-directory_exists",
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "/bin/echo",
+          ""
+        ],
+        "checks": [
+          {
+            "type": "directory_exists",
+            "path": "/example/file"
+          }
+        ]
+      },
+      "normalized": {
+        "type": "run_command",
+        "argv": [
+          "/bin/echo",
+          ""
+        ],
+        "checks": [
+          {
+            "type": "directory_exists",
+            "path": "/example/file"
+          }
+        ]
+      }
+    },
+    {
+      "name": "check-path_absent",
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "/bin/echo",
+          ""
+        ],
+        "checks": [
+          {
+            "type": "path_absent",
+            "path": "/example/file"
+          }
+        ]
+      },
+      "normalized": {
+        "type": "run_command",
+        "argv": [
+          "/bin/echo",
+          ""
+        ],
+        "checks": [
+          {
+            "type": "path_absent",
+            "path": "/example/file"
+          }
+        ]
+      }
+    },
+    {
+      "name": "check-file_contents",
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "/bin/echo",
+          ""
+        ],
+        "checks": [
+          {
+            "type": "file_contents",
+            "path": "/example/file",
+            "content": "abc"
+          }
+        ]
+      },
+      "normalized": {
+        "type": "run_command",
+        "argv": [
+          "/bin/echo",
+          ""
+        ],
+        "checks": [
+          {
+            "type": "file_contents",
+            "path": "/example/file",
+            "content": "abc"
+          }
+        ]
+      }
+    },
+    {
+      "name": "check-stdout_equals",
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "/bin/echo",
+          ""
+        ],
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "text": ""
+          }
+        ]
+      },
+      "normalized": {
+        "type": "run_command",
+        "argv": [
+          "/bin/echo",
+          ""
+        ],
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "text": ""
+          }
+        ]
+      }
+    },
+    {
+      "name": "pid-bool",
+      "action": {
+        "type": "none",
+        "pid": true
+      },
+      "error": "action.pid must be an integer"
+    },
+    {
+      "name": "pid-string",
+      "action": {
+        "type": "none",
+        "pid": "1"
+      },
+      "error": "action.pid must be an integer"
+    },
+    {
+      "name": "pid-float",
+      "action": {
+        "type": "none",
+        "pid": 1.0
+      },
+      "error": "action.pid must be an integer"
+    },
+    {
+      "name": "pid-fraction",
+      "action": {
+        "type": "none",
+        "pid": 1.5
+      },
+      "error": "action.pid must be an integer"
+    },
+    {
+      "name": "delta_y-bool",
+      "action": {
+        "type": "none",
+        "delta_y": true
+      },
+      "error": "action.delta_y must be an integer"
+    },
+    {
+      "name": "delta_y-string",
+      "action": {
+        "type": "none",
+        "delta_y": "1"
+      },
+      "error": "action.delta_y must be an integer"
+    },
+    {
+      "name": "delta_y-float",
+      "action": {
+        "type": "none",
+        "delta_y": 1.0
+      },
+      "error": "action.delta_y must be an integer"
+    },
+    {
+      "name": "delta_y-fraction",
+      "action": {
+        "type": "none",
+        "delta_y": 1.5
+      },
+      "error": "action.delta_y must be an integer"
+    },
+    {
+      "name": "max_bytes-bool",
+      "action": {
+        "type": "none",
+        "max_bytes": true
+      },
+      "error": "action.max_bytes must be an integer"
+    },
+    {
+      "name": "max_bytes-string",
+      "action": {
+        "type": "none",
+        "max_bytes": "1"
+      },
+      "error": "action.max_bytes must be an integer"
+    },
+    {
+      "name": "max_bytes-float",
+      "action": {
+        "type": "none",
+        "max_bytes": 1.0
+      },
+      "error": "action.max_bytes must be an integer"
+    },
+    {
+      "name": "max_bytes-fraction",
+      "action": {
+        "type": "none",
+        "max_bytes": 1.5
+      },
+      "error": "action.max_bytes must be an integer"
+    },
+    {
+      "name": "coordinate-bool",
+      "action": {
+        "type": "click",
+        "pid": 42,
+        "x": true,
+        "y": 2
+      },
+      "error": "action.x must be a number"
+    },
+    {
+      "name": "coordinate-string",
+      "action": {
+        "type": "click",
+        "pid": 42,
+        "x": "1",
+        "y": 2
+      },
+      "error": "action.x must be a number"
+    },
+    {
+      "name": "coordinate-pair",
+      "action": {
+        "type": "click",
+        "x": 2
+      },
+      "error": "action coordinates require both x and y"
+    },
+    {
+      "name": "coordinate-pid",
+      "action": {
+        "type": "click",
+        "x": 2,
+        "y": 2
+      },
+      "error": "action.pid is required for coordinate targets"
+    },
+    {
+      "name": "coordinate-limit",
+      "action": {
+        "type": "click",
+        "pid": 42,
+        "x": 1001,
+        "y": 2
+      },
+      "error": "action.x must be finite and between 0 and 1000"
+    },
+    {
+      "name": "zero-scroll",
+      "action": {
+        "type": "scroll",
+        "delta_y": 0
+      },
+      "error": "action scroll requires a nonzero delta"
+    },
+    {
+      "name": "unknown-key",
+      "action": {
+        "type": "key",
+        "key": "bad"
+      },
+      "error": "action.key must be a supported key name"
+    },
+    {
+      "name": "unknown-modifier",
+      "action": {
+        "type": "key",
+        "key": "return",
+        "modifiers": [
+          "super"
+        ]
+      },
+      "error": "action.modifiers must be a list of supported modifier names"
+    },
+    {
+      "name": "missing-launch",
+      "action": {
+        "type": "launch_app"
+      },
+      "error": "action launch_app requires an app name or bundle id"
+    },
+    {
+      "name": "missing-url",
+      "action": {
+        "type": "navigate_browser"
+      },
+      "error": "action navigate_browser requires url or query"
+    },
+    {
+      "name": "invalid-url",
+      "action": {
+        "type": "navigate_browser",
+        "url": "file:///tmp/x"
+      },
+      "error": "action.url must be an http/https URL"
+    },
+    {
+      "name": "malformed-url",
+      "action": {
+        "type": "navigate_browser",
+        "url": "https://bad host/"
+      },
+      "error": "action.url must be an http/https URL"
+    },
+    {
+      "name": "missing-command",
+      "action": {
+        "type": "run_command"
+      },
+      "error": "action.command is required when argv is absent"
+    },
+    {
+      "name": "both-command-methods",
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "/bin/pwd"
+        ],
+        "command": "pwd"
+      },
+      "error": "action requires exactly one of command or argv"
+    },
+    {
+      "name": "empty-argv",
+      "action": {
+        "type": "run_command",
+        "argv": []
+      },
+      "error": "action.argv must be a list of 1 to 256 strings"
+    },
+    {
+      "name": "argv-nul",
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "/bin/echo",
+          "x\u0000"
+        ]
+      },
+      "error": "action.argv[1] must contain no NUL bytes"
+    },
+    {
+      "name": "command-nul",
+      "action": {
+        "type": "run_command",
+        "command": "pwd\u0000"
+      },
+      "error": "action.command must contain no NUL bytes and at most 16384 bytes"
+    },
+    {
+      "name": "relative-path",
+      "action": {
+        "type": "read_file",
+        "path": "relative"
+      },
+      "error": "action.path must be an absolute or ~/ path without NUL bytes"
+    },
+    {
+      "name": "null-path",
+      "action": {
+        "type": "read_file",
+        "path": null
+      },
+      "error": "action.path must be a string"
+    },
+    {
+      "name": "boolean-parent",
+      "action": {
+        "type": "write_file",
+        "path": "/example/a",
+        "content": "",
+        "create_parents": 1
+      },
+      "error": "action.create_parents must be a boolean"
+    },
+    {
+      "name": "base64-???",
+      "action": {
+        "type": "write_file",
+        "path": "/example/a",
+        "content": "???",
+        "encoding": "base64"
+      },
+      "error": "action.content must be valid base64 for this encoding"
+    },
+    {
+      "name": "base64-YQ=",
+      "action": {
+        "type": "write_file",
+        "path": "/example/a",
+        "content": "YQ=",
+        "encoding": "base64"
+      },
+      "error": "action.content must be valid base64 for this encoding"
+    },
+    {
+      "name": "base64-YQ====",
+      "action": {
+        "type": "write_file",
+        "path": "/example/a",
+        "content": "YQ====",
+        "encoding": "base64"
+      },
+      "error": "action.content must be valid base64 for this encoding"
+    },
+    {
+      "name": "base64-A===",
+      "action": {
+        "type": "write_file",
+        "path": "/example/a",
+        "content": "A===",
+        "encoding": "base64"
+      },
+      "error": "action.content must be valid base64 for this encoding"
+    },
+    {
+      "name": "oversized-file",
+      "action": {
+        "type": "write_file",
+        "path": "/example/a",
+        "content": ""
+      },
+      "error": "action.content must contain at most 2 MiB",
+      "repeat": {
+        "field": "content",
+        "text": "a",
+        "count": 2097153
+      }
+    },
+    {
+      "name": "oversized-command",
+      "action": {
+        "type": "run_command",
+        "command": "x"
+      },
+      "error": "action.command must contain no NUL bytes and at most 16384 bytes",
+      "repeat": {
+        "field": "command",
+        "text": "x",
+        "count": 16385
+      }
+    },
+    {
+      "name": "nonfinite",
+      "action": {
+        "type": "click",
+        "pid": 42,
+        "x": 1,
+        "y": 2
+      },
+      "error": "action.x must be finite and between 0 and 1000",
+      "special": {
+        "field": "x",
+        "value": "infinity"
+      }
+    },
+    {
+      "name": "invalid-check",
+      "action": {
+        "type": "run_command",
+        "command": "true",
+        "checks": [
+          {
+            "type": "bad"
+          }
+        ]
+      },
+      "error": "action.checks[0].type must be a supported outcome check"
+    },
+    {
+      "name": "missing-check-content",
+      "action": {
+        "type": "run_command",
+        "command": "true",
+        "checks": [
+          {
+            "type": "file_contents",
+            "path": "/example/file"
+          }
+        ]
+      },
+      "error": "action.checks[0].content is required"
+    },
+    {
+      "name": "extra-check-field",
+      "action": {
+        "type": "run_command",
+        "command": "true",
+        "checks": [
+          {
+            "type": "file_exists",
+            "path": "/example/file",
+            "content": "x"
+          }
+        ]
+      },
+      "error": "action.checks[0] contains unsupported parameters"
+    },
+    {
+      "name": "invalid-check-encoding",
+      "action": {
+        "type": "run_command",
+        "command": "true",
+        "checks": [
+          {
+            "type": "file_contents",
+            "path": "/example/file",
+            "content": "x",
+            "encoding": "bad"
+          }
+        ]
+      },
+      "error": "action.checks[0].encoding must be utf-8 or base64"
+    },
+    {
+      "name": "checks-on-wait",
+      "action": {
+        "type": "wait",
+        "checks": []
+      },
+      "error": "action.checks must be a list of 1 to 16 outcome checks"
+    },
+    {
+      "name": "url-without-host",
+      "action": {
+        "type": "navigate_browser",
+        "url": "http://:80/"
+      },
+      "error": "action.url must be an http/https URL"
+    }
+  ],
+  "defaults": {
+    "wait": {
+      "seconds": 2.0
+    },
+    "read_file": {
+      "max_bytes": 131072
+    },
+    "write_file": {
+      "encoding": "utf-8",
+      "mode": "overwrite",
+      "create_parents": true
+    },
+    "run_command": {
+      "timeout_seconds": 120
+    },
+    "navigate_browser": {
+      "browser": "Safari"
+    }
+  }
+}
