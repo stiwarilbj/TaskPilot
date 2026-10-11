@@ -508,7 +508,7 @@ def action_identity(action: dict[str, Any], observation: dict[str, Any]) -> str:
 
 def action_may_mutate(action: dict[str, Any], observation: dict[str, Any]) -> bool:
     kind = action.get("type")
-    if kind in {"type_text", "write_file", "run_command"}:
+    if kind in {"type_text", "set_value", "write_file", "run_command"}:
         return True
     if kind == "key":
         return str(action.get("key")).lower() in {"return", "enter", "delete", "backspace"}
@@ -563,7 +563,7 @@ def observation_progress_signature(observation: dict[str, Any], pid: int | None 
             for app in observation.get("applications", []) if isinstance(app, dict)
             and (pid is None or app.get("pid") == pid)]
     elements = [{key: element[key] for key in
-                ("pid", "role", "subrole", "title", "value", "focused", "enabled", "busy", "frame", "sort_direction")
+                ("pid", "role", "subrole", "title", "value", "focused", "selection_range", "enabled", "busy", "frame", "sort_direction")
                 if key in element}
                 for element in observation.get("elements", []) if isinstance(element, dict)
                 and (pid is None or element.get("pid") == pid)]
@@ -844,18 +844,16 @@ def request_and_enter_user_input(
     )
     secret = wait_for_user_input(request_id)
     try:
-        bridge_call(
+        delivery = bridge_call(
             "act", display_id,
-            action={"type": "focus", "element_id": target["element_id"]},
-        )
-        bridge_call(
-            "act", display_id,
-            action={"type": "type_text", "pid": target["pid"], "text": secret},
+            action={"type": "type_text", "element_id": target["element_id"], "pid": target["pid"], "text": secret},
+            private_input=True,
         )
     finally:
         secret = ""
     return {
-        "message": f"The user supplied the secure value and {PRODUCT_NAME} entered it directly into the waiting app.",
+        "message": f"{PRODUCT_NAME} delivered private input to the intended focused field; its value was not read back.",
+        "outcome": delivery.get("outcome", "delivered_unconfirmed"),
         "target_signature": target["target_signature"],
         "input_kind": target["input_kind"],
         "secret_retained": False,
@@ -1669,6 +1667,7 @@ def relevant_action_examples(context: dict[str, Any], observation: dict[str, Any
         fields = [e for e in elements if e.get("role") in {"AXTextField", "AXTextArea", "AXComboBox", "AXSecureTextField"}]
         if fields:
             examples.append({"type": "set_value", "element_id": "<current field_id>", "text": "Example text"})
+            examples.append({"type": "type_text", "element_id": "<current field_id>", "text": "Example text"})
         if apps and (not elements or any(app.get("accessibility_available") is False for app in apps if isinstance(app, dict))):
             examples.append({"type": "click", "pid": 1, "x": 500, "y": 500})
         if "browser" in capabilities or any(e.get("role") in {"AXScrollArea", "AXTable", "AXOutline"} for e in elements):
@@ -1724,6 +1723,8 @@ def desktop_instruction(
         "Resolve references from evidence; inspect ambiguous candidates.\n"
     )
     bounds = ["wait seconds: number 0.2..15."]
+    if fields:
+        bounds.append("set_value replaces a field; type_text inserts at its selection. Use the intended field ID; focus_mismatch requires inspecting/refocusing it.")
     if types & {"press", "set_value", "double_click", "click", "scroll"}:
         bounds.append("PID: positive integer from observation; x/y: paired numbers 0..1000; scroll deltas: integers -2000..2000 (negative y scrolls down).")
     if "read_file" in types:
@@ -1741,7 +1742,7 @@ def desktop_instruction(
     reference = (
         "All actions remain available (examples are advisory): "
         "press/focus/double_click(element_id); set_value(element_id,text); click/double_click(pid,x,y); "
-        "type_text(pid,text); key(pid,key[,modifiers]); scroll(element_id or pid,delta_x or delta_y); "
+        "type_text(element_id or focused pid,text); key(pid,key[,modifiers]); scroll(element_id or pid,delta_x or delta_y); "
         "launch_app(app or bundle_id); open_route(route_id); read_file(path); write_file(path,content); "
         "run_command(command); navigate_browser(url or query); wait(seconds); none(). "
         "Keys: return/enter, tab, space, delete/backspace, escape, left/right/up/down, home/end, page_up/page_down, a/c/v/x/z/f/l/w/q/n/s/r, 0..9; "

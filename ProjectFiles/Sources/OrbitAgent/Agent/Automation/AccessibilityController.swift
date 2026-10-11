@@ -73,6 +73,7 @@ enum AccessibilityActionError: LocalizedError {
     case cancelled
     case permissionDenied
     case uncertainDelivery(String)
+    case focusMismatch
 
     var code: String {
         switch self {
@@ -82,6 +83,7 @@ enum AccessibilityActionError: LocalizedError {
         case .cancelled: return "cancelled"
         case .permissionDenied: return "permission_denied"
         case .uncertainDelivery: return "delivery_uncertain"
+        case .focusMismatch: return "focus_mismatch"
         case .controllerProtected: return "protected_target"
         case .invalidAction: return "invalid_action"
         case .operationFailed: return "delivery_rejected"
@@ -99,6 +101,7 @@ enum AccessibilityActionError: LocalizedError {
         case .cancelled: return "Task cancelled before input delivery"
         case .permissionDenied: return "Accessibility permission is unavailable; restore TaskPilot’s existing macOS permission before continuing"
         case .uncertainDelivery(let message): return message
+        case .focusMismatch: return "The intended field does not have confirmed focus; observe and focus the correct field before typing"
         }
     }
 }
@@ -136,6 +139,9 @@ final class AccessibilityController {
         let window: AXUIElement?
         let depth: Int
         let supportsPress: Bool
+        let wasFocused: Bool
+        let observedTextValue: String?
+        let observedSelection: NSRange?
         var pid: pid_t { identity.application.pid }
         var role: String { identity.role }
         var observedBounds: CGRect? { identity.bounds }
@@ -380,7 +386,8 @@ final class AccessibilityController {
             // Menu bars and focused fields are not necessarily descendants of
             // AXWindows. Collect them first so large web trees cannot hide them.
             var roots: [AXUIElement] = []
-            if let focused = accessibilityElement(appElement, kAXFocusedUIElementAttribute),
+            let focusedElement = accessibilityElement(appElement, kAXFocusedUIElementAttribute)
+            if let focused = focusedElement,
                ["AXTextField", "AXTextArea", "AXSecureTextField"].contains(stringAttribute(focused, kAXRoleAttribute) ?? ""),
                frame(of: focused)?.intersects(display.frame) == true { roots.append(focused) }
             if let menu = accessibilityElement(appElement, kAXMenuBarAttribute) { roots.append(menu) }
@@ -390,6 +397,7 @@ final class AccessibilityController {
             for root in roots {
                 walk(element: root, pid: pid, appName: app.localizedName ?? "Unknown app",
                      application: appIdentity,
+                     focusedElement: focusedElement,
                      depth: 0, nextID: &nextID, map: &newMap, rows: &elementRows,
                      revision: revision, parentID: nil, ownerWindow: nil)
             }
@@ -400,6 +408,7 @@ final class AccessibilityController {
                     pid: pid,
                     appName: app.localizedName ?? "Unknown app",
                     application: appIdentity,
+                    focusedElement: focusedElement,
                     depth: 0,
                     nextID: &nextID,
                     map: &newMap,
@@ -441,6 +450,7 @@ final class AccessibilityController {
         pid: pid_t,
         appName: String,
         application: AutomationApplicationIdentity,
+        focusedElement: AXUIElement?,
         depth: Int,
         nextID: inout Int,
         map: inout [String: ElementRecord],
@@ -463,10 +473,13 @@ final class AccessibilityController {
         let subrole = stringAttribute(element, kAXSubroleAttribute) ?? ""
         let title = elementTitle(element)
         let bounds = frame(of: element)
-        let rawValue = role == "AXSecureTextField"
-            ? "[secure]"
-            : printableValue(attribute(element, kAXValueAttribute))
+        let secure = AutomationTextEntryPolicy.isSecure(role: role, subrole: subrole)
+        let value = secure ? nil : attribute(element, kAXValueAttribute)
+        let rawValue = secure ? "[secure]" : printableValue(value)
+        let focused = boolAttribute(element, kAXFocusedAttribute) == true
+            || focusedElement.map { CFEqual($0, element) } == true
         let actions = actionNames(element)
+        let selection = secure || !AutomationTextEntryPolicy.inputRoles.contains(role) ? nil : selectedTextRange(element)
         let window = role == "AXWindow" ? element
             : (ownerWindow ?? accessibilityElement(element, kAXWindowAttribute))
         // Use the same immutable values in the private record and the rows
@@ -475,7 +488,9 @@ final class AccessibilityController {
             identity: AutomationTargetIdentity(application: application, role: role, subrole: subrole,
                 label: title, bounds: bounds, windowTitle: window.map { elementTitle($0) },
                 windowBounds: window.flatMap { frame(of: $0) }),
-            window: window, depth: depth, supportsPress: actions.contains("AXPress"))
+            window: window, depth: depth, supportsPress: actions.contains("AXPress"),
+            wasFocused: focused, observedTextValue: AutomationTextEntryPolicy.inputRoles.contains(role) ? value as? String : nil,
+            observedSelection: selection)
         var row: [String: Any] = [
             "id": id,
             "pid": Int(pid),
@@ -484,7 +499,8 @@ final class AccessibilityController {
             "depth": depth,
             "enabled": boolAttribute(element, kAXEnabledAttribute) ?? true
         ]
-        row["focused"] = boolAttribute(element, kAXFocusedAttribute) ?? false
+        row["focused"] = focused
+        if let selection { row["selection_range"] = ["location": selection.location, "length": selection.length] }
         if let parentID { row["parent_id"] = parentID }
         if !subrole.isEmpty { row["subrole"] = subrole }
         if !title.isEmpty { row["title"] = clipped(title) }
@@ -510,6 +526,7 @@ final class AccessibilityController {
                 pid: pid,
                 appName: appName,
                 application: application,
+                focusedElement: focusedElement,
                 depth: depth + 1,
                 nextID: &nextID,
                 map: &map,
@@ -651,7 +668,7 @@ final class AccessibilityController {
             guard depth < 14, budget > 0 else { return }
             budget -= 1
             let role = stringAttribute(element, kAXRoleAttribute) ?? ""
-            if role != "AXSecureTextField" {
+            if !AutomationTextEntryPolicy.isSecure(role: role, subrole: stringAttribute(element, kAXSubroleAttribute) ?? "") {
                 states.append("\(role)|\(stringAttribute(element, kAXTitleAttribute) ?? "")|\(printableValue(attribute(element, kAXValueAttribute)))|\(boolAttribute(element, kAXSelectedAttribute) ?? false)")
             }
             for child in (attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? []).prefix(160) {
@@ -667,7 +684,7 @@ final class AccessibilityController {
         return states
     }
 
-    func performStructured(action: [String: Any], on display: DisplayDescriptor) async throws -> [String: Any] {
+    func performStructured(action: [String: Any], on display: DisplayDescriptor, privateInput: Bool = false) async throws -> [String: Any] {
         guard !inputIsCancelled() else { throw AccessibilityActionError.cancelled }
         let planningRevision = lock.withLock { observationRevision }
         let type = action["type"] as? String ?? ""
@@ -696,8 +713,12 @@ final class AccessibilityController {
                     cancelled: { self.inputIsCancelled() })
             }
         }
-        let before = actionState(pid)
         try validateObservation(planningRevision)
+        if ["set_value", "type_text"].contains(type) {
+            let target = try record ?? observedFocusedInput(pid: pid)
+            return try await performTextEntry(action: action, record: target, on: display, privateInput: privateInput).dictionary(pid: pid)
+        }
+        let before = actionState(pid)
         let message = try await perform(action: action, on: display, planningRevision: planningRevision)
         let method = ["focus", "set_value", "press"].contains(type) && !message.hasPrefix("Clicked")
             ? "accessibility" : (requiresHIDFallback(pid) ? "hid" : (["click", "double_click", "scroll"].contains(type) ? "session_event" : "process_event"))
@@ -706,10 +727,8 @@ final class AccessibilityController {
         repeat {
             guard !inputIsCancelled() else { throw AccessibilityActionError.cancelled }
             try Task.checkCancellation()
-            if type == "set_value", let record, record.role != "AXSecureTextField" {
-                verified = printableValue(attribute(record.element, kAXValueAttribute)) == action["text"] as? String
-            } else if type == "focus", let record {
-                verified = boolAttribute(record.element, kAXFocusedAttribute) == true
+            if type == "focus", let record {
+                verified = intendedElementHasFocus(record)
             } else { verified = actionState(pid) != before }
             if verified { break }
             try await Task.sleep(for: .milliseconds(80))
@@ -785,33 +804,13 @@ final class AccessibilityController {
             let record = try record(for: action)
             try ensureAllowedOnDisplay(record.pid, display: display)
             rememberManualTarget(record.pid)
-            let result = AXUIElementSetAttributeValue(
-                record.element,
-                kAXFocusedAttribute as CFString,
-                kCFBooleanTrue
-            )
-            guard result == .success else {
-                throw AccessibilityActionError.operationFailed("Focus failed with Accessibility error \(result.rawValue)")
-            }
+            try await ensureElementFocus(record, action: action, on: display)
             return "Focused the requested control"
 
-        case "set_value":
-            let record = try record(for: action)
-            try ensureAllowedOnDisplay(record.pid, display: display)
-            rememberManualTarget(record.pid)
-            guard let text = action["text"] as? String else {
-                throw AccessibilityActionError.invalidAction("set_value requires text")
-            }
-            _ = AXUIElementSetAttributeValue(record.element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-            let result = AXUIElementSetAttributeValue(
-                record.element,
-                kAXValueAttribute as CFString,
-                text as CFString
-            )
-            guard result == .success else {
-                throw AccessibilityActionError.operationFailed("Text entry failed with Accessibility error \(result.rawValue)")
-            }
-            return "Entered text"
+        case "set_value", "type_text":
+            let target = try action["element_id"] == nil
+                ? observedFocusedInput(pid: actionPID(action, on: display)) : record(for: action)
+            return try await performTextEntry(action: action, record: target, on: display).message
 
         case "click", "double_click":
             let record = action["element_id"] == nil ? nil : try self.record(for: action)
@@ -853,16 +852,6 @@ final class AccessibilityController {
                 }
             )
             return type == "double_click" ? "Double-clicked" : "Clicked"
-
-        case "type_text":
-            let pid = try actionPID(action, on: display)
-            try ensureAllowedOnDisplay(pid, display: display)
-            rememberManualTarget(pid)
-            guard let text = action["text"] as? String, !text.isEmpty else {
-                throw AccessibilityActionError.invalidAction("type_text requires text")
-            }
-            try postUnicode(text, to: pid)
-            return "Typed text into the target app"
 
         case "key":
             let pid = try actionPID(action, on: display)
@@ -1220,9 +1209,35 @@ final class AccessibilityController {
         try await beginVerifiedInput(to: browserPID)
         defer { scheduleInputRestoration(browserPID) }
         try postKey("l", modifiers: ["command"], to: browserPID)
-        try? await Task.sleep(for: .milliseconds(80))
-        try postUnicode(navigationText, to: browserPID)
-        try postKey("return", modifiers: [], to: browserPID)
+        var addressField: ElementRecord?
+        try await AutomationInputPolicy.waitUntilReady(ready: {
+            guard let field = self.currentFocusedInput(pid: browserPID, on: display),
+                  ["AXTextField", "AXComboBox"].contains(field.role) else { return false }
+            var ancestorRoles: [String] = []
+            var parent = self.accessibilityElement(field.element, kAXParentAttribute)
+            for _ in 0..<15 {
+                guard let element = parent else { break }
+                let role = self.stringAttribute(element, kAXRoleAttribute) ?? ""
+                ancestorRoles.append(role)
+                if role == "AXWindow" { break }
+                parent = self.accessibilityElement(element, kAXParentAttribute)
+            }
+            guard AutomationTextEntryPolicy.isBrowserAddressField(label: field.identity.label, ancestorRoles: ancestorRoles) else { return false }
+            addressField = field
+            return true
+        }, cancelled: { self.inputIsCancelled() }, timeoutError: .focusMismatch)
+        guard let addressField else { throw AccessibilityActionError.focusMismatch }
+        let textResult = try await performTextEntry(action: ["type": "set_value", "pid": Int(browserPID), "text": navigationText],
+            record: addressField, on: display)
+        guard textResult.verified else {
+            throw AccessibilityActionError.uncertainDelivery("The browser address could not be verified; navigation was not submitted. Inspect the address field before continuing")
+        }
+        try postKey("return", modifiers: [], to: browserPID, preflight: {
+            try self.validateRecord(addressField, action: ["pid": Int(browserPID)], on: display)
+            guard self.intendedElementHasFocus(addressField), self.readableTextValue(addressField) == navigationText else {
+                throw AccessibilityActionError.focusMismatch
+            }
+        })
         try? await Task.sleep(for: .milliseconds(350))
         return "Opened \(description) in \(browserName); inspect the rendered page before finishing"
     }
@@ -1981,6 +1996,156 @@ final class AccessibilityController {
 
     // MARK: - Action target validation
 
+    private func observedFocusedInput(pid: pid_t) throws -> ElementRecord {
+        let candidates = lock.withLock { elementMap.values.filter {
+            $0.pid == pid && $0.wasFocused && AutomationTextEntryPolicy.inputRoles.contains($0.role)
+        }.sorted { $0.depth > $1.depth } }
+        guard let first = candidates.first,
+              candidates.allSatisfy({ element(first.element, isWithin: $0.element) }) else {
+            throw AccessibilityActionError.focusMismatch
+        }
+        return first
+    }
+
+    private func currentFocusedInput(pid: pid_t, on display: DisplayDescriptor) -> ElementRecord? {
+        guard let app = NSRunningApplication(processIdentifier: pid),
+              let focused = accessibilityElement(AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute),
+              let rectangle = frame(of: focused), rectangle.intersects(display.frame) else { return nil }
+        let window = accessibilityElement(focused, kAXWindowAttribute)
+        let identity = targetIdentity(focused, application: applicationIdentity(app), window: window)
+        guard AutomationTextEntryPolicy.inputRoles.contains(identity.role),
+              !AutomationTextEntryPolicy.isSecure(role: identity.role, subrole: identity.subrole) else { return nil }
+        return ElementRecord(element: focused, revision: lock.withLock { observationRevision }, identity: identity,
+            window: window, depth: 0, supportsPress: false, wasFocused: true,
+            observedTextValue: stringAttribute(focused, kAXValueAttribute), observedSelection: selectedTextRange(focused))
+    }
+
+    private func element(_ child: AXUIElement, isWithin parent: AXUIElement) -> Bool {
+        var current = child
+        for _ in 0..<15 {
+            if CFEqual(current, parent) { return true }
+            guard let ancestor = accessibilityElement(current, kAXParentAttribute), !CFEqual(ancestor, current) else { break }
+            current = ancestor
+        }
+        return false
+    }
+
+    private func intendedElementHasFocus(_ record: ElementRecord) -> Bool {
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == record.pid,
+              let focused = accessibilityElement(AXUIElementCreateApplication(record.pid), kAXFocusedUIElementAttribute)
+        else { return false }
+        if CFEqual(focused, record.element) { return true }
+        // Editable combo boxes can delegate focus to their text-field child.
+        return AutomationTextEntryPolicy.inputRoles.contains(record.role)
+            && AutomationTextEntryPolicy.inputRoles.contains(stringAttribute(focused, kAXRoleAttribute) ?? "")
+            && element(focused, isWithin: record.element)
+    }
+
+    private func ensureElementFocus(_ record: ElementRecord, action: [String: Any], on display: DisplayDescriptor) async throws {
+        try validateRecord(record, action: action, on: display)
+        if !intendedElementHasFocus(record) {
+            // PID-only insertion refers to the field focused in the planning
+            // observation. Never redirect it to a newly focused field.
+            guard action["type"] as? String != "type_text" || action["element_id"] != nil else {
+                throw AccessibilityActionError.focusMismatch
+            }
+            let result = AXUIElementSetAttributeValue(record.element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            if result == .apiDisabled { throw AccessibilityActionError.permissionDenied }
+            guard result == .success else { throw AccessibilityActionError.focusMismatch }
+        }
+        try await AutomationInputPolicy.waitUntilReady(
+            ready: { self.intendedElementHasFocus(record) }, cancelled: { self.inputIsCancelled() },
+            timeoutError: .focusMismatch)
+        try validateRecord(record, action: action, on: display)
+    }
+
+    private func selectedTextRange(_ element: AXUIElement) -> NSRange? {
+        guard let value = attribute(element, kAXSelectedTextRangeAttribute), CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(value as! AXValue, .cfRange, &range), range.location >= 0, range.length >= 0 else { return nil }
+        return NSRange(location: range.location, length: range.length)
+    }
+
+    private func readableTextValue(_ record: ElementRecord) -> String? {
+        var pid: pid_t = 0
+        let role = stringAttribute(record.element, kAXRoleAttribute) ?? ""
+        let subrole = stringAttribute(record.element, kAXSubroleAttribute) ?? ""
+        guard AXUIElementGetPid(record.element, &pid) == .success, pid == record.pid,
+              role == record.role, !AutomationTextEntryPolicy.isSecure(role: role, subrole: subrole) else { return nil }
+        return stringAttribute(record.element, kAXValueAttribute)
+    }
+
+    private func setTextAttribute(_ name: String, value: CFTypeRef, record: ElementRecord) throws -> TextAttributeDelivery {
+        var settable = DarwinBoolean(false)
+        let support = AXUIElementIsAttributeSettable(record.element, name as CFString, &settable)
+        if support == .apiDisabled { throw AccessibilityActionError.permissionDenied }
+        guard support == .success, settable.boolValue else { return .unsupported }
+        guard !inputIsCancelled() else { throw AccessibilityActionError.cancelled }
+        guard intendedElementHasFocus(record) else { throw AccessibilityActionError.focusMismatch }
+        switch AXUIElementSetAttributeValue(record.element, name as CFString, value) {
+        case .success: return .accepted
+        case .attributeUnsupported, .actionUnsupported, .notImplemented: return .unsupported
+        case .apiDisabled: throw AccessibilityActionError.permissionDenied
+        default: return .uncertain
+        }
+    }
+
+    private func performTextEntry(action: [String: Any], record: ElementRecord, on display: DisplayDescriptor, privateInput: Bool = false) async throws -> AutomationTextEntryResult {
+        guard AutomationTextEntryPolicy.inputRoles.contains(record.role), let text = action["text"] as? String else {
+            throw AccessibilityActionError.invalidAction("Text entry requires an observed text input and text")
+        }
+        guard action["type"] as? String != "type_text" || !text.isEmpty else {
+            throw AccessibilityActionError.invalidAction("type_text requires nonempty text")
+        }
+        try validateRecord(record, action: action, on: display)
+        let secure = privateInput || AutomationTextEntryPolicy.isSecure(role: record.role, subrole: record.identity.subrole)
+        if !secure {
+            guard readableTextValue(record) == record.observedTextValue else { throw AccessibilityActionError.staleObservation }
+            if action["type"] as? String == "type_text", record.wasFocused,
+               selectedTextRange(record.element) != record.observedSelection { throw AccessibilityActionError.staleObservation }
+        }
+        rememberManualTarget(record.pid)
+        return try await AutomationTextEntryPolicy.enter(text: text, replacement: action["type"] as? String == "set_value", secure: secure,
+            focus: {
+                try await self.ensureElementFocus(record, action: action, on: display)
+                if !secure, self.readableTextValue(record) != record.observedTextValue {
+                    throw AccessibilityActionError.staleObservation
+                }
+                if !secure, action["type"] as? String == "type_text", record.wasFocused,
+                   self.selectedTextRange(record.element) != record.observedSelection {
+                    throw AccessibilityActionError.staleObservation
+                }
+            },
+            preflight: {
+                try self.validateRecord(record, action: action, on: display)
+                guard self.intendedElementHasFocus(record) else { throw AccessibilityActionError.focusMismatch }
+            },
+            readValue: { self.readableTextValue(record) }, readSelection: { self.selectedTextRange(record.element) },
+            setValue: { try self.setTextAttribute(kAXValueAttribute, value: $0 as CFString, record: record) },
+            setSelectedText: { try self.setTextAttribute(kAXSelectedTextAttribute, value: $0 as CFString, record: record) },
+            selectRange: { requested in
+                var range = CFRange(location: requested.location, length: requested.length)
+                guard let value = AXValueCreate(.cfRange, &range) else { return false }
+                return try self.setTextAttribute(kAXSelectedTextRangeAttribute, value: value, record: record) == .accepted
+            },
+            typeText: { text, preflight in
+                if text.isEmpty { try self.postKey("delete", modifiers: [], to: record.pid, preflight: preflight) }
+                else { try self.postUnicode(text, to: record.pid, preflight: preflight) }
+            },
+            waitForMatch: { matches in
+                guard !self.inputIsCancelled() else { throw AccessibilityActionError.cancelled }
+                try Task.checkCancellation()
+                let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+                while !matches(), ContinuousClock.now < deadline {
+                    guard !self.inputIsCancelled() else { throw AccessibilityActionError.cancelled }
+                    try Task.checkCancellation()
+                    try await Task.sleep(for: .milliseconds(50))
+                }
+                guard !self.inputIsCancelled() else { throw AccessibilityActionError.cancelled }
+                try Task.checkCancellation()
+            })
+    }
+
     private func record(for action: [String: Any]) throws -> ElementRecord {
         guard let id = action["element_id"] as? String else {
             throw AccessibilityActionError.invalidAction("This action requires an element_id")
@@ -2062,14 +2227,10 @@ final class AccessibilityController {
         var hit: AXUIElement?
         let result = AXUIElementCopyElementAtPosition(AXUIElementCreateApplication(record.pid),
             Float(point.x), Float(point.y), &hit)
-        guard result == .success, var current = hit else { throw AccessibilityActionError.staleObservation }
+        guard result == .success, let current = hit else { throw AccessibilityActionError.staleObservation }
         // A button can hit-test as its image/label child. Accept only that same
         // control or a descendant, never a different control at the old point.
-        for _ in 0..<15 {
-            if CFEqual(current, record.element) { return }
-            guard let parent = accessibilityElement(current, kAXParentAttribute), !CFEqual(parent, current) else { break }
-            current = parent
-        }
+        if element(current, isWithin: record.element) { return }
         throw AccessibilityActionError.staleObservation
     }
 
@@ -2464,7 +2625,7 @@ final class AccessibilityController {
         agentCursor?.move(to: end, on: display, clicking: false)
     }
 
-    private func postUnicode(_ text: String, to pid: pid_t) throws {
+    private func postUnicode(_ text: String, to pid: pid_t, preflight: () throws -> Void = {}) throws {
         let previouslyActiveApp = activateForTargetedInput(pid)
         defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.05, targetPID: pid) }
         guard let source = CGEventSource(stateID: .privateState),
@@ -2472,7 +2633,8 @@ final class AccessibilityController {
               let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else {
             throw AccessibilityActionError.operationFailed("Could not create a keyboard event")
         }
-        for chunk in text.chunked(maxUTF16Count: 40) {
+        try AutomationTextEntryPolicy.deliverChunks(text.chunked(maxUTF16Count: 40), preflight: preflight,
+            cancelled: { self.inputIsCancelled() }) { chunk in
             let units = Array(chunk.utf16)
             units.withUnsafeBufferPointer { buffer in
                 down.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: buffer.baseAddress!)
@@ -2485,7 +2647,7 @@ final class AccessibilityController {
         Thread.sleep(forTimeInterval: 0.035)
     }
 
-    private func postKey(_ key: String, modifiers: [String], to pid: pid_t) throws {
+    private func postKey(_ key: String, modifiers: [String], to pid: pid_t, preflight: () throws -> Void = {}) throws {
         let previouslyActiveApp = activateForTargetedInput(pid)
         defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.05, targetPID: pid) }
         guard let code = Self.supportedKeyCodes[key.lowercased()],
@@ -2506,7 +2668,7 @@ final class AccessibilityController {
         }
         down.flags = flags
         up.flags = flags
-        down.postToPid(pid)
+        try AutomationTargetPolicy.deliver(preflight: preflight, event: { down.postToPid(pid) })
         Thread.sleep(forTimeInterval: 0.018)
         up.postToPid(pid)
         Thread.sleep(forTimeInterval: 0.035)

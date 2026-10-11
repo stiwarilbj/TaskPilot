@@ -206,6 +206,53 @@ class ScreenSettlingTests(unittest.TestCase):
         self.assertEqual(router.metrics['action_deliveries'], 1)
         self.assertEqual(router.metrics['repairs'], 0)
 
+    def test_unconfirmed_text_replacement_is_not_replayed_after_observation(self):
+        import json
+        current = self.observation('Body', role='AXTextField', value='', focused=True)
+        deliveries = []
+        state = mock.Mock()
+        class Client:
+            prompt_calls = 0
+            model_switches = 0
+            selected_model = None
+            def select_model(client, model): client.selected_model = model
+            def prompt(client, instruction, image):
+                client.prompt_calls += 1
+                return json.dumps({'status': 'act', 'action': {
+                    'type': 'set_value', 'element_id': current['elements'][0]['id'], 'text': 'full'}})
+            def close(client): pass
+        client = Client()
+        router = runtime.AdaptiveModelRouter(lambda *a, **k: None)
+        def bridge(method, display_id, **params):
+            if method == 'act':
+                deliveries.append(params['action'])
+                return {'message': 'Read-back mismatch', 'outcome': 'delivered_unconfirmed',
+                        'text_verification': 'mismatch', 'pid': 42}
+            return self.observation('Body', role='AXTextField', focused=True,
+                                    value='partial' if deliveries else '')
+        def instruction(task, observation, history):
+            nonlocal current
+            current = observation
+            return 'plan'
+        def sleep(seconds): self.now += seconds
+        with mock.patch.object(runtime, 'find_openclaw', return_value='mock'), \
+             mock.patch.object(runtime, 'prepare_runtime', return_value=state), \
+             mock.patch.object(runtime, 'ACPClient', return_value=client), \
+             mock.patch.object(runtime, 'TaskModelRouter', side_effect=lambda **kwargs: router), \
+             mock.patch.object(runtime, 'bridge_call', side_effect=bridge), \
+             mock.patch.object(runtime, 'secure_input_target', return_value=None), \
+             mock.patch.object(runtime, 'desktop_instruction', side_effect=instruction), \
+             mock.patch.object(runtime, 'record_action_diagnostic'), \
+             mock.patch.object(runtime.time, 'monotonic', side_effect=lambda: self.now), \
+             mock.patch.object(runtime.time, 'sleep', side_effect=sleep), \
+             mock.patch.object(runtime, 'emit'):
+            with self.assertRaisesRegex(RuntimeError, 'stopped rather than repeat an uncertain mutation'):
+                runtime.run_task('Enter full into Body', 1, 'mock', '')
+        self.assertEqual(len(deliveries), 1)
+        self.assertEqual(router.metrics['action_deliveries'], 1)
+        self.assertEqual(router.metrics['unconfirmed_actions'], 1)
+        self.assertEqual(router.metrics['repairs'], 0)
+
     def test_task_loop_reuses_settled_observation_and_executes_once(self):
         import json
         initial = self.baseline

@@ -54,3 +54,20 @@ Automated fixtures cover changed targets, replaced windows, rejected delivery,
 cancellation, and fresh-observation replanning without replaying the rejected click.
 These local checks make no model requests. No live-control tester or Chrome interaction
 was run; live compatibility and accuracy validation remain incomplete.
+
+Text entry now binds to the supplied observed field or the uniquely observed focused
+input in the supplied app. It acknowledges focus before delivery, prefers supported
+Accessibility setters, preserves insertion/selection semantics, and checks readable
+values locally for up to two seconds. Keyboard chunks stop if focus changes; partial
+or ambiguous delivery is never replayed automatically. Whole-field replacement is
+idempotent, and unconfirmed replacements share the existing mutation replay guard.
+Secure fields and private credential/code entry skip read-back and return no values;
+secure subroles are redacted in Accessibility observations as well as secure roles.
+Browser navigation requires an identified address field in the browser toolbar and
+verified entry before Return; unknown/localized toolbar labels may require the
+existing model-driven desktop recovery path.
+Automated tests cover focus rejection/timeouts, direct setters, selection-preserving
+insertion, Unicode boundaries, delayed/ignored/partial/duplicate entry, safe fallback,
+unreadable and secure values, cancellation, and zero replay. Local focus/read-back
+checks make no model requests. No Chrome interaction or live-control tester was run;
+live compatibility validation remains incomplete.

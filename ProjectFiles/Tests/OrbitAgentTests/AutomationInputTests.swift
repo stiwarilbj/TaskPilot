@@ -33,6 +33,13 @@ final class AutomationInputTests: XCTestCase {
         } catch { XCTFail("Unexpected error: \(error)") }
     }
 
+    func testFocusTimeoutIsClassifiedWithoutAuthorizingText() async {
+        do {
+            try await AutomationInputPolicy.waitUntilReady(timeout: 0.01, ready: { false }, timeoutError: .focusMismatch)
+            XCTFail("Unconfirmed focus must not authorize typing")
+        } catch { XCTAssertEqual((error as? AccessibilityActionError)?.code, "focus_mismatch") }
+    }
+
     func testRestorationCannotOverrideAnotherActionOrUserFocus() {
         XCTAssertTrue(AutomationInputPolicy.shouldRestore(scheduledGeneration: 1, currentGeneration: 1,
             targetPID: 42, currentPID: 42, previousPID: 77))

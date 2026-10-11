@@ -4,13 +4,14 @@ enum AutomationInputPolicy {
     static func waitUntilReady(
         timeout: TimeInterval = 2,
         ready: () -> Bool,
-        cancelled: () -> Bool = { false }
+        cancelled: () -> Bool = { false },
+        timeoutError: AccessibilityActionError = .activationFailed
     ) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(timeout))
         while !ready() {
             if cancelled() { throw AccessibilityActionError.cancelled }
             try Task.checkCancellation()
-            guard ContinuousClock.now < deadline else { throw AccessibilityActionError.activationFailed }
+            guard ContinuousClock.now < deadline else { throw timeoutError }
             try await Task.sleep(for: .milliseconds(25))
         }
         if cancelled() { throw AccessibilityActionError.cancelled }

@@ -375,12 +375,17 @@ class OpenClawRuntimeTests(unittest.TestCase):
 
         self.assertEqual(emitted[0]["kind"], "user_input_required")
         self.assertNotIn(secret, json.dumps(emitted))
+        self.assertEqual(len(bridge_calls), 1)
         self.assertEqual(bridge_calls[0][2]["action"], {
-            "type": "focus", "element_id": "e9"
+            "type": "type_text", "element_id": "e9", "pid": 444, "text": secret
         })
-        self.assertEqual(bridge_calls[1][2]["action"]["text"], secret)
+        self.assertTrue(bridge_calls[0][2]["private_input"])
         self.assertNotIn(secret, json.dumps(result))
         self.assertFalse(result["secret_retained"])
+
+    def test_uncertain_replacement_is_protected_like_insertion(self):
+        observation = {"elements": [{"id": "one:e1", "pid": 42, "role": "AXTextField", "title": "Body"}]}
+        self.assertTrue(runtime.action_may_mutate({"type": "set_value", "element_id": "one:e1", "text": "Draft"}, observation))
 
     def test_simple_file_requests_route_to_native_file_tools(self):
         create = runtime.task_capability_context(

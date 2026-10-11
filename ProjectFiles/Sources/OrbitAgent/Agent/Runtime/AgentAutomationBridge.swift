@@ -78,7 +78,8 @@ final class AgentAutomationBridge {
                     result = try await taskTools.perform(action: action)
                 } else {
                     try accessibility.validateObservation(params["observation_revision"] as? String)
-                    result = try await accessibility.performStructured(action: action, on: display)
+                    result = try await accessibility.performStructured(action: action, on: display,
+                        privateInput: params["private_input"] as? Bool == true)
                 }
 
             default:
