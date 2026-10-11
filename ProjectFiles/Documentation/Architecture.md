@@ -2,6 +2,11 @@
 
 TaskPilot is split by responsibility, so the folder name tells you why the code exists before you even open a file.
 
+Background prompt changes can be evaluated against private sanitized cases
+using the [offline prompt regression workflow](PromptRegression.md). It
+exercises the existing runtime without desktop events or provider calls and
+keeps reproduction controls distinct from recorded model comparisons.
+
 ## The main flow
 
 1. `TaskPilotApp` creates the macOS windows.
