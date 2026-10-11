@@ -131,11 +131,14 @@ final class AccessibilityController {
 
     private struct ElementRecord {
         let element: AXUIElement
-        let pid: pid_t
-        let role: String
-        let title: String
+        let revision: String
+        let identity: AutomationTargetIdentity
         let window: AXUIElement?
-        let observedBounds: CGRect?
+        let depth: Int
+        let supportsPress: Bool
+        var pid: pid_t { identity.application.pid }
+        var role: String { identity.role }
+        var observedBounds: CGRect? { identity.bounds }
     }
 
     private struct TaskApplicationBaseline {
@@ -154,7 +157,8 @@ final class AccessibilityController {
     private let agentCursor: AgentCursorOverlayController?
     private var elementMap: [String: ElementRecord] = [:]
     private var observationRevision = ""
-    private var observedWindowFrames: [pid_t: [CGRect]] = [:]
+    private var observedGraphicsWindows: [pid_t: [AutomationGraphicsWindow]] = [:]
+    private var observedApplications: [pid_t: AutomationApplicationIdentity] = [:]
     private var inputGeneration = 0
     private var inputCancelled = false
     private var restoreWorkItem: DispatchWorkItem?
@@ -327,7 +331,8 @@ final class AccessibilityController {
         var applicationRows: [[String: Any]] = []
         var nextID = 1
         let revision = UUID().uuidString
-        var observedFrames: [pid_t: [CGRect]] = [:]
+        var observedGraphics: [pid_t: [AutomationGraphicsWindow]] = [:]
+        var observedApps: [pid_t: AutomationApplicationIdentity] = [:]
 
         let apps = orderedApplicationsForSnapshot(on: display)
 
@@ -340,9 +345,12 @@ final class AccessibilityController {
                 guard let frame = frame(of: window) else { return false }
                 return frame.intersects(display.frame)
             }
-            let cgFrames = cgWindowFrames(of: pid).filter { $0.intersects(display.frame) }
+            let graphics = graphicsWindows(of: pid).filter { $0.frame.intersects(display.frame) }
+            let cgFrames = graphics.map(\.frame)
             guard Self.hasObservableWindow(accessibilityCount: visibleWindows.count, graphicsCount: cgFrames.count) else { continue }
-            observedFrames[pid] = cgFrames.isEmpty ? visibleWindows.compactMap { frame(of: $0) } : cgFrames
+            observedGraphics[pid] = graphics
+            let appIdentity = applicationIdentity(app)
+            observedApps[pid] = appIdentity
 
             applicationRows.append([
                 "name": app.localizedName ?? "Unknown app",
@@ -381,6 +389,7 @@ final class AccessibilityController {
             }
             for root in roots {
                 walk(element: root, pid: pid, appName: app.localizedName ?? "Unknown app",
+                     application: appIdentity,
                      depth: 0, nextID: &nextID, map: &newMap, rows: &elementRows,
                      revision: revision, parentID: nil, ownerWindow: nil)
             }
@@ -390,6 +399,7 @@ final class AccessibilityController {
                     element: window,
                     pid: pid,
                     appName: app.localizedName ?? "Unknown app",
+                    application: appIdentity,
                     depth: 0,
                     nextID: &nextID,
                     map: &newMap,
@@ -403,7 +413,8 @@ final class AccessibilityController {
         lock.lock()
         elementMap = newMap
         observationRevision = revision
-        observedWindowFrames = observedFrames
+        observedGraphicsWindows = observedGraphics
+        observedApplications = observedApps
         lock.unlock()
         return AccessibilitySnapshot(
             revision: revision,
@@ -429,6 +440,7 @@ final class AccessibilityController {
         element: AXUIElement,
         pid: pid_t,
         appName: String,
+        application: AutomationApplicationIdentity,
         depth: Int,
         nextID: inout Int,
         map: inout [String: ElementRecord],
@@ -450,13 +462,20 @@ final class AccessibilityController {
         }
         let subrole = stringAttribute(element, kAXSubroleAttribute) ?? ""
         let title = elementTitle(element)
+        let bounds = frame(of: element)
         let rawValue = role == "AXSecureTextField"
             ? "[secure]"
             : printableValue(attribute(element, kAXValueAttribute))
         let actions = actionNames(element)
-        map[id] = ElementRecord(element: element, pid: pid, role: role, title: title,
-                                window: ownerWindow ?? accessibilityElement(element, kAXWindowAttribute),
-                                observedBounds: frame(of: element))
+        let window = role == "AXWindow" ? element
+            : (ownerWindow ?? accessibilityElement(element, kAXWindowAttribute))
+        // Use the same immutable values in the private record and the rows
+        // sent for planning, rather than fetching two different layouts.
+        map[id] = ElementRecord(element: element, revision: revision,
+            identity: AutomationTargetIdentity(application: application, role: role, subrole: subrole,
+                label: title, bounds: bounds, windowTitle: window.map { elementTitle($0) },
+                windowBounds: window.flatMap { frame(of: $0) }),
+            window: window, depth: depth, supportsPress: actions.contains("AXPress"))
         var row: [String: Any] = [
             "id": id,
             "pid": Int(pid),
@@ -475,7 +494,7 @@ final class AccessibilityController {
         )
         if !sortDirection.isEmpty { row["sort_direction"] = clipped(sortDirection) }
         if !actions.isEmpty { row["actions"] = actions }
-        if let frame = frame(of: element),
+        if let frame = bounds,
            let serializedFrame = serializedAccessibilityFrame(frame) {
             row["frame"] = serializedFrame
         }
@@ -490,6 +509,7 @@ final class AccessibilityController {
                 element: child,
                 pid: pid,
                 appName: appName,
+                application: application,
                 depth: depth + 1,
                 nextID: &nextID,
                 map: &map,
@@ -649,6 +669,7 @@ final class AccessibilityController {
 
     func performStructured(action: [String: Any], on display: DisplayDescriptor) async throws -> [String: Any] {
         guard !inputIsCancelled() else { throw AccessibilityActionError.cancelled }
+        let planningRevision = lock.withLock { observationRevision }
         let type = action["type"] as? String ?? ""
         if ["launch_app", "open_route", "navigate_browser"].contains(type) {
             let message = try await perform(action: action, on: display)
@@ -663,12 +684,7 @@ final class AccessibilityController {
         defer { scheduleInputRestoration(pid) }
         if let record { try validateRecord(record, action: action, on: display) }
         else if ["click", "double_click", "scroll"].contains(type) {
-            let expected = lock.withLock { observedWindowFrames[pid] ?? [] }
-            let current = cgWindowFrames(of: pid).filter { $0.intersects(display.frame) }
-            guard !expected.isEmpty, expected.count == current.count,
-                  expected.allSatisfy({ old in current.contains { $0 == old } }) else {
-                throw AccessibilityActionError.staleObservation
-            }
+            try validateCoordinateWindows(pid, on: display)
         }
         if ["click", "double_click", "scroll"].contains(type), let record,
            let rectangle = frame(of: record.element) {
@@ -681,7 +697,8 @@ final class AccessibilityController {
             }
         }
         let before = actionState(pid)
-        let message = try await perform(action: action, on: display)
+        try validateObservation(planningRevision)
+        let message = try await perform(action: action, on: display, planningRevision: planningRevision)
         let method = ["focus", "set_value", "press"].contains(type) && !message.hasPrefix("Clicked")
             ? "accessibility" : (requiresHIDFallback(pid) ? "hid" : (["click", "double_click", "scroll"].contains(type) ? "session_event" : "process_event"))
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
@@ -702,7 +719,7 @@ final class AccessibilityController {
                 "verification_scope": "action_effect", "pid": Int(pid)]
     }
 
-    func perform(action: [String: Any], on display: DisplayDescriptor) async throws -> String {
+    func perform(action: [String: Any], on display: DisplayDescriptor, planningRevision: String? = nil) async throws -> String {
         guard let type = action["type"] as? String else {
             throw AccessibilityActionError.invalidAction("The action has no type")
         }
@@ -725,7 +742,11 @@ final class AccessibilityController {
                     )
                 }
             }
-            let result = AXUIElementPerformAction(record.element, kAXPressAction as CFString)
+            let result = try AutomationTargetPolicy.deliver(preflight: {
+                try self.validateRecord(record, action: action, on: display)
+            }, event: {
+                AXUIElementPerformAction(record.element, kAXPressAction as CFString)
+            })
             if result != .success {
                 // cannotComplete is ambiguous: the application may already
                 // have handled a submit/send. Only unsupported delivery can
@@ -750,7 +771,11 @@ final class AccessibilityController {
                     to: record.pid,
                     point: CGPoint(x: elementFrame.midX, y: elementFrame.midY),
                     double: false,
-                    on: display
+                    on: display,
+                    preflight: {
+                        try self.validateRecord(record, action: action, on: display)
+                        try self.validatePointerHit(record, at: CGPoint(x: elementFrame.midX, y: elementFrame.midY))
+                    }
                 )
                 return "Clicked the requested control"
             }
@@ -805,11 +830,27 @@ final class AccessibilityController {
             }
             try ensureAllowedOnDisplay(pid, display: display)
             rememberManualTarget(pid)
+            // Bind coordinates to the control in the planning observation,
+            // before activation or z-order recovery can change its position.
+            let coordinateRecord = record == nil ? observedControl(at: point, pid: pid) : nil
             try postClick(
                 to: pid,
                 point: point,
                 double: type == "double_click",
-                on: display
+                on: display,
+                preflight: {
+                    if let planningRevision { try self.validateObservation(planningRevision) }
+                    if let record {
+                        try self.validateRecord(record, action: action, on: display)
+                        try self.validatePointerHit(record, at: point)
+                    } else {
+                        try self.validateCoordinateWindows(pid, on: display)
+                        if let coordinateRecord {
+                            try self.validateRecord(coordinateRecord, action: action, on: display)
+                            try self.validatePointerHit(coordinateRecord, at: point)
+                        }
+                    }
+                }
             )
             return type == "double_click" ? "Double-clicked" : "Clicked"
 
@@ -1952,31 +1993,84 @@ final class AccessibilityController {
     }
 
     private func validateRecord(_ record: ElementRecord, action: [String: Any], on display: DisplayDescriptor) throws {
-        guard NSRunningApplication(processIdentifier: record.pid)?.isTerminated == false,
-              stringAttribute(record.element, kAXRoleAttribute) == record.role else {
+        guard !inputIsCancelled() else { throw AccessibilityActionError.cancelled }
+        try validateObservation(record.revision)
+        var ownerPID: pid_t = 0
+        guard let app = NSRunningApplication(processIdentifier: record.pid), !app.isTerminated,
+              AXUIElementGetPid(record.element, &ownerPID) == .success, ownerPID == record.pid else {
             throw AccessibilityActionError.staleObservation
         }
         if let pid = intValue(action["pid"]), pid != Int(record.pid) {
             throw AccessibilityActionError.staleObservation
         }
-        let title = elementTitle(record.element)
-        guard title == record.title else { throw AccessibilityActionError.staleObservation }
-        guard boolAttribute(record.element, kAXEnabledAttribute) != false else {
-            throw AccessibilityActionError.disabledElement
-        }
-        if let expected = record.window {
-            let current = accessibilityElement(record.element, kAXWindowAttribute)
-            if record.role != "AXWindow", current == nil || !CFEqual(current!, expected) {
-                throw AccessibilityActionError.staleObservation
-            }
-        }
-        guard let rectangle = frame(of: record.element),
-              serializedAccessibilityFrame(rectangle) != nil,
-              rectangle.width > 0, rectangle.height > 0,
-              rectangle.intersects(display.frame),
-              rectangle == record.observedBounds else {
+        let currentWindow = record.role == "AXWindow" ? record.element
+            : accessibilityElement(record.element, kAXWindowAttribute)
+        let sameWindow: Bool
+        if let expected = record.window, let currentWindow {
+            // Open app menus may have an AX owner window that is absent from
+            // AXWindows; still require the same owner and its observed state.
+            sameWindow = CFEqual(expected, currentWindow)
+                && (record.role.hasPrefix("AXMenu") || windows(of: record.pid).contains { CFEqual($0, expected) })
+        } else { sameWindow = record.window == nil && currentWindow == nil }
+        try AutomationTargetPolicy.validate(observed: record.identity,
+            current: targetIdentity(record.element, application: applicationIdentity(app), window: currentWindow),
+            sameWindow: sameWindow, enabled: boolAttribute(record.element, kAXEnabledAttribute) != false,
+            displayFrame: display.frame)
+    }
+
+    private func applicationIdentity(_ app: NSRunningApplication) -> AutomationApplicationIdentity {
+        AutomationApplicationIdentity(pid: app.processIdentifier, bundleID: app.bundleIdentifier,
+            bundlePath: app.bundleURL?.path, name: app.localizedName, launchDate: app.launchDate)
+    }
+
+    private func targetIdentity(_ element: AXUIElement, application: AutomationApplicationIdentity,
+                                window: AXUIElement?) -> AutomationTargetIdentity {
+        AutomationTargetIdentity(application: application,
+            role: stringAttribute(element, kAXRoleAttribute) ?? "unknown",
+            subrole: stringAttribute(element, kAXSubroleAttribute) ?? "",
+            label: elementTitle(element), bounds: frame(of: element),
+            windowTitle: window.map { elementTitle($0) }, windowBounds: window.flatMap { frame(of: $0) })
+    }
+
+    private func validateCoordinateWindows(_ pid: pid_t, on display: DisplayDescriptor) throws {
+        let (expectedApp, expected) = lock.withLock { (observedApplications[pid], observedGraphicsWindows[pid] ?? []) }
+        let current = graphicsWindows(of: pid).filter { $0.frame.intersects(display.frame) }
+        guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated,
+              expectedApp == applicationIdentity(app) else {
             throw AccessibilityActionError.staleObservation
         }
+        guard !inputIsCancelled() else { throw AccessibilityActionError.cancelled }
+        try AutomationTargetPolicy.validateWindows(observed: expected, current: current)
+    }
+
+    private func observedControl(at point: CGPoint, pid: pid_t) -> ElementRecord? {
+        let containers: Set<String> = ["AXApplication", "AXWindow", "AXGroup", "AXScrollArea", "AXSplitGroup",
+                                       "AXWebArea", "AXLayoutArea", "AXMenuBar", "unknown"]
+        return lock.withLock {
+            elementMap.values.filter {
+                $0.pid == pid && !containers.contains($0.role) && $0.observedBounds?.contains(point) == true
+            }.sorted {
+                if $0.supportsPress != $1.supportsPress { return $0.supportsPress }
+                let a = $0.observedBounds!, b = $1.observedBounds!
+                return a.width * a.height == b.width * b.height ? $0.depth > $1.depth
+                    : a.width * a.height < b.width * b.height
+            }.first
+        }
+    }
+
+    private func validatePointerHit(_ record: ElementRecord, at point: CGPoint) throws {
+        var hit: AXUIElement?
+        let result = AXUIElementCopyElementAtPosition(AXUIElementCreateApplication(record.pid),
+            Float(point.x), Float(point.y), &hit)
+        guard result == .success, var current = hit else { throw AccessibilityActionError.staleObservation }
+        // A button can hit-test as its image/label child. Accept only that same
+        // control or a descendant, never a different control at the old point.
+        for _ in 0..<15 {
+            if CFEqual(current, record.element) { return }
+            guard let parent = accessibilityElement(current, kAXParentAttribute), !CFEqual(parent, current) else { break }
+            current = parent
+        }
+        throw AccessibilityActionError.staleObservation
     }
 
     static func resolvedTargetPID(
@@ -2237,7 +2331,8 @@ final class AccessibilityController {
         to pid: pid_t,
         point: CGPoint,
         double: Bool,
-        on display: DisplayDescriptor
+        on display: DisplayDescriptor,
+        preflight: () throws -> Void = {}
     ) throws {
         let previouslyActiveApp = activateForTargetedInput(pid)
         defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.10, targetPID: pid) }
@@ -2249,19 +2344,28 @@ final class AccessibilityController {
             throw AccessibilityActionError.activationFailed
         }
         agentCursor?.move(to: point, on: display, clicking: true)
+        func finalPreflight() throws {
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
+                throw AccessibilityActionError.activationFailed
+            }
+            guard pointerTargetIsVisible(pid, at: point, display: display) else {
+                throw AccessibilityActionError.staleObservation
+            }
+            try preflight()
+        }
 
         // iOS-on-Mac wrappers (including BASEBALL 9) discard events delivered
         // only to their process queue. Use the real HID event tap for those
         // wrappers, then immediately put the user's physical pointer back.
         if requiresHIDFallback(pid) {
-            try postHIDClick(at: point, double: double)
+            try postHIDClick(at: point, double: double, preflight: finalPreflight)
             return
         }
 
         // The WindowServer session route performs AppKit's hit testing. A
         // process queue accepts mouse events without delivering them to views.
         // Use exactly one route, after verifying the foreground and target.
-        try postSessionClick(at: point, double: double)
+        try postSessionClick(at: point, double: double, preflight: finalPreflight)
         // Catalyst/iOS-on-Mac apps can discard an instantaneous background
         // mouse sequence. Give their event loop one frame to consume the
         // targeted events before restoring whatever app the user was using.
@@ -2276,11 +2380,12 @@ final class AccessibilityController {
         return (Bundle(url: url)?.object(forInfoDictionaryKey: "LSRequiresIPhoneOS") as? Bool) == true
     }
 
-    private func postHIDClick(at point: CGPoint, double: Bool) throws {
-        try postSessionClick(at: point, double: double, tap: .cghidEventTap)
+    private func postHIDClick(at point: CGPoint, double: Bool, preflight: () throws -> Void) throws {
+        try postSessionClick(at: point, double: double, tap: .cghidEventTap, preflight: preflight)
     }
 
-    private func postSessionClick(at point: CGPoint, double: Bool, tap: CGEventTapLocation = .cgSessionEventTap) throws {
+    private func postSessionClick(at point: CGPoint, double: Bool, tap: CGEventTapLocation = .cgSessionEventTap,
+                                  preflight: () throws -> Void) throws {
         let originalPointer = CGEvent(source: nil)?.location
         defer {
             if let originalPointer {
@@ -2301,7 +2406,7 @@ final class AccessibilityController {
         Thread.sleep(forTimeInterval: 0.008)
         down.setIntegerValueField(.mouseEventClickState, value: 1)
         up.setIntegerValueField(.mouseEventClickState, value: 1)
-        down.post(tap: tap)
+        try AutomationTargetPolicy.deliver(preflight: preflight, event: { down.post(tap: tap) })
         Thread.sleep(forTimeInterval: Self.hidClickPressDuration)
         up.post(tap: tap)
         if double {
@@ -2553,6 +2658,10 @@ final class AccessibilityController {
     }
 
     private func cgWindowFrames(of pid: pid_t) -> [CGRect] {
+        graphicsWindows(of: pid).map(\.frame)
+    }
+
+    private func graphicsWindows(of pid: pid_t) -> [AutomationGraphicsWindow] {
         let rows = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID
@@ -2562,9 +2671,11 @@ final class AccessibilityController {
                   pid_t(owner.intValue) == pid,
                   let layer = row[kCGWindowLayer as String] as? NSNumber,
                   layer.intValue == 0,
+                  let id = row[kCGWindowNumber as String] as? NSNumber,
                   let boundsDictionary = row[kCGWindowBounds as String] as? [String: Any]
             else { return nil }
-            return CGRect(dictionaryRepresentation: boundsDictionary as CFDictionary)
+            guard let frame = CGRect(dictionaryRepresentation: boundsDictionary as CFDictionary) else { return nil }
+            return AutomationGraphicsWindow(id: id.uint32Value, title: row[kCGWindowName as String] as? String ?? "", frame: frame)
         }
     }
 

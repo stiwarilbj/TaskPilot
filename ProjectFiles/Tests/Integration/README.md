@@ -43,3 +43,14 @@ and fixture-bound validation, compact recovery references, preserved task eviden
 local credentials, completion rules, and one-call healthy decisions. Empty-observation
 fixtures are capped at 4,000 characters. No Chrome interaction or live-control tester
 was used; live accuracy validation remains incomplete.
+
+Click preflight compares the observed app identity, Accessibility owner PID, window
+identity/title/bounds, control label/role/subrole/bounds, and enabled state immediately
+before AXPress or the first mouse-down. Pointer hit testing rejects another control
+covering a known target. Coordinate clicks also check Core Graphics window IDs and
+bind to an observed control when available; apps that expose no Accessibility control
+still have only app/window metadata available for that part of the check.
+Automated fixtures cover changed targets, replaced windows, rejected delivery,
+cancellation, and fresh-observation replanning without replaying the rejected click.
+These local checks make no model requests. No live-control tester or Chrome interaction
+was run; live compatibility and accuracy validation remain incomplete.

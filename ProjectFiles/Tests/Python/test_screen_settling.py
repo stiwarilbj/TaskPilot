@@ -146,6 +146,66 @@ class ScreenSettlingTests(unittest.TestCase):
                 runtime.wait_for_screen_change(1, self.baseline, self.action, self.baseline_digest)
         self.assertFalse(Path(frame['screenshot_path']).exists())
 
+    def test_stale_target_refreshes_and_replans_without_delivering_old_click(self):
+        import json
+        planned = []
+        histories = []
+        current = self.baseline
+        attempts = []
+        delivered = []
+        state = mock.Mock()
+        class Client:
+            prompt_calls = 0
+            model_switches = 0
+            selected_model = None
+            def select_model(client, model): client.selected_model = model
+            def prompt(client, instruction, image):
+                client.prompt_calls += 1
+                if client.prompt_calls <= 2:
+                    return json.dumps({'status': 'act', 'action': {
+                        'type': 'press', 'element_id': current['elements'][0]['id']}})
+                return '{"status":"done"}' if client.prompt_calls == 3 else '{"verified":true}'
+            def close(client): pass
+        client = Client()
+        router = runtime.AdaptiveModelRouter(lambda *a, **k: None)
+        def bridge(method, display_id, **params):
+            if method == 'act':
+                target = params['action']['element_id']
+                attempts.append(target)
+                if len(attempts) == 1:
+                    raise runtime.ActionRejected('Control moved; observe again', 'stale_target')
+                delivered.append(target)
+                return {'message': 'Delivered once', 'outcome': 'verified', 'pid': 42}
+            return self.observation('ready' if delivered else 'Save')
+        def instruction(task, observation, history):
+            nonlocal current
+            current = observation
+            planned.append(observation['observation_revision'])
+            histories.append(list(history))
+            return 'plan'
+        def sleep(seconds): self.now += seconds
+        with mock.patch.object(runtime, 'find_openclaw', return_value='mock'), \
+             mock.patch.object(runtime, 'prepare_runtime', return_value=state), \
+             mock.patch.object(runtime, 'ACPClient', return_value=client), \
+             mock.patch.object(runtime, 'TaskModelRouter', side_effect=lambda **kwargs: router), \
+             mock.patch.object(runtime, 'bridge_call', side_effect=bridge), \
+             mock.patch.object(runtime, 'secure_input_target', return_value=None), \
+             mock.patch.object(runtime, 'desktop_instruction', side_effect=instruction), \
+             mock.patch.object(runtime, 'verification_instruction', return_value='verify'), \
+             mock.patch.object(runtime, 'record_action_diagnostic'), \
+             mock.patch.object(runtime.time, 'monotonic', side_effect=lambda: self.now), \
+             mock.patch.object(runtime.time, 'sleep', side_effect=sleep), \
+             mock.patch.object(runtime, 'emit'):
+            runtime.run_task('Click Save once', 1, 'mock', '')
+        self.assertNotEqual(planned[0], planned[1])
+        self.assertEqual(attempts, [f'{planned[0]}:e1', f'{planned[1]}:e1'])
+        self.assertEqual(delivered, [f'{planned[1]}:e1'])
+        self.assertEqual(histories[1][-1]['result']['error_code'], 'stale_target')
+        self.assertEqual(client.prompt_calls, 4)  # Three decisions and fresh completion verification.
+        self.assertEqual(router.metrics['action_rejections'], 1)
+        self.assertEqual(router.metrics['action_deliveries'], 1)
+        self.assertEqual(router.metrics['repairs'], 0)
+
     def test_task_loop_reuses_settled_observation_and_executes_once(self):
         import json
         initial = self.baseline
