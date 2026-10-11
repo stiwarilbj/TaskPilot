@@ -37,3 +37,9 @@ waits. Mock fixtures cover stable dialogs, loading indicators, field readiness,
 revision and foreground churn, screenshot-only changes, bounded waits, cancellation,
 cleanup, and reuse of the final observation without duplicate actions or model calls.
 Live-control validation remains incomplete; no Chrome or live fixture was used.
+
+Decision-prompt regression fixtures check context-specific action examples, valid JSON
+and fixture-bound validation, compact recovery references, preserved task evidence,
+local credentials, completion rules, and one-call healthy decisions. Empty-observation
+fixtures are capped at 4,000 characters. No Chrome interaction or live-control tester
+was used; live accuracy validation remains incomplete.

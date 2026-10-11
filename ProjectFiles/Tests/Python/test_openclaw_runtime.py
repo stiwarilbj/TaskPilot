@@ -215,8 +215,8 @@ class OpenClawRuntimeTests(unittest.TestCase):
         self.assertIn("cross-app control", prompt)
         self.assertIn("TASK CAPABILITY CONTEXT", prompt)
         self.assertIn("ORIGINAL USER TASK", prompt)
-        self.assertIn("brand-new execution on every run", prompt)
-        self.assertIn("do not treat it as already completed", prompt)
+        self.assertIn("Each task is a new execution", prompt)
+        self.assertIn("earlier tasks are not completion evidence", prompt)
         self.assertIn("Open Notes", prompt)
 
     def test_instruction_keeps_credentials_local_and_allows_verified_fast_finish(self):
@@ -226,7 +226,8 @@ class OpenClawRuntimeTests(unittest.TestCase):
         self.assertIn("needs_user", prompt)
         self.assertIn("never guess, retrieve, or type a credential", prompt)
         self.assertIn("without sending it to you", prompt)
-        self.assertIn("finish_after_action", prompt)
+        file_prompt = runtime.desktop_instruction("Create todo.txt on my Desktop saying buy milk", {"elements": []}, [])
+        self.assertIn("finish_after_action", file_prompt)
 
     def test_local_screen_wait_limits_preserve_native_fast_paths(self):
         self.assertEqual(runtime.screen_wait_limit("read_file"), 0)
