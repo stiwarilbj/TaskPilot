@@ -103,7 +103,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
         self.assertEqual(value["action"]["type"], "wait")
 
     def test_rejects_unknown_action(self):
-        with self.assertRaisesRegex(RuntimeError, "unsupported"):
+        with self.assertRaisesRegex(RuntimeError, "supported action"):
             runtime.normalized_action({"type": "shell"})
 
     def test_native_file_and_shell_actions_are_validated(self):
@@ -121,11 +121,11 @@ class OpenClawRuntimeTests(unittest.TestCase):
             runtime.normalized_action({"type": "run_command", "command": "pwd"})["command"],
             "pwd",
         )
-        with self.assertRaisesRegex(RuntimeError, "requires path"):
+        with self.assertRaisesRegex(RuntimeError, "action.path is required"):
             runtime.normalized_action({"type": "read_file"})
-        with self.assertRaisesRegex(RuntimeError, "requires content"):
+        with self.assertRaisesRegex(RuntimeError, "action.content is required"):
             runtime.normalized_action({"type": "write_file", "path": "/tmp/a"})
-        with self.assertRaisesRegex(RuntimeError, "requires command"):
+        with self.assertRaisesRegex(RuntimeError, "action.command is required"):
             runtime.normalized_action({"type": "run_command"})
 
     def test_browser_navigation_requires_a_url_or_query(self):
@@ -139,7 +139,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
             runtime.normalized_action({"type": "navigate_browser"})
 
     def test_coordinate_click_requires_both_coordinates(self):
-        with self.assertRaisesRegex(RuntimeError, "requires"):
+        with self.assertRaisesRegex(RuntimeError, "coordinates require both"):
             runtime.normalized_action({"type": "click", "x": 500})
 
     def test_semantic_click_does_not_require_coordinates(self):
@@ -147,9 +147,9 @@ class OpenClawRuntimeTests(unittest.TestCase):
         self.assertEqual(action["element_id"], "e12")
         self.assertEqual(action["type"], "press")
 
-    def test_nonpositive_pid_is_removed(self):
-        action = runtime.normalized_action({"type": "key", "key": "return", "pid": 0})
-        self.assertNotIn("pid", action)
+    def test_nonpositive_pid_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "action.pid must be finite and between"):
+            runtime.normalized_action({"type": "key", "key": "return", "pid": 0})
 
     def test_blocked_decision_with_a_real_action_is_recovered_as_act(self):
         self.assertEqual(runtime.effective_decision_status({

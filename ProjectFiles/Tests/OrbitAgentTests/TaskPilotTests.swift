@@ -4,6 +4,21 @@ import XCTest
 @testable import OrbitAgent
 
 final class TaskPilotTests: XCTestCase {
+    func testRequestMetricsDecodeOlderRecordsWithoutRepairCounter() throws {
+        let data = Data("""
+        {"planning":1,"verification":0,"retries":0,"model_switches":1,"cache_hits":0,"reconnects":0}
+        """.utf8)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        XCTAssertNil(try decoder.decode(AgentRequestMetrics.self, from: data).repairs)
+        let updated = Data("""
+        {"planning":2,"verification":0,"retries":0,"model_switches":1,"cache_hits":0,"reconnects":0,"repairs":1}
+        """.utf8)
+        let metrics = try decoder.decode(AgentRequestMetrics.self, from: updated)
+        XCTAssertEqual(metrics.repairs, 1)
+        XCTAssertTrue(metrics.summary.contains("2 TaskPilot calls"))
+    }
+
     func testTaskPilotProductIdentityPreservesCompatibilityScreenName() {
         XCTAssertEqual(TaskPilotIdentity.displayName, "TaskPilot")
         XCTAssertEqual(

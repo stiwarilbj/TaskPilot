@@ -1,6 +1,8 @@
 """TaskPilot's bounded model policy and private readiness cache."""
 from __future__ import annotations
 
+from response_validation import VALIDATION_VERSION
+
 from dataclasses import dataclass
 import hashlib
 from datetime import datetime
@@ -30,16 +32,19 @@ class Failure:
 
 
 class ModelAttemptError(RuntimeError):
-    def __init__(self, detail: str, kind: str = "invalid_output") -> None:
+    def __init__(self, detail: str, kind: str = "invalid_output", retry_at: float = 0,
+                 recovered_upstream: bool = False) -> None:
         super().__init__(detail)
         self.kind = kind
+        self.retry_at = retry_at
+        self.recovered_upstream = recovered_upstream
 
 
 def classify_failure(error: BaseException, now: float) -> Failure:
     message = str(error)
     lowered = message.lower()
     if isinstance(error, ModelAttemptError):
-        return Failure(error.kind, message)
+        return Failure(error.kind, message, error.retry_at, error.recovered_upstream)
     upstream = any(s in lowered for s in ("all models failed", "recovery exhausted", "retry budget exhausted"))
     if any(s in lowered for s in ("invalid api key", "api key not valid", "api_key_invalid", "api key expired", "invalid credential", "unauthorized", "http 401")):
         return Failure("credentials", message)
@@ -93,7 +98,7 @@ class AdaptiveModelRouter:
                 if health.get("state") == "temporary":
                     self.cooldowns[model] = health.get("retry_at") or float("inf")
         self.metrics = {"planning": 0, "verification": 0, "retries": 0, "model_switches": 0,
-                        "cache_hits": 0, "reconnects": 0, "provider_retries": None,
+                        "cache_hits": 0, "reconnects": 0, "repairs": 0, "provider_retries": None,
                         "action_deliveries": 0, "action_rejections": 0, "unconfirmed_actions": 0}
 
     def execute(self, operation: Callable[[str], Any], purpose: str = "planning") -> Any:
@@ -134,7 +139,7 @@ class AdaptiveModelRouter:
                     self.unavailable.add(model)
                 elif failure.kind in {"quota", "temporary"}:
                     self.cooldowns[model] = failure.retry_at
-                if model in PRIMARY_MODELS and (failure.kind in {"temporary", "invalid_output"} or (failure.kind == "quota" and failure.retry_at != float("inf"))) and not failure.recovered_upstream:
+                if model in PRIMARY_MODELS and (failure.kind == "temporary" or (failure.kind == "quota" and failure.retry_at != float("inf"))) and not failure.recovered_upstream:
                     delayed.append((model, failure))
                 self.emit("model_health", model=model,
                           state="temporary" if failure.kind in {"quota", "temporary"} else "repair",
@@ -188,7 +193,7 @@ class RuntimeState:
     def __init__(self, fingerprint: str, version: str, root: Path | None = None, configuration: str = "") -> None:
         self.root = root or Path(os.environ.get("ORBIT_RUNTIME_STATE_DIRECTORY", str(Path.home() / "Library/Application Support/Orbit Agent")))
         self.path = self.root / "runtime-readiness.json"
-        self.identity = hashlib.sha256(json.dumps([fingerprint, version, CONFIG_VERSION, ALL_MODELS, configuration]).encode()).hexdigest()
+        self.identity = hashlib.sha256(json.dumps([fingerprint, version, CONFIG_VERSION, ALL_MODELS, configuration, VALIDATION_VERSION]).encode()).hexdigest()
         try:
             value = json.loads(self.path.read_text())
             self.value = value if isinstance(value, dict) and value.get("identity") == self.identity else ({"config_version": value.get("config_version")} if isinstance(value, dict) else {})

@@ -24,3 +24,10 @@ Validation performed during implementation:
 
 The final bundle is validated by compilation, automated suites, and signature
 verification. These checks do not establish complete live app compatibility.
+
+Response repair validation uses mocked ACP terminal responses and current-observation
+fixtures. It covers strict parsing and native parameters, the shared one-call repair
+budget, same-model retention, fallback, provider errors, cache identity, and request
+counts. The Swift suite also checks compatibility with older diagnostic records.
+No live-control tester, Chrome interaction, or live ACP check was run for this change;
+live validation remains incomplete.

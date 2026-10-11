@@ -137,7 +137,7 @@ class RequestPolicyTests(unittest.TestCase):
             image.write_bytes(b'image')
             class Client:
                 model_switches = 0
-                def select_model(self, model): pass
+                def select_model(self, model): self.selected_model = model
                 prompt = mock.Mock(return_value='{"status":"act","action":{"type":"wait"}}')
             client = Client()
             router = self.router()
@@ -148,7 +148,7 @@ class RequestPolicyTests(unittest.TestCase):
                 runtime.routed_json_prompt(router, client, 'new evidence', image)
                 self.assertEqual(client.prompt.call_count, 2)
                 client.decision_cache = {}
-                client.prompt.return_value = '{"status":"act","action":{"type":"click","x":1,"y":2}}'
+                client.prompt.return_value = '{"status":"act","action":{"type":"click","x":1,"y":2,"pid":42}}'
                 for _ in range(2):
                     runtime.routed_json_prompt(router, client, 'mutation', image)
                 self.assertEqual(client.prompt.call_count, 4)
@@ -159,7 +159,7 @@ class RequestPolicyTests(unittest.TestCase):
             class Client:
                 model_switches = 0
                 reconnects = 0
-                def select_model(self, model): pass
+                def select_model(self, model): self.selected_model = model
                 def reconnect(self): self.reconnects += 1
                 prompt = mock.Mock(side_effect=[RuntimeError('OpenClaw ACP exited'), '{"status":"done"}'])
             client = Client(); router = self.router()
@@ -169,12 +169,12 @@ class RequestPolicyTests(unittest.TestCase):
             self.assertEqual(client.reconnects, 1)
             self.assertEqual(client.prompt.call_count, 2)
 
-    def test_malformed_output_recovers_to_secondary(self):
+    def test_malformed_output_repairs_before_switching(self):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / 'image.png'; image.write_bytes(b'image')
             class Client:
                 model_switches = 0
-                def select_model(self, model): pass
+                def select_model(self, model): self.selected_model = model
                 prompt = mock.Mock(side_effect=['partial {', '{"status":"done"}'])
             with mock.patch.object(runtime, 'emit'):
                 self.assertEqual(runtime.routed_json_prompt(self.router(), Client(), 'reason', image)['status'], 'done')
@@ -323,7 +323,7 @@ class RequestPolicyTests(unittest.TestCase):
             image = Path(directory) / 'image.png'; image.write_bytes(b'image')
             class Client:
                 model_switches = 0
-                def select_model(self, model): pass
+                def select_model(self, model): self.selected_model = model
                 prompt = mock.Mock(side_effect=['{"verified":"false"}', '{"verified":false}'])
             with mock.patch.object(runtime, 'emit'):
                 result = runtime.routed_json_prompt(self.router(), Client(), 'verify', image, purpose='verification')
