@@ -1,4 +1,6 @@
+import CoreFoundation
 import Foundation
+import OSLog
 
 final class AgentAutomationBridge {
     private let displayService: DisplayService
@@ -7,11 +9,15 @@ final class AgentAutomationBridge {
     private let taskTools = TaskToolExecutor()
     private let ownershipLock = NSLock()
     private var activeLease: TaskLease?
+    // Aggregate numbers only; no capture/target contents or generation IDs.
+    private var observationDiagnostics = ObservationConsistencyDiagnostics()
+    private let observationLogger = Logger(subsystem: "com.orbitagent.controller", category: "ObservationConsistency")
     func bind(_ lease: TaskLease) throws {
         ownershipLock.lock(); defer { ownershipLock.unlock() }
         try lease.check()
         guard activeLease == nil || activeLease?.state == .retired else { throw RuntimeProcessError.alreadyRunning }
         activeLease = lease
+        observationDiagnostics = ObservationConsistencyDiagnostics()
     }
     private func owns(_ lease: TaskLease) -> Bool {
         ownershipLock.lock(); defer { ownershipLock.unlock() }
@@ -64,17 +70,50 @@ final class AgentAutomationBridge {
                 // before every screenshot so an idle cursor never obscures
                 // page text or becomes part of the model's visual context.
                 accessibility.hideAgentCursor()
-                // Capture first, then bind element IDs to the immediately
-                // following tree instead of racing an older tree with pixels.
-                let screenshotURL = try await capture.capture(display: display)
-                try await TaskOwnership.checkpoint()
-                let snapshot = accessibility.snapshot(on: display)
+                try accessibility.invalidateObservation()
+                let budget: Double
+                if let supplied = params["consistency_budget_ms"] {
+                    guard let number = supplied as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                          number.doubleValue.isFinite, number.doubleValue.rounded() == number.doubleValue,
+                          (1...5000).contains(number.intValue) else {
+                        throw BridgeError.invalidRequest("consistency_budget_ms must be an integer from 1 to 5000")
+                    }
+                    budget = number.doubleValue / 1000
+                } else { budget = 5 }
+                var observationDisplay = display
+                let (accepted, screenshotURL) = try await ObservationConsistency.collect(
+                    budget: budget,
+                    checkpoint: { try await TaskOwnership.checkpoint() },
+                    suspensionRevision: { lease.suspensionRevision },
+                    scene: {
+                        let current = try self.targetDisplay(from: params)
+                        return try self.accessibility.observationScene(on: current)
+                    },
+                    stage: {
+                        observationDisplay = try self.targetDisplay(from: params)
+                        return try self.accessibility.stageSnapshot(on: observationDisplay)
+                    },
+                    signature: { $0.consistencySignature },
+                    capture: { refresh in try await self.capture.capture(display: observationDisplay, forceRefresh: refresh) },
+                    discard: { lease.discardArtifact($0) },
+                    publish: { try $0.publish() },
+                    report: { summary in
+                        self.observationLogger.debug("Capture attempts: \(summary.attempts), rejected: \(summary.rejected.values.reduce(0, +)), elapsed seconds: \(summary.elapsedSeconds)")
+                        self.ownershipLock.withLock {
+                            self.observationDiagnostics.attempts += summary.attempts
+                            self.observationDiagnostics.elapsedSeconds += summary.elapsedSeconds
+                            for (reason, count) in summary.rejected {
+                                self.observationDiagnostics.rejected[reason, default: 0] += count
+                            }
+                        }
+                    })
+                let snapshot = accepted.snapshot
                 try TaskOwnership.check()
                 result = [
                     "task_generation_id": lease.id,
                     "observation_revision": snapshot.revision,
                     "screenshot_path": screenshotURL.path,
-                    "display": displayDictionary(display),
+                    "display": displayDictionary(observationDisplay),
                     "applications": snapshot.applications,
                     "installed_applications": snapshot.installedApplications,
                     "system_context": snapshot.systemContext,
@@ -121,7 +160,7 @@ final class AgentAutomationBridge {
                 "result": result
             ]
         } catch {
-            let code = error is CancellationError ? "cancelled" : error is ActionContract.ValidationError ? "invalid_action" :
+            let code = error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" :
                 (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? "action_rejected"
             return [
                 "task_generation_id": lease?.id ?? "",

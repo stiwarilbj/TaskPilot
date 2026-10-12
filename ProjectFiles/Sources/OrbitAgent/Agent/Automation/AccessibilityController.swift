@@ -17,6 +17,12 @@ struct AccessibilitySnapshot {
     let systemContext: [String: Any]
 }
 
+struct StagedAccessibilitySnapshot {
+    let snapshot: AccessibilitySnapshot
+    let consistencySignature: String
+    let publish: () throws -> Void
+}
+
 func serializedAccessibilityFrame(_ frame: CGRect) -> [String: Int]? {
     // Some macOS views expose AX frames with CGFloat.greatestFiniteMagnitude
     // while their layout is still being calculated. Converting that value to
@@ -349,7 +355,63 @@ final class AccessibilityController {
 
     // MARK: - Screen observation and actions
 
+    // Legacy/manual snapshot callers retain immediate publication. Task
+    // observations use stageSnapshot and explicitly commit the accepted pair.
     func snapshot(on display: DisplayDescriptor) -> AccessibilitySnapshot {
+        guard let staged = try? stageSnapshot(on: display) else {
+            return AccessibilitySnapshot(revision: "", elements: [], applications: [], installedApplications: [], systemContext: [:])
+        }
+        try? staged.publish()
+        return staged.snapshot
+    }
+
+    func invalidateObservation() throws {
+        try TaskOwnership.commit {
+            lock.withLock {
+                elementMap.removeAll()
+                observationRevision = ""
+                observedGraphicsWindows.removeAll()
+                observedApplications.removeAll()
+            }
+        }
+    }
+
+    /// Fresh Core Graphics z-order, including transient app windows. Never use
+    /// ScreenCaptureKit's content cache as evidence that the layout is stable.
+    func observationScene(on display: DisplayDescriptor) throws -> String {
+        try TaskOwnership.check()
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] ?? []
+        let applications = controllableRunningApplications()
+        let byPID = Dictionary(uniqueKeysWithValues: applications.map { ($0.processIdentifier, $0) })
+        var ordered: [[String: Any]] = []
+        for row in windows {
+            guard let owner = row[kCGWindowOwnerPID as String] as? NSNumber,
+                  let app = byPID[pid_t(owner.intValue)],
+                  let bounds = row[kCGWindowBounds as String] as? [String: Any],
+                  let rectangle = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+                  rectangle.intersects(display.frame), serializedAccessibilityFrame(rectangle) != nil else { continue }
+            let identity = applicationIdentity(app)
+            ordered.append([
+                "pid": owner.intValue, "bundle": identity.bundleID ?? "",
+                "path": identity.bundlePath ?? "", "launch": identity.launchDate?.timeIntervalSince1970 ?? 0,
+                "window": row[kCGWindowNumber as String] as? NSNumber ?? 0,
+                "layer": row[kCGWindowLayer as String] as? NSNumber ?? 0,
+                "title": row[kCGWindowName as String] as? String ?? "",
+                "frame": [rectangle.minX, rectangle.minY, rectangle.width, rectangle.height],
+                "active": app.isActive
+            ])
+        }
+        let scene: [String: Any] = ["display": Int(display.id),
+            "pixels": [CGDisplayPixelsWide(display.id), CGDisplayPixelsHigh(display.id)],
+            "frame": [display.frame.minX, display.frame.minY, display.frame.width, display.frame.height],
+            "windows": ordered]
+        return String(decoding: try JSONSerialization.data(withJSONObject: scene, options: [.sortedKeys]), as: UTF8.self)
+    }
+
+    func stageSnapshot(on display: DisplayDescriptor) throws -> StagedAccessibilitySnapshot {
+        try TaskOwnership.check()
+        let suspension = TaskOwnership.current?.suspensionRevision
         var newMap: [String: ElementRecord] = [:]
         var elementRows: [[String: Any]] = []
         var applicationRows: [[String: Any]] = []
@@ -362,6 +424,7 @@ final class AccessibilityController {
 
 
         for app in apps {
+            try TaskOwnership.check()
             let pid = app.processIdentifier
             let appElement = AXUIElementCreateApplication(pid)
             let windows = attribute(appElement, kAXWindowsAttribute) as? [AXUIElement] ?? []
@@ -444,16 +507,7 @@ final class AccessibilityController {
             }
         }
 
-        TaskOwnership.callback(TaskOwnership.current) {
-            lock.lock()
-            elementMap = newMap
-            observationRevision = revision
-            observationTaskGenerationID = TaskOwnership.current?.id
-            observedGraphicsWindows = observedGraphics
-            observedApplications = observedApps
-            lock.unlock()
-        }
-        return AccessibilitySnapshot(
+        let snapshot = AccessibilitySnapshot(
             revision: revision,
             elements: elementRows,
             applications: applicationRows,
@@ -471,6 +525,45 @@ final class AccessibilityController {
             },
             systemContext: systemContext()
         )
+        // Compare full target labels/geometry and full editable text in memory;
+        // prompt clipping must not hide a change. Secure values are never read.
+        let signatureRows = elementRows.map { row -> [String: Any] in
+            var result = row
+            if let id = row["id"] as? String, let record = newMap[id] {
+                result["title"] = record.identity.label
+                result["element_identity"] = String(CFHash(record.element))
+                if let window = record.window { result["window_identity"] = String(CFHash(window)) }
+                if let frame = record.identity.bounds, serializedAccessibilityFrame(frame) != nil {
+                    result["frame"] = ["x": frame.minX, "y": frame.minY, "width": frame.width, "height": frame.height]
+                }
+                if let value = record.observedTextValue { result["value"] = value }
+            }
+            return result
+        }
+        let signatureApps = applicationRows.map { row -> [String: Any] in
+            var result = row
+            if let pid = row["pid"] as? Int, let identity = observedApps[pid_t(pid)] {
+                result["launch"] = identity.launchDate?.timeIntervalSince1970 ?? 0
+                result["bundle_path"] = identity.bundlePath ?? ""
+            }
+            return result
+        }
+        let signature = try ObservationConsistency.controlSignature(elements: signatureRows, applications: signatureApps)
+        let lease = TaskOwnership.current
+        return StagedAccessibilitySnapshot(snapshot: snapshot, consistencySignature: signature, publish: { [self] in
+            try TaskOwnership.$current.withValue(lease) {
+                try TaskOwnership.commit {
+                    guard lease?.suspensionRevision == suspension else { throw CancellationError() }
+                    lock.withLock {
+                        elementMap = newMap
+                        observationRevision = revision
+                        observationTaskGenerationID = lease?.id
+                        observedGraphicsWindows = observedGraphics
+                        observedApplications = observedApps
+                    }
+                }
+            }
+        })
     }
 
     private func walk(
@@ -488,7 +581,7 @@ final class AccessibilityController {
         ownerWindow: AXUIElement?,
         windowRecords: [SnapshotWindowRecord]
     ) {
-        guard depth <= 14, rows.count < maxElements else { return }
+        guard (try? TaskOwnership.check()) != nil, depth <= 14, rows.count < maxElements else { return }
         let alreadyVisited = map.values.contains(where: { CFEqual($0.element, element) })
         let id = "\(revision):e\(nextID)"
         nextID += 1

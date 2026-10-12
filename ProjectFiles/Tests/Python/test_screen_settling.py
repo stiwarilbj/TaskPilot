@@ -31,10 +31,12 @@ class ScreenSettlingTests(unittest.TestCase):
     def run_wait(self, frames, timeout=2.0):
         iterator = iter(frames)
         last = frames[-1]
-        def observe(method, display_id):
+        def observe(method, display_id, **params):
             nonlocal last
             self.assertEqual(method, 'observe')
             self.assertEqual(display_id, 1)
+            self.assertGreater(params['consistency_budget_ms'], 0)
+            self.assertLessEqual(params['consistency_budget_ms'], max(1, min(5000, round((timeout - self.now) * 1000) + 1)))
             try: last = next(iterator)
             except StopIteration:
                 last = self.observation(last['elements'][0]['title'],
@@ -60,6 +62,53 @@ class ScreenSettlingTests(unittest.TestCase):
         self.assertFalse(result['changed'])
         self.assertEqual(self.now, 2.0)
         self.assertTrue(Path(latest['screenshot_path']).is_file())
+
+    def test_native_consistency_retries_share_remaining_settling_budget(self):
+        calls = []
+        def observe(method, display_id, **params):
+            calls.append(params['consistency_budget_ms'])
+            self.now += 0.2  # Native collection/retries consumed local time.
+            return self.observation()
+        with mock.patch.object(runtime, 'bridge_call', side_effect=observe), \
+             mock.patch.object(runtime.time, 'monotonic', side_effect=lambda: self.now), \
+             mock.patch.object(runtime.time, 'sleep', side_effect=lambda seconds: setattr(self, 'now', self.now + seconds)), \
+             mock.patch.object(runtime, 'routed_json_prompt') as model:
+            _, result = runtime.wait_for_screen_change(1, self.baseline, self.action, timeout=1.0)
+        model.assert_not_called()
+        self.assertEqual(calls[0], 1000)
+        self.assertTrue(all(1 <= value <= 1000 for value in calls))
+        self.assertEqual(calls, sorted(calls, reverse=True))
+        self.assertLessEqual(self.now, 1.0)
+        self.assertEqual(result['reason'], 'bounded_wait_elapsed')
+
+    def test_unstable_observation_never_reuses_old_targets_or_asks_model(self):
+        frame = self.observation()
+        with mock.patch.object(runtime, 'bridge_call', side_effect=[frame, runtime.ActionRejected('Changing layout', 'observation_unstable')]) as bridge, \
+             mock.patch.object(runtime.time, 'monotonic', return_value=0), \
+             mock.patch.object(runtime.time, 'sleep'), \
+             mock.patch.object(runtime, 'routed_json_prompt') as model:
+            with self.assertRaises(runtime.ActionRejected) as error:
+                runtime.wait_for_screen_change(1, self.baseline, self.action, timeout=1.0)
+        self.assertEqual(error.exception.code, 'observation_unstable')
+        self.assertFalse(Path(frame['screenshot_path']).exists())
+        self.assertTrue(all(call.args[0] == 'observe' for call in bridge.call_args_list))
+        model.assert_not_called()
+
+    def test_initial_unstable_capture_stops_before_planning_or_actions(self):
+        client = mock.Mock(prompt_calls=0, model_switches=0)
+        router = runtime.AdaptiveModelRouter(lambda *args, **kwargs: None)
+        with mock.patch.object(runtime, 'find_openclaw', return_value='mock'), \
+             mock.patch.object(runtime, 'prepare_runtime', return_value=mock.Mock()), \
+             mock.patch.object(runtime, 'ACPClient', return_value=client), \
+             mock.patch.object(runtime, 'TaskModelRouter', return_value=router), \
+             mock.patch.object(runtime, 'bridge_call', side_effect=runtime.ActionRejected('Changing layout', 'observation_unstable')) as bridge, \
+             mock.patch.object(runtime, 'emit'):
+            with self.assertRaises(runtime.ActionRejected):
+                runtime.run_task('Click the observed button', 1, 'mock', '')
+        bridge.assert_called_once_with('observe', 1)
+        client.prompt.assert_not_called()
+        self.assertEqual(router.metrics['planning'], 0)
+        self.assertEqual(router.metrics['model_switches'], 0)
 
     def test_dialog_must_stabilize_before_next_decision(self):
         frames = [self.observation(), self.observation('Confirm', role='AXSheet')]
@@ -158,7 +207,7 @@ class ScreenSettlingTests(unittest.TestCase):
              mock.patch.object(runtime.time, 'sleep', side_effect=SystemExit(143)):
             with self.assertRaises(SystemExit):
                 runtime.wait_for_screen_change(1, self.baseline, self.action, self.baseline_digest)
-        bridge.assert_called_once_with('observe', 1)
+        bridge.assert_called_once_with('observe', 1, consistency_budget_ms=2000)
         self.assertFalse(Path(frame['screenshot_path']).exists())
 
     def test_bridge_errors_propagate_and_cleanup(self):

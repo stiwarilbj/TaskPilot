@@ -142,3 +142,28 @@ metadata churn during settling. Ranking and progress memory make no model or
 native-action calls; healthy decisions still use one planning request. No Chrome
 interaction, live-control tester, or live ACP task was run for this change; live
 accuracy validation remains incomplete.
+
+Task observations now stage Accessibility trees before and after the screenshot,
+bracketed by fresh display geometry, resolution, application identity, and window
+z-order checks. Only an accepted second tree publishes executable observation IDs.
+Control signatures retain hierarchy, full labels/bounds, focus, enabled state, and
+nonsecure editable values while ignoring scoped IDs, enumeration order, and numeric
+progress values. Graphics-only apps keep window-identity checks without requiring
+pixel equality. Rejected screenshots are deleted and removed from the task ledger.
+
+Consistency recovery uses local cancellable backoff and a five-second retry budget;
+settling calls pass their remaining budget rather than stacking another five seconds.
+Already-running macOS reads may finish after that deadline; no additional attempt is
+started, and only a matched pair can be accepted. Persistent changes return
+`observation_unstable` before any planning, fallback, action replay, or completion.
+Pause discards unfinished pairs; Resume starts fresh, while revoked generations
+cannot publish. Diagnostics contain only counts, fixed rejection categories, and
+elapsed time, with no captured content or secrets.
+
+Fake-provider Swift fixtures cover each bracketing boundary, control changes,
+menus/sheets, graphics-only metadata, ID/order churn, progress values, deadlines,
+slow reads, cancellation, Pause/Resume, and ownership revocation. Python fixtures
+cover shared settling budgets and failure before provider requests or action delivery.
+Full offline suites and signed-bundle checks pass. No fixer, live-control tester,
+Chrome interaction, live desktop task, or live ACP check was run; live accuracy
+validation remains incomplete. These checks do not make the two macOS APIs atomic.

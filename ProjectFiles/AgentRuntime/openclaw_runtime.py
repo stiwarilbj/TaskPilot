@@ -14,6 +14,7 @@ import base64
 from collections import deque
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -839,7 +840,15 @@ def wait_for_screen_change(display_id: int, before: dict[str, Any], action: dict
     polls = 0
     try:
         while True:
-            current = bridge_call("observe", display_id)
+            remaining = deadline - time.monotonic()
+            if latest is not None and remaining <= 0:
+                reason = "bounded_wait_elapsed"
+                break
+            # The native consistency loop shares this wait's remaining budget.
+            # An unstable capture is not a provider failure or permission to use
+            # an older revision (native observation authority was invalidated).
+            current = bridge_call("observe", display_id,
+                                  consistency_budget_ms=max(1, min(5000, math.ceil(remaining * 1000))))
             discard_observation_image(latest)
             latest = current
             polls += 1

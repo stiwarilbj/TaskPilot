@@ -8,17 +8,23 @@ final class TaskLease: @unchecked Sendable {
     private let lock = NSRecursiveLock()
     private var value: State = .running
     private var discarded = 0
+    private var suspensions = 0
     private var artifacts: Set<URL> = []
     init(id: String = UUID().uuidString) { self.id = id }
     var state: State { lock.lock(); defer { lock.unlock() }; return value }
     var staleWorkCount: Int { lock.lock(); defer { lock.unlock() }; return discarded }
-    func pause() { lock.lock(); defer { lock.unlock() }; if value == .running { value = .paused } }
+    var suspensionRevision: Int { lock.lock(); defer { lock.unlock() }; return suspensions }
+    func pause() { lock.lock(); defer { lock.unlock() }; if value == .running { value = .paused; suspensions += 1 } }
     func resume() { lock.lock(); defer { lock.unlock() }; if value == .paused { value = .running } }
     func revoke() { lock.lock(); defer { lock.unlock() }; if value != .retired { value = .draining } }
     func ownArtifact(_ url: URL) throws {
         lock.lock(); defer { lock.unlock() }
         guard value == .running || value == .paused else { try? FileManager.default.removeItem(at: url); throw CancellationError() }
         artifacts.insert(url)
+    }
+    func discardArtifact(_ url: URL) {
+        lock.lock(); artifacts.remove(url); lock.unlock()
+        try? FileManager.default.removeItem(at: url)
     }
     func retire() {
         lock.lock(); value = .retired; let files = artifacts; artifacts.removeAll(); lock.unlock()
