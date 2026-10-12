@@ -9,13 +9,14 @@ from observation_context import coordinates_are_ambiguous
 from expected_effects import validate_expectation, ExpectedEffectError
 from command_intents import explicit_operation, matches_explicit_request
 from local_text_recognition import coordinate_text_target, TextRecognitionError
+from task_inputs import InputReferenceError, reject_unbound_references
 
 from action_contract_generated import (
     CONTRACT_HASH, CONTRACT_VERSION, VALID_ACTIONS, KEYS,
     ActionContractError, validate_action,
 )
 
-VALIDATION_VERSION = 8
+VALIDATION_VERSION = 9
 
 
 class ResponseValidationError(RuntimeError):
@@ -127,6 +128,10 @@ def bind_command_outcomes(action: dict, result: dict) -> dict:
 
 
 def validate_response(value: dict[str, Any], purpose: str, observation: dict[str, Any] | None = None, ledger=None) -> dict[str, Any]:
+    try:
+        if ledger is not None: value = ledger.inputs.resolve(value)
+        else: reject_unbound_references(value)
+    except InputReferenceError as error: raise ResponseValidationError(str(error)) from error
     result = dict(value)
     for key in ("summary", "context_used", "visual_evidence", "intended_target", "output", "output_title", "reason", "message", "title", "check"):
         if key in result: string(result[key], key)

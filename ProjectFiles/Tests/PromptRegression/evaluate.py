@@ -425,6 +425,8 @@ def replay_case(case, pack, requests=None, script=None):
         original_route, planning, verification = runtime.routed_json_prompt, runtime.desktop_instruction, runtime.verification_instruction
         capability_context = runtime.task_capability_context
         compact_history = runtime.compact_history
+        original_ledger = runtime.TaskEvidenceLedger
+        input_scope = digest(["fixture-inputs", case["id"], case["task"]])[:16]
         completion = premature = False
         failure = None
         def route(router, client, instruction, image, purpose="planning", observation=None, ledger=None):
@@ -448,6 +450,7 @@ def replay_case(case, pack, requests=None, script=None):
                        "record_action_diagnostic": lambda *_: None,
                        "request_and_enter_user_input": forbidden, "largest_top_level_file": forbidden,
                        "task_capability_context": fixture_context,
+                       "TaskEvidenceLedger": lambda task, generation=None: original_ledger(task, generation, input_scope=input_scope),
                        "compact_history": lambda history: json.loads(json.dumps(compact_history(history), sort_keys=True)),
                        "desktop_instruction": lambda *args: apply_rules(planning(*args), pack, "planning"),
                        "verification_instruction": lambda *args: apply_rules(verification(*args), pack, "verification")}

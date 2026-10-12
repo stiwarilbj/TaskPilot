@@ -22,7 +22,8 @@ against the requirement/evidence ledger. Delivery acknowledgement and an
 unrelated screen change remain insufficient proof of the intended outcome.
 
 All templates use a fixed order: phase instructions, response examples, original
-task, capability context, current observation, phase-specific failed condition or
+task, optional [exact task-input catalogue](TaskInputs.md), capability context,
+current observation, phase-specific failed condition or
 completion claim, recent validated results, checklist evidence, then earlier
 confirmed facts. Task and data sections use canonical JSON serialization, with
 sorted object keys and preserved array order and contents. Embedded newlines or

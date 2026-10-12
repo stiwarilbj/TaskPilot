@@ -60,6 +60,7 @@ from local_text_recognition import (TEXT_RECOGNITION_VERSION, TextRecognitionErr
                                     validate_text_recognition, prompt_text_recognition, detail_images)
 from task_evidence import TaskEvidenceLedger, CHECKLIST_VERSION, LARGEST_PATTERN
 from expected_effects import ExpectedEffect, EXPECTED_EFFECT_VERSION, FILE_EFFECTS
+from task_inputs import TASK_INPUT_VERSION, input_reference_rules
 
 from response_validation import (
     VALIDATION_VERSION, ResponseValidationError, extract_json_object, bind_command_outcomes,
@@ -1960,7 +1961,7 @@ class ACPClient:
 def prompt_capability_context(context: dict[str, Any]) -> dict[str, Any]:
     # Rules and examples belong in one prompt section, not duplicated here.
     return {key: value for key, value in context.items()
-            if key not in {"context_rules", "relevant_examples"}}
+            if key not in {"context_rules", "relevant_examples"} and value not in ([], {})}
 
 
 def prompt_observation(observation: dict[str, Any], task: str = "") -> dict[str, Any]:
@@ -2028,6 +2029,9 @@ def desktop_instruction(
         else: examples[index] = template
         if not re.search(r'\b(?:write|append|overwrite|contents|containing)\b', task, re.I):
             examples = [example for example in examples if example['type'] != 'write_file']
+    if (not observation.get('applications') and not observation.get('elements')
+            and all(e['type'] in TRUSTED_NATIVE_ACTIONS | {'wait'} for e in examples)):
+        examples = [e for e in examples if e['type'] != 'wait']
     types = {example["type"] for example in examples}
     illustrated = [{"status": "act", "intended_target": "<target>",
                     "expected_result": "<effect>", "action": examples[0]}, *examples[1:]]
@@ -2066,7 +2070,7 @@ def desktop_instruction(
         condition = {**condition, "failed_action": recent[-1].get("action"), "result": recent[-1].get("result")}
     rules = decision_rules(bool(observation.get("elements")), condition,
                            bool(observation.get('text_recognition', {}).get('targets')))
-    bounds = [PROMPT_BOUNDS["wait"]]
+    bounds = [PROMPT_BOUNDS["wait"]] if 'wait' in types else []
     if observation.get('elements'):
         bounds.append('Expected checks: dialog_appeared(pid,title[,window_title]); field_value(element_id,value[,pid]); '
                       'file_contents(path,content[,encoding]); file_exists/directory_exists/path_absent(path). Unknown checks remain unconfirmed.')
@@ -2080,20 +2084,28 @@ def desktop_instruction(
     if types & {"read_file", "write_file"}:
         bounds.append("Paths: absolute or ~/.")
     if types & {"write_file", "run_command"}:
-        bounds.append("finish_after_action:true requests completion verification after this native action.")
+        bounds.append("finish_after_action:true requests final verification.")
     if 'run_command' in types and operation_kind:
         bounds.append('operation types: ' + COMMAND_OPERATION_REFERENCE + '.')
-    reference = ACTION_REFERENCE
-    if not observation.get('applications') and not observation.get('elements'):
-        reference = reference.split(' Keys:', 1)[0] + '\n'
+    reference = 'Other actions (examples are advisory): ' + ';'.join(
+        spec['reference'] for kind, spec in CONTRACT['actions'].items() if kind not in types) + '.\n'
+    if observation.get('applications') or observation.get('elements'):
+        reference += ' Keys:' + ACTION_REFERENCE.split(' Keys:', 1)[1]
     guidance = largest_downloads_guidance(task)
     progress = historical_progress(history, MAX_RECENT_ACTIONS, command_outcome_verified, task)
+    inputs = ledger.inputs if ledger is not None and ledger.inputs.entries else None
+    if inputs:
+        rules += input_reference_rules()
+        recent = [inputs.project(entry) for entry in recent]
+        if condition:
+            condition = {**condition, "failed_action": recent[-1].get("action")}
     return compile_prompt("recovery" if condition else "planning",
         instructions=rules + (checklist_instruction(ledger) if ledger else "") + (guidance + "\n" if guidance else ""),
-        examples="Illustrations: replace IDs/PID 1. Do not copy example IDs, paths, commands or text.\n"
+        examples="Illustrations, PID 1/IDs are placeholders. Do not copy example inputs.\n"
                  + "\n".join(json_data(example) for example in illustrated) + "\n" + " ".join(bounds) + "\n" + reference,
         task=task, context=prompt_capability_context(context), observation=prompt_observation(observation, task),
-        history=recent, progress=progress, checklist=ledger.prompt_state() if ledger else None, condition=condition)
+        history=recent, progress=progress, checklist=ledger.prompt_state() if ledger else None, condition=condition,
+        inputs=inputs.prompt_state() if inputs else None)
 
 
 def verification_instruction(
@@ -2113,14 +2125,21 @@ def verification_instruction(
         examples += ('Successful shape: {"verified":true,"coverage_complete":true,"message":"<exact requested result>",'
                      '"proofs":[{"requirement_id":"r1","evidence_ids":["e1"],"rationale":"<what the evidence proves>"}]}. '
                      'These IDs are illustrations; use supplied IDs.\n')
+    inputs = ledger.inputs if ledger is not None and ledger.inputs.entries else None
+    recent = compact_history(history)
+    if inputs:
+        recent = [inputs.project(entry) for entry in recent]
+        candidate = inputs.project(candidate)
     return compile_prompt("completion",
         instructions=COMPLETION_RULES + (verification_checklist_instruction(ledger) if ledger else "")
                      + ("Vision labels/crops are provisional text, not proof of control role, enabled state, focus or successful execution.\n"
                         if observation.get('text_recognition', {}).get('targets') else "")
-                     + (task_guidance + "\n" if task_guidance else ""), examples=examples,
+                     + (task_guidance + "\n" if task_guidance else "")
+                     + (input_reference_rules(completion=True) if inputs else ""), examples=examples,
         task=task, context=prompt_capability_context(task_capability_context(task, observation)),
-        observation=prompt_observation(observation, task), history=compact_history(history), progress=progress,
-        checklist=ledger.prompt_state() if ledger else None, candidate=candidate)
+        observation=prompt_observation(observation, task), history=recent, progress=progress,
+        checklist=ledger.prompt_state() if ledger else None, candidate=candidate,
+        inputs=inputs.prompt_state() if inputs else None)
 
 
 class ResponseRepairBudget:
@@ -2130,11 +2149,10 @@ class ResponseRepairBudget:
 
 def checklist_instruction(ledger: TaskEvidenceLedger) -> str:
     contract = (
-        "\nCHECKLIST: First decision: list ALL requirements with task quotes. "
+        "\nCHECKLIST: First decision: ALL requirements(source task quote,description,check). "
         "Checks: visual/answer(expected); file_read/file_exists/directory_exists/path_absent(path); "
-        "file_contents(path,content[,encoding]); file_written(path,content[,encoding,mode]); stdout_equals(text); "
+        "final file_contents(path,content[,encoding]); historical file_written adds mode; stdout_equals(text); "
         "command_executed(argv or command[,working_directory]); command_operation(operation). "
-        "file_contents: final; file_written: historical. "
 
     ) if not ledger.requirements else "\nCHECKLIST: Fulfill every requirement; pending/invalidated entries need evidence, not repeated uncertain mutations. "
     return contract
@@ -2294,7 +2312,7 @@ def routed_json_prompt(
     observation: dict[str, Any] | None = None,
     ledger: TaskEvidenceLedger | None = None,
 ) -> dict[str, Any]:
-    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, PROMPT_COMPILER_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation)], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
+    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, PROMPT_COMPILER_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, TASK_INPUT_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation)], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
     cached = getattr(client, "decision_cache", {})
     if cached.get("key") == key:
         value = validate_response(json.loads(json.dumps(cached["decision"])), purpose, observation, ledger)

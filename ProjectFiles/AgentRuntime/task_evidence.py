@@ -14,6 +14,7 @@ from copy import deepcopy
 from typing import Any
 
 from action_contract_generated import CONTRACT, ActionContractError, _field, validate_action, validate_outcome_check
+from task_inputs import TaskInputBindings
 
 CHECKLIST_VERSION = 3
 FILE_CHECKS = {"file_exists", "directory_exists", "path_absent", "file_contents"}
@@ -161,8 +162,9 @@ def validate_metadata(value: dict, purpose: str, ledger: TaskEvidenceLedger | No
 
 
 class TaskEvidenceLedger:
-    def __init__(self, task: str, generation: str | None = None) -> None:
+    def __init__(self, task: str, generation: str | None = None, *, input_scope: str | None = None) -> None:
         self.task, self.generation = task, generation
+        self.inputs = TaskInputBindings(task, scope=input_scope)
         self.requirements: dict[str, dict] = {}
         self.evidence: dict[str, dict] = {}
         self.coverage_complete = False
@@ -438,6 +440,6 @@ class TaskEvidenceLedger:
                              for key, e in self.evidence.items() if e["valid"]}}
 
     def fingerprint(self) -> str:
-        return digest([CHECKLIST_VERSION, self.task, self.generation, self.requirements,
+        return digest([CHECKLIST_VERSION, self.task, self.generation, self.inputs.fingerprint(), self.requirements,
                        {key: [e["fact_fingerprint"], e["action_fingerprint"], e["valid"], e["mutable"], e["origin"], e.get('effect_check')]
                         for key, e in self.evidence.items()}, self.coverage_complete])

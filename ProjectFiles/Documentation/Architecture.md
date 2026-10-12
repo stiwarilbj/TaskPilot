@@ -11,6 +11,9 @@ keeps reproduction controls distinct from recorded model comparisons.
 planning, recovery and completion contracts locally and separates instructions
 from canonical task evidence.
 
+[Exact task inputs](TaskInputs.md) retain immutable literal values in task memory
+and resolve model references before ordinary action validation and execution.
+
 Task completion is guarded by the runtime's private
 [requirement evidence ledger](TaskEvidence.md), including whole-request
 coverage and fresh proof for mutable outcomes.

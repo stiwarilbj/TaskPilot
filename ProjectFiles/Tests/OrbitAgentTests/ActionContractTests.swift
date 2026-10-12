@@ -54,7 +54,9 @@ final class ActionContractTests: XCTestCase {
         let executor = TaskToolExecutor()
         let actions: [[String: Any]] = [
             ["type": "write_file", "path": marker.path, "content": "unexpected", "create_parents": 1],
-            ["type": "run_command", "argv": ["/usr/bin/touch", marker.path], "timeout_seconds": true]
+            ["type": "run_command", "argv": ["/usr/bin/touch", marker.path], "timeout_seconds": true],
+            ["type": "write_file", "path": marker.path, "content": ["input_ref": "unresolved"]],
+            ["type": "run_command", "argv": ["/usr/bin/touch", ["input_ref": "unresolved"]]]
         ]
         for action in actions {
             do { _ = try await executor.perform(action: action); XCTFail("Invalid payload executed") }
@@ -67,7 +69,8 @@ final class ActionContractTests: XCTestCase {
         let display = DisplayDescriptor(id: 1, name: "fixture", x: 0, y: 0, width: 10, height: 10, isMain: true)
         let actions: [[String: Any]] = [
             ["type": "click", "pid": 42, "x": true, "y": 2],
-            ["type": "press"], ["type": "scroll", "delta_y": 0], ["type": "wait", "seconds": 1]
+            ["type": "press"], ["type": "scroll", "delta_y": 0], ["type": "wait", "seconds": 1],
+            ["type": "set_value", "element_id": "fixture:field", "text": ["input_ref": "unresolved"]]
         ]
         for action in actions {
             do { _ = try await controller.performStructured(action: action, on: display); XCTFail("Invalid action reached desktop delivery") }
