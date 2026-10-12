@@ -29,6 +29,7 @@ import request_policy as policy
 from provider_errors import ProviderRequestError
 from response_validation import extract_json_object, ResponseValidationError
 from action_contract_generated import CONTRACT_HASH
+from prompt_compiler import PROMPT_COMPILER_VERSION, EXAMPLE_MARKERS, REPAIR_HEADER, phase_header, prompt_phase
 from fixtures import seed_cases
 
 VERSION = 1
@@ -37,6 +38,7 @@ REPO = Path(__file__).resolve().parents[3]
 DEFAULT_ROOT = Path.home() / "Library/Application Support/TaskPilot/PromptRegression"
 SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 DIGEST = re.compile(r"[a-f0-9]{64}\Z")
+RULE_FIELDS = {"planning": "planning_rules", "recovery": "recovery_rules", "completion": "verification_rules"}
 
 
 class RecordingMismatch(BaseException):
@@ -195,14 +197,17 @@ def validate_corpus(corpus):
 
 def prompt_pack(label="current", **rules):
     return {"version": VERSION, "label": checked_slug(label), "runtime_revision": runtime_revision(),
-            "planning_rules": rules.get("planning_rules"), "verification_rules": rules.get("verification_rules")}
+            "prompt_compiler_version": PROMPT_COMPILER_VERSION,
+            **{field: rules.get(field) for field in RULE_FIELDS.values()}}
 
 
 def validate_pack(pack):
     checked_slug(pack.get("label"))
     if pack.get("version") != VERSION or pack.get("runtime_revision") != runtime_revision():
         raise ValueError("Prompt pack was built for another runtime; compare with the same executor version")
-    for field in ("planning_rules", "verification_rules"):
+    if type(pack.get("prompt_compiler_version")) is not int or pack["prompt_compiler_version"] != PROMPT_COMPILER_VERSION:
+        raise ValueError("Prompt compiler version does not match")
+    for field in RULE_FIELDS.values():
         value = pack.get(field)
         if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > 16000):
             raise ValueError("Prompt rules must be nonempty bounded text, or null for current rules")
@@ -210,15 +215,18 @@ def validate_pack(pack):
 
 
 def apply_rules(original, pack, purpose):
-    rules = pack[purpose + "_rules"]
+    phase = prompt_phase(original)
+    if (purpose == "planning") != (phase in {"planning", "recovery"}):
+        raise RecordingMismatch("prompt_phase_mismatch")
+    rules = pack.get(RULE_FIELDS[phase])
     if rules is None:
         return original
-    marker = "\nRELEVANT ACTION EXAMPLES:\n" if purpose == "planning" else "ORIGINAL TASK:\n"
+    marker = EXAMPLE_MARKERS[phase] + ":\n"
     if marker not in original:
         raise RecordingMismatch("prompt_contract_changed")
     # Replace the rule section only. Task, evidence, context examples and history
     # always come from the same production builder and fixture state.
-    return rules.rstrip() + "\n" + marker + original.split(marker, 1)[1]
+    return phase_header(phase) + "\n\n" + phase.upper() + " RULES:\n" + rules.rstrip() + "\n\n" + marker + original.split(marker, 1)[1]
 
 
 def fixture_image(frame):
@@ -372,7 +380,7 @@ class RecordedClient:
 
     def prompt(self, instruction, image):
         index = self.prompt_calls
-        fields = {"purpose": self.purpose, "repair": instruction.startswith("Repair your previous response"),
+        fields = {"purpose": self.purpose, "repair": instruction.startswith(REPAIR_HEADER),
                   "model": self.selected_model, "instruction_sha256": hashlib.sha256(instruction.encode()).hexdigest(),
                   "image_sha256": hashlib.sha256(image.read_bytes()).hexdigest()}
         if self.script is not None:
@@ -533,7 +541,7 @@ def evaluate(corpus, pack, recording):
         results.append({**result, "trial": run["trial"]})
     return {"version": VERSION, "source": recording["source"], "label": pack["label"],
             "corpus_sha256": digest(corpus), "prompt_pack_sha256": digest(pack),
-            "rules_sha256": digest({k: pack[k] for k in ("planning_rules", "verification_rules")}),
+            "rules_sha256": digest({k: pack.get(k) for k in RULE_FIELDS.values()}),
             "runtime_revision": runtime_revision(), "runs": results,
             "measurement": ("in-memory fixture outcomes; " + ("scripted response time" if recording["source"] == "scripted_control" else "recorded terminal-response time")
                             + " plus simulated local waits; replay wall time is separate"),

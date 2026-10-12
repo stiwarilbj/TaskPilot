@@ -10,7 +10,8 @@ does not change the interface or require end-user setup.
 Fixtures replace the home-directory context with `/fixture` and canonicalize
 JSON dictionary ordering, including compacted history. This keeps sanitized
 prompt inputs identical across users, saved files, and Python hash seeds.
-Production prompt content and serialization are not modified.
+Production phase compilation already canonicalizes JSON object ordering;
+fixtures also normalize the home-directory context without changing evidence.
 
 ## Create the private corpus
 
@@ -46,9 +47,11 @@ it does not measure an improvement in model accuracy.
 
 Freeze `corpus.json` before recording either variant. `baseline-prompt.json`
 and `candidate-prompt.json` identify the executor revision and rule sections.
-`null` uses the current production rules. A proposed `planning_rules` or
-`verification_rules` string replaces that rule section while preserving the
-same task evidence, context examples, and validated history. This tool does
+`null` uses the current production rules. Proposed `planning_rules`,
+`recovery_rules` and `verification_rules` strings replace only their matching
+phase's rule section while preserving the phase, task evidence, examples and
+validated history. Planning overrides do not replace recovery rules. Packs
+also bind the prompt compiler version. This tool does
 not load or execute candidate Python code. A changed executor needs a new
 experiment; do not compare different executor versions as a prompt-only change.
 

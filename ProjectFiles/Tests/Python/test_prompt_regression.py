@@ -50,6 +50,49 @@ class PromptRegressionTests(unittest.TestCase):
                 self.assertEqual(result["duplicate_actions"], 0)
                 self.assertEqual(result["premature_completion"], False)
 
+    def test_prompt_rule_overrides_are_scoped_to_the_compiled_phase(self):
+        runtime = regression.runtime
+        observation = {'elements': [], 'applications': []}
+        failed = [{'action': {'type': 'press', 'element_id': 'old:save'},
+                   'result': {'error_code': 'stale_target', 'outcome': 'rejected', 'message': 'Moved before delivery'}}]
+        planning = runtime.desktop_instruction('Click Save', observation, [])
+        recovery = runtime.desktop_instruction('Click Save', observation, failed)
+        completion = runtime.verification_instruction('Click Save', {'status': 'done'}, observation, failed)
+        pack = regression.prompt_pack('candidate', planning_rules='New planning rules')
+        self.assertEqual(regression.apply_rules(recovery, pack, 'planning'), recovery)
+        self.assertEqual(regression.apply_rules(completion, pack, 'verification'), completion)
+        self.assertIn('New planning rules', regression.apply_rules(planning, pack, 'planning'))
+        pack = regression.prompt_pack('candidate', recovery_rules='New recovery rules', verification_rules='New completion rules')
+        self.assertEqual(regression.apply_rules(planning, pack, 'planning'), planning)
+        changed = regression.apply_rules(recovery, pack, 'planning')
+        self.assertIn('New recovery rules', changed)
+        self.assertEqual(changed.split('RELEVANT ACTION EXAMPLES:', 1)[1], recovery.split('RELEVANT ACTION EXAMPLES:', 1)[1])
+        self.assertEqual(regression.prompt_phase(changed), 'recovery')
+        self.assertIn('New completion rules', regression.apply_rules(completion, pack, 'verification'))
+
+    def test_real_loop_compiles_failure_and_completion_templates_without_extra_calls(self):
+        planning, verification = regression.runtime.desktop_instruction, regression.runtime.verification_instruction
+        prompts = []
+        def capture(builder, *args):
+            result = builder(*args); prompts.append(result); return result
+        with mock.patch.object(regression.runtime, 'desktop_instruction', side_effect=lambda *args: capture(planning, *args)), \
+             mock.patch.object(regression.runtime, 'verification_instruction', side_effect=lambda *args: capture(verification, *args)):
+            result, requests = self.scripted('moved-control')
+        self.assertTrue(result['success'])
+        self.assertEqual([regression.prompt_phase(p) for p in prompts], ['planning', 'recovery', 'recovery', 'completion'])
+        self.assertEqual(len(requests), 4)
+        self.assertIn('stale_target', prompts[1])
+        self.assertIn('FAILED CONDITION', prompts[1])
+        self.assertNotIn('FAILED CONDITION', prompts[-1])
+        self.assertEqual(result['duplicate_actions'], 0)
+
+    def test_regression_pack_binds_compiler_version_and_recovery_rules(self):
+        changed = regression.prompt_pack('candidate', recovery_rules='Changed recovery rules')
+        self.assertNotEqual(regression.digest(changed), regression.digest(self.pack))
+        changed['prompt_compiler_version'] += 1
+        with self.assertRaisesRegex(ValueError, 'Prompt compiler version'):
+            regression.validate_pack(changed)
+
     def test_wrong_control_and_premature_verifier_claim_are_scored_independently(self):
         result, _ = self.scripted("wrong-window", "baseline")
         self.assertTrue(result["completed"])

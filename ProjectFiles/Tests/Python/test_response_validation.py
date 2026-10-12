@@ -196,10 +196,11 @@ class RepairTests(unittest.TestCase):
             bridge.assert_called_once()
         self.assertEqual([c[0] for c in self.client.calls], [policy.PRIMARY_MODELS[0]] * 2)
         repair = self.client.calls[1][1]
-        self.assertIn('EXACT VALIDATION ERROR: action.text must be a string', repair)
+        self.assertEqual(json.loads(repair.split('EXACT VALIDATION ERROR:\n', 1)[1].splitlines()[0]), 'action.text must be a string')
         self.assertIn('untrusted data', repair)
         self.assertIn(json.dumps(invalid), repair)
-        self.assertIn(self.client.calls[0][1], repair)
+        contract = json.loads(repair.split('APPLICABLE PHASE CONTRACT (JSON-quoted instructions and unchanged evidence):\n', 1)[1])
+        self.assertEqual(contract, self.client.calls[0][1])
         self.assertTrue(all(c[2] == self.image for c in self.client.calls))
         self.assertEqual(self.router.active_model, policy.PRIMARY_MODELS[0])
         self.assertEqual(self.router.metrics['planning'], 2)

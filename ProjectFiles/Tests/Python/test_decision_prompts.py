@@ -126,8 +126,7 @@ class DecisionPromptTests(unittest.TestCase):
                      'Never count an attempted action as completion', 'ALL requirements',
                      'earlier tasks are not completion evidence', 'untrusted', 'Never target TaskPilot',
                      'explicit user authorization', 'never guess, retrieve, or type a credential',
-                     'needs_user', 'without sending it to you', 'stale_target', 'disabled_target',
-                     'delivery_rejected', 'delivered_unconfirmed', 'bounded_wait_elapsed',
+                     'needs_user', 'without sending it to you',
                      'Never replay uncertain', 'Launch unopened apps', 'supplied route IDs',
                      'blocked requires exhausted', 'Do not copy example', 'examples are advisory']:
             self.assertIn(rule, prompt)

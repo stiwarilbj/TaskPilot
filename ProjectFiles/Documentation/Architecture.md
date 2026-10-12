@@ -7,6 +7,10 @@ using the [offline prompt regression workflow](PromptRegression.md). It
 exercises the existing runtime without desktop events or provider calls and
 keeps reproduction controls distinct from recorded model comparisons.
 
+[Execution-phase prompt compilation](PromptCompilation.md) selects distinct
+planning, recovery and completion contracts locally and separates instructions
+from canonical task evidence.
+
 Task completion is guarded by the runtime's private
 [requirement evidence ledger](TaskEvidence.md), including whole-request
 coverage and fresh proof for mutable outcomes.
