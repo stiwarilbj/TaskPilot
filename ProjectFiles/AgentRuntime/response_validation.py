@@ -6,13 +6,14 @@ import math
 from typing import Any
 from task_evidence import EvidenceValidationError, validate_metadata
 from observation_context import coordinates_are_ambiguous
+from expected_effects import validate_expectation, ExpectedEffectError
 
 from action_contract_generated import (
     CONTRACT_HASH, CONTRACT_VERSION, VALID_ACTIONS, KEYS,
     ActionContractError, validate_action,
 )
 
-VALIDATION_VERSION = 5
+VALIDATION_VERSION = 6
 
 
 class ResponseValidationError(RuntimeError):
@@ -100,8 +101,11 @@ def normalize_action(value: Any, observation: dict[str, Any] | None = None) -> d
 
 def validate_response(value: dict[str, Any], purpose: str, observation: dict[str, Any] | None = None, ledger=None) -> dict[str, Any]:
     result = dict(value)
-    for key in ("summary", "context_used", "visual_evidence", "intended_target", "expected_result", "output", "output_title", "reason", "message", "title", "check"):
+    for key in ("summary", "context_used", "visual_evidence", "intended_target", "output", "output_title", "reason", "message", "title", "check"):
         if key in result: string(result[key], key)
+    if 'expected_result' in result:
+        try: result['expected_result'] = validate_expectation(result['expected_result'], observation)
+        except ExpectedEffectError as error: raise ResponseValidationError(str(error)) from error
     for key in ("completed_requirements", "remaining_requirements", "missing"):
         if key in result and (not isinstance(result[key], list) or any(not isinstance(item, str) for item in result[key])):
             fail(key, "must be a list of strings")

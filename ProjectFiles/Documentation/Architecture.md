@@ -49,6 +49,7 @@ TaskPilot/
 ## Naming rules
 
 Private target context and delivery checks are described in [Target relationships](TargetRelationships.md).
+Local postconditions and read-only checks are described in [Executable expected results](ExpectedEffects.md).
 
 - Types say what they own or do. `TaskPilotCoordinator` coordinates the app, while `TaskToolExecutor` executes native tools.
 - Views describe the screen they render, such as `TaskQueueHistoryView`.

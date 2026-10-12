@@ -893,18 +893,19 @@ final class AccessibilityController {
             ? "accessibility" : (requiresHIDFallback(pid) ? "hid" : (["click", "double_click", "scroll"].contains(type) ? "session_event" : "process_event"))
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
         var verified = false
+        var changed = false
         repeat {
             guard !inputIsCancelled() else { throw AccessibilityActionError.cancelled }
             try Task.checkCancellation()
             if type == "focus", let record {
                 verified = intendedElementHasFocus(record)
-            } else { verified = actionState(pid) != before }
-            if verified { break }
+            } else { changed = actionState(pid) != before }
+            if verified || changed { break }
             try await Task.sleep(for: .milliseconds(80))
         } while ContinuousClock.now < deadline
-        return ["message": verified ? "\(message); observed the action effect" : "\(message); delivery acknowledged, effect not confirmed",
+        return ["message": verified ? "\(message); confirmed focus" : "\(message); delivery acknowledged, intended effect not confirmed",
                 "delivery_method": method, "outcome": verified ? "verified" : "delivered_unconfirmed",
-                "verification_scope": "action_effect", "pid": Int(pid)]
+                "verification_scope": verified ? "focus" : "delivery_only", "pid": Int(pid)]
     }
 
     func perform(action: [String: Any], on display: DisplayDescriptor, planningRevision: String? = nil) async throws -> String {

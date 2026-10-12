@@ -13,9 +13,9 @@ import re
 from copy import deepcopy
 from typing import Any
 
-from action_contract_generated import CONTRACT, ActionContractError, _field, validate_action
+from action_contract_generated import CONTRACT, ActionContractError, _field, validate_action, validate_outcome_check
 
-CHECKLIST_VERSION = 1
+CHECKLIST_VERSION = 2
 FILE_CHECKS = {"file_exists", "directory_exists", "path_absent", "file_contents"}
 READ_PATTERN = r'\s*(?:read|show|print)\s+(?:the\s+)?(?:contents of\s+)?file\s+(["`\'])((?:/|~/)(?:(?!\1)[^\n])+)\1\s*[.!]?\s*'
 LARGEST_PATTERN = (r"\s*(?:(?:what(?:['’]s| is)|which is) (?:the |my )?|(?:find|tell me|show me) (?:the )?)"
@@ -283,6 +283,19 @@ class TaskEvidenceLedger:
             if actual.get("text_sha256") != hashlib.sha256(check["text"].encode()).hexdigest(): return
             self.add_evidence({"type": kind, "text": check["text"]}, action=action)
 
+    def record_effect(self, check: dict, actual: dict, action: dict | None = None) -> None:
+        """Only validated local checks enter this path; model claims do not."""
+        try: check = validate_outcome_check(check)
+        except ActionContractError: return
+        if check.get('type') not in FILE_CHECKS: return
+        if any(self.matches(check, evidence) for evidence in self.evidence.values()): return
+        self.checks += 1
+        self.readback = True
+        previous = set(self.evidence)
+        self.record_check(check, actual, action)
+        for identifier in set(self.evidence) - previous:
+            self.evidence[identifier]['effect_check'] = deepcopy(check)
+
     def matches(self, check: dict, evidence: dict, *, semantic=False) -> bool:
         if not evidence["valid"] or evidence["generation"] != self.generation: return False
         fact, kind = evidence["fact"], check["type"]
@@ -360,11 +373,20 @@ class TaskEvidenceLedger:
             if requirement["check"]["type"] in {"answer", "visual", "command_executed", "stdout_equals", "file_append", "file_written"}: continue
             for evidence in reversed(list(self.evidence.values())):
                 action = evidence["action"]
-                if not action or not evidence["mutable"]: continue
+                if not action or not evidence["mutable"] or evidence.get('effect_check'): continue
                 # Match a revoked fact's identity without promoting it to proof.
                 if self.matches(requirement["check"], {**evidence, "valid": True}):
                     selected[digest(action)] = action
                     break
+        return list(selected.values())
+
+    def recheck_effects(self) -> list[dict]:
+        selected = {}
+        for requirement in self.requirements.values():
+            for evidence in self.evidence.values():
+                check = evidence.get('effect_check')
+                if check and self.matches(requirement['check'], {**evidence, 'valid': True}):
+                    selected[digest(check)] = deepcopy(check)
         return list(selected.values())
 
     def prompt_state(self) -> dict:
@@ -381,5 +403,5 @@ class TaskEvidenceLedger:
 
     def fingerprint(self) -> str:
         return digest([CHECKLIST_VERSION, self.task, self.generation, self.requirements,
-                       {key: [e["fact_fingerprint"], e["action_fingerprint"], e["valid"], e["mutable"], e["origin"]]
+                       {key: [e["fact_fingerprint"], e["action_fingerprint"], e["valid"], e["mutable"], e["origin"], e.get('effect_check')]
                         for key, e in self.evidence.items()}, self.coverage_complete])

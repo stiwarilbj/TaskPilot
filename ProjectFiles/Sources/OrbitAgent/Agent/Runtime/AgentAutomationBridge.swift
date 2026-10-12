@@ -69,6 +69,13 @@ final class AgentAutomationBridge {
                 return ["task_generation_id": lease.id, "kind": "bridge_response",
                         "request_id": requestID, "ok": true, "result": lease.actionReceipts.lookup(id)]
             }
+            if method == "check_effect" {
+                guard let check = params["check"] else { throw BridgeError.invalidRequest("Missing expected effect check") }
+                let result = try await taskTools.checkOutcome(check)
+                try lease.check()
+                return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
+                        "ok": true, "result": result]
+            }
             var validatedAction: [String: Any]?
             if method == "act" {
                 guard let input = params["action"] as? [String: Any] else {

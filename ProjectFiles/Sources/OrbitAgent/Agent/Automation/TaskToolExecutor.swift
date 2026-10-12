@@ -68,6 +68,26 @@ final class TaskToolExecutor {
         } else if action["type"] as? String == "run_command" {
             requested = (action["checks"] as? [[String: Any]] ?? []).filter { $0["type"] as? String != "stdout_equals" }
         } else { throw TaskToolError.invalidAction("Only native file outcomes can be rechecked") }
+        return try await checkOutcomes(requested)
+    }
+
+    /// Read-only expected effect check; no action dispatch or command launch.
+    func checkOutcome(_ input: Any) async throws -> [String: Any] {
+        let check: [String: Any]
+        do { check = try ActionContract.validateOutcomeCheck(input) }
+        catch { throw TaskToolError.invalidAction(error.localizedDescription) }
+        guard check["type"] as? String != "stdout_equals" else {
+            throw TaskToolError.invalidAction("Standalone checks cannot inspect command output")
+        }
+        return try await checkOutcomes([check])
+    }
+
+    private func checkOutcomes(_ input: [[String: Any]]) async throws -> [String: Any] {
+        var requested: [[String: Any]] = []
+        for check in input {
+            do { requested.append(try ActionContract.validateOutcomeCheck(check)) }
+            catch { throw TaskToolError.invalidAction(error.localizedDescription) }
+        }
         var checks: [[String: Any]] = []
         for check in requested {
             try await TaskOwnership.checkpoint()

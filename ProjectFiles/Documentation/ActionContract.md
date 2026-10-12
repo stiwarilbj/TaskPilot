@@ -4,6 +4,8 @@
 parameters, constraints, safe executor defaults, normalization, key codes,
 modifier aliases, examples, prompt bounds, and command outcome checks. Shared
 field and limit references prevent values from drifting within the definition.
+Standalone expected file checks reuse the generated outcome-check validator in
+both languages. Their native entrypoint performs read-only inspection only.
 Optional metadata remains compatible. Defaults are read by executors; validation
 never supplies missing targets, commands, paths, or content.
 

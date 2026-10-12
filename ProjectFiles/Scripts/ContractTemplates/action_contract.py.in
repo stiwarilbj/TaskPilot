@@ -124,6 +124,16 @@ def action_example(kind):
     return copy.deepcopy(CONTRACT['actions'][kind]['example'])
 
 
+def validate_outcome_check(value, path='check'):
+    _field(value, CONTRACT['fields']['checks']['items'], path)
+    return copy.deepcopy(value)
+
+
+def validate_contract_field(name, value, path):
+    _field(value, CONTRACT['fields'][name], path)
+    return value
+
+
 def action_default(kind, field):
     return CONTRACT['actions'][kind]['defaults'][field]
 

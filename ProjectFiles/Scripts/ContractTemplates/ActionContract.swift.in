@@ -153,3 +153,8 @@
         try validateParameters(action, kind: kind)
         return action
     }
+    static func validateOutcomeCheck(_ value: Any, path: String = "check") throws -> [String: Any] {
+        let fields = definition["fields"] as! [String: [String: Any]]
+        try field(value, fields["checks"]!["items"] as! [String: Any], path)
+        return value as! [String: Any]
+    }
