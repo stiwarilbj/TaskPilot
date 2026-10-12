@@ -15,6 +15,7 @@ final class ObservationConsistencyTests: XCTestCase {
         var images: [URL] = []
         var refreshes: [Bool] = []
         var sleeps: [Double] = []
+        var stageBudgets: [Double] = []
         var summary = ObservationConsistencyDiagnostics()
         var cancelled = false
         var checkpoints = 0
@@ -31,7 +32,8 @@ final class ObservationConsistencyTests: XCTestCase {
                     if self.cancelled { throw CancellationError() }
                 },
                 suspensionRevision: { self.epoch }, scene: { self.scene },
-                stage: {
+                stage: { remaining in
+                    self.stageBudgets.append(remaining)
                     self.stages += 1; self.onStage?()
                     return Candidate(number: self.stages, signature: self.controls)
                 }, signature: { $0.signature }, capture: { refresh in
@@ -60,6 +62,16 @@ final class ObservationConsistencyTests: XCTestCase {
         XCTAssertEqual(world.refreshes, [false])
         XCTAssertTrue(world.discarded.isEmpty)
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testSubtreeExpansionSharesTheExistingCaptureDeadline() async throws {
+        let world = World()
+        world.onStage = { world.time += 0.5 }
+        world.onCapture = { world.time += 0.75 }
+        _ = try await world.collect(budget: 2)
+        XCTAssertEqual(world.stageBudgets, [2, 0.75])
+        XCTAssertEqual(world.captures, 1)
+        XCTAssertEqual(world.summary.elapsedSeconds, 1.75)
     }
 
     func testCaptureGeometryMismatchRefreshesWithoutPublishingWrongTargets() async throws {

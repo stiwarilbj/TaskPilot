@@ -112,6 +112,14 @@ final class AgentAutomationBridge {
                     }
                     budget = number.doubleValue / 1000
                 } else { budget = 5 }
+                let keywords: [String]
+                if let supplied = params["observation_keywords"] {
+                    guard let values = supplied as? [String], values.count <= 48,
+                          values.allSatisfy({ !$0.isEmpty && $0.count <= 64 && $0.allSatisfy({ $0.isLetter || $0.isNumber }) }) else {
+                        throw BridgeError.invalidRequest("observation_keywords must be at most 48 bounded words")
+                    }
+                    keywords = values
+                } else { keywords = [] }
                 var observationDisplay = display
                 var capturedCoordinates: ScreenCoordinateMapping?
                 let (accepted, screenshotURL) = try await ObservationConsistency.collect(
@@ -122,9 +130,9 @@ final class AgentAutomationBridge {
                         let current = try self.targetDisplay(from: params)
                         return try self.accessibility.observationScene(on: current)
                     },
-                    stage: {
+                    stage: { remaining in
                         observationDisplay = try self.targetDisplay(from: params)
-                        return try self.accessibility.stageSnapshot(on: observationDisplay)
+                        return try self.accessibility.stageSnapshot(on: observationDisplay, keywords: keywords, budget: remaining)
                     },
                     signature: { $0.consistencySignature },
                     capture: { refresh in
@@ -146,6 +154,9 @@ final class AgentAutomationBridge {
                     })
                 let snapshot = accepted.snapshot
                 try TaskOwnership.check()
+                let expansion = snapshot.completeness["local_expansion"] as? [String: Int] ?? [:]
+                let gaps = snapshot.completeness["reason_counts"] as? [String: Int] ?? [:]
+                observationLogger.debug("Collected controls: \(snapshot.elements.count), gap scopes: \(gaps.values.reduce(0, +)), expanded subtrees: \(expansion["subtrees_attempted", default: 0]), read retries: \(expansion["read_retries", default: 0])")
                 guard let coordinates = capturedCoordinates else {
                     lease.discardArtifact(screenshotURL)
                     throw ScreenCoordinateError.invalidGeometry
@@ -162,6 +173,7 @@ final class AgentAutomationBridge {
                     "installed_applications": snapshot.installedApplications,
                     "system_context": snapshot.systemContext,
                     "elements": snapshot.elements,
+                    "observation_completeness": snapshot.completeness,
                     "agent_tools": [
                         "read_file": "Read a text or binary file by path; binary content is returned as base64.",
                         "write_file": "Create, overwrite, or append a file by path.",

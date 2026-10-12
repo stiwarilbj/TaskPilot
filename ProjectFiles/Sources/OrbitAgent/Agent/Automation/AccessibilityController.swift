@@ -15,6 +15,7 @@ struct AccessibilitySnapshot {
     let applications: [[String: Any]]
     let installedApplications: [[String: Any]]
     let systemContext: [String: Any]
+    let completeness: [String: Any]
 }
 
 struct StagedAccessibilitySnapshot {
@@ -159,6 +160,20 @@ final class AccessibilityController {
         let frame: CGRect
     }
 
+    private struct ObservationNode {
+        let element: AXUIElement
+        let pid: pid_t
+        let appName: String
+        let application: AutomationApplicationIdentity
+        let focusedElement: AXUIElement?
+        let ownerWindow: AXUIElement?
+        let windowRecords: [SnapshotWindowRecord]
+        func child(_ element: AXUIElement) -> Self {
+            Self(element: element, pid: pid, appName: appName, application: application,
+                 focusedElement: focusedElement, ownerWindow: ownerWindow, windowRecords: windowRecords)
+        }
+    }
+
     private struct TaskApplicationBaseline {
         let display: DisplayDescriptor
         let runningPIDs: Set<pid_t>
@@ -192,7 +207,6 @@ final class AccessibilityController {
     private var taskApplicationBaseline: TaskApplicationBaseline?
     private var taskDisplayOverrideID: CGDirectDisplayID?
     private let controllerPID = getpid()
-    private let maxElements = 640
     private let passiveLaunchWait: Duration = .seconds(4)
     private let activatedLaunchWait: Duration = .seconds(16)
     private lazy var installedApplicationEntries = discoverInstalledApplications()
@@ -367,7 +381,8 @@ final class AccessibilityController {
     // observations use stageSnapshot and explicitly commit the accepted pair.
     func snapshot(on display: DisplayDescriptor) -> AccessibilitySnapshot {
         guard let staged = try? stageSnapshot(on: display) else {
-            return AccessibilitySnapshot(revision: "", elements: [], applications: [], installedApplications: [], systemContext: [:])
+            return AccessibilitySnapshot(revision: "", elements: [], applications: [], installedApplications: [], systemContext: [:],
+                completeness: ["version": 1, "state": "partial", "reason_counts": ["collection_failed": 1]])
         }
         try? staged.publish()
         return staged.snapshot
@@ -418,28 +433,56 @@ final class AccessibilityController {
         return String(decoding: try JSONSerialization.data(withJSONObject: scene, options: [.sortedKeys]), as: UTF8.self)
     }
 
-    func stageSnapshot(on display: DisplayDescriptor) throws -> StagedAccessibilitySnapshot {
+    func stageSnapshot(on display: DisplayDescriptor, keywords: [String] = [], budget: TimeInterval = 1.5) throws -> StagedAccessibilitySnapshot {
+        let collection = ObservationCollection<ObservationNode>(budget: min(1.5, max(0, budget)))
+        let reads = ObservationAccessibilityReads.Context(deadline: collection.deadline, now: collection.now,
+            report: { collection.issue($0, attribute: $1, code: $2) }, retried: { collection.retriedRead() },
+            shouldRetry: { collection.scope.priority > 0 })
+        return try ObservationAccessibilityReads.$current.withValue(reads) {
+            try stageSnapshot(on: display, keywords: keywords, collection: collection)
+        }
+    }
+
+    private func stageSnapshot(on display: DisplayDescriptor, keywords: [String], collection: ObservationCollection<ObservationNode>) throws -> StagedAccessibilitySnapshot {
         try TaskOwnership.check()
         let suspension = TaskOwnership.current?.suspensionRevision
         var newMap: [String: ElementRecord] = [:]
         var structureCache: [UInt: AutomationStructureNode] = [:]
         var elementRows: [[String: Any]] = []
         var applicationRows: [[String: Any]] = []
-        var nextID = 1
+        var roots: [ObservationCollection<ObservationNode>.Entry] = []
         let revision = UUID().uuidString
         var observedGraphics: [pid_t: [AutomationGraphicsWindow]] = [:]
         var observedApps: [pid_t: AutomationApplicationIdentity] = [:]
 
         let apps = orderedApplicationsForSnapshot(on: display)
 
-
-        for app in apps {
+        func collectRoots(expand: Bool) throws {
+            try collection.collect(roots: roots, revision: revision, expand: expand, check: { try TaskOwnership.check() },
+                equal: { CFEqual($0.element, $1.element) }, inspect: { entry, id in
+                    try self.inspectObservation(entry: entry, id: id, keywords: keywords, map: &newMap,
+                        rows: &elementRows, revision: revision, structureCache: &structureCache)
+                }, children: { entry, offset, count in
+                    self.observationChildren(entry: entry, offset: offset, count: count, collection: collection)
+                })
+            roots.removeAll(keepingCapacity: true)
+        }
+        for (appIndex, app) in apps.enumerated() {
             try TaskOwnership.check()
             let pid = app.processIdentifier
+            let appPriority = (appIndex == 0 ? 120 : 0) + (app.isActive ? 80 : 0)
+                + AutomationObservationPolicy.keywordScore(app.localizedName ?? "", keywords: keywords)
+            collection.scope = .init(pid: Int(pid), priority: appPriority)
             let appElement = AXUIElementCreateApplication(pid)
-            let windows = attribute(appElement, kAXWindowsAttribute) as? [AXUIElement] ?? []
+            let windowValue = attribute(appElement, kAXWindowsAttribute)
+            let windows = windowValue as? [AXUIElement] ?? []
+            if windowValue != nil, !(windowValue is [AXUIElement]) {
+                collection.issue("accessibility_incomplete", attribute: kAXWindowsAttribute)
+            }
             let visibleWindows = windows.filter { window in
-                guard let frame = frame(of: window) else { return false }
+                guard let frame = frame(of: window) else {
+                    collection.issue("accessibility_incomplete", attribute: "AXWindowBounds"); return false
+                }
                 return frame.intersects(display.frame)
             }
             let graphics = graphicsWindows(of: pid).filter { $0.frame.intersects(display.frame) }
@@ -457,6 +500,11 @@ final class AccessibilityController {
                     focused: index == focusedIndex, topmost: index == topmostIndex, frame: rectangle)
             }
             guard Self.hasObservableWindow(accessibilityCount: visibleWindows.count, graphicsCount: cgFrames.count) else { continue }
+            if visibleWindows.isEmpty {
+                collection.issue("accessibility_unavailable", attribute: kAXWindowsAttribute)
+            } else if cgFrames.count > visibleWindows.count {
+                collection.issue("accessibility_incomplete", attribute: kAXWindowsAttribute)
+            }
             observedGraphics[pid] = graphics
             let appIdentity = applicationIdentity(app)
             observedApps[pid] = appIdentity
@@ -482,40 +530,37 @@ final class AccessibilityController {
 
             // Menu bars and focused fields are not necessarily descendants of
             // AXWindows. Collect them first so large web trees cannot hide them.
-            var roots: [AXUIElement] = []
+            var transientRoots: [AXUIElement] = []
             let focusedElement = accessibilityElement(appElement, kAXFocusedUIElementAttribute)
             if let focused = focusedElement,
                ["AXTextField", "AXTextArea", "AXSecureTextField"].contains(stringAttribute(focused, kAXRoleAttribute) ?? ""),
-               frame(of: focused)?.intersects(display.frame) == true { roots.append(focused) }
-            if let menu = accessibilityElement(appElement, kAXMenuBarAttribute) { roots.append(menu) }
-            roots += (attribute(appElement, kAXChildrenAttribute) as? [AXUIElement] ?? []).filter {
+               frame(of: focused)?.intersects(display.frame) == true { transientRoots.append(focused) }
+            if let menu = accessibilityElement(appElement, kAXMenuBarAttribute) { transientRoots.append(menu) }
+            transientRoots += (attribute(appElement, kAXChildrenAttribute) as? [AXUIElement] ?? []).filter {
                 ["AXMenu", "AXSheet"].contains(stringAttribute($0, kAXRoleAttribute) ?? "")
             }
-            for root in roots {
-                walk(element: root, pid: pid, appName: app.localizedName ?? "Unknown app",
-                     application: appIdentity,
-                     focusedElement: focusedElement,
-                     depth: 0, nextID: &nextID, map: &newMap, rows: &elementRows,
-                     revision: revision, parentID: nil, ownerWindow: nil, windowRecords: windowRecords, structureCache: &structureCache)
+            for root in transientRoots {
+                roots.append(.init(node: ObservationNode(element: root, pid: pid, appName: app.localizedName ?? "Unknown app",
+                    application: appIdentity, focusedElement: focusedElement, ownerWindow: nil, windowRecords: windowRecords),
+                    scope: .init(pid: Int(pid), priority: appPriority + 400)))
             }
 
             for index in AutomationObservationPolicy.windowOrder(count: visibleWindows.count, focusedIndex: focusedIndex, topmostIndex: topmostIndex) {
                 let window = visibleWindows[index]
-                walk(
-                    element: window,
-                    pid: pid,
-                    appName: app.localizedName ?? "Unknown app",
-                    application: appIdentity,
-                    focusedElement: focusedElement,
-                    depth: 0,
-                    nextID: &nextID,
-                    map: &newMap,
-                    rows: &elementRows,
-                    revision: revision, parentID: nil, ownerWindow: window, windowRecords: windowRecords, structureCache: &structureCache
-                )
-                if elementRows.count >= maxElements { break }
+                let record = windowRecords.first { CFEqual($0.element, window) }
+                let title = stringAttribute(window, kAXTitleAttribute) ?? ""
+                roots.append(.init(node: ObservationNode(element: window, pid: pid, appName: app.localizedName ?? "Unknown app",
+                    application: appIdentity, focusedElement: focusedElement, ownerWindow: window, windowRecords: windowRecords),
+                    scope: .init(pid: Int(pid), windowID: record?.id,
+                        priority: appPriority + (index == focusedIndex || index == topmostIndex ? 300 : 0)
+                            + AutomationObservationPolicy.keywordScore(title, keywords: keywords))))
             }
+            // Read the visible app's controls before probing unrelated apps;
+            // slow background metadata must not consume the entire AX budget.
+            try collectRoots(expand: false)
         }
+
+        try collectRoots(expand: true)
 
         let snapshot = AccessibilitySnapshot(
             revision: revision,
@@ -533,7 +578,7 @@ final class AccessibilityController {
                 }
                 return row
             },
-            systemContext: systemContext()
+            systemContext: systemContext(), completeness: collection.metadata
         )
         // Compare full target labels/geometry and full editable text in memory;
         // prompt clipping must not hide a change. Secure values are never read.
@@ -559,7 +604,9 @@ final class AccessibilityController {
             }
             return result
         }
-        let signature = try ObservationConsistency.controlSignature(elements: signatureRows, applications: signatureApps)
+        let controls = try ObservationConsistency.controlSignature(elements: signatureRows, applications: signatureApps)
+        let signature = String(decoding: try JSONSerialization.data(withJSONObject:
+            ["controls": controls, "collection_gaps": collection.reasonCounts], options: [.sortedKeys]), as: UTF8.self)
         let lease = TaskOwnership.current
         return StagedAccessibilitySnapshot(snapshot: snapshot, consistencySignature: signature, publish: { [self] in
             try TaskOwnership.$current.withValue(lease) {
@@ -578,37 +625,37 @@ final class AccessibilityController {
         })
     }
 
-    private func walk(
-        element: AXUIElement,
-        pid: pid_t,
-        appName: String,
-        application: AutomationApplicationIdentity,
-        focusedElement: AXUIElement?,
-        depth: Int,
-        nextID: inout Int,
+    private func inspectObservation(
+        entry: ObservationCollection<ObservationNode>.Entry,
+        id: String,
+        keywords: [String],
         map: inout [String: ElementRecord],
         rows: inout [[String: Any]],
         revision: String,
-        parentID: String?,
-        ownerWindow: AXUIElement?,
-        windowRecords: [SnapshotWindowRecord],
         structureCache: inout [UInt: AutomationStructureNode]
-    ) {
-        guard (try? TaskOwnership.check()) != nil, depth <= 14, rows.count < maxElements else { return }
-        let alreadyVisited = map.values.contains(where: { CFEqual($0.element, element) })
-        let id = "\(revision):e\(nextID)"
-        nextID += 1
+    ) throws -> ObservationCollection<ObservationNode>.Inspection {
+        try TaskOwnership.check()
+        let node = entry.node
+        let element = node.element, pid = node.pid, appName = node.appName, application = node.application
+        let focusedElement = node.focusedElement, ownerWindow = node.ownerWindow, windowRecords = node.windowRecords
+        let depth = entry.scope.depth, parentID = entry.scope.parentID
 
-        let role = stringAttribute(element, kAXRoleAttribute) ?? "unknown"
+        let identityFailures = ObservationAccessibilityReads.current?.failures
+        guard let role = stringAttribute(element, kAXRoleAttribute), !role.isEmpty else {
+            return .init(included: false) // Required role failure is already reported; no value or executable ID.
+        }
         // Closed menu trees expose commands with zero bounds. They consume the
         // observation budget and can be mistaken for currently usable controls.
         if role == "AXMenu" {
-            guard let bounds = frame(of: element), bounds.width > 0, bounds.height > 0 else { return }
+            guard let bounds = frame(of: element), bounds.width > 0, bounds.height > 0 else {
+                return .init(included: false)
+            }
         }
         let subrole = stringAttribute(element, kAXSubroleAttribute) ?? ""
+        let secure = AutomationTextEntryPolicy.isSecure(role: role, subrole: subrole)
+            || ObservationAccessibilityReads.current?.failures != identityFailures
         let title = elementTitle(element)
         let bounds = frame(of: element)
-        let secure = AutomationTextEntryPolicy.isSecure(role: role, subrole: subrole)
         let value = secure ? nil : attribute(element, kAXValueAttribute)
         let rawValue = secure ? "[secure]" : printableValue(value)
         let focused = boolAttribute(element, kAXFocusedAttribute) == true
@@ -657,26 +704,59 @@ final class AccessibilityController {
            let serializedFrame = serializedAccessibilityFrame(frame) {
             row["frame"] = serializedFrame
         }
-        rows.append(row)
-        // A focused-field alias still appears in its window hierarchy, but
-        // never traverse the same subtree twice or follow Accessibility cycles.
-        if alreadyVisited { return }
-
-        let children = attribute(element, kAXChildrenAttribute) as? [AXUIElement] ?? []
-        for child in children.prefix(160) {
-            walk(
-                element: child,
-                pid: pid,
-                appName: appName,
-                application: application,
-                focusedElement: focusedElement,
-                depth: depth + 1,
-                nextID: &nextID,
-                map: &map,
-                rows: &rows, revision: revision, parentID: id, ownerWindow: ownerWindow, windowRecords: windowRecords, structureCache: &structureCache
-            )
-            if rows.count >= maxElements { break }
+        guard let reads = ObservationAccessibilityReads.current, reads.now() < reads.deadline else {
+            map.removeValue(forKey: id)
+            return .init(included: false, omission: "collection_timeout")
         }
+        rows.append(row)
+        return .init(relevance: AutomationObservationPolicy.keywordScore(title, keywords: keywords))
+    }
+
+    private func observationChildren(entry: ObservationCollection<ObservationNode>.Entry, offset: Int, count: Int,
+                                     collection: ObservationCollection<ObservationNode>) -> ObservationCollection<ObservationNode>.Page {
+        let element = entry.node.element
+        var total = 0
+        let read = ObservationAccessibilityReads.current!
+        let counted = read.read(element, attribute: kAXChildrenAttribute) {
+            AXUIElementGetAttributeValueCount(element, kAXChildrenAttribute as CFString, &total)
+        }
+        if counted == .success {
+            guard total >= 0 else {
+                collection.issue("accessibility_incomplete", attribute: kAXChildrenAttribute)
+                return .init(nodes: [], total: 0, incomplete: true)
+            }
+            guard total > offset else { return .init(nodes: [], total: total) }
+            var values: CFArray?
+            let result = read.read(element, attribute: kAXChildrenAttribute) {
+                AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, offset, min(count, total - offset), &values)
+            }
+            if result == .success, let nodes = values as? [AXUIElement], nodes.count == min(count, total - offset) {
+                return .init(nodes: nodes.map { entry.node.child($0) }, total: total)
+            }
+            if result == .attributeUnsupported || result == .notImplemented {
+                if let nodes = attribute(element, kAXChildrenAttribute) as? [AXUIElement] {
+                    return .init(nodes: Array(nodes.dropFirst(offset).prefix(count)).map { entry.node.child($0) }, total: nodes.count)
+                }
+            }
+            collection.issue("accessibility_incomplete", attribute: kAXChildrenAttribute)
+            return .init(nodes: [], total: total, incomplete: true)
+        }
+        // Some apps implement only the single-value children attribute. Do
+        // not interpret unsupported pagination as an unavailable control.
+        if counted == .attributeUnsupported || counted == .notImplemented || counted == .noValue {
+            let value = attribute(element, kAXChildrenAttribute)
+            if let nodes = value as? [AXUIElement] {
+                return .init(nodes: Array(nodes.dropFirst(offset).prefix(count)).map { entry.node.child($0) }, total: nodes.count)
+            }
+            if value != nil {
+                collection.issue("accessibility_incomplete", attribute: kAXChildrenAttribute)
+            } else if let role = stringAttribute(element, kAXRoleAttribute),
+               ["AXWindow", "AXGroup", "AXScrollArea", "AXOutline", "AXTable", "AXWebArea", "AXSheet", "AXDialog", "AXMenu"].contains(role) {
+                collection.issue("accessibility_incomplete", attribute: kAXChildrenAttribute)
+            }
+            return .init(nodes: [], total: 0)
+        }
+        return .init(nodes: [], total: 0, incomplete: true)
     }
 
     static func hasObservableWindow(accessibilityCount: Int, graphicsCount: Int) -> Bool {
@@ -3253,8 +3333,19 @@ final class AccessibilityController {
 
     private func attribute(_ element: AXUIElement, _ name: String) -> AnyObject? {
         var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else {
+        let result: AXError
+        if let read = ObservationAccessibilityReads.current {
+            result = read.read(element, attribute: name, required: name == kAXRoleAttribute) {
+                AXUIElementCopyAttributeValue(element, name as CFString, &value)
+            }
+        } else { result = AXUIElementCopyAttributeValue(element, name as CFString, &value) }
+        guard result == .success else {
             return nil
+        }
+        if name == kAXRoleAttribute, (value as? String)?.isEmpty != false {
+            ObservationAccessibilityReads.current?.report("accessibility_incomplete", name, nil)
+        } else if name == kAXSubroleAttribute, value != nil, !(value is String) {
+            ObservationAccessibilityReads.current?.report("accessibility_incomplete", name, nil)
         }
         return value
     }
@@ -3299,7 +3390,10 @@ final class AccessibilityController {
 
     private func actionNames(_ element: AXUIElement) -> [String] {
         var names: CFArray?
-        guard AXUIElementCopyActionNames(element, &names) == .success else { return [] }
+        let result = ObservationAccessibilityReads.current.map { read in
+            read.read(element, attribute: "AXActions") { AXUIElementCopyActionNames(element, &names) }
+        } ?? AXUIElementCopyActionNames(element, &names)
+        guard result == .success else { return [] }
         return names as? [String] ?? []
     }
 

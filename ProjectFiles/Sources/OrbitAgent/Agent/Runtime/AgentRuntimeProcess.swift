@@ -172,7 +172,8 @@ final class AgentRuntimeProcess {
                 "action_contract_version": ActionContract.version,
                 "task_generation_id": lease.id,
                 "task_protocol_version": ActionContract.taskProtocolVersion,
-                "coordinate_mapping_version": ScreenCoordinateMapping.version
+                "coordinate_mapping_version": ScreenCoordinateMapping.version,
+                "observation_completeness_version": ObservationCollection<Int>.version
             ])
             configuration.append(0x0A)
             try input.fileHandleForWriting.write(contentsOf: configuration)

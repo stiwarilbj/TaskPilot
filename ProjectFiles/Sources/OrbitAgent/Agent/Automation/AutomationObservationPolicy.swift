@@ -1,6 +1,13 @@
 import CoreGraphics
+import Foundation
 
 enum AutomationObservationPolicy {
+    static func keywordScore(_ label: String, keywords: [String]) -> Int {
+        let words = Set(label.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .split { !$0.isLetter && !$0.isNumber }.map(String.init))
+        return min(12, words.intersection(keywords.map { $0.lowercased() }).count) * 60
+    }
+
     /// Prefer the focused visible window and actual display z-order before
     /// another window of the same application consumes the capture budget.
     static func windowOrder(count: Int, focusedIndex: Int?, topmostIndex: Int?) -> [Int] {

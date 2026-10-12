@@ -52,8 +52,10 @@ from prompt_compiler import (
     decision_rules, compile_prompt, compile_repair,
 )
 
-from observation_context import select_elements, historical_progress, coordinate_targets, structural_identity, RELATIONSHIPS_VERSION
+from observation_context import select_elements, historical_progress, coordinate_targets, structural_identity, RELATIONSHIPS_VERSION, words
 from screen_coordinates import COORDINATE_MAPPING_VERSION, CoordinateMappingError, validate_observation_mapping
+from observation_completeness import (OBSERVATION_COMPLETENESS_VERSION, ObservationCompletenessError,
+                                      validate_completeness, prompt_coverage, coverage_cache_input)
 from task_evidence import TaskEvidenceLedger, CHECKLIST_VERSION, LARGEST_PATTERN
 from expected_effects import ExpectedEffect, EXPECTED_EFFECT_VERSION, FILE_EFFECTS
 
@@ -85,6 +87,7 @@ STANDARD_LOCATIONS = {
 _active_acp_process: subprocess.Popen[str] | None = None
 _bridge_observation_revision: str | None = None
 _task_generation_id: str | None = None
+_observation_keywords: list[str] = []
 _runtime_inbox: RuntimeInbox | None = None
 _receipt_metrics = {"receipt_queries": 0, "receipt_recoveries": 0, "receipt_unresolved": 0}
 
@@ -320,6 +323,8 @@ def bridge_exchange(method: str, display_id: int, params: dict[str, Any], timeou
 def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
     global _bridge_observation_revision
     timeout = params.pop("_reply_timeout", None)
+    if method == "observe":
+        params.setdefault("observation_keywords", _observation_keywords)
     if method == "act":
         if _bridge_observation_revision:
             params.setdefault("observation_revision", _bridge_observation_revision)
@@ -373,8 +378,10 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
                 raise ActionRejected("Observation belongs to another task", "cancelled")
             result = dict(result)
             result.pop("task_generation_id", None)
-            try: validate_observation_mapping(result, required=_task_generation_id is not None)
-            except CoordinateMappingError as error:
+            try:
+                validate_observation_mapping(result, required=_task_generation_id is not None)
+                validate_completeness(result, required=_task_generation_id is not None)
+            except (CoordinateMappingError, ObservationCompletenessError) as error:
                 _bridge_observation_revision = None
                 discard_observation_image(result)
                 raise ActionRejected(str(error), "observation_unstable") from error
@@ -1211,6 +1218,7 @@ def compact_observation(observation: dict[str, Any], task: str = "") -> dict[str
     if isinstance(elements, list):
         compact["visible_element_count"] = len(elements)
         compact["elements"] = select_elements(observation, task, MAX_COMPACT_ELEMENTS)
+        compact["observation_completeness"] = prompt_coverage(observation, compact["elements"], MAX_COMPACT_ELEMENTS)
         if elements: compact["target_relationships_version"] = RELATIONSHIPS_VERSION
         if len(elements) > len(compact["elements"]):
             compact["element_selection"] = {"strategy": "active_window_task_and_labels", "partial": True}
@@ -2269,7 +2277,7 @@ def routed_json_prompt(
     observation: dict[str, Any] | None = None,
     ledger: TaskEvidenceLedger | None = None,
 ) -> dict[str, Any]:
-    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, PROMPT_COMPILER_VERSION, COORDINATE_MAPPING_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, observation], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
+    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, PROMPT_COMPILER_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation)], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
     cached = getattr(client, "decision_cache", {})
     if cached.get("key") == key:
         value = validate_response(json.loads(json.dumps(cached["decision"])), purpose, observation, ledger)
@@ -2292,6 +2300,8 @@ def routed_json_prompt(
 
 
 def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str) -> None:
+    global _observation_keywords
+    _observation_keywords = []
     _receipt_metrics.update(receipt_queries=0, receipt_recoveries=0, receipt_unresolved=0)
     ledger = TaskEvidenceLedger(task, _task_generation_id)
     resolved_openclaw = find_openclaw(openclaw_path)
@@ -2326,9 +2336,11 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
         complete_from_decision({"output": output, "output_title": "File contents", "output_kind": "result"}, str(result.get("message") or "Read file"), ledger)
         return
 
+    _observation_keywords = sorted(w for w in words(task) if len(w) <= 64 and w.isalnum())[:48]
     try:
         client = ACPClient(resolved_openclaw)
     except Exception as error:
+        _observation_keywords = []
         state.record_failure(PRIMARY_MODELS[0], classify_failure(error, time.time()))
         emit("model_health", model=PRIMARY_MODELS[0], state="repair", detail=str(error))
         raise
@@ -2584,6 +2596,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
         raise
     finally:
         discard_observation_image(pending_observation)
+        _observation_keywords = []
         publish_task_metrics(model_router, client, ledger)
         client.close()
 
@@ -2605,9 +2618,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_runtime_configuration(require_generation: bool = False) -> str:
-    global _task_generation_id, _bridge_observation_revision
+    global _task_generation_id, _bridge_observation_revision, _observation_keywords
     _task_generation_id = None
     _bridge_observation_revision = None
+    _observation_keywords = []
     raw_line = runtime_line()
     try:
         configuration = json.loads(raw_line)
@@ -2629,6 +2643,8 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
             raise RuntimeError("TaskPilot task ownership protocol does not match; rebuild the bundled components together")
         if type(configuration.get("coordinate_mapping_version")) is not int or configuration["coordinate_mapping_version"] != COORDINATE_MAPPING_VERSION:
             raise RuntimeError("TaskPilot screen coordinate mapping versions do not match; rebuild the bundled components together")
+        if type(configuration.get("observation_completeness_version")) is not int or configuration["observation_completeness_version"] != OBSERVATION_COMPLETENESS_VERSION:
+            raise RuntimeError("TaskPilot observation completeness versions do not match; rebuild the bundled components together")
     api_key = configuration.get("gemini_api_key")
     if not isinstance(api_key, str):
         raise RuntimeError(f"{PRODUCT_NAME} did not provide the secure runtime configuration")

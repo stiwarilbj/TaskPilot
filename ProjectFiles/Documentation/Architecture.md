@@ -30,6 +30,9 @@ verified delivery methods without retaining control targets or user content.
 pixels, crop geometry, and normalized actions to the accepted display and
 observation revision.
 
+[Observation completeness](ObservationCompleteness.md) reports collection gaps
+and expands relevant omitted Accessibility branches locally before planning.
+
 ## The main flow
 
 1. `TaskPilotApp` creates the macOS windows.

@@ -25,7 +25,7 @@ local consistency retry. Failed pairs never reach planning. Mapping metadata
 adds no provider calls and supplies no missing action targets. Preview size
 limits and the current manual viewer behavior remain unchanged.
 
-Task protocol version 3 and the existing generated contract fingerprint reject
+Task protocol version 4 and the existing generated contract fingerprint reject
 old/new bundled component mixtures before task requests. The private startup
 configuration also checks coordinate mapping version 1, and decision caches
 include that version.

@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import unittest
 from unittest import mock
+from coordinate_fixtures import fixture_coordinates
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'AgentRuntime'))
@@ -95,6 +96,7 @@ class ScreenCoordinatesTests(unittest.TestCase):
         generation = 'd0b9c0fc-01af-42f0-b749-1027c907a2cd'
         for invalid in [False, True]:
             case = fixtures()[0]
+            case.update(fixture_coordinates('fixture:accepted'))
             case['task_generation_id'] = generation
             if invalid: case['coordinate_mapping']['observation_revision'] = 'stale'
             reply = dict(ok=True, result=case)

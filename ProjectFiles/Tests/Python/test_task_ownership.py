@@ -9,6 +9,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import openclaw_runtime as runtime
+from coordinate_fixtures import fixture_coordinates
 from action_contract_generated import CONTRACT_HASH, CONTRACT_VERSION, TASK_PROTOCOL_VERSION
 
 
@@ -31,9 +32,7 @@ class TaskOwnershipTests(unittest.TestCase):
             self.assertEqual(message['message'], 'fixture')
 
     def test_cross_task_bridge_reply_is_ignored_and_observation_is_bound(self):
-        fixture = json.loads((Path(__file__).resolve().parents[2] / 'Tests/Fixtures/screen-coordinate-cases.json').read_text())['cases'][0]
-        fixture = {key: fixture[key] for key in ('display', 'coordinate_mapping')}
-        fixture['coordinate_mapping']['observation_revision'] = 'current'
+        fixture = fixture_coordinates('current')
         replies = [
             {'kind': 'bridge_response', 'request_id': 'same', 'task_generation_id': 'old', 'ok': True, 'result': {'observation_revision': 'old'}},
             {'kind': 'bridge_response', 'request_id': 'same', 'task_generation_id': self.generation, 'ok': True,
@@ -64,7 +63,7 @@ class TaskOwnershipTests(unittest.TestCase):
             self.assertEqual(runtime.wait_for_user_input('same'), 'current')
 
     def test_startup_requires_valid_generation_only_for_tasks_and_clears_old_state(self):
-        config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=CONTRACT_HASH, action_contract_version=CONTRACT_VERSION, task_protocol_version=TASK_PROTOCOL_VERSION, coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION)
+        config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=CONTRACT_HASH, action_contract_version=CONTRACT_VERSION, task_protocol_version=TASK_PROTOCOL_VERSION, coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION, observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION)
         for invalid in [None, '', 'old', True, 7]:
             with self.subTest(invalid=invalid), mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(dict(config, task_generation_id=invalid)))):
                 with self.assertRaisesRegex(RuntimeError, 'generation ID'): runtime.read_runtime_configuration(require_generation=True)
