@@ -134,3 +134,5 @@ KEYS = frozenset(CONTRACT['key_codes'])
 ACTION_CAPABILITIES = {k: v['capability'] for k, v in CONTRACT['actions'].items() if v.get('capability')}
 ACTION_REFERENCE = 'All actions remain available (examples are advisory): ' + '; '.join(v['reference'] for v in CONTRACT['actions'].values()) + '. Keys: ' + ', '.join(CONTRACT['key_codes']) + '; modifiers: ' + ', '.join(CONTRACT['modifier_flags']) + '.\n'
 PROMPT_BOUNDS = CONTRACT['prompt_bounds']
+
+TASK_PROTOCOL_VERSION = CONTRACT["task_protocol_version"]

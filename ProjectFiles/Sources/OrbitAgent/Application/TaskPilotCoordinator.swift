@@ -145,6 +145,8 @@ final class TaskPilotCoordinator: ObservableObject {
         capture: capture
     )
     private lazy var runtime = AgentRuntimeProcess(bridge: bridge)
+    private var currentTaskLease: TaskLease?
+    private var taskNotification: Task<Void, Never>?
     private var takeoverPlacements: [WindowPlacement] = []
     private var mainDisplayModePlacements: [WindowPlacement] = []
     private var openClawExecutableURL: URL?
@@ -1091,11 +1093,14 @@ final class TaskPilotCoordinator: ObservableObject {
         requestMetrics = nil
         userInputRequest = nil
         userInputDraft = ""
-        accessibility.beginTaskResourceTracking(on: display)
+        let lease = TaskLease()
+        currentTaskLease = lease
+        accessibility.beginTaskResourceTracking(on: display, lease: lease)
         agentCursor.hide()
 
         runtime.onEvent = { [weak self] event in
-            Task { @MainActor in self?.handleRuntimeEvent(event) }
+            guard let self, self.currentTaskLease?.id == lease.id else { return }
+            self.handleRuntimeEvent(event)
         }
 
         do {
@@ -1104,13 +1109,16 @@ final class TaskPilotCoordinator: ObservableObject {
                 display: display,
             runtimeURL: bundledRuntime.executableURL,
                 openClawURL: openClawExecutableURL,
-                geminiAPIKey: savedGeminiAPIKey
+                geminiAPIKey: savedGeminiAPIKey,
+                lease: lease
             )
         } catch {
+            lease.revoke()
             agentCursor.hide()
             _ = accessibility.finishTaskResourceTracking(
                 closeOpenedResources: closesTaskAppsAfterUse
             )
+            lease.retire()
             let wasQueued = currentTaskWasQueued
             runState = .failed
             let message = "Could not start the agent: \(error.localizedDescription)"
@@ -1160,6 +1168,8 @@ final class TaskPilotCoordinator: ObservableObject {
         status = "Stopping safely…"
         userInputRequest = nil
         userInputDraft = ""
+        taskNotification?.cancel()
+        currentTaskLease?.revoke()
         runtime.stop()
     }
 
@@ -1168,7 +1178,7 @@ final class TaskPilotCoordinator: ObservableObject {
         let value = userInputDraft
         userInputDraft = ""
         userInputRequest = nil
-        runtime.submitUserInput(requestID: request.requestID, value: value)
+        runtime.submitUserInput(requestID: request.requestID, value: value, taskGenerationID: request.taskGenerationID)
         runState = .running
         status = "Credential entered securely — continuing the task…"
     }
@@ -1247,7 +1257,8 @@ final class TaskPilotCoordinator: ObservableObject {
         case .diagnostics(let metrics):
             requestMetrics = metrics
         case .status(let message):
-            if runState == .running { status = message }
+            if currentTaskLease?.state == .draining { runState = .stopping }
+            if runState == .running || runState == .stopping { status = message }
         case .output(let output):
             taskOutput = output
         case .userInputRequired(let request):
@@ -1256,14 +1267,18 @@ final class TaskPilotCoordinator: ObservableObject {
             userInputRequest = request
             runState = .waitingForUser
             status = "Paused — \(request.title.lowercased())"
-            Task {
+            let lease = currentTaskLease
+            taskNotification?.cancel()
+            taskNotification = Task {
                 let state = await completionNotifications.authorizationState()
+                guard !Task.isCancelled, self.currentTaskLease?.id == lease?.id, lease?.state != .draining, lease?.state != .retired else { return }
                 let allowed: Bool
                 if state == .notDetermined {
                     allowed = await completionNotifications.requestAuthorization()
                 } else {
                     allowed = state == .allowed
                 }
+                guard !Task.isCancelled, self.currentTaskLease?.id == lease?.id, self.userInputRequest?.requestID == request.requestID, lease?.state != .draining, lease?.state != .retired else { return }
                 if allowed {
                     completionNotifications.deliverUserActionRequired(
                         title: request.title,
@@ -1274,6 +1289,7 @@ final class TaskPilotCoordinator: ObservableObject {
                 }
             }
         case .completed(let message):
+            taskNotification?.cancel(); taskNotification = nil
             agentCursor.hide()
             userInputRequest = nil
             userInputDraft = ""
@@ -1313,6 +1329,7 @@ final class TaskPilotCoordinator: ObservableObject {
             )
             advanceQueueAfterTerminalTask()
         case .failed(let message):
+            taskNotification?.cancel(); taskNotification = nil
             geminiAPIKeyVerified = false
             for index in geminiModelChecks.indices {
                 if case .working = geminiModelChecks[index].state { geminiModelChecks[index].state = .waiting }
@@ -1347,6 +1364,7 @@ final class TaskPilotCoordinator: ObservableObject {
             }
             advanceQueueAfterTerminalTask()
         case .stopped:
+            taskNotification?.cancel(); taskNotification = nil
             agentCursor.hide()
             userInputRequest = nil
             userInputDraft = ""
@@ -1402,8 +1420,10 @@ final class TaskPilotCoordinator: ObservableObject {
 
     private func advanceQueueAfterTerminalTask() {
         if !queuedTasks.isEmpty {
+            let generation = currentTaskLease?.id
             Task { @MainActor [weak self] in
                 await Task.yield()
+                guard self?.currentTaskLease?.id == generation else { return }
                 self?.startNextQueuedTaskIfPossible()
             }
             return

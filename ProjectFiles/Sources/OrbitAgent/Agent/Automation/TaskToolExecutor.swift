@@ -39,7 +39,7 @@ final class TaskToolExecutor {
     private var commandPaused = false
 
     func perform(action input: [String: Any]) async throws -> [String: Any] {
-        try Task.checkCancellation()
+        try await TaskOwnership.checkpoint()
         let action: [String: Any]
         do { action = try ActionContract.validate(input) }
         catch { throw TaskToolError.invalidAction(error.localizedDescription) }
@@ -159,10 +159,9 @@ final class TaskToolExecutor {
         let parent = url.deletingLastPathComponent()
         if createParents {
             do {
-                try FileManager.default.createDirectory(
-                    at: parent,
-                    withIntermediateDirectories: true
-                )
+                try TaskOwnership.commit {
+                    try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+                }
             } catch {
                 throw TaskToolError.operationFailed(
                     "\(TaskPilotIdentity.displayName) could not create the destination folder: \(error.localizedDescription)"
@@ -171,6 +170,7 @@ final class TaskToolExecutor {
         }
 
         do {
+            try TaskOwnership.commit {
             if mode == "append", FileManager.default.fileExists(atPath: url.path) {
                 let handle = try FileHandle(forWritingTo: url)
                 defer { try? handle.close() }
@@ -179,12 +179,14 @@ final class TaskToolExecutor {
             } else {
                 try data.write(to: url, options: .atomic)
             }
+            }
         } catch {
             throw TaskToolError.uncertainDelivery(
                 "\(TaskPilotIdentity.displayName) could not write \(url.lastPathComponent): \(error.localizedDescription)"
             )
         }
 
+        try TaskOwnership.check()
         let verified: Bool
         let finalSize: Int
         do {
@@ -214,6 +216,7 @@ final class TaskToolExecutor {
     }
 
     private func runCommand(_ action: [String: Any]) throws -> [String: Any] {
+        try TaskOwnership.check()
         commandLock.lock(); commandCancelled = false; commandLock.unlock()
         try Task.checkCancellation()
         var environment = ProcessInfo.processInfo.environment
@@ -285,20 +288,19 @@ final class TaskToolExecutor {
         process.standardOutput = stdoutHandle
         process.standardError = stderrHandle
 
-        // Serialize launching with Stop, including the gap after preflight.
-        commandLock.lock()
-        if commandCancelled { commandLock.unlock(); throw CancellationError() }
-        do { try process.run() }
-        catch {
-            commandLock.unlock()
-            throw TaskToolError.operationFailed("Could not start the command: \(error.localizedDescription)")
+        // Always acquire the ownership gate before the command lock. Pause
+        // cannot strand a launcher holding the lock Resume needs.
+        try TaskOwnership.commit {
+            commandLock.lock(); defer { commandLock.unlock() }
+            if commandCancelled { throw CancellationError() }
+            do { try process.run() }
+            catch { throw TaskToolError.operationFailed("Could not start the command: \(error.localizedDescription)") }
+            _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
+            activeCommand = process
+            if commandPaused, Darwin.kill(-process.processIdentifier, SIGSTOP) != 0 {
+                Darwin.kill(process.processIdentifier, SIGSTOP)
+            }
         }
-        _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
-        activeCommand = process
-        if commandPaused, Darwin.kill(-process.processIdentifier, SIGSTOP) != 0 {
-            Darwin.kill(process.processIdentifier, SIGSTOP)
-        }
-        commandLock.unlock()
         defer {
             commandLock.lock()
             if activeCommand === process { activeCommand = nil }
@@ -306,7 +308,7 @@ final class TaskToolExecutor {
         }
         let deadline = Date().addingTimeInterval(timeout)
         while process.isRunning && Date() < deadline {
-            if Task.isCancelled { cancelActiveCommand() }
+            if Task.isCancelled || (TaskOwnership.current?.state == .draining) || (TaskOwnership.current?.state == .retired) { cancelActiveCommand() }
             commandLock.lock(); let cancelled = commandCancelled; commandLock.unlock()
             if cancelled { break }
             Thread.sleep(forTimeInterval: 0.025)

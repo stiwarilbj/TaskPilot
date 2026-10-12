@@ -103,6 +103,7 @@ actor ScreenCaptureService {
     }
 
     func capture(display: DisplayDescriptor) async throws -> URL {
+        try await TaskOwnership.checkpoint()
         guard Self.preflightAuthorizationStatus() == .authorized else {
             throw ScreenCaptureError.permissionDenied("Screen capture is not authorized for this TaskPilot process")
         }
@@ -150,6 +151,7 @@ actor ScreenCaptureService {
             contentCachedAt = nil
             throw permissionError(for: error)
         }
+        try await TaskOwnership.checkpoint()
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("OrbitAgent", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -166,6 +168,8 @@ actor ScreenCaptureService {
         guard CGImageDestinationFinalize(destination) else {
             throw ScreenCaptureError.couldNotWriteImage
         }
+        do { try TaskOwnership.check(); try TaskOwnership.current?.ownArtifact(url) }
+        catch { try? FileManager.default.removeItem(at: url); throw error }
         return url
     }
 

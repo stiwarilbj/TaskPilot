@@ -56,6 +56,7 @@ from response_validation import (
 MAX_COMPACT_ELEMENTS = 360
 MAX_RECENT_ACTIONS = 8
 from action_contract_generated import (
+    TASK_PROTOCOL_VERSION,
     CONTRACT_HASH, CONTRACT_VERSION, VALID_ACTIONS, TRUSTED_NATIVE_ACTIONS,
     action_example, action_default, ACTION_REFERENCE, PROMPT_BOUNDS, ACTION_CAPABILITIES,
 )
@@ -73,6 +74,7 @@ STANDARD_LOCATIONS = {
 
 _active_acp_process: subprocess.Popen[str] | None = None
 _bridge_observation_revision: str | None = None
+_task_generation_id: str | None = None
 
 
 class ActionRejected(RuntimeError):
@@ -104,7 +106,9 @@ class TaskModelRouter(AdaptiveModelRouter):
 
 
 def emit(kind: str, **payload: Any) -> None:
-    print(json.dumps({"kind": kind, **payload}, separators=(",", ":")), flush=True)
+    envelope = {"kind": kind, **payload}
+    if _task_generation_id is not None: envelope["task_generation_id"] = _task_generation_id
+    print(json.dumps(envelope, separators=(",", ":")), flush=True)
 
 
 def runtime_fingerprint(key: str) -> str:
@@ -287,11 +291,17 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
             continue
         if response.get("request_id") != request_id:
             continue
+        if _task_generation_id is not None and response.get("task_generation_id") != _task_generation_id:
+            continue
         if not response.get("ok"):
             raise ActionRejected(str(response.get("error") or f"{PRODUCT_NAME} rejected the request"),
                                  str(response.get("error_code") or "action_rejected"))
         result = response.get("result")
         if method == "observe" and isinstance(result, dict):
+            if _task_generation_id is not None and result.get("task_generation_id") != _task_generation_id:
+                raise ActionRejected("Observation belongs to another task", "cancelled")
+            result = dict(result)
+            result.pop("task_generation_id", None)
             _bridge_observation_revision = result.get("observation_revision")
         return result if isinstance(result, dict) else {}
     raise RuntimeError(f"Lost contact with the native {PRODUCT_NAME} controller")
@@ -1050,6 +1060,8 @@ def wait_for_user_input(request_id: str) -> str:
         if response.get("kind") != "user_input_response":
             continue
         if response.get("request_id") != request_id:
+            continue
+        if _task_generation_id is not None and response.get("task_generation_id") != _task_generation_id:
             continue
         value = response.get("value")
         if not isinstance(value, str) or not value:
@@ -2535,7 +2547,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def read_runtime_configuration() -> str:
+def read_runtime_configuration(require_generation: bool = False) -> str:
+    global _task_generation_id, _bridge_observation_revision
+    _task_generation_id = None
+    _bridge_observation_revision = None
     raw_line = sys.stdin.readline()
     try:
         configuration = json.loads(raw_line)
@@ -2545,6 +2560,16 @@ def read_runtime_configuration() -> str:
         raise RuntimeError(f"{PRODUCT_NAME} did not provide the secure runtime configuration")
     if configuration.get("action_contract_hash") != CONTRACT_HASH or type(configuration.get("action_contract_version")) is not int or configuration.get("action_contract_version") != CONTRACT_VERSION:
         raise RuntimeError("TaskPilot backend action contracts do not match; rebuild the bundled app and runtime together")
+    generation = configuration.get("task_generation_id")
+    if require_generation:
+        try:
+            if not isinstance(generation, str) or str(uuid.UUID(generation)).lower() != generation.lower():
+                raise ValueError("Invalid generation")
+        except (ValueError, AttributeError):
+            raise RuntimeError("TaskPilot did not provide a valid task generation ID")
+        _task_generation_id = generation
+        if type(configuration.get("task_protocol_version")) is not int or configuration["task_protocol_version"] != TASK_PROTOCOL_VERSION:
+            raise RuntimeError("TaskPilot task ownership protocol does not match; rebuild the bundled components together")
     api_key = configuration.get("gemini_api_key")
     if not isinstance(api_key, str):
         raise RuntimeError(f"{PRODUCT_NAME} did not provide the secure runtime configuration")
@@ -2564,7 +2589,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, _stop_handler)
     args = parse_args()
     try:
-        api_key = read_runtime_configuration()
+        api_key = read_runtime_configuration(require_generation=args.task is not None)
         if args.check_models or args.read_readiness:
             return 0 if check_models(find_openclaw(args.openclaw_path), api_key, read_only=args.read_readiness) else 1
         if args.task is None or args.display_id is None:

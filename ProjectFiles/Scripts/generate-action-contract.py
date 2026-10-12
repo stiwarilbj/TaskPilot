@@ -40,6 +40,7 @@ def artifacts():
         contract['prompt_bounds'][name] = re.sub(r'\{([a-z_]+\.(?:min|max)|defaults\.[a-z_]+\.[a-z_]+)\}', substitute, text)
     actions = contract['actions']
     assert type(contract['version']) is int and contract['version'] > 0 and actions
+    assert type(contract['task_protocol_version']) is int and contract['task_protocol_version'] > 0
     def check_condition(test):
         assert len(test) == 1
         op, value = next(iter(test.items()))

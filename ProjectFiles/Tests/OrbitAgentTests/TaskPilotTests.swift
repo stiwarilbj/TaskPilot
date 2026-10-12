@@ -831,6 +831,7 @@ final class TaskPilotTests: XCTestCase {
     func testSecureUserInputRequestCarriesNoCredentialValue() {
         let request = AgentUserInputRequest(
             requestID: "request-123",
+            taskGenerationID: UUID().uuidString,
             title: "Password required",
             message: "The waiting app needs your password.",
             kind: .password
@@ -929,15 +930,16 @@ final class TaskPilotTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let helper = directory.appendingPathComponent("runtime")
+        let lease = TaskLease()
         let script = """
         #!/bin/bash
         IFS= read -r configuration
         for index in {1..100}; do
-          printf '%s\\n' '{"kind":"status","message":"Streaming"}'
+          printf '%s\\n' '{"task_generation_id":"\(lease.id)","kind":"status","message":"Streaming"}'
         done
-        printf '%s\\n' '{"kind":"bridge_request","request_id":"fixture","method":"unsupported_fixture","params":{"display_id":1}}'
+        printf '%s\\n' '{"task_generation_id":"\(lease.id)","kind":"bridge_request","request_id":"fixture","method":"unsupported_fixture","params":{"display_id":1}}'
         IFS= read -r response
-        printf '%s' '{"kind":"complete","message":"Late completion"}'
+        printf '%s' '{"task_generation_id":"\(lease.id)","kind":"complete","message":"Late completion"}'
         """
         try script.write(to: helper, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
@@ -956,7 +958,7 @@ final class TaskPilotTests: XCTestCase {
             default: break
             }
         }
-        try runtime.start(task: "test", display: DisplayDescriptor(id: 1, name: "fixture", x: 0, y: 0, width: 10, height: 10, isMain: false), runtimeURL: helper, openClawURL: helper, geminiAPIKey: "fixture")
+        try runtime.start(task: "test", display: DisplayDescriptor(id: 1, name: "fixture", x: 0, y: 0, width: 10, height: 10, isMain: false), runtimeURL: helper, openClawURL: helper, geminiAPIKey: "fixture", lease: lease)
         wait(for: [completed], timeout: 5)
     }
 
@@ -965,7 +967,8 @@ final class TaskPilotTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let helper = directory.appendingPathComponent("runtime")
-        try "#!/bin/bash\nIFS= read -r configuration\nprintf '%s\\n' '{\"kind\":\"status\",\"message\":\"Pending\"}'\nexec /bin/sleep 20\n".write(to: helper, atomically: true, encoding: .utf8)
+        let lease = TaskLease()
+        try "#!/bin/bash\nIFS= read -r configuration\nprintf '%s\\n' '{\"task_generation_id\":\"\(lease.id)\",\"kind\":\"status\",\"message\":\"Pending\"}'\nexec /bin/sleep 20\n".write(to: helper, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
         let runtime = AgentRuntimeProcess(bridge: AgentAutomationBridge(
             displayService: DisplayService(), accessibility: AccessibilityController(), capture: ScreenCaptureService()
@@ -979,7 +982,7 @@ final class TaskPilotTests: XCTestCase {
             default: break
             }
         }
-        try runtime.start(task: "test", display: DisplayDescriptor(id: 1, name: "fixture", x: 0, y: 0, width: 10, height: 10, isMain: false), runtimeURL: helper, openClawURL: helper, geminiAPIKey: "fixture")
+        try runtime.start(task: "test", display: DisplayDescriptor(id: 1, name: "fixture", x: 0, y: 0, width: 10, height: 10, isMain: false), runtimeURL: helper, openClawURL: helper, geminiAPIKey: "fixture", lease: lease)
         wait(for: [stopped], timeout: 5)
     }
 

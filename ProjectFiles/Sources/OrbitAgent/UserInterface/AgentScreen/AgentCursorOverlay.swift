@@ -80,7 +80,9 @@ final class AgentCursorOverlayController: @unchecked Sendable {
             hide()
             return
         }
+        let lease = TaskOwnership.current
         performOnMain { [weak self] in
+            TaskOwnership.callback(lease) {
             self?.present(
                 at: point,
                 on: display,
@@ -88,12 +90,14 @@ final class AgentCursorOverlayController: @unchecked Sendable {
                 animated: true,
                 visibilityDuration: visibilityDuration
             )
+            }
         }
     }
 
     func hide() {
+        let lease = TaskOwnership.current
         performOnMain { [weak self] in
-            self?.orderOut()
+            TaskOwnership.callback(lease) { self?.orderOut() }
         }
     }
 
@@ -166,11 +170,12 @@ final class AgentCursorOverlayController: @unchecked Sendable {
         } else {
             glyph.setFrameOrigin(targetOrigin)
         }
+        let lease = TaskOwnership.current
         DispatchQueue.main.asyncAfter(
             deadline: .now() + max(0.1, visibilityDuration)
         ) { [weak self] in
             guard let self, self.visibilityGeneration == visibilityToken else { return }
-            self.orderOut()
+            TaskOwnership.callback(lease) { self.orderOut() }
         }
 
         guard clicking else { return }
@@ -179,7 +184,7 @@ final class AgentCursorOverlayController: @unchecked Sendable {
         glyph.isClicking = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self, weak glyph] in
             guard let self, self.pulseGeneration == pulseToken else { return }
-            glyph?.isClicking = false
+            TaskOwnership.callback(lease) { glyph?.isClicking = false }
         }
     }
 

@@ -1,3 +1,4 @@
+    static var taskProtocolVersion: Int { (definition["task_protocol_version"] as! NSNumber).intValue }
     struct ValidationError: LocalizedError {
         let path: String
         let expectation: String

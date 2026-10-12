@@ -37,6 +37,7 @@ enum AgentUserInputKind: String, Equatable {
 
 struct AgentUserInputRequest: Equatable, Identifiable {
     let requestID: String
+    let taskGenerationID: String
     let title: String
     let message: String
     let kind: AgentUserInputKind
@@ -68,20 +69,38 @@ enum RuntimeProcessError: LocalizedError {
 }
 
 final class AgentRuntimeProcess {
-    var onEvent: ((RuntimeEvent) -> Void)?
+    var onEvent: (@MainActor (RuntimeEvent) -> Void)?
 
     private let bridge: AgentAutomationBridge
+    private let bridgeHandler: (([String: Any]) async -> [String: Any])?
+    private let drainReportingDelay: TimeInterval
     private let ioQueue = DispatchQueue(label: "com.orbitagent.runtime-io")
-    private var process: Process?
-    private var inputPipe: Pipe?
-    private var outputBuffer = Data()
-    private var lastErrorLine = ""
-    private var requestedStop = false
-    private var receivedTerminalEvent = false
-    private var pendingTerminalEvent: RuntimeEvent?
+    private final class Invocation {
+        let lease: TaskLease
+        let process: Process
+        let input: Pipe
+        let handler: (@MainActor (RuntimeEvent) -> Void)?
+        var outputBuffer = Data()
+        var lastErrorLine = ""
+        var requestedStop = false
+        var receivedTerminalEvent = false
+        var pendingTerminalEvent: RuntimeEvent?
+        var operations: [UUID: Task<Void, Never>] = [:]
+        var exited = false
+        var pendingUserInputID: String?
+        var terminalDelivered = false
+        var drainStarted: ContinuousClock.Instant?
+        var drainReported = false
+        init(lease: TaskLease, process: Process, input: Pipe, handler: (@MainActor (RuntimeEvent) -> Void)?) {
+            self.lease = lease; self.process = process; self.input = input; self.handler = handler
+        }
+    }
+    private var invocation: Invocation?
 
-    init(bridge: AgentAutomationBridge) {
+    init(bridge: AgentAutomationBridge, drainReportingDelay: TimeInterval = 5, bridgeHandler: (([String: Any]) async -> [String: Any])? = nil) {
         self.bridge = bridge
+        self.bridgeHandler = bridgeHandler
+        self.drainReportingDelay = drainReportingDelay
     }
 
     func start(
@@ -89,13 +108,15 @@ final class AgentRuntimeProcess {
         display: DisplayDescriptor,
         runtimeURL: URL,
         openClawURL: URL,
-        geminiAPIKey: String
+        geminiAPIKey: String,
+        lease: TaskLease = TaskLease()
     ) throws {
-        guard process == nil else { throw RuntimeProcessError.alreadyRunning }
+        guard ioQueue.sync(execute: { invocation == nil || invocation?.lease.state == .retired }) else { throw RuntimeProcessError.alreadyRunning }
         guard FileManager.default.isExecutableFile(atPath: runtimeURL.path) else {
             throw RuntimeProcessError.runtimeMissing
         }
 
+        try bridge.bind(lease)
         let process = Process()
         let input = Pipe()
         let output = Pipe()
@@ -115,47 +136,32 @@ final class AgentRuntimeProcess {
         process.standardOutput = output
         process.standardError = error
 
-        installOutputHandler(output.fileHandleForReading, for: process)
-        error.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            self?.ioQueue.async {
-                let lines = text.split(whereSeparator: \.isNewline)
-                if let last = lines.last { self?.lastErrorLine = String(last) }
-            }
-        }
+        let run = Invocation(lease: lease, process: process, input: input, handler: onEvent)
+        ioQueue.sync { invocation = run }
+        installOutputHandler(output.fileHandleForReading, for: run)
+        installErrorHandler(error.fileHandleForReading, for: run)
 
-        requestedStop = false
-        receivedTerminalEvent = false
-        pendingTerminalEvent = nil
-        outputBuffer.removeAll(keepingCapacity: true)
-        lastErrorLine = ""
         process.terminationHandler = { [weak self] terminated in
             guard let self else { return }
             self.ioQueue.async {
+                terminated.terminationHandler = nil
+                guard self.invocation === run, run.process === terminated else { return }
                 output.fileHandleForReading.readabilityHandler = nil
                 error.fileHandleForReading.readabilityHandler = nil
-                self.appendOutput(output.fileHandleForReading.readDataToEndOfFile(), flush: true)
-                self.process = nil
-                self.inputPipe = nil
-                if self.requestedStop {
-                    self.emit(.stopped)
-                } else if let pendingTerminalEvent = self.pendingTerminalEvent {
-                    self.pendingTerminalEvent = nil
-                    self.emit(pendingTerminalEvent)
-                } else if !self.receivedTerminalEvent {
-                    let detail = self.lastErrorLine.isEmpty
-                        ? "The OpenClaw bridge exited unexpectedly"
-                        : self.lastErrorLine
-                    self.emit(.failed(detail))
+                self.appendOutput(output.fileHandleForReading.readDataToEndOfFile(), for: run, flush: true)
+                self.appendError(error.fileHandleForReading.readDataToEndOfFile(), for: run)
+                run.exited = true
+                if !run.requestedStop && run.pendingTerminalEvent == nil {
+                    run.pendingTerminalEvent = .failed(run.lastErrorLine.isEmpty ? "The OpenClaw bridge exited unexpectedly" : run.lastErrorLine)
                 }
+                self.beginDrain(run)
             }
         }
 
-        self.process = process
-        self.inputPipe = input
+        var launched = false
         do {
-            try process.run()
+            try lease.commit { try process.run() }
+            launched = true
             // Pass the secret through the already-private controller pipe,
             // never through arguments, environment variables, or logs. The
             // runtime consumes this first line before it begins bridge calls.
@@ -163,56 +169,79 @@ final class AgentRuntimeProcess {
                 "kind": "runtime_configuration",
                 "gemini_api_key": geminiAPIKey,
                 "action_contract_hash": ActionContract.fingerprint,
-                "action_contract_version": ActionContract.version
+                "action_contract_version": ActionContract.version,
+                "task_generation_id": lease.id,
+                "task_protocol_version": ActionContract.taskProtocolVersion
             ])
             configuration.append(0x0A)
             try input.fileHandleForWriting.write(contentsOf: configuration)
         } catch let launchError {
+            if launched {
+                // A successfully spawned helper must drain like every other
+                // invocation, even if writing its startup configuration fails.
+                ioQueue.async {
+                    run.pendingTerminalEvent = .failed("Could not start the agent: \(launchError.localizedDescription)")
+                    self.beginDrain(run)
+                    if process.isRunning { process.terminate() }
+                }
+                return
+            }
             output.fileHandleForReading.readabilityHandler = nil
             error.fileHandleForReading.readabilityHandler = nil
             process.terminationHandler = nil
             if process.isRunning { process.terminate() }
-            self.process = nil
-            self.inputPipe = nil
-            pendingTerminalEvent = nil
+            lease.revoke()
+            ioQueue.sync { run.exited = true; run.pendingTerminalEvent = nil; run.lease.retire() }
             throw launchError
         }
     }
 
     func pause() {
+        ioQueue.sync { invocation?.lease.pause() }
         bridge.pauseActiveTool()
         signalRuntime(SIGSTOP)
     }
 
     func resume() {
+        ioQueue.sync { invocation?.lease.resume() }
         bridge.resumeActiveTool()
         signalRuntime(SIGCONT)
     }
 
     func stop() {
-        requestedStop = true
+        let run = ioQueue.sync { () -> Invocation? in
+            guard let run = invocation, run.lease.state != .retired else { return nil }
+            run.lease.revoke(); run.requestedStop = true
+            beginDrain(run)
+            return run
+        }
+        guard let run else { return }
         bridge.cancelActiveTool()
-        guard let process else { return }
         signalRuntime(SIGCONT)
         signalRuntime(SIGTERM)
-        if process.isRunning {
-            process.terminate()
-        }
+        if run.process.isRunning { run.process.terminate() }
     }
 
-    func submitUserInput(requestID: String, value: String) {
+    func submitUserInput(requestID: String, value: String, taskGenerationID: String) {
         // The credential crosses only the existing private stdin pipe. It is
         // never placed in arguments, environment variables, status text, or
         // the OpenClaw conversation.
+        let run = ioQueue.sync { () -> Invocation? in
+            guard let run = invocation, run.pendingUserInputID == requestID, run.lease.accepts(taskGenerationID) else { return nil }
+            run.pendingUserInputID = nil
+            return run
+        }
+        guard let run, run.lease.accepts(taskGenerationID) else { return }
         send([
+            "task_generation_id": run.lease.id,
             "kind": "user_input_response",
             "request_id": requestID,
             "value": value
-        ])
+        ], for: run)
     }
 
     private func signalRuntime(_ signal: Int32) {
-        guard let pid = process?.processIdentifier else { return }
+        guard let pid = ioQueue.sync(execute: { invocation?.process.processIdentifier }) else { return }
         // The packaged Python helper makes itself a process-group leader, so
         // pause/stop applies to its OpenClaw ACP child as well. Fall back to the
         // helper pid during the brief startup window before setpgrp completes.
@@ -221,25 +250,41 @@ final class AgentRuntimeProcess {
         }
     }
 
-    private func installOutputHandler(_ handle: FileHandle, for process: Process) {
+    private func installOutputHandler(_ handle: FileHandle, for run: Invocation) {
         handle.readabilityHandler = { [weak self] handle in
             // Admit one read at a time. Leaving the handler enabled while a
             // read is queued can enqueue another blocking read ahead of a
             // bridge response and deadlock the controller pipe.
             handle.readabilityHandler = nil
             self?.ioQueue.async { [weak self] in
-                guard let self, self.process === process else { return }
-                self.appendOutput(handle.availableData)
-                if process.isRunning { self.installOutputHandler(handle, for: process) }
+                guard let self, self.invocation === run else { return }
+                self.appendOutput(handle.availableData, for: run)
+                if run.process.isRunning { self.installOutputHandler(handle, for: run) }
             }
         }
     }
 
+    private func installErrorHandler(_ handle: FileHandle, for run: Invocation) {
+        handle.readabilityHandler = { [weak self] handle in
+            handle.readabilityHandler = nil
+            self?.ioQueue.async { [weak self] in
+                guard let self, self.invocation === run else { return }
+                self.appendError(handle.availableData, for: run)
+                if run.process.isRunning { self.installErrorHandler(handle, for: run) }
+            }
+        }
+    }
+
+    private func appendError(_ data: Data, for run: Invocation) {
+        guard let text = String(data: data, encoding: .utf8), let last = text.split(whereSeparator: \.isNewline).last else { return }
+        run.lastErrorLine = String(last)
+    }
+
     // Also used after process exit; the final event need not end with a newline.
-    private func appendOutput(_ data: Data, flush: Bool = false) {
-        outputBuffer.append(data)
-        let lines = Self.extractOutputLines(from: &outputBuffer, flush: flush)
-        for line in lines { processLine(line) }
+    private func appendOutput(_ data: Data, for run: Invocation, flush: Bool = false) {
+        run.outputBuffer.append(data)
+        let lines = Self.extractOutputLines(from: &run.outputBuffer, flush: flush)
+        for line in lines { processLine(line, for: run) }
     }
 
     static func extractOutputLines(from buffer: inout Data, flush: Bool = false) -> [Data] {
@@ -253,26 +298,42 @@ final class AgentRuntimeProcess {
         return lines
     }
 
-    private func processLine(_ data: Data) {
+    private func processLine(_ data: Data, for run: Invocation) {
         guard let object = try? JSONSerialization.jsonObject(with: data),
               let message = object as? [String: Any],
               let kind = message["kind"] as? String else { return }
 
+        guard invocation === run, run.lease.accepts(message["task_generation_id"] as? String) else {
+            if !run.requestedStop && run.lease.state != .draining && run.lease.state != .retired {
+                run.pendingTerminalEvent = .failed("TaskPilot runtime task ownership does not match; rebuild the bundled components together")
+                beginDrain(run)
+                run.process.terminate()
+            }
+            return
+        }
         switch kind {
         case "model_health":
-            emit(.modelHealth(message["model"] as? String ?? "", message["state"] as? String ?? "repair", message["detail"] as? String ?? ""))
+            emit(.modelHealth(message["model"] as? String ?? "", message["state"] as? String ?? "repair", message["detail"] as? String ?? ""), for: run)
         case "request_metrics":
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
-            if let metrics = try? decoder.decode(AgentRequestMetrics.self, from: data) { emit(.diagnostics(metrics)) }
+            if let metrics = try? decoder.decode(AgentRequestMetrics.self, from: data) { emit(.diagnostics(metrics), for: run) }
         case "bridge_request":
-            Task { [weak self] in
+            let operationID = UUID()
+            let operation = Task { [weak self] in
                 guard let self else { return }
-                let response = await self.bridge.handle(message)
-                self.send(response)
+                let response = await TaskOwnership.$current.withValue(run.lease) {
+                    if let handler = self.bridgeHandler { return await handler(message) }
+                    return await self.bridge.handle(message)
+                }
+                self.ioQueue.async {
+                    self.send(response, for: run)
+                    run.operations.removeValue(forKey: operationID)
+                }
             }
+            run.operations[operationID] = operation
         case "status":
-            if let text = message["message"] as? String { emit(.status(text)) }
+            if let text = message["message"] as? String { emit(.status(text), for: run) }
         case "output":
             let output = AgentTaskOutput(
                 shouldShow: message["show_output"] as? Bool ?? false,
@@ -281,49 +342,79 @@ final class AgentRuntimeProcess {
                 decidedByAgent: message["decided_by_agent"] as? Bool ?? false,
                 kind: AgentTaskOutputKind(rawValue: message["output_kind"] as? String ?? "result") ?? .result
             )
-            emit(.output(output))
+            emit(.output(output), for: run)
         case "user_input_required":
             guard let requestID = message["request_id"] as? String else { return }
+            run.pendingUserInputID = requestID
             let request = AgentUserInputRequest(
                 requestID: requestID,
+                taskGenerationID: run.lease.id,
                 title: message["title"] as? String ?? "Password required",
                 message: message["message"] as? String ?? "Enter the requested credential to continue.",
                 kind: AgentUserInputKind(
                     rawValue: message["input_kind"] as? String ?? "password"
                 ) ?? .password
             )
-            emit(.userInputRequired(request))
+            emit(.userInputRequired(request), for: run)
         case "complete":
-            receivedTerminalEvent = true
-            pendingTerminalEvent = .completed(message["message"] as? String ?? "Task complete")
+            run.receivedTerminalEvent = true
+            run.pendingTerminalEvent = .completed(message["message"] as? String ?? "Task complete")
+            beginDrain(run)
         case "error":
-            receivedTerminalEvent = true
-            pendingTerminalEvent = .failed(message["message"] as? String ?? "The task failed")
+            run.receivedTerminalEvent = true
+            run.pendingTerminalEvent = .failed(message["message"] as? String ?? "The task failed")
+            beginDrain(run)
         default:
             break
         }
     }
 
-    private func send(_ object: [String: Any]) {
+    private func send(_ object: [String: Any], for run: Invocation) {
         ioQueue.async { [weak self] in
-            guard let self, let handle = self.inputPipe?.fileHandleForWriting,
+            guard let self, self.invocation === run, run.lease.accepts(object["task_generation_id"] as? String),
                   var data = try? JSONSerialization.data(withJSONObject: object) else { return }
             data.append(0x0A)
-            do {
-                try handle.write(contentsOf: data)
-            } catch {
-                self.receivedTerminalEvent = true
-                self.pendingTerminalEvent = .failed(
-                    "Lost contact with the native screen controller"
-                )
-                if let process = self.process, process.isRunning {
-                    process.terminate()
-                }
+            do { try run.input.fileHandleForWriting.write(contentsOf: data) }
+            catch {
+                run.pendingTerminalEvent = .failed("Lost contact with the native screen controller")
+                self.beginDrain(run)
+                if run.process.isRunning { run.process.terminate() }
             }
         }
     }
 
-    private func emit(_ event: RuntimeEvent) {
-        DispatchQueue.main.async { [weak self] in self?.onEvent?(event) }
+    private func beginDrain(_ run: Invocation) {
+        guard run.drainStarted == nil else { return }
+        run.drainStarted = .now
+        run.lease.revoke()
+        for operation in run.operations.values { operation.cancel() }
+        bridge.cancelActiveTool()
+        pollDrain(run)
+    }
+
+    private func pollDrain(_ run: Invocation) {
+        guard invocation === run, !run.terminalDelivered else { return }
+        if run.exited && run.operations.isEmpty {
+            run.terminalDelivered = true
+            emit(run.requestedStop ? .stopped : (run.pendingTerminalEvent ?? .failed("Runtime ended without a result")), for: run, terminal: true, retireAfterDelivery: true)
+            return
+        }
+        if !run.drainReported, ContinuousClock.now >= (run.drainStarted ?? .now).advanced(by: .seconds(drainReportingDelay)) {
+            run.drainReported = true
+            emit(.status("Waiting for the previous task’s native work to finish safely…"), for: run, terminal: true)
+        }
+        ioQueue.asyncAfter(deadline: .now() + 0.025) { [weak self] in self?.pollDrain(run) }
+    }
+
+    private func emit(_ event: RuntimeEvent, for run: Invocation, terminal: Bool = false, retireAfterDelivery: Bool = false) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let delivery = self.ioQueue.sync {
+                (self.invocation === run && (terminal || !run.requestedStop), retireAfterDelivery && run.requestedStop)
+            }
+            guard delivery.0 else { return }
+            run.handler?(delivery.1 ? .stopped : event)
+            if retireAfterDelivery { run.lease.retire() }
+        }
     }
 }

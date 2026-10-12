@@ -165,8 +165,12 @@ final class AccessibilityController {
     private let agentCursor: AgentCursorOverlayController?
     private var elementMap: [String: ElementRecord] = [:]
     private var observationRevision = ""
+    private var observationTaskGenerationID: String?
     private var observedGraphicsWindows: [pid_t: [AutomationGraphicsWindow]] = [:]
     private var observedApplications: [pid_t: AutomationApplicationIdentity] = [:]
+    private var taskLease: TaskLease?
+    private var teardownForeground: (NSRunningApplication, pid_t)?
+    private var taskGenerationID: String?
     private var inputGeneration = 0
     private var inputCancelled = false
     private var restoreWorkItem: DispatchWorkItem?
@@ -195,7 +199,7 @@ final class AccessibilityController {
     /// `launch_app` action.
     // MARK: - Task resource tracking
 
-    func beginTaskResourceTracking(on display: DisplayDescriptor) {
+    func beginTaskResourceTracking(on display: DisplayDescriptor, lease: TaskLease? = nil) {
         resetInputCancellation()
         let applications = controllableRunningApplications()
         var windowsByPID: [pid_t: [AXUIElement]] = [:]
@@ -206,6 +210,9 @@ final class AccessibilityController {
         }
 
         lock.lock()
+        taskLease = lease
+        taskGenerationID = lease?.id
+        elementMap.removeAll(); observationRevision = ""
         manualTargetPID = nil
         taskDisplayOverrideID = nil
         taskApplicationBaseline = TaskApplicationBaseline(
@@ -228,11 +235,20 @@ final class AccessibilityController {
         cancelInputDelivery()
         lock.lock()
         let baseline = taskApplicationBaseline
+        let foreground = teardownForeground
+        teardownForeground = nil
+        taskLease = nil
         taskApplicationBaseline = nil
+        taskGenerationID = nil
+        elementMap.removeAll(); observationRevision = ""
         manualTargetPID = nil
         taskDisplayOverrideID = nil
         lock.unlock()
 
+        if let (previous, target) = foreground, !previous.isTerminated,
+           NSWorkspace.shared.frontmostApplication?.processIdentifier == target {
+            _ = ownedActivate(previous)
+        }
         guard closeOpenedResources, let baseline else { return .empty }
 
         let currentApplications = controllableRunningApplications()
@@ -267,7 +283,7 @@ final class AccessibilityController {
                       CFGetTypeID(closeButton) == AXUIElementGetTypeID(),
                       actionNames(closeButton as! AXUIElement).contains(kAXPressAction as String)
                 else { continue }
-                if AXUIElementPerformAction(
+                if ownedAXPress(
                     closeButton as! AXUIElement,
                     kAXPressAction as CFString
                 ) == .success {
@@ -428,12 +444,15 @@ final class AccessibilityController {
             }
         }
 
-        lock.lock()
-        elementMap = newMap
-        observationRevision = revision
-        observedGraphicsWindows = observedGraphics
-        observedApplications = observedApps
-        lock.unlock()
+        TaskOwnership.callback(TaskOwnership.current) {
+            lock.lock()
+            elementMap = newMap
+            observationRevision = revision
+            observationTaskGenerationID = TaskOwnership.current?.id
+            observedGraphicsWindows = observedGraphics
+            observedApplications = observedApps
+            lock.unlock()
+        }
         return AccessibilitySnapshot(
             revision: revision,
             elements: elementRows,
@@ -560,8 +579,10 @@ final class AccessibilityController {
     func validateObservation(_ revision: String?) throws {
         lock.lock()
         let current = observationRevision
+        let generation = observationTaskGenerationID
         lock.unlock()
-        guard let revision, !revision.isEmpty, revision == current else {
+        guard let revision, !revision.isEmpty, revision == current,
+              TaskOwnership.current == nil || TaskOwnership.current?.id == generation else {
             throw AccessibilityActionError.staleObservation
         }
     }
@@ -576,6 +597,8 @@ final class AccessibilityController {
     }
 
     func cancelInputDelivery() {
+        let taskLease = TaskOwnership.current ?? lock.withLock { self.taskLease }
+
         lock.lock()
         inputCancelled = true
         inputGeneration += 1
@@ -583,21 +606,30 @@ final class AccessibilityController {
         let previous = previousInputApplication
         let target = inputTargetPID
         let generation = inputGeneration
+        if let previous, let target { teardownForeground = (previous, target) }
         previousInputApplication = nil
         inputTargetPID = nil
         lock.unlock()
         if let previous, let target, NSWorkspace.shared.frontmostApplication?.processIdentifier == target {
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.lock.withLock({ self.inputGeneration == generation }),
-                      NSWorkspace.shared.frontmostApplication?.processIdentifier == target else { return }
-                _ = previous.activate(options: [.activateAllWindows])
+                TaskOwnership.callback(taskLease) {
+                    guard let self, self.lock.withLock({ self.inputGeneration == generation }),
+                          NSWorkspace.shared.frontmostApplication?.processIdentifier == target else { return }
+                    _ = ownedActivate(previous)
+                }
             }
         }
     }
 
+    private func inputIsCancelledUnlocked() -> Bool {
+        inputCancelled || Task.isCancelled
+    }
+
     private func inputIsCancelled() -> Bool {
+        let state = TaskOwnership.current?.state
+        let stale = state != nil && state != .running && state != .paused
         lock.lock(); defer { lock.unlock() }
-        return inputCancelled
+        return inputCancelled || Task.isCancelled || stale
     }
 
     private func prepareInputTarget(_ pid: pid_t) {
@@ -614,12 +646,13 @@ final class AccessibilityController {
     }
 
     private func beginVerifiedInput(to pid: pid_t) async throws {
+        try await TaskOwnership.checkpoint()
         prepareInputTarget(pid)
         guard let target = NSRunningApplication(processIdentifier: pid), !target.isTerminated else {
             throw AccessibilityActionError.elementUnavailable
         }
         if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
-            let allowed = await MainActor.run { target.activate(options: [.activateAllWindows]) }
+            let allowed = try await ownedActivateAsync(target)
             guard allowed else { throw AccessibilityActionError.activationFailed }
         }
         try await AutomationInputPolicy.waitUntilReady(
@@ -644,32 +677,36 @@ final class AccessibilityController {
     }
 
     private func scheduleInputRestoration(_ pid: pid_t) {
+        let taskLease = TaskOwnership.current ?? lock.withLock { self.taskLease }
+
         lock.lock()
         let generation = inputGeneration
         let previous = previousInputApplication
         lock.unlock()
         guard let previous else { return }
         let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.lock.lock()
-            let currentGeneration = self.inputGeneration
-            self.lock.unlock()
-            guard !previous.isTerminated, AutomationInputPolicy.shouldRestore(
-                scheduledGeneration: generation, currentGeneration: currentGeneration,
-                targetPID: pid, currentPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
-                previousPID: previous.processIdentifier
-            ) else { return }
-            if self.hasOpenMenu(pid) {
-                self.scheduleInputRestoration(pid)
-                return
+            TaskOwnership.callback(taskLease) {
+                guard let self else { return }
+                self.lock.lock()
+                let currentGeneration = self.inputGeneration
+                self.lock.unlock()
+                guard !previous.isTerminated, AutomationInputPolicy.shouldRestore(
+                    scheduledGeneration: generation, currentGeneration: currentGeneration,
+                    targetPID: pid, currentPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+                    previousPID: previous.processIdentifier
+                ) else { return }
+                if self.hasOpenMenu(pid) {
+                    self.scheduleInputRestoration(pid)
+                    return
+                }
+                _ = ownedActivate(previous)
+                self.lock.lock()
+                if generation == self.inputGeneration {
+                    self.previousInputApplication = nil
+                    self.inputTargetPID = nil
+                }
+                self.lock.unlock()
             }
-            _ = previous.activate(options: [.activateAllWindows])
-            self.lock.lock()
-            if generation == self.inputGeneration {
-                self.previousInputApplication = nil
-                self.inputTargetPID = nil
-            }
-            self.lock.unlock()
         }
         lock.lock()
         restoreWorkItem?.cancel()
@@ -714,6 +751,7 @@ final class AccessibilityController {
     }
 
     func performStructured(action: [String: Any], on display: DisplayDescriptor, privateInput: Bool = false) async throws -> [String: Any] {
+        try await TaskOwnership.checkpoint()
         let action = try validatedDesktopAction(action)
         guard !inputIsCancelled() else { throw AccessibilityActionError.cancelled }
         let planningRevision = lock.withLock { observationRevision }
@@ -737,7 +775,7 @@ final class AccessibilityController {
            let rectangle = frame(of: record.element) {
             let targetPoint = CGPoint(x: rectangle.midX, y: rectangle.midY)
             if !pointerTargetIsVisible(pid, at: targetPoint, display: display) {
-                if let window = record.window { _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString) }
+                if let window = record.window { _ = ownedAXPress(window, kAXRaiseAction as CFString) }
                 try await AutomationInputPolicy.waitUntilReady(
                     ready: { self.pointerTargetIsVisible(pid, at: targetPoint, display: display) && NSWorkspace.shared.frontmostApplication?.processIdentifier == pid },
                     cancelled: { self.inputIsCancelled() })
@@ -769,6 +807,7 @@ final class AccessibilityController {
     }
 
     func perform(action: [String: Any], on display: DisplayDescriptor, planningRevision: String? = nil) async throws -> String {
+        try await TaskOwnership.checkpoint()
         let action = try validatedDesktopAction(action)
         let kind = ActionKind(rawValue: action["type"] as! String)!
         let type = kind.rawValue
@@ -794,7 +833,7 @@ final class AccessibilityController {
             let method = try AutomationPressPolicy.deliver(preflight: {
                 try self.validateRecord(record, action: action, on: display)
             }, press: {
-                AXUIElementPerformAction(record.element, kAXPressAction as CFString)
+                ownedAXPress(record.element, kAXPressAction as CFString)
             }, fallback: {
                 // Some macOS apps advertise a semantic control but reject
                 // AXPress. Fall back to a targeted click at that element's
@@ -962,7 +1001,7 @@ final class AccessibilityController {
                     y: destination.frame.minY + 80 + cascade
                 )
                 guard let value = AXValueCreate(.cgPoint, &newPosition),
-                      AXUIElementSetAttributeValue(
+                      ownedAXSet(
                         window,
                         kAXPositionAttribute as CFString,
                         value
@@ -970,7 +1009,7 @@ final class AccessibilityController {
 
                 placements.append(WindowPlacement(element: window, position: oldPosition))
                 movedApplications[app.processIdentifier] = app
-                _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+                _ = ownedAXPress(window, kAXRaiseAction as CFString)
                 cascade = min(cascade + 24, 144)
             }
         }
@@ -981,7 +1020,7 @@ final class AccessibilityController {
         for application in movedApplications.values.sorted(by: {
             ($0.localizedName ?? "") < ($1.localizedName ?? "")
         }) {
-            application.activate(options: [.activateAllWindows])
+            _ = ownedActivate(application)
         }
         return placements
     }
@@ -1007,7 +1046,7 @@ final class AccessibilityController {
                     skippedWindowCount += 1
                     continue
                 }
-                if AXUIElementPerformAction(
+                if ownedAXPress(
                     closeButton as! AXUIElement,
                     kAXPressAction as CFString
                 ) == .success {
@@ -1041,7 +1080,7 @@ final class AccessibilityController {
         for placement in placements {
             var position = placement.position
             guard let value = AXValueCreate(.cgPoint, &position) else { continue }
-            _ = AXUIElementSetAttributeValue(
+            _ = ownedAXSet(
                 placement.element,
                 kAXPositionAttribute as CFString,
                 value
@@ -1160,7 +1199,7 @@ final class AccessibilityController {
 
         if let settingsURLText = route["settings_url"] {
             guard let settingsURL = URL(string: settingsURLText),
-                  NSWorkspace.shared.open(settingsURL) else {
+                  TaskOwnership.permitted(false, { NSWorkspace.shared.open(settingsURL) }) else {
                 throw AccessibilityActionError.operationFailed(
                     "Could not open the predefined \(route["destination"] ?? appName) route"
                 )
@@ -1363,15 +1402,18 @@ final class AccessibilityController {
         configuration.addsToRecentItems = false
         configuration.hidesOthers = false
 
-        let app: NSRunningApplication
+        var app: NSRunningApplication
         do {
-            app = try await workspace.openApplication(at: url, configuration: configuration)
+            app = try await ownedOpenApplication(workspace, at: url, configuration: configuration)
+            recordAgentLaunch(pids: [app.processIdentifier])
+            try await TaskOwnership.checkpoint()
         } catch {
+            try TaskOwnership.check()
             // iPhone/iPad-style wrappers can be registered with LaunchServices
             // without behaving like a conventional macOS bundle. The plain
             // workspace open route handles those wrappers, after which we bind
             // to the actual (sometimes translocated) running process.
-            guard workspace.open(url),
+            guard TaskOwnership.permitted(false, { workspace.open(url) }),
                   let launched = await waitForRunningApplication(
                     bundleID: expectedBundleID,
                     name: requestedName,
@@ -1415,7 +1457,7 @@ final class AccessibilityController {
             )
             for candidate in candidates {
                 candidate.unhide()
-                _ = candidate.activate(options: [.activateAllWindows])
+                _ = ownedActivate(candidate)
             }
             try? await Task.sleep(for: .milliseconds(250))
             placement = LaunchPlacementResult(
@@ -1452,8 +1494,8 @@ final class AccessibilityController {
                 displays: DisplayService().displays()
             ), fallbackDisplay.id != display.id {
                 for candidate in finalCandidates {
-                    candidate.unhide()
-                    _ = candidate.activate(options: [.activateAllWindows])
+                    TaskOwnership.callback(TaskOwnership.current) { candidate.unhide() }
+                    _ = ownedActivate(candidate)
                 }
                 setTaskDisplayOverride(fallbackDisplay.id)
                 rememberPreferredTaskTarget(from: finalPIDs, on: fallbackDisplay)
@@ -1473,7 +1515,8 @@ final class AccessibilityController {
 
     private func recordAgentLaunch(pids: [pid_t]) {
         lock.lock()
-        guard var baseline = taskApplicationBaseline else {
+        guard TaskOwnership.current == nil || TaskOwnership.current?.id == taskGenerationID,
+              var baseline = taskApplicationBaseline else {
             lock.unlock()
             return
         }
@@ -1484,6 +1527,7 @@ final class AccessibilityController {
 
     private func setTaskDisplayOverride(_ displayID: CGDirectDisplayID) {
         lock.lock()
+        guard !inputIsCancelledUnlocked() else { lock.unlock(); return }
         taskDisplayOverrideID = displayID
         lock.unlock()
     }
@@ -1501,6 +1545,7 @@ final class AccessibilityController {
         var seenPIDs: Set<pid_t> = []
         var activatedPIDs: Set<pid_t> = []
         repeat {
+            guard (try? await TaskOwnership.checkpoint()) != nil else { break }
             let candidates = candidateApplications(
                 launchedApplication: launchedApplication,
                 bundleID: bundleID,
@@ -1515,8 +1560,8 @@ final class AccessibilityController {
             if activateCandidates {
                 for candidate in candidates
                     where !activatedPIDs.contains(candidate.processIdentifier) {
-                    candidate.unhide()
-                    _ = candidate.activate(options: [.activateAllWindows])
+                    TaskOwnership.callback(TaskOwnership.current) { candidate.unhide() }
+                    _ = ownedActivate(candidate)
                     activatedPIDs.insert(candidate.processIdentifier)
                 }
             }
@@ -1558,13 +1603,13 @@ final class AccessibilityController {
                 y: display.frame.minY + 70 + offset
             )
             if let value = AXValueCreate(.cgPoint, &position) {
-                _ = AXUIElementSetAttributeValue(
+                _ = ownedAXSet(
                     window,
                     kAXPositionAttribute as CFString,
                     value
                 )
             }
-            _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+            _ = ownedAXPress(window, kAXRaiseAction as CFString)
             let currentFrame = frame(of: window)
             if currentFrame?.intersects(display.frame) == true {
                 visibleCount += 1
@@ -1647,6 +1692,7 @@ final class AccessibilityController {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
         repeat {
+            guard (try? await TaskOwnership.checkpoint()) != nil else { return nil }
             if let app = matchingRunningApplication(bundleID: bundleID, name: name) {
                 return app
             }
@@ -2067,7 +2113,7 @@ final class AccessibilityController {
             guard action["type"] as? String != "type_text" || action["element_id"] != nil else {
                 throw AccessibilityActionError.focusMismatch
             }
-            let result = AXUIElementSetAttributeValue(record.element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            let result = ownedAXSet(record.element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
             if result == .apiDisabled { throw AccessibilityActionError.permissionDenied }
             guard result == .success else { throw AccessibilityActionError.focusMismatch }
         }
@@ -2100,7 +2146,7 @@ final class AccessibilityController {
         guard support == .success, settable.boolValue else { return .unsupported }
         guard !inputIsCancelled() else { throw AccessibilityActionError.cancelled }
         guard intendedElementHasFocus(record) else { throw AccessibilityActionError.focusMismatch }
-        switch AXUIElementSetAttributeValue(record.element, name as CFString, value) {
+        switch ownedAXSet(record.element, name as CFString, value) {
         case .success: return .accepted
         case .attributeUnsupported, .actionUnsupported, .notImplemented: return .unsupported
         case .apiDisabled: throw AccessibilityActionError.permissionDenied
@@ -2357,12 +2403,10 @@ final class AccessibilityController {
             targetPID: pid,
             topmostPID: topmostWindowOwnerPID(at: point)
         ) {
-            _ = NSRunningApplication(processIdentifier: pid)?.activate(
-                options: [.activateAllWindows]
-            )
+            _ = ownedActivate(NSRunningApplication(processIdentifier: pid))
             for window in windows(of: pid)
                 where frame(of: window)?.contains(point) == true {
-                _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+                _ = ownedAXPress(window, kAXRaiseAction as CFString)
             }
             Thread.sleep(forTimeInterval: 0.12)
             if pointerTargetIsVisible(pid, at: point, display: display) {
@@ -2566,11 +2610,6 @@ final class AccessibilityController {
     private func postSessionClick(at point: CGPoint, double: Bool, tap: CGEventTapLocation = .cgSessionEventTap,
                                   preflight: () throws -> Void) throws {
         let originalPointer = CGEvent(source: nil)?.location
-        defer {
-            if let originalPointer {
-                CGWarpMouseCursorPosition(originalPointer)
-            }
-        }
         guard let source = CGEventSource(stateID: .hidSystemState),
               let move = CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
                                  mouseCursorPosition: point, mouseButton: .left),
@@ -2581,20 +2620,23 @@ final class AccessibilityController {
             throw AccessibilityActionError.operationFailed("Could not create a HID mouse event")
         }
         source.localEventsSuppressionInterval = 0
-        move.post(tap: tap)
-        Thread.sleep(forTimeInterval: 0.008)
-        down.setIntegerValueField(.mouseEventClickState, value: 1)
-        up.setIntegerValueField(.mouseEventClickState, value: 1)
-        try AutomationTargetPolicy.deliver(preflight: preflight, event: { down.post(tap: tap) })
-        Thread.sleep(forTimeInterval: Self.hidClickPressDuration)
-        up.post(tap: tap)
-        if double {
-            Thread.sleep(forTimeInterval: 0.060)
-            down.setIntegerValueField(.mouseEventClickState, value: 2)
-            up.setIntegerValueField(.mouseEventClickState, value: 2)
-            down.post(tap: tap)
+        try TaskOwnership.commit {
+            defer { if let originalPointer { CGWarpMouseCursorPosition(originalPointer) } }
+            move.post(tap: tap)
+            Thread.sleep(forTimeInterval: 0.008)
+            down.setIntegerValueField(.mouseEventClickState, value: 1)
+            up.setIntegerValueField(.mouseEventClickState, value: 1)
+            try AutomationTargetPolicy.deliver(preflight: preflight, event: { down.post(tap: tap) })
             Thread.sleep(forTimeInterval: Self.hidClickPressDuration)
             up.post(tap: tap)
+            if double {
+                Thread.sleep(forTimeInterval: 0.060)
+                down.setIntegerValueField(.mouseEventClickState, value: 2)
+                up.setIntegerValueField(.mouseEventClickState, value: 2)
+                down.post(tap: tap)
+                Thread.sleep(forTimeInterval: Self.hidClickPressDuration)
+                up.post(tap: tap)
+            }
         }
         // iOS game result screens sometimes process the tap on the next run
         // loop turn. Keep the pointer over the target briefly before restoring
@@ -2632,13 +2674,13 @@ final class AccessibilityController {
         }
         source.localEventsSuppressionInterval = 0
         let originalPointer = useHID ? CGEvent(source: nil)?.location : nil
-        defer {
-            if let originalPointer { CGWarpMouseCursorPosition(originalPointer) }
-        }
-        let events = [move, down, dragged, up]
-        for (index, event) in events.enumerated() {
-            if useHID { event.post(tap: .cghidEventTap) } else { event.postToPid(pid) }
-            if index < events.count - 1 { Thread.sleep(forTimeInterval: 0.020) }
+        try TaskOwnership.commit {
+            defer { if let originalPointer { CGWarpMouseCursorPosition(originalPointer) } }
+            let events = [move, down, dragged, up]
+            for (index, event) in events.enumerated() {
+                if useHID { event.post(tap: .cghidEventTap) } else { event.postToPid(pid) }
+                if index < events.count - 1 { Thread.sleep(forTimeInterval: 0.020) }
+            }
         }
         agentCursor?.move(to: end, on: display, clicking: false)
     }
@@ -2658,9 +2700,11 @@ final class AccessibilityController {
                 down.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: buffer.baseAddress!)
                 up.keyboardSetUnicodeString(stringLength: buffer.count, unicodeString: buffer.baseAddress!)
             }
-            down.postToPid(pid)
-            Thread.sleep(forTimeInterval: 0.012)
-            up.postToPid(pid)
+            try TaskOwnership.commit {
+                down.postToPid(pid)
+                Thread.sleep(forTimeInterval: 0.012)
+                up.postToPid(pid)
+            }
         }
         Thread.sleep(forTimeInterval: 0.035)
     }
@@ -2683,9 +2727,11 @@ final class AccessibilityController {
         }
         down.flags = flags
         up.flags = flags
-        try AutomationTargetPolicy.deliver(preflight: preflight, event: { down.postToPid(pid) })
-        Thread.sleep(forTimeInterval: 0.018)
-        up.postToPid(pid)
+        try TaskOwnership.commit {
+            try AutomationTargetPolicy.deliver(preflight: preflight, event: { down.postToPid(pid) })
+            Thread.sleep(forTimeInterval: 0.018)
+            up.postToPid(pid)
+        }
         Thread.sleep(forTimeInterval: 0.035)
     }
 
@@ -2708,9 +2754,11 @@ final class AccessibilityController {
         if modifiers.contains(.control) { flags.insert(.maskControl) }
         down.flags = flags
         up.flags = flags
-        down.postToPid(pid)
-        Thread.sleep(forTimeInterval: 0.012)
-        up.postToPid(pid)
+        try TaskOwnership.commit {
+            down.postToPid(pid)
+            Thread.sleep(forTimeInterval: 0.012)
+            up.postToPid(pid)
+        }
     }
 
     @discardableResult
@@ -2741,16 +2789,18 @@ final class AccessibilityController {
             throw AccessibilityActionError.operationFailed("Could not create a scroll event")
         }
         let originalPointer = CGEvent(source: nil)?.location
-        defer { if let originalPointer { CGWarpMouseCursorPosition(originalPointer) } }
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
             throw AccessibilityActionError.activationFailed
         }
         let move = CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
                            mouseCursorPosition: resolvedPoint, mouseButton: .left)
-        move?.post(tap: .cgSessionEventTap)
-        Thread.sleep(forTimeInterval: 0.025)
-        event.location = resolvedPoint
-        event.post(tap: .cgSessionEventTap)
+        try TaskOwnership.commit {
+            defer { if let originalPointer { CGWarpMouseCursorPosition(originalPointer) } }
+            move?.post(tap: .cgSessionEventTap)
+            Thread.sleep(forTimeInterval: 0.025)
+            event.location = resolvedPoint
+            event.post(tap: .cgSessionEventTap)
+        }
         Thread.sleep(forTimeInterval: 0.05)
         return resolvedPoint != point
     }
@@ -2866,7 +2916,7 @@ final class AccessibilityController {
               !target.isActive else { return nil }
 
         let previous = NSWorkspace.shared.frontmostApplication
-        target.activate(options: [.activateAllWindows])
+        _ = ownedActivate(target)
         // Agent actions have already awaited confirmed activation in
         // beginVerifiedInput. Viewer input must never block the main run loop.
         return previous?.processIdentifier == pid ? nil : previous
@@ -2877,6 +2927,8 @@ final class AccessibilityController {
         after delay: TimeInterval,
         targetPID: pid_t
     ) {
+        let taskLease = TaskOwnership.current ?? lock.withLock { self.taskLease }
+
         guard let application,
               application.processIdentifier != controllerPID,
               !application.isTerminated else { return }
@@ -2884,15 +2936,17 @@ final class AccessibilityController {
         let generation = inputGeneration
         lock.unlock()
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self else { return }
-            self.lock.lock()
-            let currentGeneration = self.inputGeneration
-            self.lock.unlock()
-            guard !application.isTerminated,
-                  AutomationInputPolicy.shouldRestore(scheduledGeneration: generation, currentGeneration: currentGeneration,
-                    targetPID: targetPID, currentPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
-                    previousPID: application.processIdentifier), !self.hasOpenMenu(targetPID) else { return }
-            application.activate(options: [.activateAllWindows])
+            TaskOwnership.callback(taskLease) {
+                guard let self else { return }
+                self.lock.lock()
+                let currentGeneration = self.inputGeneration
+                self.lock.unlock()
+                guard !application.isTerminated,
+                      AutomationInputPolicy.shouldRestore(scheduledGeneration: generation, currentGeneration: currentGeneration,
+                        targetPID: targetPID, currentPID: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+                        previousPID: application.processIdentifier), !self.hasOpenMenu(targetPID) else { return }
+                _ = ownedActivate(application)
+            }
         }
     }
 
@@ -2992,5 +3046,36 @@ private extension String {
         }
         if !current.isEmpty { result.append(current) }
         return result
+    }
+}
+
+
+private func ownedAXSet(_ element: AXUIElement, _ name: CFString, _ value: CFTypeRef) -> AXError {
+    TaskOwnership.permitted(.cannotComplete) { AXUIElementSetAttributeValue(element, name, value) }
+}
+private func ownedAXPress(_ element: AXUIElement, _ action: CFString) -> AXError {
+    TaskOwnership.permitted(.cannotComplete) { AXUIElementPerformAction(element, action) }
+}
+private func ownedActivate(_ app: NSRunningApplication?) -> Bool {
+    TaskOwnership.permitted(false) { app?.activate(options: [.activateAllWindows]) ?? false }
+}
+private func ownedActivateAsync(_ app: NSRunningApplication) async throws -> Bool {
+    while true {
+        try await TaskOwnership.checkpoint()
+        do { return try await MainActor.run { try TaskOwnership.commit { app.activate(options: [.activateAllWindows]) } } }
+        catch { if TaskOwnership.current?.state != .paused { throw error } }
+    }
+}
+private func ownedOpenApplication(_ workspace: NSWorkspace, at url: URL, configuration: NSWorkspace.OpenConfiguration) async throws -> NSRunningApplication {
+    try await TaskOwnership.checkpoint()
+    return try await withCheckedThrowingContinuation { continuation in
+        do {
+            try TaskOwnership.commit {
+                workspace.openApplication(at: url, configuration: configuration) { app, error in
+                    if let app { continuation.resume(returning: app) }
+                    else { continuation.resume(throwing: error ?? AccessibilityActionError.elementUnavailable) }
+                }
+            }
+        } catch { continuation.resume(throwing: error) }
     }
 }

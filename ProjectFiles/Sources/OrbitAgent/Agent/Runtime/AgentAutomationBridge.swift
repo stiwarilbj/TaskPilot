@@ -5,6 +5,18 @@ final class AgentAutomationBridge {
     private let accessibility: AccessibilityController
     private let capture: ScreenCaptureService
     private let taskTools = TaskToolExecutor()
+    private let ownershipLock = NSLock()
+    private var activeLease: TaskLease?
+    func bind(_ lease: TaskLease) throws {
+        ownershipLock.lock(); defer { ownershipLock.unlock() }
+        try lease.check()
+        guard activeLease == nil || activeLease?.state == .retired else { throw RuntimeProcessError.alreadyRunning }
+        activeLease = lease
+    }
+    private func owns(_ lease: TaskLease) -> Bool {
+        ownershipLock.lock(); defer { ownershipLock.unlock() }
+        return activeLease === lease
+    }
 
     init(
         displayService: DisplayService,
@@ -29,9 +41,16 @@ final class AgentAutomationBridge {
         taskTools.cancelActiveCommand()
     }
 
+    func handleOwned(_ request: [String: Any], lease: TaskLease?) async -> [String: Any] {
+        await TaskOwnership.$current.withValue(lease) { await handle(request) }
+    }
+
     func handle(_ request: [String: Any]) async -> [String: Any] {
         let requestID = request["request_id"] as? String ?? UUID().uuidString
+        let lease = TaskOwnership.current
         do {
+            guard let lease, owns(lease), lease.accepts(request["task_generation_id"] as? String) else { throw CancellationError() }
+            try await lease.checkpoint()
             guard let method = request["method"] as? String else {
                 throw BridgeError.invalidRequest("Missing bridge method")
             }
@@ -48,8 +67,11 @@ final class AgentAutomationBridge {
                 // Capture first, then bind element IDs to the immediately
                 // following tree instead of racing an older tree with pixels.
                 let screenshotURL = try await capture.capture(display: display)
+                try await TaskOwnership.checkpoint()
                 let snapshot = accessibility.snapshot(on: display)
+                try TaskOwnership.check()
                 result = [
+                    "task_generation_id": lease.id,
                     "observation_revision": snapshot.revision,
                     "screenshot_path": screenshotURL.path,
                     "display": displayDictionary(display),
@@ -90,7 +112,9 @@ final class AgentAutomationBridge {
             default:
                 throw BridgeError.invalidRequest("Unknown bridge method: \(method)")
             }
+            try TaskOwnership.check()
             return [
+                "task_generation_id": lease.id,
                 "kind": "bridge_response",
                 "request_id": requestID,
                 "ok": true,
@@ -100,6 +124,7 @@ final class AgentAutomationBridge {
             let code = error is CancellationError ? "cancelled" : error is ActionContract.ValidationError ? "invalid_action" :
                 (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? "action_rejected"
             return [
+                "task_generation_id": lease?.id ?? "",
                 "kind": "bridge_response",
                 "request_id": requestID,
                 "ok": false,

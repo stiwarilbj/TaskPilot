@@ -8,6 +8,7 @@ import Foundation
 enum AutomationIntegrationBridge {
     private final class Placements {
         var windows: [WindowPlacement] = []
+        var lease: TaskLease?
     }
     static func startIfRequested() -> Bool {
         guard CommandLine.arguments.contains("--automation-test-bridge") else { return false }
@@ -31,15 +32,28 @@ enum AutomationIntegrationBridge {
                        let id = (request["params"] as? [String: Any])?["display_id"] as? UInt32,
                        let display = DisplayService().displays().first(where: { $0.id == id }) {
                         placements.windows = accessibility.captureWindowPlacements()
-                        accessibility.beginTaskResourceTracking(on: display)
+                        if let old = placements.lease {
+                            old.revoke()
+                            _ = accessibility.finishTaskResourceTracking(closeOpenedResources: false)
+                            old.retire()
+                        }
+                        placements.lease = TaskLease()
+                        try? bridge.bind(placements.lease!)
+                        accessibility.beginTaskResourceTracking(on: display, lease: placements.lease)
                         result = ["kind": "bridge_response", "request_id": request["request_id"] ?? "", "ok": true,
-                                  "result": ["displays": DisplayService().displays().map { ["id": $0.id, "name": $0.name, "main": $0.isMain] as [String: Any] }]]
+                                  "result": ["task_generation_id": placements.lease!.id, "displays": DisplayService().displays().map { ["id": $0.id, "name": $0.name, "main": $0.isMain] as [String: Any] }]]
                     } else if request["method"] as? String == "test_end" {
+                        placements.lease?.revoke()
                         _ = accessibility.finishTaskResourceTracking(closeOpenedResources: false)
                         accessibility.restoreWindows(placements.windows)
                         placements.windows = []
+                        placements.lease?.retire(); placements.lease = nil
                         result = ["kind": "bridge_response", "request_id": request["request_id"] ?? "", "ok": true, "result": [:]]
-                    } else { result = await bridge.handle(request) }
+                    } else {
+                        var ownedRequest = request
+                        ownedRequest["task_generation_id"] = placements.lease?.id
+                        result = await bridge.handleOwned(ownedRequest, lease: placements.lease)
+                    }
                     if let output = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]) {
                         FileHandle.standardOutput.write(output)
                         FileHandle.standardOutput.write(Data([10]))
@@ -49,6 +63,7 @@ enum AutomationIntegrationBridge {
                 finished.wait()
             }
             FileHandle.standardError.write(Data("integration input closed\n".utf8))
+            placements.lease?.revoke()
             accessibility.cancelInputDelivery()
             accessibility.restoreWindows(placements.windows)
             DispatchQueue.main.async { NSApp.terminate(nil) }
