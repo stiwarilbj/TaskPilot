@@ -11,6 +11,7 @@ final class TaskLease: @unchecked Sendable {
     private var discarded = 0
     private var suspensions = 0
     private var artifacts: Set<URL> = []
+    private var screenText: (revision: String, suspension: Int, snapshot: ScreenTextSnapshot)?
     init(id: String = UUID().uuidString) {
         self.id = id; self.actionReceipts = ActionReceiptStore(generation: id)
     }
@@ -29,8 +30,18 @@ final class TaskLease: @unchecked Sendable {
         lock.lock(); artifacts.remove(url); lock.unlock()
         try? FileManager.default.removeItem(at: url)
     }
+    func bindScreenText(_ snapshot: ScreenTextSnapshot?, revision: String = "") throws {
+        try commit { screenText = snapshot.map { (revision, suspensions, $0) } }
+    }
+    func screenTextSnapshot(revision: String) throws -> ScreenTextSnapshot? {
+        lock.lock(); defer { lock.unlock() }
+        try check()
+        guard screenText?.revision == revision else { return nil }
+        guard screenText?.suspension == suspensions else { throw AccessibilityActionError.staleObservation }
+        return screenText?.snapshot
+    }
     func retire() {
-        lock.lock(); value = .retired; let files = artifacts; artifacts.removeAll(); lock.unlock()
+        lock.lock(); value = .retired; let files = artifacts; artifacts.removeAll(); screenText = nil; lock.unlock()
         actionReceipts.discard()
         for url in files { try? FileManager.default.removeItem(at: url) }
     }

@@ -56,6 +56,8 @@ from observation_context import select_elements, historical_progress, coordinate
 from screen_coordinates import COORDINATE_MAPPING_VERSION, CoordinateMappingError, validate_observation_mapping
 from observation_completeness import (OBSERVATION_COMPLETENESS_VERSION, ObservationCompletenessError,
                                       validate_completeness, prompt_coverage, coverage_cache_input)
+from local_text_recognition import (TEXT_RECOGNITION_VERSION, TextRecognitionError,
+                                    validate_text_recognition, prompt_text_recognition, detail_images)
 from task_evidence import TaskEvidenceLedger, CHECKLIST_VERSION, LARGEST_PATTERN
 from expected_effects import ExpectedEffect, EXPECTED_EFFECT_VERSION, FILE_EFFECTS
 
@@ -381,7 +383,8 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
             try:
                 validate_observation_mapping(result, required=_task_generation_id is not None)
                 validate_completeness(result, required=_task_generation_id is not None)
-            except (CoordinateMappingError, ObservationCompletenessError) as error:
+                validate_text_recognition(result, required=_task_generation_id is not None)
+            except (CoordinateMappingError, ObservationCompletenessError, TextRecognitionError) as error:
                 _bridge_observation_revision = None
                 discard_observation_image(result)
                 raise ActionRejected(str(error), "observation_unstable") from error
@@ -1197,8 +1200,10 @@ def complete_from_decision(decision: dict[str, Any], fallback: str, ledger: Task
 def compact_observation(observation: dict[str, Any], task: str = "") -> dict[str, Any]:
     compact = {
         key: value for key, value in observation.items()
-        if key not in {"screenshot_path", "agent_cursor", "installed_applications", "elements"}
+        if key not in {"screenshot_path", "agent_cursor", "installed_applications", "elements", "text_recognition"}
     }
+    text = prompt_text_recognition(observation)
+    if text is not None: compact['text_recognition'] = text
     installed = observation.get("installed_applications")
     if isinstance(installed, list):
         compact["installed_application_count"] = len(installed)
@@ -1903,15 +1908,21 @@ class ACPClient:
         self.model_switches = switches
         self.successful_provider_retries = provider_retries
 
-    def prompt(self, instruction: str, screenshot_path: Path) -> str:
+    def prompt(self, instruction: str, screenshot_path: Path, *, detail_images: list[dict] | None = None) -> str:
         self.prompt_calls = getattr(self, "prompt_calls", 0) + 1
         image_data = base64.b64encode(screenshot_path.read_bytes()).decode("ascii")
         mime_type = image_mime_type(screenshot_path)
-        result, response = self._run_prompt(
-            [
+        content = [
                 {"type": "text", "text": instruction},
                 {"type": "image", "data": image_data, "mimeType": mime_type},
-            ],
+            ]
+        for index, crop in enumerate(detail_images or []):
+            # Crops are already bounded/validated, from the accepted screenshot.
+            # Standard ACP image blocks, in this same request and format repair.
+            content.extend([{'type': 'text', 'text': f'Detail crop {index + 1}; use its image_to_global mapping in the observation.'},
+                            {'type': 'image', 'data': crop['data'], 'mimeType': 'image/png'}])
+        result, response = self._run_prompt(
+            content,
             timeout=PROMPT_TIMEOUT_SECONDS,
         )
         # _run_prompt has reached a terminal result and already surfaced any
@@ -2053,7 +2064,8 @@ def desktop_instruction(
         # Classify against the complete owned result, then use the same safe
         # history projection as the evidence section (no native snapshots).
         condition = {**condition, "failed_action": recent[-1].get("action"), "result": recent[-1].get("result")}
-    rules = decision_rules(bool(observation.get("elements")), condition)
+    rules = decision_rules(bool(observation.get("elements")), condition,
+                           bool(observation.get('text_recognition', {}).get('targets')))
     bounds = [PROMPT_BOUNDS["wait"]]
     if observation.get('elements'):
         bounds.append('Expected checks: dialog_appeared(pid,title[,window_title]); field_value(element_id,value[,pid]); '
@@ -2103,6 +2115,8 @@ def verification_instruction(
                      'These IDs are illustrations; use supplied IDs.\n')
     return compile_prompt("completion",
         instructions=COMPLETION_RULES + (verification_checklist_instruction(ledger) if ledger else "")
+                     + ("Vision labels/crops are provisional text, not proof of control role, enabled state, focus or successful execution.\n"
+                        if observation.get('text_recognition', {}).get('targets') else "")
                      + (task_guidance + "\n" if task_guidance else ""), examples=examples,
         task=task, context=prompt_capability_context(task_capability_context(task, observation)),
         observation=prompt_observation(observation, task), history=compact_history(history), progress=progress,
@@ -2203,10 +2217,13 @@ def validated_prompt(client: ACPClient, instruction: str, screenshot_path: Path,
                      observation: dict[str, Any] | None = None,
                      metrics: dict[str, Any] | None = None,
                      ledger: TaskEvidenceLedger | None = None) -> dict[str, Any]:
+    images = detail_images(observation)
+    def request(text: str) -> str:
+        return client.prompt(text, screenshot_path, detail_images=images) if images else client.prompt(text, screenshot_path)
     def prompt(text: str) -> str:
         before = getattr(client, "successful_provider_retries", None)
         try:
-            return client.prompt(text, screenshot_path)
+            return request(text)
         except Exception as error:
             if classify_failure(error, time.time()).kind != "transport" or getattr(client, "reconnects", 0) >= 1:
                 raise
@@ -2216,7 +2233,7 @@ def validated_prompt(client: ACPClient, instruction: str, screenshot_path: Path,
                 metrics["reconnects"] += 1
                 metrics[purpose] += 1
             client.select_model(selected)
-            return client.prompt(text, screenshot_path)
+            return request(text)
         finally:
             after = getattr(client, "successful_provider_retries", None)
             if metrics is not None and type(after) is int:
@@ -2277,7 +2294,7 @@ def routed_json_prompt(
     observation: dict[str, Any] | None = None,
     ledger: TaskEvidenceLedger | None = None,
 ) -> dict[str, Any]:
-    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, PROMPT_COMPILER_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation)], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
+    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, PROMPT_COMPILER_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation)], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
     cached = getattr(client, "decision_cache", {})
     if cached.get("key") == key:
         value = validate_response(json.loads(json.dumps(cached["decision"])), purpose, observation, ledger)
@@ -2645,6 +2662,8 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
             raise RuntimeError("TaskPilot screen coordinate mapping versions do not match; rebuild the bundled components together")
         if type(configuration.get("observation_completeness_version")) is not int or configuration["observation_completeness_version"] != OBSERVATION_COMPLETENESS_VERSION:
             raise RuntimeError("TaskPilot observation completeness versions do not match; rebuild the bundled components together")
+        if type(configuration.get("text_recognition_version")) is not int or configuration["text_recognition_version"] != TEXT_RECOGNITION_VERSION:
+            raise RuntimeError("TaskPilot text recognition versions do not match; rebuild the bundled components together")
     api_key = configuration.get("gemini_api_key")
     if not isinstance(api_key, str):
         raise RuntimeError(f"{PRODUCT_NAME} did not provide the secure runtime configuration")

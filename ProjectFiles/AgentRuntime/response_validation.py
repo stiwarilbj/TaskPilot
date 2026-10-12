@@ -8,13 +8,14 @@ from task_evidence import EvidenceValidationError, validate_metadata
 from observation_context import coordinates_are_ambiguous
 from expected_effects import validate_expectation, ExpectedEffectError
 from command_intents import explicit_operation, matches_explicit_request
+from local_text_recognition import coordinate_text_target, TextRecognitionError
 
 from action_contract_generated import (
     CONTRACT_HASH, CONTRACT_VERSION, VALID_ACTIONS, KEYS,
     ActionContractError, validate_action,
 )
 
-VALIDATION_VERSION = 7
+VALIDATION_VERSION = 8
 
 
 class ResponseValidationError(RuntimeError):
@@ -97,6 +98,8 @@ def normalize_action(value: Any, observation: dict[str, Any] | None = None) -> d
                 fail("action.route_id", "must reference a supplied task route")
         if coordinates_are_ambiguous(action, observation):
             fail("action.element_id", "must select one observed control; these coordinates overlap multiple unrelated controls")
+        try: coordinate_text_target(action, observation)
+        except TextRecognitionError as error: raise ResponseValidationError(str(error)) from error
     return action
 
 

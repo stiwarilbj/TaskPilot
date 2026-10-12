@@ -15,8 +15,8 @@ existing stale-target recovery.
 Action coordinates remain 0–1000 across the full display, with x increasing
 right and y increasing down. Pixel coordinates describe the presented image.
 The mapping composes crop origins and independent resize scales; nested crops
-do not change the action coordinate space. This adds no new crop behavior or
-user controls. Image edges remain exact for geometric conversion; delivered
+do not change the action coordinate space. Local Vision detail crops use the
+same mapping without adding user controls. Image edges remain exact for geometric conversion; delivered
 events at the inclusive 1000 endpoint are inset half a point to stay on the
 assigned display instead of its neighbor.
 
@@ -25,7 +25,7 @@ local consistency retry. Failed pairs never reach planning. Mapping metadata
 adds no provider calls and supplies no missing action targets. Preview size
 limits and the current manual viewer behavior remain unchanged.
 
-Task protocol version 4 and the existing generated contract fingerprint reject
+Task protocol version 5 and the existing generated contract fingerprint reject
 old/new bundled component mixtures before task requests. The private startup
 configuration also checks coordinate mapping version 1, and decision caches
 include that version.

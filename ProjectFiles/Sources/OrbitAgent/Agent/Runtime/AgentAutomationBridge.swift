@@ -103,6 +103,7 @@ final class AgentAutomationBridge {
                 // page text or becomes part of the model's visual context.
                 accessibility.hideAgentCursor()
                 try accessibility.invalidateObservation()
+                try lease.bindScreenText(nil)
                 let budget: Double
                 if let supplied = params["consistency_budget_ms"] {
                     guard let number = supplied as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
@@ -122,6 +123,10 @@ final class AgentAutomationBridge {
                 } else { keywords = [] }
                 var observationDisplay = display
                 var capturedCoordinates: ScreenCoordinateMapping?
+                var stagedSnapshot: AccessibilitySnapshot?
+                var recognitionDeadline = ProcessInfo.processInfo.systemUptime
+                var screenText = ScreenTextSnapshot()
+                var textMetadata: [String: Any] = [:]
                 let (accepted, screenshotURL) = try await ObservationConsistency.collect(
                     budget: budget,
                     checkpoint: { try await TaskOwnership.checkpoint() },
@@ -132,16 +137,37 @@ final class AgentAutomationBridge {
                     },
                     stage: { remaining in
                         observationDisplay = try self.targetDisplay(from: params)
-                        return try self.accessibility.stageSnapshot(on: observationDisplay, keywords: keywords, budget: remaining)
+                        recognitionDeadline = ProcessInfo.processInfo.systemUptime + remaining
+                        let staged = try self.accessibility.stageSnapshot(on: observationDisplay, keywords: keywords, budget: remaining)
+                        stagedSnapshot = staged.snapshot
+                        return staged
                     },
                     signature: { $0.consistencySignature },
                     capture: { refresh in
                         let captured = try await self.capture.capture(display: observationDisplay, forceRefresh: refresh)
                         capturedCoordinates = captured.coordinates
+                        do {
+                            guard let snapshot = stagedSnapshot else { throw ScreenCoordinateError.invalidGeometry }
+                            screenText = try await LocalTextRecognition.supplement(image: captured.image,
+                                coordinates: captured.coordinates, snapshot: snapshot,
+                                scene: self.accessibility.observationScene(on: observationDisplay), keywords: keywords,
+                                budget: recognitionDeadline - ProcessInfo.processInfo.systemUptime)
+                        } catch { lease.discardArtifact(captured.url); throw error }
                         return captured.url
                     },
                     discard: { lease.discardArtifact($0) },
-                    publish: { try $0.publish() },
+                    publish: { candidate in
+                        guard let coordinates = capturedCoordinates else { throw ScreenCoordinateError.invalidGeometry }
+                        let metadata = try screenText.metadata(revision: candidate.snapshot.revision, coordinates: coordinates)
+                        // Text evidence, AX IDs and image coordinates become
+                        // authoritative together, under the same epoch check.
+                        try lease.commit {
+                            try candidate.publish()
+                            try self.accessibility.bindCoordinates(coordinates, revision: candidate.snapshot.revision, on: observationDisplay)
+                            try lease.bindScreenText(screenText, revision: candidate.snapshot.revision)
+                        }
+                        textMetadata = metadata
+                    },
                     report: { summary in
                         self.observationLogger.debug("Capture attempts: \(summary.attempts), rejected: \(summary.rejected.values.reduce(0, +)), elapsed seconds: \(summary.elapsedSeconds)")
                         self.ownershipLock.withLock {
@@ -161,8 +187,7 @@ final class AgentAutomationBridge {
                     lease.discardArtifact(screenshotURL)
                     throw ScreenCoordinateError.invalidGeometry
                 }
-                do { try accessibility.bindCoordinates(coordinates, revision: snapshot.revision, on: observationDisplay) }
-                catch { lease.discardArtifact(screenshotURL); throw error }
+                observationLogger.debug("Local text candidates: \(screenText.targets.count), detail crops: \(screenText.crops.count)")
                 result = [
                     "task_generation_id": lease.id,
                     "observation_revision": snapshot.revision,
@@ -174,6 +199,7 @@ final class AgentAutomationBridge {
                     "system_context": snapshot.systemContext,
                     "elements": snapshot.elements,
                     "observation_completeness": snapshot.completeness,
+                    "text_recognition": textMetadata,
                     "agent_tools": [
                         "read_file": "Read a text or binary file by path; binary content is returned as base64.",
                         "write_file": "Create, overwrite, or append a file by path.",
@@ -205,7 +231,11 @@ final class AgentAutomationBridge {
                         try accessibility.validateObservation(params["observation_revision"] as? String)
                         try accessibility.validateCoordinates(on: display)
                         return try await accessibility.performStructured(action: action, on: display,
-                            privateInput: params["private_input"] as? Bool == true)
+                            privateInput: params["private_input"] as? Bool == true,
+                            verifyScreenshotTarget: {
+                                try await self.verifyTextTarget(action, display: display, lease: lease,
+                                    revision: params["observation_revision"] as? String ?? "")
+                            })
                     }
                 }
                 receiptToken?.complete(result)
@@ -242,6 +272,43 @@ final class AgentAutomationBridge {
                 "error_code": code,
                 "outcome": code == "delivery_uncertain" ? "delivered_unconfirmed" : "rejected"
             ]
+        }
+    }
+
+    private func verifyTextTarget(_ action: [String: Any], display: DisplayDescriptor, lease: TaskLease,
+                                  revision: String) async throws -> (() throws -> Void)? {
+        guard action["element_id"] == nil, ["click", "double_click"].contains(action["type"] as? String ?? ""),
+              let x = action["x"] as? NSNumber, let y = action["y"] as? NSNumber, let pid = action["pid"] as? Int,
+              let text = try lease.screenTextSnapshot(revision: revision) else { return nil }
+        let point = try ScreenCoordinateMapping.displayOnly(display).eventPoint(fromNormalized:
+            CGPoint(x: x.doubleValue, y: y.doubleValue))
+        guard let target = try text.target(at: point, pid: pid) else { return nil }
+        let suspension = lease.suspensionRevision
+        try accessibility.validateTextPointer(action: action, on: display)
+        let scene = try accessibility.observationScene(on: display)
+        guard LocalTextRecognition.windows(scene: scene).contains(target.window) else {
+            throw AccessibilityActionError.staleObservation
+        }
+        let captured = try await capture.capture(display: display, forceRefresh: true)
+        defer { lease.discardArtifact(captured.url) }
+        let region = target.match.frame.insetBy(dx: -40, dy: -25).intersection(target.window.frame).intersection(display.frame)
+        guard let (image, mapping) = try LocalTextRecognition.crop(captured.image, coordinates: captured.coordinates, frame: region) else {
+            throw AccessibilityActionError.staleObservation
+        }
+        let matches: [ScreenTextMatch]
+        do { matches = try await LocalTextRecognition.recognize(image, mapping, 1) }
+        catch { try TaskOwnership.check(); throw AccessibilityActionError.staleObservation }
+        try LocalTextRecognition.validate(target, matches: matches, point: point)
+        guard suspension == lease.suspensionRevision, try accessibility.observationScene(on: display) == scene else {
+            throw AccessibilityActionError.staleObservation
+        }
+        return { [self] in
+            try lease.check()
+            try accessibility.validateObservation(revision)
+            guard suspension == lease.suspensionRevision, try accessibility.observationScene(on: display) == scene else {
+                throw AccessibilityActionError.staleObservation
+            }
+            try accessibility.validateTextPointer(action: action, on: display)
         }
     }
 

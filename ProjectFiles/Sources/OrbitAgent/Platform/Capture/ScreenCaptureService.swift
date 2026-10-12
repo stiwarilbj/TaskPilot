@@ -33,6 +33,7 @@ enum ScreenCaptureAuthorization: Equatable {
 struct CapturedScreen {
     let url: URL
     let coordinates: ScreenCoordinateMapping
+    let image: CGImage
 }
 
 actor ScreenCaptureService {
@@ -180,7 +181,7 @@ actor ScreenCaptureService {
         }
         do { try TaskOwnership.check(); try TaskOwnership.current?.ownArtifact(url) }
         catch { try? FileManager.default.removeItem(at: url); throw error }
-        return CapturedScreen(url: url, coordinates: coordinates)
+        return CapturedScreen(url: url, coordinates: coordinates, image: image)
     }
 
     /// Captures a local-only viewer frame. Unlike the OpenClaw frame, this keeps

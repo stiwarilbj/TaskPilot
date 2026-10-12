@@ -18,7 +18,8 @@ let package = Package(
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("CoreServices"),
                 .linkedFramework("ScreenCaptureKit"),
-                .linkedFramework("UserNotifications")
+                .linkedFramework("UserNotifications"),
+                .linkedFramework("Vision")
             ]
         ),
         .testTarget(

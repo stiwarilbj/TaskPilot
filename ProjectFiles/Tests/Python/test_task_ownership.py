@@ -63,7 +63,7 @@ class TaskOwnershipTests(unittest.TestCase):
             self.assertEqual(runtime.wait_for_user_input('same'), 'current')
 
     def test_startup_requires_valid_generation_only_for_tasks_and_clears_old_state(self):
-        config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=CONTRACT_HASH, action_contract_version=CONTRACT_VERSION, task_protocol_version=TASK_PROTOCOL_VERSION, coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION, observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION)
+        config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=CONTRACT_HASH, action_contract_version=CONTRACT_VERSION, task_protocol_version=TASK_PROTOCOL_VERSION, coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION, observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION, text_recognition_version=runtime.TEXT_RECOGNITION_VERSION)
         for invalid in [None, '', 'old', True, 7]:
             with self.subTest(invalid=invalid), mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(dict(config, task_generation_id=invalid)))):
                 with self.assertRaisesRegex(RuntimeError, 'generation ID'): runtime.read_runtime_configuration(require_generation=True)

@@ -33,6 +33,10 @@ observation revision.
 [Observation completeness](ObservationCompleteness.md) reports collection gaps
 and expands relevant omitted Accessibility branches locally before planning.
 
+[Local text recognition](LocalTextRecognition.md) supplements poorly exposed
+controls with provisional Vision word boxes and same-screenshot detail crops.
+Text-based coordinate clicks are rechecked natively before delivery.
+
 ## The main flow
 
 1. `TaskPilotApp` creates the macOS windows.

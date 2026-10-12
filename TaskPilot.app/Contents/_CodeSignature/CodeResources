@@ -34,7 +34,7 @@
 		</data>
 		<key>Resources/AgentRuntime/_internal/base_library.zip</key>
 		<data>
-		gLCy10zoOhsc5zOno3VD402pTgE=
+		Eauv2URRTt1GA+WT0WYu5ILiRSA=
 		</data>
 		<key>Resources/AgentRuntime/_internal/libcrypto.3.dylib</key>
 		<data>
@@ -238,7 +238,7 @@
 		</data>
 		<key>Resources/AgentRuntime/orbit_openclaw_runtime</key>
 		<data>
-		GbBwnvym13e5Q3qlxOH6kx7eY5s=
+		6aqiJe/TbaiN21/yU1EgeGWG28Y=
 		</data>
 		<key>Resources/OpenClaw/__pycache__/gemini-probe.cpython-311.pyc</key>
 		<data>
@@ -250,7 +250,7 @@
 		</data>
 		<key>Resources/OpenClaw/action-contract.sh</key>
 		<data>
-		fBmZM7bZtUY6EPb6BJIQjgM88v8=
+		w/VOvk04+AbUl2mLG3a2fRrRiao=
 		</data>
 		<key>Resources/OpenClaw/gemini-probe.py</key>
 		<data>
@@ -320,7 +320,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			03TTH0JrZxv2/+NwZZ1Yew379DfjGlAxlwcMFeHoM6o=
+			c2EyozMn0+KYUuy8kDvCXJYNlZFBrCB9y9so4dB5kjM=
 			</data>
 		</dict>
 		<key>Resources/AgentRuntime/_internal/libcrypto.3.dylib</key>
@@ -677,7 +677,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			PxgkdiEGS6CFTXSvZjJJIymSwcvTdhYVRsPL1C2XwA4=
+			75ZrADlkVuhtLZFMFGCmC0Lsh3PPAcPHsvRUX3+8JRs=
 			</data>
 		</dict>
 		<key>Resources/OpenClaw/__pycache__/gemini-probe.cpython-311.pyc</key>
@@ -698,7 +698,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			MOjhx6M5aNbK5NjRe4koh0C2HhZ5nABuuJomzaJg+Pk=
+			9DvFCKqvu91uJf3R00jPKgS2B8hKZUYa0O5Ya1Nl+Us=
 			</data>
 		</dict>
 		<key>Resources/OpenClaw/gemini-probe.py</key>

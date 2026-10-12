@@ -517,6 +517,10 @@ final class AccessibilityController {
                 "accessibility_available": !visibleWindows.isEmpty,
                 "active": app.isActive,
                 "topmost_on_agent_screen": applicationRows.isEmpty,
+                "graphics_windows": graphics.compactMap { window -> [String: Any]? in
+                    guard serializedAccessibilityFrame(window.frame) != nil else { return nil }
+                    return ["id": Int(window.id), "frame": LocalTextRecognition.rect(window.frame), "title": window.title]
+                },
                 "windows": windowRecords.compactMap { record -> [String: Any]? in
                     guard let serialized = serializedAccessibilityFrame(record.frame) else { return nil }
                     return ["title": stringAttribute(record.element, kAXTitleAttribute) ?? "",
@@ -960,7 +964,8 @@ final class AccessibilityController {
         }
     }
 
-    func performStructured(action: [String: Any], on display: DisplayDescriptor, privateInput: Bool = false) async throws -> [String: Any] {
+    func performStructured(action: [String: Any], on display: DisplayDescriptor, privateInput: Bool = false,
+                           verifyScreenshotTarget: (() async throws -> (() throws -> Void)?)? = nil) async throws -> [String: Any] {
         try await TaskOwnership.checkpoint()
         let action = try validatedDesktopAction(action)
         guard !inputIsCancelled() else { throw AccessibilityActionError.cancelled }
@@ -1001,7 +1006,9 @@ final class AccessibilityController {
         if let profileKey { _ = try ControlCompatibilityProfiles.owned { compatibilityProfiles.preferred(for: profileKey, permitted: []) } }
         let controlBefore = record.map(controlInteractionState)
         let before = actionState(pid)
-        let message = try await perform(action: action, on: display, planningRevision: planningRevision)
+        let screenshotPreflight = try await verifyScreenshotTarget?()
+        let message = try await perform(action: action, on: display, planningRevision: planningRevision,
+                                        screenshotPreflight: screenshotPreflight ?? nil)
         let method = ControlDeliveryMethod.delivered(action: ActionKind(rawValue: type)!,
             coordinatePress: message.hasPrefix("Clicked"), hid: requiresHIDFallback(pid))?.rawValue ?? "process_event"
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
@@ -1027,7 +1034,8 @@ final class AccessibilityController {
                 "verification_scope": verified ? "focus" : "delivery_only", "pid": Int(pid)]
     }
 
-    func perform(action: [String: Any], on display: DisplayDescriptor, planningRevision: String? = nil) async throws -> String {
+    func perform(action: [String: Any], on display: DisplayDescriptor, planningRevision: String? = nil,
+                 screenshotPreflight: (() throws -> Void)? = nil) async throws -> String {
         try await TaskOwnership.checkpoint()
         let action = try validatedDesktopAction(action)
         let kind = ActionKind(rawValue: action["type"] as! String)!
@@ -1148,6 +1156,7 @@ final class AccessibilityController {
                         try self.validatePointerHit(record, at: point)
                     } else {
                         try self.validateCoordinateWindows(pid, on: display)
+                        try screenshotPreflight?()
                         if let coordinateRecord {
                             try self.validateRecord(coordinateRecord, action: action, on: display)
                             try self.validatePointerHit(coordinateRecord, at: point)
@@ -2637,6 +2646,27 @@ final class AccessibilityController {
         }
         guard !inputIsCancelled() else { throw AccessibilityActionError.cancelled }
         try AutomationTargetPolicy.validateWindows(observed: expected, current: current)
+    }
+
+    /// OCR cannot infer enabled/focus/role. Keep existing app/window checks and
+    /// reject secure or disabled controls whenever native hit testing exposes them.
+    func validateTextPointer(action: [String: Any], on display: DisplayDescriptor) throws {
+        let point = try point(from: action, display: display)
+        let pid = try actionPID(action, on: display, fallbackPoint: point)
+        try ensureAllowedOnDisplay(pid, display: display)
+        try validateCoordinateWindows(pid, on: display)
+        guard pointerTargetIsVisible(pid, at: point, display: display) else { throw AccessibilityActionError.staleObservation }
+        if let record = try observedControl(at: point, pid: pid) {
+            try validateRecord(record, action: action, on: display)
+            try validatePointerHit(record, at: point)
+        }
+        var hit: AXUIElement?
+        if AXUIElementCopyElementAtPosition(AXUIElementCreateApplication(pid), Float(point.x), Float(point.y), &hit) == .success,
+           let hit {
+            if boolAttribute(hit, kAXEnabledAttribute) == false { throw AccessibilityActionError.disabledElement }
+            if AutomationTextEntryPolicy.isSecure(role: stringAttribute(hit, kAXRoleAttribute) ?? "",
+                    subrole: stringAttribute(hit, kAXSubroleAttribute) ?? "") { throw AccessibilityActionError.focusMismatch }
+        }
     }
 
     private func observedControl(at point: CGPoint, pid: pid_t) throws -> ElementRecord? {

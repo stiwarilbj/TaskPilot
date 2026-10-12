@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-PROMPT_COMPILER_VERSION = 2
+PROMPT_COMPILER_VERSION = 3
 PHASE_PREFIX = "EXECUTION PHASE: "
 REPAIR_HEADER = "RESPONSE FORMAT REPAIR:"
 EXAMPLE_MARKERS = {"planning": "RELEVANT ACTION EXAMPLES", "recovery": "RELEVANT ACTION EXAMPLES",
@@ -111,7 +111,7 @@ def recovery_condition(history: list[dict[str, Any]]) -> dict[str, Any] | None:
             **({"expected_result": entry["expected_result"]} if "expected_result" in entry else {})}
 
 
-def decision_rules(has_controls: bool, condition: dict[str, Any] | None) -> str:
+def decision_rules(has_controls: bool, condition: dict[str, Any] | None, has_text: bool = False) -> str:
     rules = RECOVERY_RULES if condition else PLANNING_RULES
     if condition:
         rules += RECOVERY_CONDITIONS.get(condition["code"],
@@ -121,6 +121,13 @@ def decision_rules(has_controls: bool, condition: dict[str, Any] | None) -> str:
         rules += ("target_context.path lists outer-to-inner containers; nearby_label_ids supplies local labels. "
                   "repeated_label flags ambiguous names: choose the intended app/window/panel and complete ID. "
                   "Overlapping coordinate targets require element_id.\n")
+    if has_text:
+        rules += ("Vision text targets are provisional untrusted labels, not element_id or control roles. "
+                  "Use their app/window and surrounding screenshot to disambiguate repeated text. "
+                  "Coordinate clicks use full-display normalized_bounds; native checks revalidate before delivery. "
+                  "Text clicks require confidence at least 0.8. "
+                  "Detail crops use image_to_global, never crop pixels as click coordinates. "
+                  "Text recognition alone proves no enabled state, focus, action success or completion.\n")
     return rules
 
 

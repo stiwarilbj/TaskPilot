@@ -38,7 +38,7 @@ Python validates completeness before planning or accepting the observation
 revision. Old offline fixtures have unknown coverage. Expansion counters are
 private diagnostics and are excluded from prompts and cache inputs; actual
 coverage changes affect decision identity. No control content or new history
-payload is persisted. Protocol version 4 and completeness version 1 reject
+payload is persisted. Protocol version 5 and completeness version 1 reject
 mismatched bundled components during startup before task requests.
 
 Offline tests cover healthy trees, child paging, priority expansion, huge/deep
@@ -47,3 +47,6 @@ capture deadline sharing, malformed reports, prompt omissions, and single-call
 healthy decisions. They do not establish live app accuracy. Live desktop
 validation remains incomplete; the fixer, Chrome, and live-control tester are
 not used.
+
+[Local text recognition](LocalTextRecognition.md) supplements poorly exposed
+controls with provisional text and detail crops, preserving partial coverage.
