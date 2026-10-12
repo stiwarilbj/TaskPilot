@@ -155,6 +155,12 @@
       "error": "must be a list of 1 to 256 strings",
       "bytes_error": "must contain at most 16384 bytes"
     },
+    "operation": {
+      "type": "variant",
+      "tag": "type",
+      "variants_source": "command_operations",
+      "choices_error": "must be a supported command operation"
+    },
     "checks": {
       "type": "array",
       "min_items": 1,
@@ -865,6 +871,7 @@
     "run_command": {
       "owner": "task_tool",
       "parameters": [
+        "operation",
         "argv",
         "command",
         "working_directory",
@@ -908,7 +915,7 @@
           "/bin/pwd"
         ]
       },
-      "reference": "run_command(argv or command[,checks])",
+      "reference": "run_command(operation or argv or command[,checks])",
       "defaults": {
         "timeout_seconds": 120
       },
@@ -1068,6 +1075,7 @@
     "read_file": "read_file max_bytes: optional integer {max_bytes.min}..{max_bytes.max}.",
     "write_file": "write_file options: encoding utf-8/base64, mode overwrite/append, create_parents boolean; defaults {defaults.write_file.encoding}, {defaults.write_file.mode}, {defaults.write_file.create_parents}.",
     "run_command": "run_command: prefer literal argv. Pipelines use command; single-quote paths. working_directory: absolute/~ existing folder; timeout_seconds: {timeout_seconds.min}..{timeout_seconds.max}. Exit zero proves execution only. checks: file_exists/directory_exists/path_absent(path), file_contents(path,content[,encoding]), stdout_equals(text); check requested outcomes only.",
+    "command_operation": "operation supplies argv/checks for explicit operands only. Copy/move: regular file <={max_bytes.max} bytes, absent destination, existing parent. General argv/command stays available; exit zero proves execution only.",
     "navigate_browser": "navigate_browser: http/https url OR query; optional browser name (default {defaults.navigate_browser.browser})."
   },
   "modifier_flags": {
@@ -1076,5 +1084,76 @@
     "option": 524288,
     "control": 262144
   },
-  "task_protocol_version": 2
+  "task_protocol_version": 2,
+  "command_operations": {
+    "create_directory": {
+      "fields": {"path": {"field": "path"}},
+      "required": ["path"], "rules": [], "reject_unknown": true,
+      "argv": ["/bin/mkdir", "-p", {"parameter": "path"}],
+      "checks": [{"type": "directory_exists", "path": {"parameter": "path"}}],
+      "reference": "create_directory(path)",
+      "intent_pattern": "\\b(?:mkdir|(?:create|make)\\s+(?:(?:the|a|an)\\s+)?(?:directory|folder))\\b",
+      "request_pattern": "(?:create|make)\\s+(?:(?:a|the)\\s+)?(?:directory|folder)\\s+(?:at\\s+)?(?P<path>@path@)",
+      "example": {"type": "create_directory", "path": "/example/new folder"}
+    },
+    "copy_file": {
+      "fields": {"source": {"field": "path"}, "destination": {"field": "path"}},
+      "required": ["source", "destination"], "rules": [], "reject_unknown": true,
+      "argv": ["/bin/cp", "-n", {"parameter": "source"}, {"parameter": "destination"}],
+      "checks": [{"type": "file_exists", "path": {"parameter": "destination"}}],
+      "snapshot": {"source": "source", "destination": "destination", "max_bytes": {"limit": "read_bytes"}},
+      "absent": "destination", "regular_file": "source", "parent_directory": "destination",
+      "reference": "copy_file(source,destination)",
+      "intent_pattern": "\\b(?:copy|duplicate)\\b",
+      "request_pattern": "(?:copy|duplicate)\\s+(?:(?:the\\s+)?file\\s+)?(?P<source>@path@)\\s+to\\s+(?P<destination>@path@)",
+      "prerequisite": {"type": "create_directory", "operand": "path", "parent_of": "destination"},
+      "example": {"type": "copy_file", "source": "/example/a", "destination": "/example/b"}
+    },
+    "move_file": {
+      "fields": {"source": {"field": "path"}, "destination": {"field": "path"}},
+      "required": ["source", "destination"], "rules": [], "reject_unknown": true,
+      "argv": ["/bin/mv", "-n", {"parameter": "source"}, {"parameter": "destination"}],
+      "checks": [{"type": "file_exists", "path": {"parameter": "destination"}},
+                 {"type": "path_absent", "path": {"parameter": "source"}}],
+      "snapshot": {"source": "source", "destination": "destination", "max_bytes": {"limit": "read_bytes"}},
+      "absent": "destination", "regular_file": "source", "parent_directory": "destination",
+      "reference": "move_file(source,destination)",
+      "intent_pattern": "\\b(?:move|rename)\\b",
+      "request_pattern": "(?:move|rename)\\s+(?:(?:the\\s+)?file\\s+)?(?P<source>@path@)\\s+to\\s+(?P<destination>@path@)",
+      "prerequisite": {"type": "create_directory", "operand": "path", "parent_of": "destination"},
+      "example": {"type": "move_file", "source": "/example/a", "destination": "/example/b"}
+    },
+    "remove_file": {
+      "fields": {"path": {"field": "path"}},
+      "required": ["path"], "rules": [], "reject_unknown": true,
+      "argv": ["/bin/rm", "-f", {"parameter": "path"}],
+      "checks": [{"type": "path_absent", "path": {"parameter": "path"}}],
+      "regular_file_if_present": "path",
+      "reference": "remove_file(path)",
+      "intent_pattern": "\\b(?:remove|delete)\\s+(?:(?:the|a)\\s+)?file\\b",
+      "request_pattern": "(?:remove|delete)\\s+(?:(?:the|a)\\s+)?file\\s+(?P<path>@path@)",
+      "example": {"type": "remove_file", "path": "/example/unneeded.txt"}
+    },
+    "remove_empty_directory": {
+      "fields": {"path": {"field": "path"}},
+      "required": ["path"], "rules": [], "reject_unknown": true,
+      "argv": ["/bin/rmdir", {"parameter": "path"}],
+      "checks": [{"type": "path_absent", "path": {"parameter": "path"}}],
+      "directory": "path",
+      "reference": "remove_empty_directory(path)",
+      "intent_pattern": "\\b(?:remove|delete)\\s+(?:(?:the|a|an)\\s+)?empty\\s+(?:directory|folder)\\b",
+      "request_pattern": "(?:remove|delete)\\s+(?:(?:the|an?)\\s+)?empty\\s+(?:directory|folder)\\s+(?P<path>@path@)",
+      "example": {"type": "remove_empty_directory", "path": "/example/empty folder"}
+    },
+    "print_text": {
+      "fields": {"text": {"field": "text"}},
+      "required": ["text"], "rules": [], "reject_unknown": true,
+      "argv": ["/usr/bin/printf", "%s", {"parameter": "text"}],
+      "checks": [{"type": "stdout_equals", "text": {"parameter": "text"}}],
+      "reference": "print_text(text)",
+      "intent_pattern": "\\b(?:print|output)\\s+(?:literal\\s+)?text\\b",
+      "request_pattern": "(?:print|output)\\s+literal\\s+text\\s+(?P<text>@quoted_text@)",
+      "example": {"type": "print_text", "text": "Example output"}
+    }
+  }
 }

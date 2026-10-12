@@ -120,7 +120,7 @@
         case "variant":
             guard let object = value as? [String: Any] else { try fail(path, "must be an object") }
             let tag = spec["tag"] as! String, variants = spec["variants"] as! [String: [String: Any]]
-            guard let selected = object[tag] as? String, let variant = variants[selected] else { try fail(path + "." + tag, "must be a supported outcome check") }
+            guard let selected = object[tag] as? String, let variant = variants[selected] else { try fail(path + "." + tag, spec["choices_error"] as? String ?? "must be a supported outcome check") }
             let fields = variant["fields"] as! [String: [String: Any]]
             if variant["reject_unknown"] as? Bool == true, !Set(object.keys).isSubset(of: Set(fields.keys).union([tag])) {
                 try fail(path, "contains unsupported parameters")
@@ -150,6 +150,10 @@
                 for key in rule["remove"] as! [String] { action.removeValue(forKey: key) }
             }
         }
+        if action["operation"] != nil {
+            guard kind == .run_command else { try fail("action.operation", "is only supported for run_command") }
+            action = try compileCommandOperation(action)
+        }
         try validateParameters(action, kind: kind)
         return action
     }
@@ -157,4 +161,45 @@
         let fields = definition["fields"] as! [String: [String: Any]]
         try field(value, fields["checks"]!["items"] as! [String: Any], path)
         return value as! [String: Any]
+    }
+    static func operationDefinition(_ type: String) -> [String: Any]? {
+        (definition["command_operations"] as! [String: [String: Any]])[type]
+    }
+    private static func compileCommandOperation(_ input: [String: Any]) throws -> [String: Any] {
+        var action = input
+        let fields = definition["fields"] as! [String: [String: Any]]
+        try field(action["operation"]!, fields["operation"]!, "action.operation")
+        let operation = action["operation"] as! [String: Any]
+        let recipe = operationDefinition(operation["type"] as! String)!
+        if action["command"] != nil { try fail("action.command", "cannot accompany a command operation") }
+        var parameters = operation
+        for (name, spec) in recipe["fields"] as! [String: [String: Any]] where spec["format"] as? String == "path" {
+            let path = (parameters[name] as! NSString).expandingTildeInPath
+            if path.split(separator: "/").contains("..") {
+                try fail("action.operation." + name, "must not contain parent traversal; use general shell for complex paths")
+            }
+            parameters[name] = path
+        }
+        func resolve(_ value: Any) -> Any {
+            if let object = value as? [String: Any] {
+                if object.count == 1, let parameter = object["parameter"] as? String { return parameters[parameter]! }
+                return object.mapValues(resolve)
+            }
+            if let array = value as? [Any] { return array.map(resolve) }
+            return value
+        }
+        let argv = resolve(recipe["argv"]!) as! [String]
+        var checks = resolve(recipe["checks"]!) as! [[String: Any]]
+        if let supplied = action["argv"] {
+            try field(supplied, fields["argv"]!, "action.argv")
+            if supplied as! [String] != argv { try fail("action.argv", "must match the established operation template") }
+        }
+        if let supplied = action["checks"] {
+            try field(supplied, fields["checks"]!, "action.checks")
+            for check in supplied as! [[String: Any]] where !checks.contains(where: { NSDictionary(dictionary: $0).isEqual(to: check) }) {
+                checks.append(check)
+            }
+        }
+        action["argv"] = argv; action["checks"] = checks
+        return action
     }

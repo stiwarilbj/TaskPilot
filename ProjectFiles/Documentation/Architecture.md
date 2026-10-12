@@ -15,6 +15,10 @@ coverage and fresh proof for mutable outcomes.
 terminal results so missing acknowledgements can be reconciled without
 duplicating execution.
 
+[Deterministic command intentions](CommandOperations.md) compile explicit
+operations into shared argument templates with preflight and exact outcome
+checks.
+
 ## The main flow
 
 1. `TaskPilotApp` creates the macOS windows.

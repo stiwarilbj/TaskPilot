@@ -22,13 +22,21 @@ def artifacts():
                 return resolve(contract['actions'][kind]['defaults'][field])
             resolved = {k: resolve(v) for k, v in value.items() if k != 'choices_source'}
             if 'choices_source' in value: resolved['choices'] = list(contract[value['choices_source']])
+            if 'variants_source' in value:
+                resolved['variants'] = {name: resolve({key: item[key] for key in ('fields', 'required', 'rules', 'reject_unknown')})
+                                        for name, item in contract[value['variants_source']].items()}
             return resolved
         if isinstance(value, list): return [resolve(v) for v in value]
         return value
     contract = resolve(contract)
     contract['field_order'] = list(contract['fields'])
-    for variant in contract['fields']['checks']['items']['variants'].values():
-        variant['field_order'] = list(variant['fields'])
+    def order_variants(spec):
+        if spec['type'] == 'array': order_variants(spec['items'])
+        if spec['type'] == 'variant':
+            for variant in spec['variants'].values():
+                variant['field_order'] = list(variant['fields'])
+                for field in variant['fields'].values(): order_variants(field)
+    for spec in contract['fields'].values(): order_variants(spec)
     for name, text in contract['prompt_bounds'].items():
         def substitute(match):
             parts = match.group(1).split('.')
@@ -89,6 +97,23 @@ def artifacts():
         namespace['validate_action'](namespace['action_example'](name))
         for field, value in actions[name]['defaults'].items():
             namespace['_field'](value, contract['fields'][field], 'action.' + field)
+    for name, operation in contract.get('command_operations', {}).items():
+        assert operation['example']['type'] == name
+        assert isinstance(operation['argv'][0], str) and operation['argv'][0].startswith('/')
+        assert set(re.compile(operation['request_pattern'].replace('@path@', '.+').replace('@quoted_text@', '.+')).groupindex) == set(operation['required'])
+        re.compile(operation['intent_pattern'])
+        for key in ('absent', 'regular_file', 'regular_file_if_present', 'directory', 'parent_directory'):
+            if key in operation: assert operation['fields'][operation[key]]['format'] == 'path'
+        if 'snapshot' in operation:
+            snapshot = operation['snapshot']
+            assert type(snapshot['max_bytes']) is int and snapshot['max_bytes'] > 0
+            for key in ('source', 'destination'): assert operation['fields'][snapshot[key]]['format'] == 'path'
+        if 'prerequisite' in operation:
+            prerequisite = operation['prerequisite']
+            assert prerequisite['operand'] in contract['command_operations'][prerequisite['type']]['fields']
+            assert operation['fields'][prerequisite['parent_of']]['format'] == 'path'
+        compiled = namespace['validate_action']({'type': 'run_command', 'operation': operation['example']})
+        assert compiled['argv'][0].startswith('/') and compiled['checks']
     cases = '\n'.join('    case ' + name for name in actions)
     owners = '\n'.join('        case .' + name + ': return .' + definition['owner'] for name, definition in actions.items())
     checks = '\n'.join('    case ' + name for name in contract['fields']['checks']['items']['variants'])

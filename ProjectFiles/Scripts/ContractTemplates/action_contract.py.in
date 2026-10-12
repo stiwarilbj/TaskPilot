@@ -1,6 +1,7 @@
 import base64
 import copy
 import math
+import os
 from urllib.parse import urlsplit
 
 
@@ -87,7 +88,7 @@ def _field(value, spec, path):
         tag = spec['tag']
         selected = value.get(tag)
         if not isinstance(selected, str) or selected not in spec['variants']:
-            _fail(path + '.' + tag, 'must be a supported outcome check')
+            _fail(path + '.' + tag, spec.get('choices_error', 'must be a supported outcome check'))
         definition = spec['variants'][selected]
         if definition.get('reject_unknown') and set(value) - {tag, *definition['fields']}:
             _fail(path, 'contains unsupported parameters')
@@ -113,11 +114,48 @@ def validate_action(value):
         if kind == rule['type'] and action.get(rule['when_truthy']):
             kind = action['type'] = rule['replace_type']
             for key in rule['remove']: action.pop(key, None)
+    if 'operation' in action:
+        if kind != 'run_command': _fail('action.operation', 'is only supported for run_command')
+        action = compile_command_operation(action)
     definition = CONTRACT['actions'][kind]
     _object(action, CONTRACT['fields'], definition['required'], 'action')
     _rules(CONTRACT['common_rules'], action, 'action')
     _rules(definition['rules'], action, 'action')
     return action
+
+
+def compile_command_operation(action):
+    action = copy.deepcopy(action)
+    operation = action['operation']
+    _field(operation, CONTRACT['fields']['operation'], 'action.operation')
+    recipe = CONTRACT['command_operations'][operation['type']]
+    if 'command' in action: _fail('action.command', 'cannot accompany a command operation')
+    parameters = dict(operation)
+    for name, spec in recipe['fields'].items():
+        if spec.get('format') == 'path':
+            path = os.path.expanduser(parameters[name])
+            if '..' in path.split('/'): _fail('action.operation.' + name, 'must not contain parent traversal; use general shell for complex paths')
+            parameters[name] = path
+    def resolve(value):
+        if isinstance(value, dict):
+            if set(value) == {'parameter'}: return parameters[value['parameter']]
+            return {key: resolve(item) for key, item in value.items()}
+        if isinstance(value, list): return [resolve(item) for item in value]
+        return value
+    argv, checks = resolve(recipe['argv']), resolve(recipe['checks'])
+    if 'argv' in action:
+        _field(action['argv'], CONTRACT['fields']['argv'], 'action.argv')
+        if action['argv'] != argv: _fail('action.argv', 'must match the established operation template')
+    if 'checks' in action:
+        _field(action['checks'], CONTRACT['fields']['checks'], 'action.checks')
+        for check in action['checks']:
+            if check not in checks: checks.append(check)
+    action['argv'], action['checks'] = argv, checks
+    return action
+
+
+def operation_example(kind):
+    return {'type': 'run_command', 'operation': copy.deepcopy(CONTRACT['command_operations'][kind]['example'])}
 
 
 def action_example(kind):
@@ -144,5 +182,6 @@ KEYS = frozenset(CONTRACT['key_codes'])
 ACTION_CAPABILITIES = {k: v['capability'] for k, v in CONTRACT['actions'].items() if v.get('capability')}
 ACTION_REFERENCE = 'All actions remain available (examples are advisory): ' + '; '.join(v['reference'] for v in CONTRACT['actions'].values()) + '. Keys: ' + ', '.join(CONTRACT['key_codes']) + '; modifiers: ' + ', '.join(CONTRACT['modifier_flags']) + '.\n'
 PROMPT_BOUNDS = CONTRACT['prompt_bounds']
+COMMAND_OPERATION_REFERENCE = '; '.join(recipe['reference'] for recipe in CONTRACT['command_operations'].values())
 
 TASK_PROTOCOL_VERSION = CONTRACT["task_protocol_version"]

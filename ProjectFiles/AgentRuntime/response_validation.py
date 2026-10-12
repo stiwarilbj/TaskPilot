@@ -7,13 +7,14 @@ from typing import Any
 from task_evidence import EvidenceValidationError, validate_metadata
 from observation_context import coordinates_are_ambiguous
 from expected_effects import validate_expectation, ExpectedEffectError
+from command_intents import explicit_operation, matches_explicit_request
 
 from action_contract_generated import (
     CONTRACT_HASH, CONTRACT_VERSION, VALID_ACTIONS, KEYS,
     ActionContractError, validate_action,
 )
 
-VALIDATION_VERSION = 6
+VALIDATION_VERSION = 7
 
 
 class ResponseValidationError(RuntimeError):
@@ -99,6 +100,29 @@ def normalize_action(value: Any, observation: dict[str, Any] | None = None) -> d
     return action
 
 
+def bind_command_outcomes(action: dict, result: dict) -> dict:
+    """Bind native source snapshots to this operation, never model assertions."""
+    if action.get('type') != 'run_command' or 'operation' not in action: return action
+    if result.get('command_operation') != action['operation']:
+        raise RuntimeError('The native command result did not match its requested operation')
+    checks = result.get('outcome_checks')
+    try: bound = validate_action({**action, 'checks': checks})
+    except ActionContractError as error: raise RuntimeError('Invalid native operation evidence: ' + str(error)) from error
+    if bound['checks'] != checks or checks[:len(action['checks'])] != action['checks']:
+        raise RuntimeError('The native command result omitted the operation outcome checks')
+    from action_contract_generated import CONTRACT
+    snapshot = CONTRACT['command_operations'][action['operation']['type']].get('snapshot')
+    if snapshot:
+        extra = checks[len(action['checks']):]
+        candidates = extra if extra else action['checks']
+        if len(extra) > 1 or not any(c.get('type') == 'file_contents' and c.get('encoding') == 'base64'
+                                    and c.get('path') == action['operation'][snapshot['destination']] for c in candidates):
+            raise RuntimeError('The native command result omitted its exact source snapshot')
+    elif checks != action['checks']:
+        raise RuntimeError('The native command result supplied unexpected operation evidence')
+    return bound
+
+
 def validate_response(value: dict[str, Any], purpose: str, observation: dict[str, Any] | None = None, ledger=None) -> dict[str, Any]:
     result = dict(value)
     for key in ("summary", "context_used", "visual_evidence", "intended_target", "output", "output_title", "reason", "message", "title", "check"):
@@ -122,7 +146,11 @@ def validate_response(value: dict[str, Any], purpose: str, observation: dict[str
         status = result.get("status")
         if not isinstance(status, str) or status not in {"act", "done", "needs_user", "blocked"}: fail("status", "must be act, done, needs_user, or blocked")
         if purpose == "readiness" and (status != "done" or result.get("check") != "TASKPILOT_READY"): fail("check", "must equal TASKPILOT_READY with status done")
-    if "action" in result: result["action"] = normalize_action(result["action"], observation)
+    if "action" in result:
+        result["action"] = normalize_action(result["action"], observation)
+        expected = explicit_operation(ledger.task) if ledger else None
+        if expected and 'operation' in result['action'] and not matches_explicit_request(result['action']['operation'], expected):
+            fail('action.operation', 'must match the explicit operation and operands in the original request')
     if "user_input" in result:
         request = result["user_input"]
         if not isinstance(request, dict): fail("user_input", "must be an object")

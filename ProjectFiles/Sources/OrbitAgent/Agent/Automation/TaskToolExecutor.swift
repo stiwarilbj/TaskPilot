@@ -300,7 +300,7 @@ final class TaskToolExecutor {
         let checks = policy.checks.map { $0.evaluate(stdout: execution.stdout.text, stdoutTruncated: execution.stdout.truncated) }
         let executed = !execution.timedOut && execution.status == 0
         let verified = executed && !checks.isEmpty && checks.allSatisfy { $0["verified"] as? Bool == true }
-        return [
+        var result: [String: Any] = [
             "message": execution.timedOut
                 ? "Command timed out; inspect its effects before retrying"
                 : verified ? "Command finished and its requested outcome checks passed"
@@ -321,6 +321,11 @@ final class TaskToolExecutor {
             "stdout_truncated": execution.stdout.truncated,
             "stderr_truncated": execution.stderr.truncated
         ]
+        if let operation = action["operation"] {
+            result["command_operation"] = operation
+            result["outcome_checks"] = policy.outcomeChecks
+        }
+        return result
     }
 
     private func executeProcess(executable: URL, arguments: [String], policy: CommandExecutionPolicy,

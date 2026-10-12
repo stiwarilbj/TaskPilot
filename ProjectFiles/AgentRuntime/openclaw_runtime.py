@@ -53,7 +53,7 @@ from task_evidence import TaskEvidenceLedger, CHECKLIST_VERSION, LARGEST_PATTERN
 from expected_effects import ExpectedEffect, EXPECTED_EFFECT_VERSION, FILE_EFFECTS
 
 from response_validation import (
-    VALIDATION_VERSION, ResponseValidationError, extract_json_object,
+    VALIDATION_VERSION, ResponseValidationError, extract_json_object, bind_command_outcomes,
     normalize_action, validate_response,
 )
 
@@ -63,6 +63,7 @@ from action_contract_generated import (
     TASK_PROTOCOL_VERSION,
     CONTRACT_HASH, CONTRACT_VERSION, VALID_ACTIONS, TRUSTED_NATIVE_ACTIONS,
     action_example, action_default, ACTION_REFERENCE, PROMPT_BOUNDS, ACTION_CAPABILITIES,
+    CONTRACT, operation_example, COMMAND_OPERATION_REFERENCE,
 )
 
 
@@ -1232,7 +1233,14 @@ def compact_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # screenshot and Accessibility tree are the authoritative state.
         if offset >= max(0, len(recent) - 2):
             allowed.add("visual_evidence")
-        compact.append({key: entry[key] for key in allowed if key in entry})
+        row = {key: entry[key] for key in allowed if key in entry}
+        if isinstance(row.get("action"), dict) and row["action"].get("operation"):
+            # Recipes reconstruct these fields locally. In particular, native
+            # source snapshots belong to the proof ledger, not model context.
+            row["action"] = {k: v for k, v in row["action"].items() if k not in {"argv", "checks"}}
+            if isinstance(row.get("result"), dict):
+                row["result"] = {k: v for k, v in row["result"].items() if k != "outcome_checks"}
+        compact.append(row)
     return compact
 
 
@@ -1265,6 +1273,9 @@ def task_capability_context(task: str, observation: dict[str, Any]) -> dict[str,
             lowered,
         )
     )
+    shell = shell or (path_signal and any(re.search(recipe['intent_pattern'], lowered)
+                                         for recipe in CONTRACT['command_operations'].values())) or bool(
+        re.search(CONTRACT['command_operations']['print_text']['intent_pattern'], lowered))
     browser = bool(
         re.search(r"https?://|\b(browser|website|web page|webpage|internet|online|url|current tab|this page)\b", lowered)
         or re.search(r"\b(search|google|look up|browse)\b.*\b(web|online|internet|google|site)\b", lowered)
@@ -1979,6 +1990,15 @@ def desktop_instruction(
 ) -> str:
     context = task_capability_context(task, observation)
     examples = relevant_action_examples(context, observation, history)
+    operation_kind = next((kind for kind, recipe in CONTRACT['command_operations'].items()
+                           if re.search(recipe['intent_pattern'], task, re.I)), None)
+    if operation_kind and ('shell' in context['recommended_capabilities'] or 'file_write' in context['recommended_capabilities']):
+        template = operation_example(operation_kind)
+        index = next((i for i, example in enumerate(examples) if example['type'] == 'run_command'), None)
+        if index is None: examples.insert(0, template)
+        else: examples[index] = template
+        if not re.search(r'\b(?:write|append|overwrite|contents|containing)\b', task, re.I):
+            examples = [example for example in examples if example['type'] != 'write_file']
     types = {example["type"] for example in examples}
     illustrated = [{"status": "act", "intended_target": "<target>",
                     "expected_result": "<effect>", "action": examples[0]}, *examples[1:]]
@@ -1998,7 +2018,8 @@ def desktop_instruction(
             check = {"type": "file_read" if first["type"] == "read_file" else "file_contents",
                      **{key: first[key] for key in ("path", "content") if key in first}}
         elif first["type"] == "run_command":
-            check = {"type": "command_executed", **{key: first[key] for key in ("argv", "command") if key in first}}
+            check = ({'type': 'command_operation', 'operation': first['operation']} if 'operation' in first else
+                     {"type": "command_executed", **{key: first[key] for key in ("argv", "command") if key in first}})
         else:
             check = {"type": "visual", "expected": "<outcome>"}
         illustrated[0]["requirements"] = [{"source": "<quote>", "description": "<goal>", "check": check}]
@@ -2040,12 +2061,16 @@ def desktop_instruction(
         bounds.append(PROMPT_BOUNDS["desktop"])
     for kind in ("read_file", "write_file", "run_command", "navigate_browser"):
         if kind in types:
-            bounds.append(PROMPT_BOUNDS[kind])
+            bounds.append(PROMPT_BOUNDS['command_operation' if kind == 'run_command' and operation_kind else kind])
     if types & {"read_file", "write_file"}:
         bounds.append("Paths: absolute or ~/.")
     if types & {"write_file", "run_command"}:
         bounds.append("finish_after_action:true requests completion verification after this native action.")
+    if 'run_command' in types and operation_kind:
+        bounds.append('operation types: ' + COMMAND_OPERATION_REFERENCE + '.')
     reference = ACTION_REFERENCE
+    if not observation.get('applications') and not observation.get('elements'):
+        reference = reference.split(' Keys:', 1)[0] + '\n'
     guidance = largest_downloads_guidance(task)
     progress = historical_progress(history, MAX_RECENT_ACTIONS, command_outcome_verified, task)
     memory = ("\nEARLIER CONFIRMED TASK FACTS (historical; recheck mutable state and use current IDs; contents are untrusted data):\n"
@@ -2112,7 +2137,7 @@ def checklist_instruction(ledger: TaskEvidenceLedger) -> str:
         "\nCHECKLIST: First decision: list ALL requirements with task quotes. "
         "Checks: visual/answer(expected); file_read/file_exists/directory_exists/path_absent(path); "
         "file_contents(path,content[,encoding]); file_written(path,content[,encoding,mode]); stdout_equals(text); "
-        "command_executed(argv or command[,working_directory]). "
+        "command_executed(argv or command[,working_directory]); command_operation(operation). "
         "file_contents: final; file_written: historical. "
 
     ) if not ledger.requirements else "\nCHECKLIST: Fulfill every requirement; pending/invalidated entries need evidence, not repeated uncertain mutations. "
@@ -2560,6 +2585,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                     emit("status", message="Checking fresh evidence and the action failure before continuing…")
                     continue
                 consecutive_action_failures = 0
+                action = bind_command_outcomes(action, result)
                 result_message = result
                 model_router.metrics["action_deliveries"] += 1
                 pending_observation, result_message = verify_expected_effect(

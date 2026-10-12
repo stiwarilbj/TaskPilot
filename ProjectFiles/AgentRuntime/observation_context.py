@@ -298,9 +298,11 @@ def historical_progress(history: list[dict[str, Any]], recent_count: int,
                 fact["evidence"]["written_content"] = action["content"]
                 fact["evidence"]["encoding"] = action.get("encoding", "utf-8")
         elif kind == "run_command":
-            checks = [{**actual, **{k: requested[k] for k in ("content", "encoding", "text") if k in requested}}
+            fields = () if action.get("operation") else ("content", "encoding", "text")
+            checks = [{**actual, **{k: requested[k] for k in fields if k in requested}}
                       for requested, actual in zip(action["checks"], result["checks"])]
             fact["evidence"] = {"exit_code": result["exit_code"], "checks": checks}
+            if action.get("operation"): fact["operation"] = action["operation"]
             if isinstance(result.get("stdout"), str) and result["stdout"]:
                 fact["evidence"]["stdout"] = result["stdout"]
                 fact["evidence"]["stdout_truncated"] = result.get("stdout_truncated", False)

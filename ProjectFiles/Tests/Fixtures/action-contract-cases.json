@@ -976,6 +976,294 @@
         "url": "http://:80/"
       },
       "error": "action.url must be an http/https URL"
+    },
+    {
+      "name": "operation-create_directory",
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "create_directory",
+          "path": "/example/new folder"
+        }
+      },
+      "normalized": {
+        "type": "run_command",
+        "operation": {
+          "type": "create_directory",
+          "path": "/example/new folder"
+        },
+        "argv": [
+          "/bin/mkdir",
+          "-p",
+          "/example/new folder"
+        ],
+        "checks": [
+          {
+            "type": "directory_exists",
+            "path": "/example/new folder"
+          }
+        ]
+      }
+    },
+    {
+      "name": "operation-copy_file",
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "copy_file",
+          "source": "/example/a",
+          "destination": "/example/b"
+        }
+      },
+      "normalized": {
+        "type": "run_command",
+        "operation": {
+          "type": "copy_file",
+          "source": "/example/a",
+          "destination": "/example/b"
+        },
+        "argv": [
+          "/bin/cp",
+          "-n",
+          "/example/a",
+          "/example/b"
+        ],
+        "checks": [
+          {
+            "type": "file_exists",
+            "path": "/example/b"
+          }
+        ]
+      }
+    },
+    {
+      "name": "operation-move_file",
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "move_file",
+          "source": "/example/a",
+          "destination": "/example/b"
+        }
+      },
+      "normalized": {
+        "type": "run_command",
+        "operation": {
+          "type": "move_file",
+          "source": "/example/a",
+          "destination": "/example/b"
+        },
+        "argv": [
+          "/bin/mv",
+          "-n",
+          "/example/a",
+          "/example/b"
+        ],
+        "checks": [
+          {
+            "type": "file_exists",
+            "path": "/example/b"
+          },
+          {
+            "type": "path_absent",
+            "path": "/example/a"
+          }
+        ]
+      }
+    },
+    {
+      "name": "operation-remove_file",
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "remove_file",
+          "path": "/example/unneeded.txt"
+        }
+      },
+      "normalized": {
+        "type": "run_command",
+        "operation": {
+          "type": "remove_file",
+          "path": "/example/unneeded.txt"
+        },
+        "argv": [
+          "/bin/rm",
+          "-f",
+          "/example/unneeded.txt"
+        ],
+        "checks": [
+          {
+            "type": "path_absent",
+            "path": "/example/unneeded.txt"
+          }
+        ]
+      }
+    },
+    {
+      "name": "operation-remove_empty_directory",
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "remove_empty_directory",
+          "path": "/example/empty folder"
+        }
+      },
+      "normalized": {
+        "type": "run_command",
+        "operation": {
+          "type": "remove_empty_directory",
+          "path": "/example/empty folder"
+        },
+        "argv": [
+          "/bin/rmdir",
+          "/example/empty folder"
+        ],
+        "checks": [
+          {
+            "type": "path_absent",
+            "path": "/example/empty folder"
+          }
+        ]
+      }
+    },
+    {
+      "name": "operation-print_text",
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "print_text",
+          "text": "Example output"
+        }
+      },
+      "normalized": {
+        "type": "run_command",
+        "operation": {
+          "type": "print_text",
+          "text": "Example output"
+        },
+        "argv": [
+          "/usr/bin/printf",
+          "%s",
+          "Example output"
+        ],
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "text": "Example output"
+          }
+        ]
+      }
+    },
+    {
+      "name": "operation-missing-source",
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "copy_file",
+          "destination": "/fixture/b"
+        }
+      },
+      "error": "action.operation.source is required"
+    },
+    {
+      "name": "operation-wrong-kind",
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "unknown"
+        }
+      },
+      "error": "action.operation.type must be a supported command operation"
+    },
+    {
+      "name": "operation-numeric-path",
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "create_directory",
+          "path": 42
+        }
+      },
+      "error": "action.operation.path must be a string"
+    },
+    {
+      "name": "operation-relative-path",
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "create_directory",
+          "path": "relative"
+        }
+      },
+      "error": "action.operation.path must be an absolute or ~/ path without NUL bytes"
+    },
+    {
+      "name": "operation-unknown-flag",
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "copy_file",
+          "source": "/fixture/a",
+          "destination": "/fixture/b",
+          "overwrite": true
+        }
+      },
+      "error": "action.operation contains unsupported parameters"
+    },
+    {
+      "name": "operation-wrong-flags",
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "copy_file",
+          "source": "/fixture/a",
+          "destination": "/fixture/b"
+        },
+        "argv": [
+          "/bin/cp",
+          "-rf",
+          "/fixture/a",
+          "/fixture/b"
+        ]
+      },
+      "error": "action.argv must match the established operation template"
+    },
+    {
+      "name": "operation-shell-conflict",
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "copy_file",
+          "source": "/fixture/a",
+          "destination": "/fixture/b"
+        },
+        "command": "true"
+      },
+      "error": "action.command cannot accompany a command operation"
+    },
+    {
+      "name": "operation-parent-traversal",
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "create_directory",
+          "path": "/fixture/../other"
+        }
+      },
+      "error": "action.operation.path must not contain parent traversal; use general shell for complex paths"
+    },
+    {
+      "name": "operation-wrong-owner",
+      "action": {
+        "type": "launch_app",
+        "operation": {
+          "type": "copy_file",
+          "source": "/fixture/a",
+          "destination": "/fixture/b"
+        },
+        "app": "Fixture"
+      },
+      "error": "action.operation is only supported for run_command"
     }
   ],
   "defaults": {

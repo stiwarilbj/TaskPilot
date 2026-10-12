@@ -13,6 +13,7 @@ struct CommandExecutionPolicy {
     let displayCommand: String
     let timeout: TimeInterval
     let checks: [Check]
+    let outcomeChecks: [[String: Any]]
 
     struct Check {
         let type: String
@@ -87,7 +88,8 @@ struct CommandExecutionPolicy {
             shellSource = nil
             displayCommand = argv.map(Self.quoteLiteral).joined(separator: " ")
         }
-        checks = try (action["checks"] as? [[String: Any]] ?? []).map { value in
+        outcomeChecks = try CommandOperationPreparation.checks(action: action)
+        checks = try outcomeChecks.map { value in
             let kind = OutcomeCheckKind(rawValue: value["type"] as! String)!
             switch kind {
             case .stdout_equals:

@@ -15,7 +15,7 @@ from typing import Any
 
 from action_contract_generated import CONTRACT, ActionContractError, _field, validate_action, validate_outcome_check
 
-CHECKLIST_VERSION = 2
+CHECKLIST_VERSION = 3
 FILE_CHECKS = {"file_exists", "directory_exists", "path_absent", "file_contents"}
 READ_PATTERN = r'\s*(?:read|show|print)\s+(?:the\s+)?(?:contents of\s+)?file\s+(["`\'])((?:/|~/)(?:(?!\1)[^\n])+)\1\s*[.!]?\s*'
 LARGEST_PATTERN = (r"\s*(?:(?:what(?:['’]s| is)|which is) (?:the |my )?|(?:find|tell me|show me) (?:the )?)"
@@ -80,6 +80,9 @@ def validate_requirement(value: Any, task: str | None, path: str) -> dict:
             if set(check) - {"type", "argv", "command", "working_directory"}:
                 fail(path + ".check", "contains unsupported fields")
             validate_action({**check, "type": "run_command"})
+        elif kind == 'command_operation':
+            if set(check) != {'type', 'operation'}: fail(path + '.check', 'requires only type and operation')
+            validate_action({'type': 'run_command', 'operation': check.get('operation')})
         elif kind in {"visual", "answer"}:
             if set(check) != {"type", "expected"}: fail(path + ".check", "requires only type and expected")
             nonempty(check.get("expected"), path + ".check.expected")
@@ -237,6 +240,7 @@ class TaskEvidenceLedger:
             self.checks += 1
             for check, actual in zip(result.get("requested_checks", []), result.get("checks", [])):
                 self.record_check(check, actual, action)
+            if kind == 'run_command': self.record_operation(action, result, recheck=True)
             if kind != "read_file": return
         if kind == "read_file":
             if (result.get("path") != path_key(action["path"]) or result.get("truncated") is not False or
@@ -267,6 +271,37 @@ class TaskEvidenceLedger:
             if len(expected) != len(actual): return
             for check, checked in zip(expected, actual):
                 self.record_check(check, checked, action)
+            self.record_operation(action, result)
+
+    def record_operation(self, action: dict, result: dict, recheck=False) -> None:
+        operation = action.get('operation')
+        if not operation: return
+        snapshot = CONTRACT['command_operations'][operation['type']].get('snapshot')
+        if snapshot and not any(c.get('type') == 'file_contents' and c.get('encoding') == 'base64'
+                                and c.get('path') == operation[snapshot['destination']] for c in action['checks']): return
+        if recheck:
+            if result.get('requested_checks') != [c for c in action['checks'] if c['type'] != 'stdout_equals']: return
+            if not any(e['generation'] == self.generation and e['fact'].get('type') == 'command_operation'
+                       and e['action_fingerprint'] == digest(action) for e in self.evidence.values()): return
+        elif result.get('command_operation') != operation or result.get('outcome_checks') != action.get('checks'):
+            return
+        expected = [c for c in action['checks'] if not recheck or c['type'] != 'stdout_equals']
+        actual = result.get('checks', [])
+        if not expected or len(expected) != len(actual): return
+        proven = all(self.check_matches(c, a) for c, a in zip(expected, actual))
+        identifier = self.add_evidence({'type': 'command_operation', 'operation': operation},
+                                       mutable=any(c['type'] in FILE_CHECKS for c in expected), action=action)
+        if not proven:
+            self.evidence[identifier]['valid'] = False
+            self.refresh()
+
+    @staticmethod
+    def check_matches(check: dict, actual: dict) -> bool:
+        if not isinstance(actual, dict) or actual.get('verified') is not True or actual.get('type') != check.get('type'): return False
+        if check['type'] in FILE_CHECKS:
+            return (actual.get('path') == path_key(check['path']) and
+                    (check['type'] != 'file_contents' or actual.get('content_sha256') == content_hash(check)))
+        return check['type'] == 'stdout_equals' and actual.get('text_sha256') == hashlib.sha256(check['text'].encode()).hexdigest()
 
     def record_check(self, check: dict, actual: dict, action: dict) -> None:
         if (not isinstance(check, dict) or not isinstance(actual, dict) or
@@ -314,6 +349,7 @@ class TaskEvidenceLedger:
         if kind == "command_executed":
             return (all(check.get(k) == fact.get(k) for k in ("argv", "command")) and
                     ("working_directory" not in check or path_key(check["working_directory"]) == fact.get("working_directory")))
+        if kind == 'command_operation': return check['operation'] == fact.get('operation')
         return True
 
     def refresh(self) -> None:
