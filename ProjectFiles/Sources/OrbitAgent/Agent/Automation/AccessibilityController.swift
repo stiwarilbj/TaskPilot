@@ -81,6 +81,7 @@ enum AccessibilityActionError: LocalizedError {
     case uncertainDelivery(String)
     case focusMismatch
     case unsupportedAction
+    case ambiguousTarget
 
     var code: String {
         switch self {
@@ -92,6 +93,7 @@ enum AccessibilityActionError: LocalizedError {
         case .uncertainDelivery: return "delivery_uncertain"
         case .focusMismatch: return "focus_mismatch"
         case .unsupportedAction: return "unsupported_action"
+        case .ambiguousTarget: return "ambiguous_target"
         case .controllerProtected: return "protected_target"
         case .invalidAction: return "invalid_action"
         case .operationFailed: return "delivery_rejected"
@@ -111,6 +113,7 @@ enum AccessibilityActionError: LocalizedError {
         case .uncertainDelivery(let message): return message
         case .focusMismatch: return "The intended field does not have confirmed focus; observe and focus the correct field before typing"
         case .unsupportedAction: return "Accessibility press is unsupported and no verified coordinate fallback is available; observe and choose another supported method"
+        case .ambiguousTarget: return "These coordinates match multiple controls; observe their app, window, and panel and select one complete element ID"
         }
     }
 }
@@ -139,6 +142,7 @@ final class AccessibilityController {
         let window: AXUIElement?
         let depth: Int
         let supportsPress: Bool
+        let supportsActions: Bool
         let wasFocused: Bool
         let observedTextValue: String?
         let observedSelection: NSRange?
@@ -413,6 +417,7 @@ final class AccessibilityController {
         try TaskOwnership.check()
         let suspension = TaskOwnership.current?.suspensionRevision
         var newMap: [String: ElementRecord] = [:]
+        var structureCache: [UInt: AutomationStructureNode] = [:]
         var elementRows: [[String: Any]] = []
         var applicationRows: [[String: Any]] = []
         var nextID = 1
@@ -486,7 +491,7 @@ final class AccessibilityController {
                      application: appIdentity,
                      focusedElement: focusedElement,
                      depth: 0, nextID: &nextID, map: &newMap, rows: &elementRows,
-                     revision: revision, parentID: nil, ownerWindow: nil, windowRecords: windowRecords)
+                     revision: revision, parentID: nil, ownerWindow: nil, windowRecords: windowRecords, structureCache: &structureCache)
             }
 
             for index in AutomationObservationPolicy.windowOrder(count: visibleWindows.count, focusedIndex: focusedIndex, topmostIndex: topmostIndex) {
@@ -501,7 +506,7 @@ final class AccessibilityController {
                     nextID: &nextID,
                     map: &newMap,
                     rows: &elementRows,
-                    revision: revision, parentID: nil, ownerWindow: window, windowRecords: windowRecords
+                    revision: revision, parentID: nil, ownerWindow: window, windowRecords: windowRecords, structureCache: &structureCache
                 )
                 if elementRows.count >= maxElements { break }
             }
@@ -532,6 +537,7 @@ final class AccessibilityController {
             if let id = row["id"] as? String, let record = newMap[id] {
                 result["title"] = record.identity.label
                 result["element_identity"] = String(CFHash(record.element))
+                result["structure"] = record.identity.structure.map(\.dictionary)
                 if let window = record.window { result["window_identity"] = String(CFHash(window)) }
                 if let frame = record.identity.bounds, serializedAccessibilityFrame(frame) != nil {
                     result["frame"] = ["x": frame.minX, "y": frame.minY, "width": frame.width, "height": frame.height]
@@ -579,7 +585,8 @@ final class AccessibilityController {
         revision: String,
         parentID: String?,
         ownerWindow: AXUIElement?,
-        windowRecords: [SnapshotWindowRecord]
+        windowRecords: [SnapshotWindowRecord],
+        structureCache: inout [UInt: AutomationStructureNode]
     ) {
         guard (try? TaskOwnership.check()) != nil, depth <= 14, rows.count < maxElements else { return }
         let alreadyVisited = map.values.contains(where: { CFEqual($0.element, element) })
@@ -609,12 +616,13 @@ final class AccessibilityController {
         map[id] = ElementRecord(element: element, revision: revision,
             identity: AutomationTargetIdentity(application: application, role: role, subrole: subrole,
                 label: title, bounds: bounds, windowTitle: window.map { elementTitle($0) },
-                windowBounds: window.flatMap { frame(of: $0) }),
-            window: window, depth: depth, supportsPress: actions.contains("AXPress"),
+                windowBounds: window.flatMap { frame(of: $0) }, structure: targetStructure(element, cache: &structureCache)),
+            window: window, depth: depth, supportsPress: actions.contains("AXPress"), supportsActions: !actions.isEmpty,
             wasFocused: focused, observedTextValue: AutomationTextEntryPolicy.inputRoles.contains(role) ? value as? String : nil,
             observedSelection: selection)
         var row: [String: Any] = [
             "id": id,
+            "native_identity": String(CFHash(element)),
             "pid": Int(pid),
             "app": appName,
             "role": role,
@@ -659,7 +667,7 @@ final class AccessibilityController {
                 depth: depth + 1,
                 nextID: &nextID,
                 map: &map,
-                rows: &rows, revision: revision, parentID: id, ownerWindow: ownerWindow, windowRecords: windowRecords
+                rows: &rows, revision: revision, parentID: id, ownerWindow: ownerWindow, windowRecords: windowRecords, structureCache: &structureCache
             )
             if rows.count >= maxElements { break }
         }
@@ -981,7 +989,7 @@ final class AccessibilityController {
             rememberManualTarget(pid)
             // Bind coordinates to the control in the planning observation,
             // before activation or z-order recovery can change its position.
-            let coordinateRecord = record == nil ? observedControl(at: point, pid: pid) : nil
+            let coordinateRecord = record == nil ? try observedControl(at: point, pid: pid) : nil
             try postClick(
                 to: pid,
                 point: point,
@@ -2173,7 +2181,7 @@ final class AccessibilityController {
         guard AutomationTextEntryPolicy.inputRoles.contains(identity.role),
               !AutomationTextEntryPolicy.isSecure(role: identity.role, subrole: identity.subrole) else { return nil }
         return ElementRecord(element: focused, revision: lock.withLock { observationRevision }, identity: identity,
-            window: window, depth: 0, supportsPress: false, wasFocused: true,
+            window: window, depth: 0, supportsPress: false, supportsActions: false, wasFocused: true,
             observedTextValue: stringAttribute(focused, kAXValueAttribute), observedSelection: selectedTextRange(focused))
     }
 
@@ -2347,11 +2355,48 @@ final class AccessibilityController {
 
     private func targetIdentity(_ element: AXUIElement, application: AutomationApplicationIdentity,
                                 window: AXUIElement?) -> AutomationTargetIdentity {
+        var cache: [UInt: AutomationStructureNode] = [:]
+        return targetIdentity(element, application: application, window: window, structure: targetStructure(element, cache: &cache))
+    }
+
+    private func targetIdentity(_ element: AXUIElement, application: AutomationApplicationIdentity,
+                                window: AXUIElement?, structure: [AutomationStructureNode]) -> AutomationTargetIdentity {
         AutomationTargetIdentity(application: application,
             role: stringAttribute(element, kAXRoleAttribute) ?? "unknown",
             subrole: stringAttribute(element, kAXSubroleAttribute) ?? "",
             label: elementTitle(element), bounds: frame(of: element),
-            windowTitle: window.map { elementTitle($0) }, windowBounds: window.flatMap { frame(of: $0) })
+            windowTitle: window.map { elementTitle($0) }, windowBounds: window.flatMap { frame(of: $0) }, structure: structure)
+    }
+
+    /// Snapshot-local caching avoids rereading a shared panel for every child.
+    /// Delivery preflight uses a fresh cache and compares the complete chain.
+    private func targetStructure(_ element: AXUIElement, cache: inout [UInt: AutomationStructureNode]) -> [AutomationStructureNode] {
+        var result: [AutomationStructureNode] = []
+        var parent = accessibilityElement(element, kAXParentAttribute)
+        var visited: Set<UInt> = [CFHash(element)]
+        while let current = parent, visited.insert(CFHash(current)).inserted, result.count < 24 {
+            let token = CFHash(current)
+            let node: AutomationStructureNode
+            if let existing = cache[token] { node = existing }
+            else {
+                let children = attribute(current, kAXChildrenAttribute) as? [AXUIElement] ?? []
+                // Only label controls, never input values or credential fields.
+                let labels = children.prefix(160).filter {
+                    ["AXStaticText", "AXHeading"].contains(stringAttribute($0, kAXRoleAttribute) ?? "")
+                        && !AutomationTextEntryPolicy.isSecure(role: stringAttribute($0, kAXRoleAttribute) ?? "",
+                                                              subrole: stringAttribute($0, kAXSubroleAttribute) ?? "")
+                }.map { label in
+                    let title = elementTitle(label)
+                    return title.isEmpty ? (stringAttribute(label, kAXValueAttribute) ?? "") : title
+                }.filter { !$0.isEmpty }.sorted()
+                node = AutomationStructureNode(identity: token, role: stringAttribute(current, kAXRoleAttribute) ?? "unknown",
+                    label: elementTitle(current), bounds: frame(of: current), labels: labels)
+                cache[token] = node
+            }
+            result.append(node)
+            parent = accessibilityElement(current, kAXParentAttribute)
+        }
+        return result
     }
 
     private func validateCoordinateWindows(_ pid: pid_t, on display: DisplayDescriptor) throws {
@@ -2365,10 +2410,10 @@ final class AccessibilityController {
         try AutomationTargetPolicy.validateWindows(observed: expected, current: current)
     }
 
-    private func observedControl(at point: CGPoint, pid: pid_t) -> ElementRecord? {
+    private func observedControl(at point: CGPoint, pid: pid_t) throws -> ElementRecord? {
         let containers: Set<String> = ["AXApplication", "AXWindow", "AXGroup", "AXScrollArea", "AXSplitGroup",
                                        "AXWebArea", "AXLayoutArea", "AXMenuBar", "unknown"]
-        return lock.withLock {
+        let all = lock.withLock {
             elementMap.values.filter {
                 $0.pid == pid && !containers.contains($0.role) && $0.observedBounds?.contains(point) == true
             }.sorted {
@@ -2376,8 +2421,15 @@ final class AccessibilityController {
                 let a = $0.observedBounds!, b = $1.observedBounds!
                 return a.width * a.height == b.width * b.height ? $0.depth > $1.depth
                     : a.width * a.height < b.width * b.height
-            }.first
+            }
         }
+        let actionable = all.filter { $0.supportsActions || AutomationTargetPolicy.pointerControlRoles.contains($0.role) }
+        let candidates = actionable.isEmpty ? all : actionable
+        try AutomationTargetPolicy.validateCoordinateCandidates(count: candidates.count) { first, second in
+            self.element(candidates[first].element, isWithin: candidates[second].element)
+                || self.element(candidates[second].element, isWithin: candidates[first].element)
+        }
+        return candidates.first
     }
 
     private func validatePointerHit(_ record: ElementRecord, at point: CGPoint) throws {

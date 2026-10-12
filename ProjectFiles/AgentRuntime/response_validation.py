@@ -5,13 +5,14 @@ import json
 import math
 from typing import Any
 from task_evidence import EvidenceValidationError, validate_metadata
+from observation_context import coordinates_are_ambiguous
 
 from action_contract_generated import (
     CONTRACT_HASH, CONTRACT_VERSION, VALID_ACTIONS, KEYS,
     ActionContractError, validate_action,
 )
 
-VALIDATION_VERSION = 4
+VALIDATION_VERSION = 5
 
 
 class ResponseValidationError(RuntimeError):
@@ -92,6 +93,8 @@ def normalize_action(value: Any, observation: dict[str, Any] | None = None) -> d
             routes = observation.get("system_context", {}).get("task_routes", [])
             if action["route_id"] not in {r.get("route_id") for r in routes if isinstance(r, dict)}:
                 fail("action.route_id", "must reference a supplied task route")
+        if coordinates_are_ambiguous(action, observation):
+            fail("action.element_id", "must select one observed control; these coordinates overlap multiple unrelated controls")
     return action
 
 

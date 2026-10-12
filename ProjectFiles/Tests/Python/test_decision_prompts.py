@@ -108,8 +108,10 @@ class DecisionPromptTests(unittest.TestCase):
     def test_prompt_observation_preserves_evidence_and_removes_duplicate_tool_descriptions(self):
         compact = runtime.prompt_observation(OBSERVATION)
         self.assertNotIn('agent_tools', compact)
-        for field in ['applications', 'elements', 'system_context', 'observation_revision']:
+        for field in ['applications', 'system_context', 'observation_revision']:
             self.assertEqual(compact[field], OBSERVATION[field])
+        self.assertEqual([{key: value for key, value in row.items() if key != 'target_context'}
+                          for row in compact['elements']], OBSERVATION['elements'])
         self.assertIn('agent_tools', OBSERVATION)
         history = [{'action': {'type': 'run_command', 'command': 'pwd'}, 'result': {'stdout': '/tmp', 'exit_code': 0}}]
         prompt = runtime.desktop_instruction('Use this exact command result', OBSERVATION, history)

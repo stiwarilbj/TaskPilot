@@ -17,6 +17,21 @@ struct AutomationTargetIdentity: Equatable {
     let bounds: CGRect?
     let windowTitle: String?
     let windowBounds: CGRect?
+    var structure: [AutomationStructureNode] = []
+}
+
+struct AutomationStructureNode: Equatable {
+    let identity: UInt
+    let role: String
+    let label: String
+    let bounds: CGRect?
+    var labels: [String] = []
+
+    var dictionary: [String: Any] {
+        var value: [String: Any] = ["identity": String(identity), "role": role, "label": label, "labels": labels]
+        if let bounds, let frame = serializedAccessibilityFrame(bounds) { value["frame"] = frame }
+        return value
+    }
 }
 
 struct AutomationGraphicsWindow: Equatable {
@@ -26,6 +41,18 @@ struct AutomationGraphicsWindow: Equatable {
 }
 
 enum AutomationTargetPolicy {
+    static let pointerControlRoles: Set<String> = ["AXApplication", "AXWindow", "AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton",
+        "AXMenu", "AXMenuItem", "AXMenuBarItem", "AXSheet", "AXTextField", "AXTextArea", "AXSearchField", "AXComboBox",
+        "AXSecureTextField", "AXSlider", "AXTab", "AXLink", "AXRow", "AXOutline", "AXTable"]
+    /// Ancestor/descendant hit candidates describe the same control. Two
+    /// unrelated controls at one point require an explicit observed element.
+    static func validateCoordinateCandidates(count: Int, related: (Int, Int) -> Bool) throws {
+        for first in 0..<count {
+            for second in (first + 1)..<count where !related(first, second) {
+                throw AccessibilityActionError.ambiguousTarget
+            }
+        }
+    }
     static func validateWindows(observed: [AutomationGraphicsWindow], current: [AutomationGraphicsWindow]) throws {
         guard !observed.isEmpty, observed.count == current.count,
               observed.allSatisfy({ current.contains($0) }) else {

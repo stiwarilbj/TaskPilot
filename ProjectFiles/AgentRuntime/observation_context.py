@@ -16,6 +16,60 @@ CONTROL_ROLES = {"AXApplication", "AXWindow", "AXButton", "AXCheckBox", "AXRadio
                  "AXComboBox", "AXSecureTextField", "AXSlider", "AXTab", "AXLink", "AXRow", "AXOutline", "AXTable"}
 LABEL_ROLES = {"AXStaticText", "AXHeading", "AXRow", "AXGroup", "AXCell", "AXColumn", "AXWindow", "AXSheet"}
 MAX_PROGRESS_CHARACTERS = 16000
+RELATIONSHIPS_VERSION = 1
+POINTER_CONTAINERS = {"AXApplication", "AXWindow", "AXGroup", "AXScrollArea", "AXSplitGroup",
+                      "AXWebArea", "AXLayoutArea", "AXMenuBar", "unknown"}
+
+
+def ancestor_ids(element: dict[str, Any], by_id: dict[str, dict[str, Any]]) -> list[str]:
+    chain, seen, parent = [], {element.get("id")}, element.get("parent_id")
+    while parent in by_id and parent not in seen and len(chain) < 24:
+        node = by_id[parent]
+        if element.get("pid") != node.get("pid"): break
+        if element.get("window_id") and node.get("window_id") and element["window_id"] != node["window_id"]: break
+        chain.append(parent); seen.add(parent); parent = node.get("parent_id")
+    return chain
+
+
+def coordinate_targets(action: dict[str, Any], observation: dict[str, Any]) -> list[dict[str, Any]]:
+    """Observed hit candidates; a label child is not a second actionable target."""
+    display = observation.get("display", {})
+    values = [display.get(k) for k in ("x", "y", "width", "height")] + [action.get("x"), action.get("y")]
+    if any(type(v) not in {int, float} or not math.isfinite(v) for v in values): return []
+    x, y, width, height, ax, ay = values
+    if width <= 0 or height <= 0: return []
+    point = (x + ax / 1000 * width, y + ay / 1000 * height)
+    targets = []
+    for element in observation.get("elements", []):
+        if not isinstance(element, dict) or element.get("pid") != action.get("pid") or element.get("role") in POINTER_CONTAINERS: continue
+        frame = element.get("frame", {})
+        values = [frame.get(k) for k in ("x", "y", "width", "height")]
+        if any(type(v) not in {int, float} or not math.isfinite(v) for v in values): continue
+        fx, fy, fw, fh = values
+        if fw > 0 and fh > 0 and fx <= point[0] <= fx + fw and fy <= point[1] <= fy + fh: targets.append(element)
+    actionable = [e for e in targets if e.get("actions") or e.get("role") in CONTROL_ROLES]
+    targets = actionable or targets
+    return sorted(targets, key=lambda e: ("AXPress" not in e.get("actions", []),
+                  e["frame"]["width"] * e["frame"]["height"], -e.get("depth", 0)))
+
+
+def coordinates_are_ambiguous(action: dict[str, Any], observation: dict[str, Any]) -> bool:
+    if action.get("element_id") or action.get("type") not in {"click", "double_click"}: return False
+    targets = coordinate_targets(action, observation)
+    by_id = {e["id"]: e for e in observation.get("elements", []) if isinstance(e, dict) and isinstance(e.get("id"), str)}
+    return any(not (first.get("native_identity") and first.get("native_identity") == second.get("native_identity"))
+               and first.get("id") not in ancestor_ids(second, by_id) and second.get("id") not in ancestor_ids(first, by_id)
+               for i, first in enumerate(targets) for second in targets[i + 1:])
+
+
+def structural_identity(target: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any]:
+    """Semantic context across revisions, used only by bounded replay protection."""
+    by_id = {e["id"]: e for e in observation.get("elements", []) if isinstance(e, dict) and isinstance(e.get("id"), str)}
+    chain = ancestor_ids(target, by_id)
+    labels = sorted({element_text(e) for e in by_id.values() if e.get("pid") == target.get("pid")
+                     and target.get("parent_id") and e.get("parent_id") == target.get("parent_id")
+                     and e.get("role") in {"AXStaticText", "AXHeading"} and element_text(e)})
+    return {"containers": [{k: by_id[p].get(k) for k in ("role", "title")} for p in reversed(chain)], "labels": labels}
 
 
 def words(value: str) -> set[str]:
@@ -39,10 +93,7 @@ def select_elements(observation: dict[str, Any], task: str, limit: int) -> list[
     indices = {e["id"]: i for i, e in enumerate(rows)}
     ancestors: dict[str, list[str]] = {}
     for e in rows:
-        chain, seen, parent = [], {e["id"]}, e.get("parent_id")
-        while parent in by_id and parent not in seen and len(chain) < 24:
-            chain.append(parent); seen.add(parent); parent = by_id[parent].get("parent_id")
-        ancestors[e["id"]] = chain
+        ancestors[e["id"]] = ancestor_ids(e, by_id)
 
     def scope(e):
         window = e.get("window_id") or next((by_id[p]["id"] for p in ancestors[e["id"]]
@@ -139,8 +190,34 @@ def select_elements(observation: dict[str, Any], task: str, limit: int) -> list[
         bundle = {identity, *ancestors[identity]}
         for label in context_labels[identity]: bundle.update([label, *ancestors[label]])
         if len(chosen | bundle) <= limit: chosen.update(bundle)
-    # Preserve tree reading order; selection itself is ranked, not sliced.
-    return [e for e in rows if e["id"] in chosen]
+    repeated = defaultdict(list)
+    unique_peers = defaultdict(set)
+    for e in rows:
+        label = str(e.get("title") or "").strip().casefold()
+        if label and (e.get("actions") or e.get("role") in CONTROL_ROLES - {"AXApplication", "AXWindow", "AXSheet", "AXMenu"}):
+            key = (e.get("pid"), e.get("role"), label)
+            identity = e.get("native_identity") or e["id"]
+            if identity not in unique_peers[key]: repeated[key].append(e["id"]); unique_peers[key].add(identity)
+    selected = []
+    # Preserve tree reading order and all executable IDs. References are only
+    # to observed nodes; clipped peers remain explicitly counted, not invented.
+    for e in rows:
+        if e["id"] not in chosen: continue
+        row = dict(e)
+        row.pop("native_identity", None)  # Private reconciliation identity, outside prompts/history.
+        if e.get("role") == "AXSecureTextField" or "secure" in str(e.get("subrole", "")).casefold():
+            if "value" in row: row["value"] = "[secure]"
+            if "value_complete" in row: row["value_complete"] = False
+        context = {"path": list(reversed(ancestors[e["id"]])), "nearby_label_ids": context_labels[e["id"]]}
+        peers = repeated[(e.get("pid"), e.get("role"), str(e.get("title") or "").strip().casefold())]
+        if len(peers) > 1:
+            # A large repeated table must not duplicate eight full IDs in every
+            # row. Its selected controls already carry complete IDs and paths.
+            visible = [p for p in peers if p in chosen] if len(peers) <= 8 else []
+            context["repeated_label"] = {"count": len(peers), "candidate_ids": visible, "partial": len(visible) < len(peers)}
+        row["target_context"] = context
+        selected.append(row)
+    return selected
 
 
 def historical_progress(history: list[dict[str, Any]], recent_count: int,

@@ -48,6 +48,8 @@ TaskPilot/
 
 ## Naming rules
 
+Private target context and delivery checks are described in [Target relationships](TargetRelationships.md).
+
 - Types say what they own or do. `TaskPilotCoordinator` coordinates the app, while `TaskToolExecutor` executes native tools.
 - Views describe the screen they render, such as `TaskQueueHistoryView`.
 - Services describe the system they wrap, such as `ScreenCaptureService` and `OpenClawService`.
