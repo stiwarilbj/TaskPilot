@@ -5,12 +5,15 @@ import Foundation
 final class TaskLease: @unchecked Sendable {
     enum State { case running, paused, draining, retired }
     let id: String
+    let actionReceipts: ActionReceiptStore
     private let lock = NSRecursiveLock()
     private var value: State = .running
     private var discarded = 0
     private var suspensions = 0
     private var artifacts: Set<URL> = []
-    init(id: String = UUID().uuidString) { self.id = id }
+    init(id: String = UUID().uuidString) {
+        self.id = id; self.actionReceipts = ActionReceiptStore(generation: id)
+    }
     var state: State { lock.lock(); defer { lock.unlock() }; return value }
     var staleWorkCount: Int { lock.lock(); defer { lock.unlock() }; return discarded }
     var suspensionRevision: Int { lock.lock(); defer { lock.unlock() }; return suspensions }
@@ -28,6 +31,7 @@ final class TaskLease: @unchecked Sendable {
     }
     func retire() {
         lock.lock(); value = .retired; let files = artifacts; artifacts.removeAll(); lock.unlock()
+        actionReceipts.discard()
         for url in files { try? FileManager.default.removeItem(at: url) }
     }
     func accepts(_ id: String?) -> Bool {
@@ -58,10 +62,21 @@ final class TaskLease: @unchecked Sendable {
 
 enum TaskOwnership {
     @TaskLocal static var current: TaskLease?
+    @TaskLocal static var actionReceipt: ActionReceiptStore.Token?
     static func check() throws { try current?.check(); try Task.checkCancellation() }
     static func checkpoint() async throws { try await current?.checkpoint(); try Task.checkCancellation() }
     static func commit<T>(_ operation: () throws -> T) throws -> T {
-        if let current { return try current.commit(operation) }
+        if let current {
+            return try current.commit {
+                if let actionReceipt {
+                    guard actionReceipt.generation == current.id else { throw CancellationError() }
+                    // Receipt dispatch and delivery share the lease's atomic
+                    // boundary. Failed delivery after this point is uncertain.
+                    try actionReceipt.dispatched()
+                }
+                return try operation()
+            }
+        }
         return try operation() // Explicit user/manual and teardown paths.
     }
     static func permitted<T>(_ fallback: T, _ operation: () -> T) -> T {

@@ -8,6 +8,9 @@ is not an action parameter, model prompt field, or persisted history value.
 Readiness processes do not acquire an execution lease. The private protocol
 version is included in the contract fingerprint, so older bundled components
 fail their startup contract check before making provider requests.
+Protocol version 2 also requires private action IDs and binds
+[native receipts](ActionReceipts.md) to the same lease. Receipt lookup has no
+execution authority, and retirement discards the table after drainage.
 
 `TaskLease` serializes revocation with native commits. Running work can deliver;
 Pause retains the generation and suspends delivery; draining and retired work

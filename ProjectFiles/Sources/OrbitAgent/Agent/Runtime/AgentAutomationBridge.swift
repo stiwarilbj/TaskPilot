@@ -54,6 +54,7 @@ final class AgentAutomationBridge {
     func handle(_ request: [String: Any]) async -> [String: Any] {
         let requestID = request["request_id"] as? String ?? UUID().uuidString
         let lease = TaskOwnership.current
+        var receiptToken: ActionReceiptStore.Token?
         do {
             guard let lease, owns(lease), lease.accepts(request["task_generation_id"] as? String) else { throw CancellationError() }
             try await lease.checkpoint()
@@ -61,6 +62,30 @@ final class AgentAutomationBridge {
                 throw BridgeError.invalidRequest("Missing bridge method")
             }
             let params = request["params"] as? [String: Any] ?? [:]
+            // Lookup and replay never require a connected display or a current
+            // element map, and never dispatch the original operation again.
+            if method == "action_receipt" {
+                let id = try ActionReceiptStore.validateID(params["action_id"] as? String)
+                return ["task_generation_id": lease.id, "kind": "bridge_response",
+                        "request_id": requestID, "ok": true, "result": lease.actionReceipts.lookup(id)]
+            }
+            var validatedAction: [String: Any]?
+            if method == "act" {
+                guard let input = params["action"] as? [String: Any] else {
+                    throw BridgeError.invalidRequest("Missing action payload")
+                }
+                let action = try ActionContract.validate(input)
+                let id = try ActionReceiptStore.validateID(params["action_id"] as? String)
+                var identity = params
+                identity.removeValue(forKey: "action_id")
+                identity["action"] = action
+                switch try lease.commit({ try lease.actionReceipts.begin(id: id, payload: identity) }) {
+                case .existing(let receipt):
+                    return receiptResponse(receipt, requestID: requestID, generation: lease.id)
+                case .new(let token): receiptToken = token
+                }
+                validatedAction = action
+            }
             let display = try targetDisplay(from: params)
             let result: [String: Any]
 
@@ -137,27 +162,29 @@ final class AgentAutomationBridge {
                 result = try await taskTools.recheck(action: action)
 
             case "act":
-                guard let inputAction = params["action"] as? [String: Any] else {
-                    throw BridgeError.invalidRequest("Missing action payload")
-                }
-                let action: [String: Any]
-                action = try ActionContract.validate(inputAction)
+                let action = validatedAction!
                 let kind = ActionKind(rawValue: action["type"] as! String)!
-                if kind.owner == .task_tool {
-                    result = try await taskTools.perform(action: action)
-                } else {
-                    guard kind.owner == .desktop else {
-                        throw BridgeError.invalidRequest("Runtime-local actions cannot be dispatched to the native bridge")
+                result = try await TaskOwnership.$actionReceipt.withValue(receiptToken) {
+                    if kind.owner == .task_tool {
+                        return try await taskTools.perform(action: action)
+                    } else {
+                        guard kind.owner == .desktop else {
+                            throw BridgeError.invalidRequest("Runtime-local actions cannot be dispatched to the native bridge")
+                        }
+                        try accessibility.validateObservation(params["observation_revision"] as? String)
+                        return try await accessibility.performStructured(action: action, on: display,
+                            privateInput: params["private_input"] as? Bool == true)
                     }
-                    try accessibility.validateObservation(params["observation_revision"] as? String)
-                    result = try await accessibility.performStructured(action: action, on: display,
-                        privateInput: params["private_input"] as? Bool == true)
                 }
+                receiptToken?.complete(result)
 
             default:
                 throw BridgeError.invalidRequest("Unknown bridge method: \(method)")
             }
             try TaskOwnership.check()
+            if let receiptToken {
+                return receiptResponse(receiptToken.receipt, requestID: requestID, generation: lease.id)
+            }
             return [
                 "task_generation_id": lease.id,
                 "kind": "bridge_response",
@@ -167,7 +194,13 @@ final class AgentAutomationBridge {
             ]
         } catch {
             let code = error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" :
-                (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? "action_rejected"
+                (error as? ActionReceiptStore.ReceiptError)?.code ?? (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? "action_rejected"
+            receiptToken?.fail(error, code: code)
+            // Cancellation must remain a stop even if an acknowledged result
+            // raced with revocation. The receipt still retains that result.
+            if let receiptToken, code != "cancelled" {
+                return receiptResponse(receiptToken.receipt, requestID: requestID, generation: lease?.id ?? "")
+            }
             return [
                 "task_generation_id": lease?.id ?? "",
                 "kind": "bridge_response",
@@ -178,6 +211,20 @@ final class AgentAutomationBridge {
                 "outcome": code == "delivery_uncertain" ? "delivered_unconfirmed" : "rejected"
             ]
         }
+    }
+
+    private func receiptResponse(_ receipt: [String: Any], requestID: String, generation: String) -> [String: Any] {
+        var response: [String: Any] = ["task_generation_id": generation, "kind": "bridge_response", "request_id": requestID,
+                                     "action_receipt": receipt.filter { ["action_id", "state", "terminal"].contains($0.key) }]
+        if let result = receipt["result"] as? [String: Any] {
+            response["ok"] = true; response["result"] = result
+        } else {
+            response["ok"] = false
+            response["error"] = receipt["error"] ?? "The action is still pending; inspect its receipt before further work"
+            response["error_code"] = receipt["error_code"] ?? "action_pending"
+            response["outcome"] = receipt["state"] as? String == "rejected" ? "rejected" : "delivered_unconfirmed"
+        }
+        return response
     }
 
     private func targetDisplay(from params: [String: Any]) throws -> DisplayDescriptor {

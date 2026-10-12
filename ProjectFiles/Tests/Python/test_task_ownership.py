@@ -41,7 +41,8 @@ class TaskOwnershipTests(unittest.TestCase):
         self.assertEqual(runtime._bridge_observation_revision, 'current')
         self.assertNotIn('task_generation_id', result)  # Not model evidence.
         self.assertEqual(emit.call_count, 1)
-        with mock.patch.object(runtime.uuid, 'uuid4', return_value='same'), mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(replies[1]))), mock.patch.object(runtime, 'emit') as emit:
+        action_reply = {**replies[1], 'action_receipt': {'action_id': 'same', 'state': 'confirmed', 'terminal': True}}
+        with mock.patch.object(runtime.uuid, 'uuid4', return_value='same'), mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(action_reply))), mock.patch.object(runtime, 'emit') as emit:
             runtime.bridge_call('act', 1, action={'type': 'none'})
         self.assertEqual(emit.call_args.kwargs['params']['observation_revision'], 'current')
 

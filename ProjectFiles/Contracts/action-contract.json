@@ -1076,5 +1076,5 @@
     "option": 524288,
     "control": 262144
   },
-  "task_protocol_version": 1
+  "task_protocol_version": 2
 }

@@ -11,6 +11,10 @@ Task completion is guarded by the runtime's private
 [requirement evidence ledger](TaskEvidence.md), including whole-request
 coverage and fresh proof for mutable outcomes.
 
+[Native action receipts](ActionReceipts.md) retain task-scoped dispatch and
+terminal results so missing acknowledgements can be reconciled without
+duplicating execution.
+
 ## The main flow
 
 1. `TaskPilotApp` creates the macOS windows.

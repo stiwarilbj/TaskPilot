@@ -46,6 +46,7 @@ from request_policy import (
     AdaptiveModelRouter, Failure, ModelAttemptError, RecoveryExhaustedError, RuntimeState, classify_failure, model_route,
 )
 from provider_errors import ProviderRequestError, facts as provider_error_facts, message_text, response_error
+from action_receipts import BridgeReplyLost, RuntimeInbox, reconcile_receipt
 
 from observation_context import select_elements, historical_progress
 from task_evidence import TaskEvidenceLedger, CHECKLIST_VERSION, LARGEST_PATTERN
@@ -77,6 +78,15 @@ STANDARD_LOCATIONS = {
 _active_acp_process: subprocess.Popen[str] | None = None
 _bridge_observation_revision: str | None = None
 _task_generation_id: str | None = None
+_runtime_inbox: RuntimeInbox | None = None
+_receipt_metrics = {"receipt_queries": 0, "receipt_recoveries": 0, "receipt_unresolved": 0}
+
+
+def runtime_line(timeout: float | None = None) -> str:
+    global _runtime_inbox
+    if _runtime_inbox is None or _runtime_inbox.stream is not sys.stdin:
+        _runtime_inbox = RuntimeInbox(sys.stdin)
+    return _runtime_inbox.read(timeout)
 
 
 class ActionRejected(RuntimeError):
@@ -273,10 +283,7 @@ def check_models(path: str, key: str, read_only: bool = False) -> bool:
     return any(c["state"] == "verified" for c in checks.values())
 
 
-def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
-    global _bridge_observation_revision
-    if method == "act" and _bridge_observation_revision:
-        params.setdefault("observation_revision", _bridge_observation_revision)
+def bridge_exchange(method: str, display_id: int, params: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
     request_id = str(uuid.uuid4())
     emit(
         "bridge_request",
@@ -284,29 +291,84 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
         method=method,
         params={"display_id": display_id, **params},
     )
-    for line in sys.stdin:
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise BridgeReplyLost("The native action reply did not arrive; checking its receipt")
+        line = runtime_line(remaining)
         try:
             response = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if response.get("kind") != "bridge_response":
+        if not isinstance(response, dict) or response.get("kind") != "bridge_response":
             continue
         if response.get("request_id") != request_id:
             continue
         if _task_generation_id is not None and response.get("task_generation_id") != _task_generation_id:
             continue
-        if not response.get("ok"):
-            raise ActionRejected(str(response.get("error") or f"{PRODUCT_NAME} rejected the request"),
-                                 str(response.get("error_code") or "action_rejected"))
-        result = response.get("result")
+        return response
+
+
+def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
+    global _bridge_observation_revision
+    timeout = params.pop("_reply_timeout", None)
+    if method == "act":
+        if _bridge_observation_revision:
+            params.setdefault("observation_revision", _bridge_observation_revision)
+        # A UUID represents this logical execution, not a hash of its payload.
+        # Repairs and model selection happen before it can be allocated.
+        if "action_id" not in params:
+            params["action_id"] = str(uuid.uuid4()).lower()
+        elif isinstance(params["action_id"], str):
+            params["action_id"] = params["action_id"].lower()
+        timeout = 30.0
+        if params.get("action", {}).get("type") == "run_command":
+            timeout += float(params["action"].get("timeout_seconds", action_default("run_command", "timeout_seconds")))
+    try:
+        response = bridge_exchange(method, display_id, params, timeout)
+        if method == "act":
+            receipt = response.get("action_receipt")
+            if receipt is not None:
+                if (not isinstance(receipt, dict) or receipt.get("action_id") != params["action_id"] or
+                        type(receipt.get("terminal")) is not bool):
+                    raise BridgeReplyLost("The native action reply has an invalid receipt")
+                if not receipt["terminal"]:
+                    raise BridgeReplyLost("The native action is still pending")
+                state = receipt.get("state")
+                if state not in {"confirmed", "unconfirmed", "rejected"}:
+                    raise BridgeReplyLost("The native action receipt has an invalid state")
+                if response.get("ok"):
+                    result = response.get("result")
+                    if (not isinstance(result, dict) or state == "rejected" or
+                            (result.get("outcome") == "delivered_unconfirmed") != (state == "unconfirmed")):
+                        raise BridgeReplyLost("The native action reply and receipt disagree")
+                elif state == "confirmed":
+                    raise BridgeReplyLost("The native action reply and receipt disagree")
+            elif response.get("ok"):
+                raise BridgeReplyLost("The native action reply lacks its receipt")
+    except BridgeReplyLost as error:
+        if method != "act": raise
+        if not error.connected:
+            _receipt_metrics["receipt_unresolved"] += 1
+            raise
+        response = reconcile_receipt(params["action_id"],
+            lambda action_id, remaining: bridge_call("action_receipt", display_id,
+                action_id=action_id, _reply_timeout=remaining), _receipt_metrics,
+            clock=time.monotonic, sleep=time.sleep)
+    if not response.get("ok"):
+        raise ActionRejected(str(response.get("error") or f"{PRODUCT_NAME} rejected the request"),
+                             str(response.get("error_code") or "action_rejected"))
+    result = response.get("result")
+    if isinstance(result, dict):
         if method == "observe" and isinstance(result, dict):
             if _task_generation_id is not None and result.get("task_generation_id") != _task_generation_id:
                 raise ActionRejected("Observation belongs to another task", "cancelled")
             result = dict(result)
             result.pop("task_generation_id", None)
             _bridge_observation_revision = result.get("observation_revision")
-        return result if isinstance(result, dict) else {}
-    raise RuntimeError(f"Lost contact with the native {PRODUCT_NAME} controller")
+        return result
+    return {}
 
 
 def find_openclaw(explicit_path: str | None = None) -> str:
@@ -1019,12 +1081,13 @@ def decision_user_input_target(decision: dict[str, Any]) -> dict[str, Any]:
 
 
 def wait_for_user_input(request_id: str) -> str:
-    for line in sys.stdin:
+    while True:
+        line = runtime_line()
         try:
             response = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if response.get("kind") != "user_input_response":
+        if not isinstance(response, dict) or response.get("kind") != "user_input_response":
             continue
         if response.get("request_id") != request_id:
             continue
@@ -1036,7 +1099,6 @@ def wait_for_user_input(request_id: str) -> str:
         if len(value) > 4096:
             raise RuntimeError("The secure value is unexpectedly long")
         return value
-    raise RuntimeError(f"{PRODUCT_NAME} stopped while waiting for secure input")
 
 
 def request_and_enter_user_input(
@@ -2062,9 +2124,19 @@ def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int
         exact = (("[Binary file; base64 encoded]\n" if fact["encoding"] == "base64" else "") + fact["content"]
                  if fact["type"] == "file_read" else fact["text"])
         if exact not in message: message += "\n\n" + exact
+    publish_task_metrics(router, client, ledger)
     complete_from_decision({"output": message, "output_title": verification.get("title") or candidate.get("output_title") or "OpenClaw result",
                             "output_kind": verification.get("kind") or candidate.get("output_kind") or "result"}, message, ledger)
     return True
+
+
+def publish_task_metrics(router: TaskModelRouter, client: ACPClient, ledger: TaskEvidenceLedger) -> None:
+    # Terminal events revoke the native lease. Publish aggregate diagnostics
+    # before completion so the originating invocation can still accept them.
+    router.metrics.update(evidence_checks=ledger.checks, coverage_rejections=ledger.rejections,
+        requirements_proven=sum(r["state"] == "proven" for r in ledger.requirements.values()), **_receipt_metrics)
+    router.metrics.update(prompt_calls=client.prompt_calls, model_switches=client.model_switches)
+    emit("request_metrics", **router.metrics)
 
 
 def validated_prompt(client: ACPClient, instruction: str, screenshot_path: Path,
@@ -2180,6 +2252,7 @@ def routed_json_prompt(
 
 
 def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str) -> None:
+    _receipt_metrics.update(receipt_queries=0, receipt_recoveries=0, receipt_unresolved=0)
     ledger = TaskEvidenceLedger(task, _task_generation_id)
     resolved_openclaw = find_openclaw(openclaw_path)
     state = prepare_runtime(resolved_openclaw, api_key)
@@ -2196,8 +2269,8 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
             f"which is {readable_size} ({int(largest['bytes']):,} bytes)."
         )
         ledger.local_answer(message)
+        emit("request_metrics", planning=0, verification=0, retries=0, model_switches=0, cache_hits=0, reconnects=0, provider_retries=None, **_receipt_metrics)
         complete_from_decision({"output": message, "output_title": "Largest File in Downloads", "output_kind": "answer"}, message, ledger)
-        emit("request_metrics", planning=0, verification=0, retries=0, model_switches=0, cache_hits=0, reconnects=0, provider_retries=None)
         return
     if ledger.local_complete_grammar:
         check = next(iter(ledger.requirements.values()))["check"]
@@ -2209,8 +2282,8 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
         output = ledger.exact_output(check, next(iter(ledger.requirements.values()))["evidence_ids"])
         if output is None:
             raise RuntimeError("TaskPilot could not verify the requested file contents; the task is incomplete")
+        emit("request_metrics", planning=0, verification=0, retries=0, model_switches=0, cache_hits=0, reconnects=0, provider_retries=None, **_receipt_metrics)
         complete_from_decision({"output": output, "output_title": "File contents", "output_kind": "result"}, str(result.get("message") or "Read file"), ledger)
-        emit("request_metrics", planning=0, verification=0, retries=0, model_switches=0, cache_hits=0, reconnects=0, provider_retries=None)
         return
 
     try:
@@ -2387,8 +2460,8 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                     ledger.before_action(action)
                     result = bridge_call("act", display_id, action=action)
                 except RuntimeError as action_error:
-                    # A lost native reply cannot prove that input was rejected.
-                    # Stop rather than wrap transport failure in action retries.
+                    # Receipt lookup has already tried to recover a lost reply.
+                    # An unresolved operation must stop, without another action.
                     if not isinstance(action_error, ActionRejected):
                         raise
                     code = getattr(action_error, "code", "action_rejected")
@@ -2469,10 +2542,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
         raise
     finally:
         discard_observation_image(pending_observation)
-        model_router.metrics.update(evidence_checks=ledger.checks, coverage_rejections=ledger.rejections, requirements_proven=sum(r["state"] == "proven" for r in ledger.requirements.values()))
-        model_router.metrics["prompt_calls"] = client.prompt_calls
-        model_router.metrics["model_switches"] = client.model_switches
-        emit("request_metrics", **model_router.metrics)
+        publish_task_metrics(model_router, client, ledger)
         client.close()
 
 
@@ -2496,7 +2566,7 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
     global _task_generation_id, _bridge_observation_revision
     _task_generation_id = None
     _bridge_observation_revision = None
-    raw_line = sys.stdin.readline()
+    raw_line = runtime_line()
     try:
         configuration = json.loads(raw_line)
     except json.JSONDecodeError as error:

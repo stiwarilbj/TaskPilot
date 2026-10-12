@@ -333,7 +333,8 @@ class EvidenceTaskLoopTests(unittest.TestCase):
         for content in [' A\n', '']:
             client, _ = self.run_task('Read file "/fixture/a.txt"', [], initial_files={'/fixture/a.txt': content})
             self.assertEqual(client.prompt_calls, 0)
-            self.assertEqual(self.events[-2][0], 'complete')
+            self.assertEqual(self.events[-1][0], 'complete')
+            self.assertTrue(any(kind == 'request_metrics' for kind, _ in self.events[:-1]))
             output = next(fields['content'] for kind, fields in self.events if kind == 'output')
             self.assertEqual(output, content)
 
