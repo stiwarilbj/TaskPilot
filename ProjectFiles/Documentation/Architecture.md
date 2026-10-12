@@ -7,6 +7,10 @@ using the [offline prompt regression workflow](PromptRegression.md). It
 exercises the existing runtime without desktop events or provider calls and
 keeps reproduction controls distinct from recorded model comparisons.
 
+Task completion is guarded by the runtime's private
+[requirement evidence ledger](TaskEvidence.md), including whole-request
+coverage and fresh proof for mutable outcomes.
+
 ## The main flow
 
 1. `TaskPilotApp` creates the macOS windows.

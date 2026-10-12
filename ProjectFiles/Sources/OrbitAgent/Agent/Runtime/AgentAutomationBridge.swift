@@ -130,6 +130,12 @@ final class AgentAutomationBridge {
                     "agent_cursor": "The blue TaskPilot pointer appears only during a validated pointer action on this display; it is not a clickable UI element"
                 ]
 
+            case "recheck":
+                guard let action = params["action"] as? [String: Any] else {
+                    throw BridgeError.invalidRequest("Missing readback payload")
+                }
+                result = try await taskTools.recheck(action: action)
+
             case "act":
                 guard let inputAction = params["action"] as? [String: Any] else {
                     throw BridgeError.invalidRequest("Missing action payload")

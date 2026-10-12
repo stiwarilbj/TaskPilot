@@ -42,15 +42,15 @@ class CommandContractTests(unittest.TestCase):
                 normalize_action(action, {})
             self.assertIn(error, str(raised.exception))
 
-    def test_only_matching_outcomes_enable_native_completion(self):
+    def test_matching_outcomes_alone_do_not_establish_full_task_coverage(self):
         action = {'type': 'run_command', 'argv': ['/usr/bin/touch', '/tmp/marker'],
                   'checks': [{'type': 'file_exists', 'path': '/tmp/marker'}]}
         result = {'exit_code': 0, 'timed_out': False, 'verified': True, 'verification_scope': 'requested_outcomes',
                   'checks': [{'type': 'file_exists', 'path': '/tmp/marker', 'verified': True}]}
         task = 'Run the shell command touch /tmp/marker'
         decision = {'finish_after_action': True, 'remaining_requirements': []}
-        self.assertTrue(runtime.native_action_can_finish(task, decision, action, result, {}))
-        self.assertTrue(runtime.trusted_native_history(task, {}, [{'action': action, 'result': result}]))
+        self.assertFalse(runtime.native_action_can_finish(task, decision, action, result, {}))
+        self.assertFalse(runtime.trusted_native_history(task, {}, [{'action': action, 'result': result}]))
         invalid = [{'verified': False}, {'timed_out': True}, {'exit_code': False}, {'exit_code': 1},
                    {'verification_scope': 'execution_only'}, {'checks': []},
                    {'checks': [{'type': 'file_exists', 'path': '/tmp/other', 'verified': True}]},

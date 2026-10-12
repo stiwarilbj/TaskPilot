@@ -244,6 +244,7 @@ class World:
         self.state, self.now, self.revision = case["start"], 0.0, 0
         self.pending = None
         self.facts = {}
+        self.files = {}
         self.latest = None
         self.delivered = self.incorrect = self.incorrect_attempts = self.duplicates = self.polls = 0
 
@@ -279,6 +280,22 @@ class World:
     def bridge(self, method, _display, **params):
         if method == "observe":
             return self.observe()
+        if method == "recheck":
+            action = params["action"]
+            checks = ([{"type": "file_contents", "path": action["path"], "content": action["content"],
+                        "encoding": action.get("encoding", "utf-8")}]
+                      if action["type"] == "write_file" else action.get("checks", []))
+            actual = []
+            for check in checks:
+                if check["type"] == "stdout_equals": continue
+                value = {"type": check["type"], "path": check["path"], "verified": False}
+                content = self.files.get(check["path"])
+                if check["type"] == "file_contents" and content == check["content"]:
+                    value.update(verified=True, content_sha256=hashlib.sha256(content.encode()).hexdigest())
+                elif check["type"] == "file_exists": value["verified"] = content is not None
+                elif check["type"] == "path_absent": value["verified"] = content is None
+                actual.append(value)
+            return {"requested_checks": [c for c in checks if c["type"] != "stdout_equals"], "checks": actual}
         if method != "act":
             raise RecordingMismatch("unsupported_fixture_bridge_method")
         action = deepcopy(params["action"])
@@ -304,16 +321,27 @@ class World:
                 if key in self.case["goals"] and amount > 0 and self.facts.get(key, 0) + amount > self.case["goals"][key]:
                     self.duplicates += 1
                 self.facts[key] = self.facts.get(key, 0) + amount
-            return deepcopy(entry["result"])
+            result = deepcopy(entry["result"])
+            if action["type"] == "write_file" and result.get("verified") is True:
+                self.files[action["path"]] = action["content"]
+            for check, checked in zip(action.get("checks", []), result.get("checks", [])):
+                if check["type"] == "file_contents" and checked.get("verified") is True:
+                    self.files[check["path"]] = check["content"]
+            return result
         self.incorrect_attempts += 1
         raise runtime.ActionRejected("Action does not match an allowed fixture operation", "unsupported_action")
 
 
-def bind(value, observation):
+def bind(value, observation, ledger=None):
     if isinstance(value, dict):
-        return {key: bind(item, observation) for key, item in value.items()}
+        return {key: bind(item, observation, ledger) for key, item in value.items()}
     if isinstance(value, list):
-        return [bind(item, observation) for item in value]
+        return [bind(item, observation, ledger) for item in value]
+    if value == "$current_proofs":
+        return [{"requirement_id": key, "evidence_ids": [next((ref for ref, evidence in reversed(list(ledger.evidence.items()))
+                 if ledger.matches(requirement["check"], evidence, semantic=True)), "unproven")],
+                 "rationale": "The cited fixture evidence shows this requested outcome"}
+                for key, requirement in ledger.requirements.items()]
     if isinstance(value, str) and value.startswith("$"):
         match = next((e["id"] for e in observation["elements"] if e["id"].endswith(":" + value[1:])), None)
         if match is None:
@@ -350,7 +378,12 @@ class RecordedClient:
         if self.script is not None:
             if index >= len(self.script):
                 raise RecordingMismatch("script_exhausted")
-            response = bind(self.script[index], self.observation)
+            response = bind(self.script[index], self.observation, self.ledger)
+            # Fictional ad-hoc scripts use the same explicit checklist metadata
+            # as seeds. Recorded model responses are never augmented.
+            if isinstance(response, dict) and "status" in response and "requirements" not in response:
+                response["requirements"] = [{"source": self.world.case["task"], "description": self.world.case["task"],
+                                             "check": {"type": "visual", "expected": self.world.case["task"]}}]
             entry = {**fields, "response": response if isinstance(response, str) else json.dumps(response, separators=(",", ":")),
                      "elapsed_seconds": 0.25, "provider_retries": None}
         else:
@@ -386,9 +419,9 @@ def replay_case(case, pack, requests=None, script=None):
         compact_history = runtime.compact_history
         completion = premature = False
         failure = None
-        def route(router, client, instruction, image, purpose="planning", observation=None):
-            client.purpose, client.observation = purpose, observation
-            return original_route(router, client, instruction, image, purpose, observation)
+        def route(router, client, instruction, image, purpose="planning", observation=None, ledger=None):
+            client.purpose, client.observation, client.ledger = purpose, observation, ledger
+            return original_route(router, client, instruction, image, purpose, observation, ledger)
         def emit(kind, **_payload):
             nonlocal completion, premature
             if kind == "complete":

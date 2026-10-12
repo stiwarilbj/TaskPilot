@@ -26,10 +26,11 @@ Use `--private-dir /absolute/private/directory` before the subcommand for a
 separate experiment. Symlinks and destinations inside the repository are
 rejected.
 
-Nine sanitized cases cover a healthy control, the wrong window with an identical
+Eleven sanitized cases cover a healthy control, the wrong window with an identical
 button label, a moved control, a delayed dialog, an invalid text parameter,
 command syntax failure, exit zero without the requested file result, premature
-completion, and an uncertain submission. Outcomes use independent state and
+completion, an uncertain submission, partial multi-file completion, and a
+successful write with incorrect contents. Outcomes use independent state and
 exact counters, so a model's completion claim does not establish success. A
 repeated mutation also fails an exactly-once requirement.
 

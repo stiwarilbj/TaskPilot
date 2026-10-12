@@ -4,13 +4,14 @@ from __future__ import annotations
 import json
 import math
 from typing import Any
+from task_evidence import EvidenceValidationError, validate_metadata
 
 from action_contract_generated import (
     CONTRACT_HASH, CONTRACT_VERSION, VALID_ACTIONS, KEYS,
     ActionContractError, validate_action,
 )
 
-VALIDATION_VERSION = 3
+VALIDATION_VERSION = 4
 
 
 class ResponseValidationError(RuntimeError):
@@ -94,7 +95,7 @@ def normalize_action(value: Any, observation: dict[str, Any] | None = None) -> d
     return action
 
 
-def validate_response(value: dict[str, Any], purpose: str, observation: dict[str, Any] | None = None) -> dict[str, Any]:
+def validate_response(value: dict[str, Any], purpose: str, observation: dict[str, Any] | None = None, ledger=None) -> dict[str, Any]:
     result = dict(value)
     for key in ("summary", "context_used", "visual_evidence", "intended_target", "expected_result", "output", "output_title", "reason", "message", "title", "check"):
         if key in result: string(result[key], key)
@@ -132,4 +133,8 @@ def validate_response(value: dict[str, Any], purpose: str, observation: dict[str
                 fail("action.element_id", "must reference an observed text input for secure input")
             if element.get("enabled") is False:
                 fail("action.element_id", "must reference an enabled secure input target")
+    try:
+        validate_metadata(result, purpose, ledger)
+    except EvidenceValidationError as error:
+        raise ResponseValidationError(str(error)) from error
     return result

@@ -1,6 +1,7 @@
 import CoreFoundation
 import Darwin
 import Foundation
+import CryptoKit
 
 /// Validates everything before launching a process. Literal argv entries never
 /// pass through a shell; shell source is preserved and checked separately.
@@ -49,6 +50,12 @@ struct CommandExecutionPolicy {
                     }
                 }
                 result["verified"] = matches
+                if matches, let expected {
+                    result["content_sha256"] = SHA256.hash(data: expected).map { String(format: "%02x", $0) }.joined()
+                }
+                if matches, type == "stdout_equals", let text {
+                    result["text_sha256"] = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+                }
                 if !matches { result["reason"] = "The requested outcome did not match" }
             } catch {
                 result["reason"] = "The requested outcome could not be inspected"

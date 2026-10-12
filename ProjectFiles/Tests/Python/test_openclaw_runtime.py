@@ -237,14 +237,14 @@ class OpenClawRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime.screen_wait_limit("press"), 2.0)
 
     def test_structured_native_history_can_skip_only_redundant_visual_verification(self):
-        self.assertTrue(runtime.trusted_native_history(
+        self.assertFalse(runtime.trusted_native_history(
             "Create todo.txt on my Desktop saying buy milk",
             {},
             [{
             "action": {"type": "write_file"},
             "result": {"verified": True, "bytes_written": 4},
         }]))
-        self.assertTrue(runtime.trusted_native_history(
+        self.assertFalse(runtime.trusted_native_history(
             "What does Documents/report.txt say?",
             {},
             [{
@@ -283,7 +283,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
 
     def test_fast_finish_is_limited_to_self_verifying_single_action_tasks(self):
         decision = {"finish_after_action": True, "remaining_requirements": []}
-        self.assertTrue(runtime.native_action_can_finish(
+        self.assertFalse(runtime.native_action_can_finish(
             "Create todo.txt on my Desktop saying buy milk",
             decision,
             {"type": "write_file"},
@@ -297,7 +297,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
             {"verified": False},
             {},
         ))
-        self.assertTrue(runtime.native_action_can_finish(
+        self.assertFalse(runtime.native_action_can_finish(
             "Run the shell command touch /tmp/taskpilot-marker",
             decision,
             {"type": "run_command", "checks": [{"type": "file_exists", "path": "/tmp/taskpilot-marker"}]},

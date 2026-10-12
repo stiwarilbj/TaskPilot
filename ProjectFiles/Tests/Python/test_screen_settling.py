@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import openclaw_runtime as runtime
+from evidence_fixtures import with_requirements, proof_response
 
 
 class ScreenSettlingTests(unittest.TestCase):
@@ -234,9 +235,9 @@ class ScreenSettlingTests(unittest.TestCase):
             def prompt(client, instruction, image):
                 client.prompt_calls += 1
                 if client.prompt_calls <= 2:
-                    return json.dumps({'status': 'act', 'action': {
-                        'type': 'press', 'element_id': current['elements'][0]['id']}})
-                return '{"status":"done"}' if client.prompt_calls == 3 else '{"verified":true}'
+                    return json.dumps(with_requirements({'status': 'act', 'action': {
+                        'type': 'press', 'element_id': current['elements'][0]['id']}}, client.ledger.task))
+                return json.dumps(with_requirements({'status': 'done'}, client.ledger.task) if client.prompt_calls == 3 else proof_response(client.ledger))
             def close(client): pass
         client = Client()
         router = runtime.AdaptiveModelRouter(lambda *a, **k: None)
@@ -249,11 +250,12 @@ class ScreenSettlingTests(unittest.TestCase):
                 delivered.append(target)
                 return {'message': 'Delivered once', 'outcome': 'verified', 'pid': 42}
             return self.observation('ready' if delivered else 'Save')
-        def instruction(task, observation, history):
+        def instruction(task, observation, history, ledger=None):
             nonlocal current
             current = observation
             planned.append(observation['observation_revision'])
             histories.append(list(history))
+            client.ledger = ledger
             return 'plan'
         def sleep(seconds): self.now += seconds
         with mock.patch.object(runtime, 'find_openclaw', return_value='mock'), \
@@ -290,8 +292,8 @@ class ScreenSettlingTests(unittest.TestCase):
             def select_model(client, model): client.selected_model = model
             def prompt(client, instruction, image):
                 client.prompt_calls += 1
-                return json.dumps({'status': 'act', 'action': {
-                    'type': 'set_value', 'element_id': current['elements'][0]['id'], 'text': 'full'}})
+                return json.dumps(with_requirements({'status': 'act', 'action': {
+                    'type': 'set_value', 'element_id': current['elements'][0]['id'], 'text': 'full'}}, client.ledger.task))
             def close(client): pass
         client = Client()
         router = runtime.AdaptiveModelRouter(lambda *a, **k: None)
@@ -302,9 +304,10 @@ class ScreenSettlingTests(unittest.TestCase):
                         'text_verification': 'mismatch', 'pid': 42}
             return self.observation('Body', role='AXTextField', focused=True,
                                     value='partial' if deliveries else '')
-        def instruction(task, observation, history):
+        def instruction(task, observation, history, ledger=None):
             nonlocal current
             current = observation
+            client.ledger = ledger
             return 'plan'
         def sleep(seconds): self.now += seconds
         with mock.patch.object(runtime, 'find_openclaw', return_value='mock'), \
@@ -344,8 +347,8 @@ class ScreenSettlingTests(unittest.TestCase):
                 client.prompt_calls += 1
                 calls.append(instruction)
                 if client.prompt_calls == 1:
-                    return json.dumps({'status': 'act', 'action': {'type': 'press', 'element_id': initial['elements'][0]['id']}})
-                return '{"status":"done"}' if client.prompt_calls == 2 else '{"verified":true}'
+                    return json.dumps(with_requirements({'status': 'act', 'action': {'type': 'press', 'element_id': initial['elements'][0]['id']}}, client.ledger.task))
+                return json.dumps(with_requirements({'status': 'done'}, client.ledger.task) if client.prompt_calls == 2 else proof_response(client.ledger))
             def close(client): pass
         client = Client()
         router = runtime.AdaptiveModelRouter(lambda *a, **k: None)
@@ -359,8 +362,9 @@ class ScreenSettlingTests(unittest.TestCase):
             revisions.append(frame['observation_revision'])
             return frame
         planning_revisions = []
-        def instruction(task, observation, history):
+        def instruction(task, observation, history, ledger=None):
             planning_revisions.append(observation['observation_revision'])
+            client.ledger = ledger
             return 'plan'
         def sleep(seconds): self.now += seconds
         with mock.patch.object(runtime, 'find_openclaw', return_value='mock'), \

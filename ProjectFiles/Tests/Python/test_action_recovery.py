@@ -7,6 +7,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import openclaw_runtime as runtime
+from evidence_fixtures import with_requirements, proof_response
 
 
 class ActionRecoveryTests(unittest.TestCase):
@@ -45,9 +46,9 @@ class ActionRecoveryTests(unittest.TestCase):
             def select_model(client, model): client.selected_model = model
             def prompt(client, instruction, image):
                 client.prompt_calls += 1
-                if instruction == 'verify': return '{"verified":true}'
+                if instruction == 'verify': return json.dumps(proof_response(client.ledger))
                 value = strategy(current, client.prompt_calls)
-                return json.dumps(value if 'status' in value else {'status': 'act', 'action': value})
+                return json.dumps(with_requirements(value if 'status' in value else {'status': 'act', 'action': value}, client.ledger.task))
             def close(client): pass
         self.client = Client()
         self.router = runtime.AdaptiveModelRouter(lambda *a, **k: None)
@@ -56,9 +57,10 @@ class ActionRecoveryTests(unittest.TestCase):
                 self.attempts.append(params['action'])
                 return delivery(params['action'], len(self.attempts))
             return observe() if observe else self.observation()
-        def instruction(task, observation, history):
+        def instruction(task, observation, history, ledger=None):
             nonlocal current
             current = observation
+            self.client.ledger = ledger
             self.histories.append(list(history))
             return 'plan'
         def sleep(seconds):

@@ -44,6 +44,7 @@ if [[ ! -x "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/openclaw_runtime.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/action_contract_generated.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/response_validation.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
+      || "$PROJECT_FILES_DIR/AgentRuntime/task_evidence.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/observation_context.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/request_policy.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/provider_errors.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \

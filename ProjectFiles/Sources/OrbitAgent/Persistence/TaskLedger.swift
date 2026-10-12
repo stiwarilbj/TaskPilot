@@ -13,6 +13,9 @@ struct AgentRequestMetrics: Codable, Equatable {
     let actionRejections: Int?
     let unconfirmedActions: Int?
     let repairs: Int?
+    var evidenceChecks: Int? = nil
+    var coverageRejections: Int? = nil
+    var requirementsProven: Int? = nil
 
     var summary: String {
         "\(promptCalls ?? planning + verification) TaskPilot calls · \(planning) planning · \(verification) verification · \(retries) retries · \(modelSwitches) switches · \(cacheHits) reused · \(reconnects) reconnects" +

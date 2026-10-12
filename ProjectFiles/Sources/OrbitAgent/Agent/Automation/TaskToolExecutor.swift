@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import CryptoKit
 
 enum TaskToolError: LocalizedError {
     case invalidAction(String)
@@ -50,6 +51,37 @@ final class TaskToolExecutor {
         case .none, .press, .focus, .set_value, .click, .double_click, .type_text, .key, .scroll, .launch_app, .open_route, .wait, .navigate_browser:
             throw TaskToolError.invalidAction("Unsupported task tool: \(action["type"]!)")
         }
+    }
+
+    /// Private completion readback. Validates the original payload but never
+    /// dispatches it, starts a process, or replays a mutation.
+    func recheck(action input: [String: Any]) async throws -> [String: Any] {
+        try await TaskOwnership.checkpoint()
+        let action: [String: Any]
+        do { action = try ActionContract.validate(input) }
+        catch { throw TaskToolError.invalidAction(error.localizedDescription) }
+        if action["type"] as? String == "read_file" { return try readFile(action) }
+        let requested: [[String: Any]]
+        if action["type"] as? String == "write_file", (action["mode"] as? String ?? "overwrite") == "overwrite" {
+            requested = [["type": "file_contents", "path": action["path"]!,
+                          "content": action["content"]!, "encoding": action["encoding"] ?? "utf-8"]]
+        } else if action["type"] as? String == "run_command" {
+            requested = (action["checks"] as? [[String: Any]] ?? []).filter { $0["type"] as? String != "stdout_equals" }
+        } else { throw TaskToolError.invalidAction("Only native file outcomes can be rechecked") }
+        var checks: [[String: Any]] = []
+        for check in requested {
+            try await TaskOwnership.checkpoint()
+            let path = Self.expandedFileURL(check["path"] as! String)
+            var expected: Data?
+            if check["type"] as? String == "file_contents" {
+                let content = check["content"] as! String
+                expected = check["encoding"] as? String == "base64" ? Data(base64Encoded: content)! : Data(content.utf8)
+            }
+            checks.append(CommandExecutionPolicy.Check(type: check["type"] as! String, path: path,
+                                                       expected: expected, text: nil).evaluate(stdout: "", stdoutTruncated: false))
+        }
+        try TaskOwnership.check()
+        return ["requested_checks": requested, "checks": checks]
     }
 
     func pauseActiveCommand() {
@@ -114,6 +146,7 @@ final class TaskToolExecutor {
             "content": content,
             "encoding": encoding,
             "bytes_returned": bounded.count,
+            "content_sha256": SHA256.hash(data: bounded).map { String(format: "%02x", $0) }.joined(),
             "truncated": truncated
         ]
     }
@@ -208,6 +241,7 @@ final class TaskToolExecutor {
             "message": "\(mode == "append" ? "Appended" : "Wrote") and verified \(data.count) bytes in \(url.lastPathComponent)",
             "path": url.path,
             "bytes_written": data.count,
+            "content_sha256": SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(),
             "file_size": finalSize,
             "mode": mode,
             "verified": true,

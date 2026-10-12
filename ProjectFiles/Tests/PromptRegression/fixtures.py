@@ -4,6 +4,7 @@ Only fictional controls, fixture paths, and local in-memory effects are used.
 Private corpus files are materialized by the evaluator, outside the checkout.
 """
 from copy import deepcopy
+import hashlib
 
 
 def control(key, title, role="AXButton", window="Draft", x=100, **fields):
@@ -25,8 +26,9 @@ def act(kind="press", target="$save", **fields):
 
 
 DONE = {"status": "done", "output": "Fixture work completed"}
-YES = {"verified": True, "message": "Fixture outcome visible"}
+YES = {"verified": True, "coverage_complete": True, "message": "Fixture outcome visible", "proofs": "$current_proofs"}
 NO = {"verified": False, "missing": ["Requested fixture outcome is not visible"]}
+BLOCKED = {"status": "blocked", "reason": "The requested outcome remains unavailable after recovery"}
 VERIFIED = {"outcome": "verified", "delivery_method": "fixture", "pid": 42,
             "message": "Fixture event delivered"}
 
@@ -89,7 +91,8 @@ def seed_cases():
                "working_directory": "/fixture", "checks": [{"type": "file_contents", "path": "/fixture/result.txt", "content": "Fixture result"}]}
     checked = {"exit_code": 0, "timed_out": False, "verified": True,
                "verification_scope": "requested_outcomes", "stdout": "", "stderr": "",
-               "checks": [{"type": "file_contents", "path": "/fixture/result.txt", "verified": True}]}
+               "working_directory": "/fixture", "checks": [{"type": "file_contents", "path": "/fixture/result.txt", "verified": True,
+                          "content_sha256": hashlib.sha256(b"Fixture result").hexdigest()}]}
     command_act = {"status": "act", "action": command, "finish_after_action": True}
     syntax_action = {"type": "run_command", "command": "printf 'unterminated", "working_directory": "/fixture"}
     syntax = case("command-syntax", "command_errors",
@@ -97,8 +100,8 @@ def seed_cases():
                   [transition("initial", syntax_action, "retry", error="command_syntax"),
                    transition("initial", command, "saved", {"saved": 1}, result=checked),
                    transition("retry", command, "saved", {"saved": 1}, result=checked)],
-                  [{"status": "act", "action": syntax_action}, DONE, YES],
-                  [{"status": "act", "action": syntax_action}, command_act, DONE, YES],
+                  [{"status": "act", "action": syntax_action}, BLOCKED, BLOCKED],
+                  [{"status": "act", "action": syntax_action}, command_act, YES],
                   "TaskToolExecutor command syntax and requested-outcome checks")
     syntax["task"] = "Run the command /fixture/create-result in /fixture and verify /fixture/result.txt contains Fixture result."
     noop = {"type": "run_command", "argv": ["/fixture/no-op"], "working_directory": "/fixture"}
@@ -107,8 +110,8 @@ def seed_cases():
                 [transition("initial", noop, "retry", correct=False, result={"exit_code": 0, "timed_out": False, "stdout": "", "stderr": ""}),
                  transition("initial", command, "saved", {"saved": 1}, result=checked),
                  transition("retry", command, "saved", {"saved": 1}, result=checked)],
-                [{"status": "act", "action": noop, "finish_after_action": True}, DONE, YES],
-                [command_act, DONE],
+                [{"status": "act", "action": noop, "finish_after_action": True}, NO, BLOCKED, BLOCKED],
+                [command_act, YES],
                 "test_command_contract.test_only_matching_outcomes_enable_native_completion")
     zero["task"] = syntax["task"]
     early = case("premature-done", "premature_completion", {"initial": state(save), "saved": saved},
@@ -122,4 +125,47 @@ def seed_cases():
                      [act(), act(), act()], normal,
                      "test_action_recovery / do not replay an uncertain mutation")
     uncertain["task"] = "In Fixture App, submit the Draft exactly once and verify the receipt."
-    return deepcopy([healthy, wrong, stale, delayed, malformed, syntax, zero, early, uncertain])
+    cases = deepcopy([healthy, wrong, stale, delayed, malformed, syntax, zero, early, uncertain, *file_coverage_cases()])
+    for item in cases:
+        item["scripts"] = deepcopy(item["scripts"])
+        requirements = [{"source": item["task"], "description": item["task"],
+                         "check": {"type": "visual", "expected": item["task"]}}]
+        if item["id"] in {"command-syntax", "exit-zero-no-result"}:
+            requirements = [{"source": item["task"], "description": "Execute the requested fixture command",
+                             "check": {"type": "command_executed", "argv": ["/fixture/create-result"], "working_directory": "/fixture"}},
+                            {"source": item["task"], "description": "Verify the requested file contents",
+                             "check": {"type": "file_contents", "path": "/fixture/result.txt", "content": "Fixture result"}}]
+        elif item["id"] in {"partial-file-coverage", "wrong-file-contents"}:
+            requirements = [{"source": item["task"], "description": "Verify " + name + " contents",
+                             "check": {"type": "file_contents", "path": "/fixture/" + name + ".txt", "content": name.upper()}}
+                            for name in ("a", "b")]
+        for script in item["scripts"].values():
+            for response in script:
+                if isinstance(response, dict) and "status" in response:
+                    response["requirements"] = deepcopy(requirements)
+    return cases
+
+
+def file_coverage_cases():
+    def write(name, content):
+        action = {"type": "write_file", "path": "/fixture/" + name + ".txt", "content": content}
+        response = {"status": "act", "action": action, "finish_after_action": True, "remaining_requirements": []}
+        result = {"verified": True, "outcome": "verified", "path": action["path"], "mode": "overwrite",
+                  "bytes_written": len(content), "content_sha256": hashlib.sha256(content.encode()).hexdigest()}
+        return action, response, result
+    a, first, ar = write("a", "A")
+    b, second, br = write("b", "B")
+    incorrect, bad, badr = write("a", "wrong")
+    states = {"initial": state(), "partial": state(), "wrong": state(), "saved": state()}
+    transitions = [transition("initial", a, "partial", {"a": 1}, result=ar),
+                   transition("partial", b, "saved", {"b": 1}, result=br),
+                   transition("initial", incorrect, "wrong", {"wrong": 1}, correct=False, result=badr)]
+    cases = []
+    for identifier, baseline in [("partial-file-coverage", [first, NO, BLOCKED, BLOCKED]),
+                                  ("wrong-file-contents", [bad, NO, BLOCKED, BLOCKED])]:
+        item = case(identifier, "premature_completion", states, transitions, baseline,
+                    [first, NO, second, YES], "Task requirement evidence: verified native output does not imply complete coverage")
+        item["task"] = "Write /fixture/a.txt with A and /fixture/b.txt with B."
+        item["goals"] = {"a": 1, "b": 1}
+        cases.append(item)
+    return cases
