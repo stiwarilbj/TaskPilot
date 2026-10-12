@@ -3,9 +3,17 @@ import ApplicationServices
 enum AutomationPressPolicy {
     /// An explicit unsupported result proves the semantic method delivered no
     /// action. All other ambiguous errors prohibit a second delivery method.
-    static func deliver(preflight: () throws -> Void, press: () -> AXError,
+    static func deliver(preferVerifiedCoordinate: Bool = false, pressAdvertised: Bool = true,
+                        recordPress: (AXError) throws -> Void = { _ in },
+                        preflight: () throws -> Void, press: () -> AXError,
                         fallback: () throws -> Void) throws -> String {
+        // Cached compatibility cannot bypass a currently advertised AXPress.
+        // The coordinate route still runs the same current-target preflight.
+        if preferVerifiedCoordinate && !pressAdvertised {
+            try preflight(); try fallback(); return "coordinate"
+        }
         let result = try AutomationTargetPolicy.deliver(preflight: preflight, event: press)
+        try recordPress(result)
         switch result {
         case .success: return "accessibility"
         case .actionUnsupported, .notImplemented:

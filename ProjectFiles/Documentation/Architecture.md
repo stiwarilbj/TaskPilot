@@ -19,6 +19,9 @@ duplicating execution.
 operations into shared argument templates with preflight and exact outcome
 checks.
 
+[Bounded control compatibility profiles](ControlCompatibility.md) retain
+verified delivery methods without retaining control targets or user content.
+
 ## The main flow
 
 1. `TaskPilotApp` creates the macOS windows.

@@ -11,6 +11,7 @@ final class AutomationTextEntryTests: XCTestCase {
         var selected: TextAttributeDelivery = .unsupported
         var selectsAll = true
         var ignoreDirect = false
+        var ignoreSelected = false
         var pending: String?
         var delayed = false
         var reads = 0
@@ -20,8 +21,11 @@ final class AutomationTextEntryTests: XCTestCase {
         var polls = 0
         var cancelReadback = false
 
-        func enter(_ text: String, replacement: Bool = false, secure: Bool = false) async throws -> AutomationTextEntryResult {
+        func enter(_ text: String, replacement: Bool = false, secure: Bool = false,
+                   preferred: ControlDeliveryMethod? = nil,
+                   recordDelivery: (ControlDeliveryMethod, TextAttributeDelivery) throws -> Void = { _, _ in }) async throws -> AutomationTextEntryResult {
             try await AutomationTextEntryPolicy.enter(text: text, replacement: replacement, secure: secure,
+                preferredMethod: preferred, recordDelivery: recordDelivery,
                 focus: {
                     guard self.focusAllowed else { throw AccessibilityActionError.focusMismatch }
                     self.focused = true
@@ -39,7 +43,7 @@ final class AutomationTextEntryTests: XCTestCase {
                 }, setSelectedText: { text in
                     guard self.selected != .unsupported else { return .unsupported }
                     self.selectionWrites += 1
-                    self.value = AutomationTextEntryPolicy.inserting(text, into: self.value, selection: self.selection)
+                    if !self.ignoreSelected { self.value = AutomationTextEntryPolicy.inserting(text, into: self.value, selection: self.selection) }
                     return self.selected
                 }, selectRange: { range in
                     guard self.selectsAll else { return false }
@@ -251,5 +255,92 @@ final class AutomationTextEntryTests: XCTestCase {
         catch { XCTAssertEqual((error as? AccessibilityActionError)?.code, "cancelled") }
         XCTAssertEqual(field.valueWrites, 1)
         XCTAssertEqual(field.keyWrites, 0)
+    }
+
+    func testVerifiedSelectedTextPreferenceUsesOneSupportedRoute() async throws {
+        let field = Field(); field.value = "old"; field.selected = .accepted
+        let result = try await field.enter("new", replacement: true, preferred: .accessibility_selected_text)
+        XCTAssertEqual(result.method, "accessibility_selected_text")
+        XCTAssertTrue(result.verified)
+        XCTAssertEqual(field.valueWrites + field.keyWrites, 0)
+        XCTAssertEqual(field.selectionWrites, 1)
+    }
+
+    func testVerifiedKeyboardPreferenceStillRequiresWholeFieldSelection() async throws {
+        let field = Field(); field.value = "old"; field.selected = .accepted
+        let result = try await field.enter("new", replacement: true, preferred: .process_event)
+        XCTAssertTrue(result.verified)
+        XCTAssertEqual(field.value, "new")
+        XCTAssertEqual(field.valueWrites + field.selectionWrites, 0)
+        XCTAssertEqual(field.keyWrites, 1)
+        let rejectedSelection = Field(); rejectedSelection.value = "old"; rejectedSelection.selectsAll = false
+        let direct = try await rejectedSelection.enter("new", replacement: true, preferred: .process_event)
+        XCTAssertTrue(direct.verified)
+        XCTAssertEqual(rejectedSelection.keyWrites + rejectedSelection.selectionWrites, 0)
+        XCTAssertEqual(rejectedSelection.valueWrites, 1)
+    }
+
+    func testPreferenceCannotConvertInsertionToReplacementOrBypassFocus() async throws {
+        let field = Field(); field.value = "prefix "; field.selection = NSRange(location: 7, length: 0); field.selected = .accepted
+        _ = try await field.enter("text", preferred: .accessibility_value)
+        XCTAssertEqual(field.value, "prefix text")
+        XCTAssertEqual(field.valueWrites, 0)
+        let unfocused = Field(); unfocused.focusAllowed = false
+        do { _ = try await unfocused.enter("text", preferred: .process_event); XCTFail("Profile bypassed focus") }
+        catch { XCTAssertEqual((error as? AccessibilityActionError)?.code, "focus_mismatch") }
+        XCTAssertEqual(unfocused.valueWrites + unfocused.selectionWrites + unfocused.keyWrites, 0)
+    }
+
+    func testUnconfirmedPreferredEntryNeverUsesAnotherMethod() async throws {
+        for accepted in [TextAttributeDelivery.accepted, .uncertain] {
+            let field = Field(); field.value = "old"; field.selected = accepted; field.ignoreSelected = true
+            let result = try await field.enter("new", replacement: true, preferred: .accessibility_selected_text)
+            XCTAssertFalse(result.verified)
+            XCTAssertEqual(field.selectionWrites, 1)
+            XCTAssertEqual(field.valueWrites + field.keyWrites, 0)
+        }
+    }
+
+    func testSecureInputNeitherUsesPreferencesNorRecordsCompatibility() async throws {
+        let field = Field(); field.selected = .accepted
+        var records = 0
+        let result = try await field.enter("private credential", secure: true, preferred: .process_event,
+            recordDelivery: { _, _ in records += 1 })
+        XCTAssertEqual(result.method, "accessibility_selected_text")
+        XCTAssertEqual(field.reads + field.keyWrites + records, 0)
+        XCTAssertFalse(result.verified)
+    }
+
+    func testProfileLearnsFromReadbackAndUsesOneDeliveryForTheNextField() async throws {
+        let environment = ControlCompatibilityProfiles.fingerprint(["fixture"])
+        let profiles = ControlCompatibilityProfiles(environment: environment)
+        let key = ControlCompatibilityProfiles.Key(appID: "fixture", bundlePath: "/fixture.app", version: "1", build: "1",
+            executableRevision: "1", role: "AXTextField", subrole: "", action: .set_value,
+            capabilities: ["value": true, "selected": true], hid: false, mainDisplay: false, environment: environment)
+        func route(_ field: Field) async throws -> AutomationTextEntryResult {
+            let preferred = profiles.preferred(for: key, permitted: [.accessibility_value, .accessibility_selected_text, .process_event])
+            let result = try await field.enter("new", replacement: true, preferred: preferred, recordDelivery: { method, delivery in
+                profiles.record(delivery == .unsupported ? .unsupported : delivery == .accepted ? .supported : .unconfirmed,
+                                method: method, for: key)
+            })
+            if let method = ControlDeliveryMethod(rawValue: result.method) {
+                profiles.record(result.verified ? .verified : .unconfirmed, method: method, for: key)
+            }
+            return result
+        }
+        let first = Field(); first.value = "old"; first.direct = .unsupported; first.selected = .accepted
+        let learned = try await route(first)
+        XCTAssertTrue(learned.verified)
+        XCTAssertEqual(profiles.evidence(for: key, method: .accessibility_value), .unsupported)
+        XCTAssertEqual(profiles.evidence(for: key, method: .accessibility_selected_text), .verified)
+        let next = Field(); next.value = "old"; next.ignoreDirect = true; next.selected = .accepted
+        let reused = try await route(next)
+        XCTAssertTrue(reused.verified)
+        XCTAssertEqual(next.valueWrites + next.keyWrites, 0); XCTAssertEqual(next.selectionWrites, 1)
+        let ignored = Field(); ignored.value = "old"; ignored.selected = .uncertain; ignored.ignoreSelected = true
+        let uncertain = try await route(ignored)
+        XCTAssertFalse(uncertain.verified)
+        XCTAssertEqual(ignored.valueWrites + ignored.keyWrites, 0); XCTAssertEqual(ignored.selectionWrites, 1)
+        XCTAssertEqual(profiles.evidence(for: key, method: .accessibility_selected_text), .unconfirmed)
     }
 }

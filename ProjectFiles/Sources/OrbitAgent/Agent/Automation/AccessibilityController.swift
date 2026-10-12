@@ -173,6 +173,7 @@ final class AccessibilityController {
 
     private let lock = NSLock()
     private let agentCursor: AgentCursorOverlayController?
+    private let compatibilityProfiles: ControlCompatibilityProfiles
     private var elementMap: [String: ElementRecord] = [:]
     private var observationRevision = ""
     private var observationTaskGenerationID: String?
@@ -195,8 +196,10 @@ final class AccessibilityController {
     private let activatedLaunchWait: Duration = .seconds(16)
     private lazy var installedApplicationEntries = discoverInstalledApplications()
 
-    init(agentCursor: AgentCursorOverlayController? = nil) {
+    init(agentCursor: AgentCursorOverlayController? = nil, compatibilityProfiles: ControlCompatibilityProfiles? = nil) {
         self.agentCursor = agentCursor
+        self.compatibilityProfiles = compatibilityProfiles ?? ControlCompatibilityProfiles(
+            fileURL: ControlCompatibilityProfiles.defaultFileURL, environment: Self.compatibilityEnvironment())
     }
 
     func hideAgentCursor() {
@@ -855,6 +858,7 @@ final class AccessibilityController {
         try await TaskOwnership.checkpoint()
         let action = try validatedDesktopAction(action)
         guard !inputIsCancelled() else { throw AccessibilityActionError.cancelled }
+        try ControlCompatibilityProfiles.owned { compatibilityProfiles.prepare(environment: Self.compatibilityEnvironment()) }
         let planningRevision = lock.withLock { observationRevision }
         let type = action["type"] as? String ?? ""
         if ["launch_app", "open_route", "navigate_browser"].contains(type) {
@@ -887,10 +891,13 @@ final class AccessibilityController {
             let target = try record ?? observedFocusedInput(pid: pid)
             return try await performTextEntry(action: action, record: target, on: display, privateInput: privateInput).dictionary(pid: pid)
         }
+        let profileKey = try record.flatMap { try compatibilityKey($0, action: action, on: display) }
+        if let profileKey { _ = try ControlCompatibilityProfiles.owned { compatibilityProfiles.preferred(for: profileKey, permitted: []) } }
+        let controlBefore = record.map(controlInteractionState)
         let before = actionState(pid)
         let message = try await perform(action: action, on: display, planningRevision: planningRevision)
-        let method = ["focus", "set_value", "press"].contains(type) && !message.hasPrefix("Clicked")
-            ? "accessibility" : (requiresHIDFallback(pid) ? "hid" : (["click", "double_click", "scroll"].contains(type) ? "session_event" : "process_event"))
+        let method = ControlDeliveryMethod.delivered(action: ActionKind(rawValue: type)!,
+            coordinatePress: message.hasPrefix("Clicked"), hid: requiresHIDFallback(pid))?.rawValue ?? "process_event"
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
         var verified = false
         var changed = false
@@ -903,6 +910,12 @@ final class AccessibilityController {
             if verified || changed { break }
             try await Task.sleep(for: .milliseconds(80))
         } while ContinuousClock.now < deadline
+        if let record, let profileKey, let controlBefore, let deliveryMethod = ControlDeliveryMethod(rawValue: method),
+           (try? validateRecord(record, action: action, on: display)) != nil {
+            let proven = controlBefore.verifies(controlInteractionState(record))
+            try recordCompatibility(proven ? .verified : .supported, method: deliveryMethod,
+                                    key: profileKey, record: record, action: action, on: display)
+        }
         return ["message": verified ? "\(message); confirmed focus" : "\(message); delivery acknowledged, intended effect not confirmed",
                 "delivery_method": method, "outcome": verified ? "verified" : "delivered_unconfirmed",
                 "verification_scope": verified ? "focus" : "delivery_only", "pid": Int(pid)]
@@ -932,7 +945,29 @@ final class AccessibilityController {
                     )
                 }
             }
-            let method = try AutomationPressPolicy.deliver(preflight: {
+            let profileKey = try compatibilityKey(record, action: action, on: display)
+            let coordinateMethod: ControlDeliveryMethod = requiresHIDFallback(record.pid) ? .hid : .session_event
+            let preferred = try profileKey.flatMap { key in
+                try ControlCompatibilityProfiles.owned { compatibilityProfiles.preferred(for: key, permitted: [.accessibility, coordinateMethod]) }
+            }
+            let unsupported = try profileKey.map { key in
+                try ControlCompatibilityProfiles.owned { compatibilityProfiles.evidence(for: key, method: .accessibility) == .unsupported }
+            } ?? false
+            let method = try AutomationPressPolicy.deliver(
+                preferVerifiedCoordinate: preferred == coordinateMethod && unsupported,
+                pressAdvertised: profileKey?.pressAdvertised ?? true,
+                recordPress: { result in
+                    guard let profileKey else { return }
+                    let evidence: ControlCompatibilityProfiles.Evidence
+                    switch result {
+                    case .success: evidence = .supported
+                    case .actionUnsupported, .notImplemented: evidence = .unsupported
+                    case .apiDisabled, .invalidUIElement: return
+                    default: evidence = .unconfirmed
+                    }
+                    try self.recordCompatibility(evidence, method: .accessibility, key: profileKey,
+                                                 record: record, action: action, on: display)
+                }, preflight: {
                 try self.validateRecord(record, action: action, on: display)
             }, press: {
                 ownedAXPress(record.element, kAXPressAction as CFString)
@@ -956,6 +991,10 @@ final class AccessibilityController {
                         try self.validatePointerHit(record, at: CGPoint(x: elementFrame.midX, y: elementFrame.midY))
                     }
                 )
+                if let profileKey {
+                    try recordCompatibility(.supported, method: coordinateMethod, key: profileKey,
+                                            record: record, action: action, on: display)
+                }
             })
             return method == "coordinate" ? "Clicked the requested control" : "Pressed the requested control"
 
@@ -2162,6 +2201,73 @@ final class AccessibilityController {
 
     // MARK: - Action target validation
 
+    private static func compatibilityEnvironment() -> String {
+        ControlCompatibilityProfiles.fingerprint([String(ControlCompatibilityProfiles.policyVersion),
+            ProcessInfo.processInfo.operatingSystemVersionString, ActionContract.fingerprint,
+            String(AXIsProcessTrusted()), String(CGPreflightScreenCaptureAccess())])
+    }
+
+    private func compatibilityKey(_ record: ElementRecord, action: [String: Any], on display: DisplayDescriptor) throws -> ControlCompatibilityProfiles.Key? {
+        guard !AutomationTextEntryPolicy.isSecure(role: record.role, subrole: record.identity.subrole),
+              let kind = ActionKind(rawValue: action["type"] as? String ?? ""),
+              ControlDeliveryMethod.allCases.contains(where: { $0.permits(kind) }),
+              let app = NSRunningApplication(processIdentifier: record.pid), applicationIdentity(app) == record.identity.application,
+              let appID = app.bundleIdentifier, let bundleURL = app.bundleURL, let bundle = Bundle(url: bundleURL),
+              let executable = bundle.executableURL,
+              let attributes = try? FileManager.default.attributesOfItem(atPath: executable.path),
+              let modified = attributes[.modificationDate] as? Date, let size = attributes[.size] as? NSNumber,
+              let launched = app.launchDate, modified <= launched else { return nil }
+        let version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
+        guard !version.isEmpty || !build.isEmpty else { return nil }
+        let infoFiles = [bundleURL.appendingPathComponent("Contents/Info.plist"), bundleURL.appendingPathComponent("Info.plist")]
+        guard let info = infoFiles.compactMap({ try? FileManager.default.attributesOfItem(atPath: $0.path) }).first,
+              let infoModified = info[.modificationDate] as? Date, infoModified <= launched,
+              let infoSize = info[.size] as? NSNumber else { return nil }
+        var capabilities: [String: Bool] = [:]
+        if kind == .press {
+            var actions: CFArray?
+            let result = AXUIElementCopyActionNames(record.element, &actions)
+            if result == .apiDisabled { throw AccessibilityActionError.permissionDenied }
+            guard result == .success else { return nil }
+            capabilities["press"] = (actions as? [String] ?? []).contains(kAXPressAction as String)
+        }
+        if kind == .set_value || kind == .type_text {
+            for name in [kAXValueAttribute, kAXSelectedTextAttribute, kAXSelectedTextRangeAttribute] {
+                var settable = DarwinBoolean(false)
+                let result = AXUIElementIsAttributeSettable(record.element, name as CFString, &settable)
+                if result == .apiDisabled { throw AccessibilityActionError.permissionDenied }
+                guard [.success, .attributeUnsupported, .notImplemented].contains(result) else { return nil }
+                capabilities[name] = result == .success && settable.boolValue
+            }
+        }
+        return ControlCompatibilityProfiles.Key(appID: appID, bundlePath: bundleURL.path, version: version, build: build,
+            executableRevision: "\(modified.timeIntervalSince1970):\(size.int64Value):\(infoModified.timeIntervalSince1970):\(infoSize.int64Value)", role: record.role,
+            subrole: record.identity.subrole, action: kind, capabilities: capabilities,
+            hid: requiresHIDFallback(record.pid), mainDisplay: display.isMain, environment: Self.compatibilityEnvironment())
+    }
+
+    private func recordCompatibility(_ evidence: ControlCompatibilityProfiles.Evidence, method: ControlDeliveryMethod,
+                                     key: ControlCompatibilityProfiles.Key, record: ElementRecord,
+                                     action: [String: Any], on display: DisplayDescriptor) throws {
+        try TaskOwnership.check()
+        guard !inputIsCancelled(), (try? compatibilityKey(record, action: action, on: display)) == key else { return }
+        try ControlCompatibilityProfiles.owned { compatibilityProfiles.record(evidence, method: method, for: key) }
+    }
+
+    private func controlInteractionState(_ record: ElementRecord) -> ControlInteractionState {
+        guard !AutomationTextEntryPolicy.isSecure(role: record.role, subrole: record.identity.subrole) else {
+            return ControlInteractionState()
+        }
+        var state = ControlInteractionState(selected: boolAttribute(record.element, kAXSelectedAttribute),
+                                            expanded: boolAttribute(record.element, kAXExpandedAttribute))
+        if ["AXCheckBox", "AXRadioButton"].contains(record.role),
+           let value = attribute(record.element, kAXValueAttribute) as? NSNumber,
+           [0.0, 1.0].contains(value.doubleValue) { state.toggle = value.boolValue }
+        if AutomationTextEntryPolicy.inputRoles.contains(record.role) { state.editableFocused = intendedElementHasFocus(record) }
+        return state
+    }
+
     private func observedFocusedInput(pid: pid_t) throws -> ElementRecord {
         let candidates = lock.withLock { elementMap.values.filter {
             $0.pid == pid && $0.wasFocused && AutomationTextEntryPolicy.inputRoles.contains($0.role)
@@ -2271,7 +2377,21 @@ final class AccessibilityController {
                selectedTextRange(record.element) != record.observedSelection { throw AccessibilityActionError.staleObservation }
         }
         rememberManualTarget(record.pid)
-        return try await AutomationTextEntryPolicy.enter(text: text, replacement: action["type"] as? String == "set_value", secure: secure,
+        let profileKey = secure ? nil : try compatibilityKey(record, action: action, on: display)
+        let permitted: [ControlDeliveryMethod] = action["type"] as? String == "set_value"
+            ? [.accessibility_value, .accessibility_selected_text, .process_event] : [.accessibility_selected_text, .process_event]
+        let preferred = try profileKey.flatMap { key in
+            try ControlCompatibilityProfiles.owned { compatibilityProfiles.preferred(for: key, permitted: permitted) }
+        }
+        let result = try await AutomationTextEntryPolicy.enter(text: text, replacement: action["type"] as? String == "set_value", secure: secure,
+            preferredMethod: preferred,
+            recordDelivery: { method, delivery in
+                guard let profileKey else { return }
+                let evidence: ControlCompatibilityProfiles.Evidence = delivery == .unsupported ? .unsupported
+                    : delivery == .accepted ? .supported : .unconfirmed
+                try self.recordCompatibility(evidence, method: method, key: profileKey,
+                                             record: record, action: action, on: display)
+            },
             focus: {
                 try await self.ensureElementFocus(record, action: action, on: display)
                 if !secure, self.readableTextValue(record) != record.observedTextValue {
@@ -2310,6 +2430,11 @@ final class AccessibilityController {
                 guard !self.inputIsCancelled() else { throw AccessibilityActionError.cancelled }
                 try Task.checkCancellation()
             })
+        if let profileKey, let method = ControlDeliveryMethod(rawValue: result.method) {
+            try recordCompatibility(result.verified ? .verified : .unconfirmed, method: method,
+                                    key: profileKey, record: record, action: action, on: display)
+        }
+        return result
     }
 
     private func record(for action: [String: Any]) throws -> ElementRecord {

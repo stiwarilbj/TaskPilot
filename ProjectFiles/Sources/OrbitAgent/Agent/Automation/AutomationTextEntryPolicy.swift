@@ -69,6 +69,8 @@ enum AutomationTextEntryPolicy {
     /// different method; accepted or ambiguous delivery never permits replay.
     static func enter(
         text: String, replacement: Bool, secure: Bool,
+        preferredMethod: ControlDeliveryMethod? = nil,
+        recordDelivery: (ControlDeliveryMethod, TextAttributeDelivery) throws -> Void = { _, _ in },
         focus: () async throws -> Void, preflight: @escaping () throws -> Void,
         readValue: @escaping () -> String?, readSelection: () -> NSRange?,
         setValue: (String) throws -> TextAttributeDelivery,
@@ -86,41 +88,45 @@ enum AutomationTextEntryPolicy {
             return AutomationTextEntryResult(method: "local_check", verification: "already_matched")
         }
 
-        var method = "process_event"
-        var delivered = false
-        // Full-value setters belong to replacement. Insertion uses the native
-        // selected-text setter so it preserves rich text and caret semantics.
-        if let expected, replacement {
-            try preflight()
-            switch try setValue(expected) {
-            case .accepted, .uncertain:
-                method = "accessibility_value"
-                delivered = true
-            case .unsupported: break
-            }
+        var methods: [ControlDeliveryMethod] = replacement
+            ? [.accessibility_value, .accessibility_selected_text, .process_event]
+            : [.accessibility_selected_text, .process_event]
+        // A preference changes the initial route, not the retry policy. All
+        // routes still bind one field; accepted/uncertain entry stops delivery.
+        if !secure, let preferredMethod, methods.contains(preferredMethod) {
+            methods.removeAll { $0 == preferredMethod }; methods.insert(preferredMethod, at: 0)
         }
-        if !delivered {
-            if replacement {
-                // Replacement by keyboard is safe only with a readable value
-                // and an acknowledged selection of the whole field.
-                guard !secure, let before else {
-                    throw AccessibilityActionError.operationFailed("The field cannot safely replace its value; choose another text-entry method")
-                }
-                let all = NSRange(location: 0, length: before.utf16.count)
-                try preflight()
-                guard try selectRange(all), readSelection() == all else {
-                    throw AccessibilityActionError.operationFailed("The field did not select its whole value; no replacement text was delivered")
-                }
-            }
+        var deliveredMethod: ControlDeliveryMethod?
+        var selectedWholeField: Bool?
+        for method in methods {
             try preflight()
-            switch try setSelectedText(text) {
-            case .accepted, .uncertain:
-                method = "accessibility_selected_text"
-                delivered = true
-            case .unsupported: break
+            if replacement && method != .accessibility_value {
+                guard !secure, let before else { continue }
+                if selectedWholeField == nil {
+                    let all = NSRange(location: 0, length: before.utf16.count)
+                    selectedWholeField = try selectRange(all) && readSelection() == all
+                }
+                // A rejected selection delivered no text. A later full-value
+                // setter can still safely replace the value; typing cannot.
+                guard selectedWholeField == true else { continue }
             }
-            if !delivered { try typeText(text, preflight) }
+            let delivery: TextAttributeDelivery
+            switch method {
+            case .accessibility_value:
+                guard let expected, replacement else { continue }
+                delivery = try setValue(expected)
+            case .accessibility_selected_text: delivery = try setSelectedText(text)
+            case .process_event:
+                try typeText(text, preflight); delivery = .accepted
+            default: continue
+            }
+            if !secure { try recordDelivery(method, delivery) }
+            if delivery != .unsupported { deliveredMethod = method; break }
         }
+        guard let deliveredMethod else {
+            throw AccessibilityActionError.operationFailed("The field cannot safely replace its value or select its whole value; no text was delivered")
+        }
+        let method = deliveredMethod.rawValue
         guard !secure else { return AutomationTextEntryResult(method: method, verification: "secure") }
         guard let expected else { return AutomationTextEntryResult(method: method, verification: "unavailable") }
         try await waitForMatch { readValue() == expected }
