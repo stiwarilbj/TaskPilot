@@ -26,6 +26,10 @@ checks.
 [Bounded control compatibility profiles](ControlCompatibility.md) retain
 verified delivery methods without retaining control targets or user content.
 
+[Screen-coordinate mapping](ScreenCoordinates.md) binds actual screenshot
+pixels, crop geometry, and normalized actions to the accepted display and
+observation revision.
+
 ## The main flow
 
 1. `TaskPilotApp` creates the macOS windows.

@@ -11,16 +11,8 @@ enum AgentCursorCoordinateMapper {
         display: DisplayDescriptor,
         screenFrame: CGRect
     ) -> CGPoint {
-        let normalizedX = display.width > 0
-            ? (quartzPoint.x - display.frame.minX) / display.frame.width
-            : 0.5
-        let normalizedY = display.height > 0
-            ? (quartzPoint.y - display.frame.minY) / display.frame.height
-            : 0.5
-        return CGPoint(
-            x: screenFrame.minX + min(max(normalizedX, 0), 1) * screenFrame.width,
-            y: screenFrame.maxY - min(max(normalizedY, 0), 1) * screenFrame.height
-        )
+        (try? ScreenCoordinateMapping.appKitPoint(quartzPoint, display: display, screenFrame: screenFrame))
+            ?? CGPoint(x: screenFrame.midX, y: screenFrame.midY)
     }
 }
 

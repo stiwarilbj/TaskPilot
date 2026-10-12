@@ -12,6 +12,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import openclaw_runtime as runtime
+from coordinate_fixtures import fixture_coordinates
 from action_receipts import BridgeReplyLost, RuntimeInbox
 
 
@@ -240,7 +241,7 @@ class ActionReceiptTests(unittest.TestCase):
                 frames += 1
                 image = Path(directory) / f'{frames}.png'
                 image.write_bytes(b'fixture')
-                return {'ok': True, 'result': dict(task_generation_id=self.generation,
+                return {'ok': True, 'result': dict(**fixture_coordinates(str(frames)), task_generation_id=self.generation,
                     screenshot_path=str(image), observation_revision=str(frames), applications=[], elements=[])}
             with mock.patch.object(runtime, 'find_openclaw', return_value='fixture'), \
                  mock.patch.object(runtime, 'prepare_runtime', return_value=mock.Mock()), \

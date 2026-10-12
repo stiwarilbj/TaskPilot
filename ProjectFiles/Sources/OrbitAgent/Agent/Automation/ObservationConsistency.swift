@@ -92,6 +92,10 @@ enum ObservationConsistency {
                     diagnostics.rejected[reason, default: 0] += 1
                     pendingBackoff = backoff
                     backoff = min(0.5, backoff * 2)
+                case ScreenCoordinateError.captureChanged:
+                    diagnostics.rejected["capture_geometry", default: 0] += 1
+                    pendingBackoff = backoff
+                    backoff = min(0.5, backoff * 2)
                 default: throw error
                 }
             }

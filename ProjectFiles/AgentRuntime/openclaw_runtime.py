@@ -53,6 +53,7 @@ from prompt_compiler import (
 )
 
 from observation_context import select_elements, historical_progress, coordinate_targets, structural_identity, RELATIONSHIPS_VERSION
+from screen_coordinates import COORDINATE_MAPPING_VERSION, CoordinateMappingError, validate_observation_mapping
 from task_evidence import TaskEvidenceLedger, CHECKLIST_VERSION, LARGEST_PATTERN
 from expected_effects import ExpectedEffect, EXPECTED_EFFECT_VERSION, FILE_EFFECTS
 
@@ -372,6 +373,11 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
                 raise ActionRejected("Observation belongs to another task", "cancelled")
             result = dict(result)
             result.pop("task_generation_id", None)
+            try: validate_observation_mapping(result, required=_task_generation_id is not None)
+            except CoordinateMappingError as error:
+                _bridge_observation_revision = None
+                discard_observation_image(result)
+                raise ActionRejected(str(error), "observation_unstable") from error
             _bridge_observation_revision = result.get("observation_revision")
         return result
     return {}
@@ -2263,7 +2269,7 @@ def routed_json_prompt(
     observation: dict[str, Any] | None = None,
     ledger: TaskEvidenceLedger | None = None,
 ) -> dict[str, Any]:
-    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, PROMPT_COMPILER_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, observation], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
+    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, PROMPT_COMPILER_VERSION, COORDINATE_MAPPING_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, observation], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
     cached = getattr(client, "decision_cache", {})
     if cached.get("key") == key:
         value = validate_response(json.loads(json.dumps(cached["decision"])), purpose, observation, ledger)
@@ -2621,6 +2627,8 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
         _task_generation_id = generation
         if type(configuration.get("task_protocol_version")) is not int or configuration["task_protocol_version"] != TASK_PROTOCOL_VERSION:
             raise RuntimeError("TaskPilot task ownership protocol does not match; rebuild the bundled components together")
+        if type(configuration.get("coordinate_mapping_version")) is not int or configuration["coordinate_mapping_version"] != COORDINATE_MAPPING_VERSION:
+            raise RuntimeError("TaskPilot screen coordinate mapping versions do not match; rebuild the bundled components together")
     api_key = configuration.get("gemini_api_key")
     if not isinstance(api_key, str):
         raise RuntimeError(f"{PRODUCT_NAME} did not provide the secure runtime configuration")

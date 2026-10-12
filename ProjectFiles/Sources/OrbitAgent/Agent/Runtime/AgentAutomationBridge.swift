@@ -113,6 +113,7 @@ final class AgentAutomationBridge {
                     budget = number.doubleValue / 1000
                 } else { budget = 5 }
                 var observationDisplay = display
+                var capturedCoordinates: ScreenCoordinateMapping?
                 let (accepted, screenshotURL) = try await ObservationConsistency.collect(
                     budget: budget,
                     checkpoint: { try await TaskOwnership.checkpoint() },
@@ -126,7 +127,11 @@ final class AgentAutomationBridge {
                         return try self.accessibility.stageSnapshot(on: observationDisplay)
                     },
                     signature: { $0.consistencySignature },
-                    capture: { refresh in try await self.capture.capture(display: observationDisplay, forceRefresh: refresh) },
+                    capture: { refresh in
+                        let captured = try await self.capture.capture(display: observationDisplay, forceRefresh: refresh)
+                        capturedCoordinates = captured.coordinates
+                        return captured.url
+                    },
                     discard: { lease.discardArtifact($0) },
                     publish: { try $0.publish() },
                     report: { summary in
@@ -141,11 +146,18 @@ final class AgentAutomationBridge {
                     })
                 let snapshot = accepted.snapshot
                 try TaskOwnership.check()
+                guard let coordinates = capturedCoordinates else {
+                    lease.discardArtifact(screenshotURL)
+                    throw ScreenCoordinateError.invalidGeometry
+                }
+                do { try accessibility.bindCoordinates(coordinates, revision: snapshot.revision, on: observationDisplay) }
+                catch { lease.discardArtifact(screenshotURL); throw error }
                 result = [
                     "task_generation_id": lease.id,
                     "observation_revision": snapshot.revision,
                     "screenshot_path": screenshotURL.path,
                     "display": displayDictionary(observationDisplay),
+                    "coordinate_mapping": coordinates.metadata(revision: snapshot.revision),
                     "applications": snapshot.applications,
                     "installed_applications": snapshot.installedApplications,
                     "system_context": snapshot.systemContext,
@@ -158,7 +170,7 @@ final class AgentAutomationBridge {
                         "app_automation": "Launch and control installed apps through visible Accessibility actions."
                     ],
                     "controller_protected": true,
-                    "coordinate_space": "x and y actions use 0…1000 relative to this display",
+                    "coordinate_space": "Actions use 0…1000 over the FULL display, x right/y down. Image pixels use coordinate_mapping.image_to_global; never use pixel values as action coordinates.",
                     "agent_cursor": "The blue TaskPilot pointer appears only during a validated pointer action on this display; it is not a clickable UI element"
                 ]
 
@@ -179,6 +191,7 @@ final class AgentAutomationBridge {
                             throw BridgeError.invalidRequest("Runtime-local actions cannot be dispatched to the native bridge")
                         }
                         try accessibility.validateObservation(params["observation_revision"] as? String)
+                        try accessibility.validateCoordinates(on: display)
                         return try await accessibility.performStructured(action: action, on: display,
                             privateInput: params["private_input"] as? Bool == true)
                     }

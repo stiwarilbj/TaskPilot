@@ -176,6 +176,7 @@ final class AccessibilityController {
     private let compatibilityProfiles: ControlCompatibilityProfiles
     private var elementMap: [String: ElementRecord] = [:]
     private var observationRevision = ""
+    private var observationCoordinates: ScreenCoordinateMapping?
     private var observationTaskGenerationID: String?
     private var observedGraphicsWindows: [pid_t: [AutomationGraphicsWindow]] = [:]
     private var observedApplications: [pid_t: AutomationApplicationIdentity] = [:]
@@ -225,7 +226,7 @@ final class AccessibilityController {
         lock.lock()
         taskLease = lease
         taskGenerationID = lease?.id
-        elementMap.removeAll(); observationRevision = ""
+        elementMap.removeAll(); observationRevision = ""; observationCoordinates = nil
         manualTargetPID = nil
         taskDisplayOverrideID = nil
         taskApplicationBaseline = TaskApplicationBaseline(
@@ -253,7 +254,7 @@ final class AccessibilityController {
         taskLease = nil
         taskApplicationBaseline = nil
         taskGenerationID = nil
-        elementMap.removeAll(); observationRevision = ""
+        elementMap.removeAll(); observationRevision = ""; observationCoordinates = nil
         manualTargetPID = nil
         taskDisplayOverrideID = nil
         lock.unlock()
@@ -377,6 +378,7 @@ final class AccessibilityController {
             lock.withLock {
                 elementMap.removeAll()
                 observationRevision = ""
+                observationCoordinates = nil
                 observedGraphicsWindows.removeAll()
                 observedApplications.removeAll()
             }
@@ -566,6 +568,7 @@ final class AccessibilityController {
                     lock.withLock {
                         elementMap = newMap
                         observationRevision = revision
+                        observationCoordinates = nil
                         observationTaskGenerationID = lease?.id
                         observedGraphicsWindows = observedGraphics
                         observedApplications = observedApps
@@ -689,6 +692,29 @@ final class AccessibilityController {
               TaskOwnership.current == nil || TaskOwnership.current?.id == generation else {
             throw AccessibilityActionError.staleObservation
         }
+    }
+
+    func bindCoordinates(_ coordinates: ScreenCoordinateMapping, revision: String, on display: DisplayDescriptor) throws {
+        try coordinates.validate(display: display)
+        try validateObservation(revision)
+        try TaskOwnership.commit {
+            try lock.withLock {
+                guard revision == observationRevision else { throw AccessibilityActionError.staleObservation }
+                observationCoordinates = coordinates
+            }
+        }
+    }
+
+    func validateCoordinates(on display: DisplayDescriptor) throws {
+        guard let coordinates = lock.withLock({ observationCoordinates }) else {
+            throw AccessibilityActionError.staleObservation
+        }
+        try coordinates.validate(display: display)
+    }
+
+    private func validateEventGeometry(on display: DisplayDescriptor) throws {
+        if TaskOwnership.current != nil { try validateCoordinates(on: display) }
+        guard CGDisplayBounds(display.id) == display.frame else { throw AccessibilityActionError.staleObservation }
     }
 
     func resetInputCancellation() {
@@ -1238,22 +1264,22 @@ final class AccessibilityController {
     ) throws -> String {
         switch interaction {
         case .click(let normalizedPoint, let count):
-            let point = displayPoint(from: normalizedPoint, display: display)
+            let point = try displayPoint(from: normalizedPoint, display: display)
             let pid = try targetPID(at: point)
             rememberManualTarget(pid)
             try postClick(to: pid, point: point, double: count > 1, on: display)
             return count > 1 ? "Double-clicked from the live viewer" : "Clicked from the live viewer"
 
         case .drag(let normalizedStart, let normalizedEnd):
-            let start = displayPoint(from: normalizedStart, display: display)
-            let end = displayPoint(from: normalizedEnd, display: display)
+            let start = try displayPoint(from: normalizedStart, display: display)
+            let end = try displayPoint(from: normalizedEnd, display: display)
             let pid = try targetPID(at: start)
             rememberManualTarget(pid)
             try postDrag(to: pid, from: start, to: end, on: display)
             return "Dragged from the live viewer"
 
         case .scroll(let normalizedPoint, let deltaX, let deltaY):
-            let point = displayPoint(from: normalizedPoint, display: display)
+            let point = try displayPoint(from: normalizedPoint, display: display)
             let pid = try targetPID(at: point)
             rememberManualTarget(pid)
             try postScroll(to: pid, point: point, deltaX: deltaX, deltaY: deltaY, on: display)
@@ -1285,11 +1311,8 @@ final class AccessibilityController {
         lock.unlock()
     }
 
-    private func displayPoint(from normalized: CGPoint, display: DisplayDescriptor) -> CGPoint {
-        CGPoint(
-            x: display.frame.minX + display.frame.width * min(1, max(0, normalized.x)),
-            y: display.frame.minY + display.frame.height * min(1, max(0, normalized.y))
-        )
+    private func displayPoint(from normalized: CGPoint, display: DisplayDescriptor) throws -> CGPoint {
+        try ScreenCoordinateMapping.displayOnly(display).eventPoint(fromUnit: normalized)
     }
 
     private func targetPID(at point: CGPoint) throws -> pid_t {
@@ -2813,10 +2836,11 @@ final class AccessibilityController {
               (0...1000).contains(nx), (0...1000).contains(ny) else {
             throw AccessibilityActionError.invalidAction("Coordinates must be normalized from 0 through 1000")
         }
-        return CGPoint(
-            x: display.frame.minX + display.frame.width * nx / 1000,
-            y: display.frame.minY + display.frame.height * ny / 1000
-        )
+        guard let coordinates = lock.withLock({ observationCoordinates }) else {
+            throw AccessibilityActionError.staleObservation
+        }
+        try coordinates.validate(display: display)
+        return try coordinates.eventPoint(fromNormalized: CGPoint(x: nx, y: ny))
     }
 
     // MARK: - Validated input delivery
@@ -2839,6 +2863,7 @@ final class AccessibilityController {
         }
         agentCursor?.move(to: point, on: display, clicking: true)
         func finalPreflight() throws {
+            try validateEventGeometry(on: display)
             guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
                 throw AccessibilityActionError.activationFailed
             }
@@ -2893,6 +2918,7 @@ final class AccessibilityController {
         source.localEventsSuppressionInterval = 0
         try TaskOwnership.commit {
             defer { if let originalPointer { CGWarpMouseCursorPosition(originalPointer) } }
+            try preflight()
             move.post(tap: tap)
             Thread.sleep(forTimeInterval: 0.008)
             down.setIntegerValueField(.mouseEventClickState, value: 1)
@@ -2902,6 +2928,7 @@ final class AccessibilityController {
             up.post(tap: tap)
             if double {
                 Thread.sleep(forTimeInterval: 0.060)
+                try preflight()
                 down.setIntegerValueField(.mouseEventClickState, value: 2)
                 up.setIntegerValueField(.mouseEventClickState, value: 2)
                 down.post(tap: tap)
@@ -2947,6 +2974,7 @@ final class AccessibilityController {
         let originalPointer = useHID ? CGEvent(source: nil)?.location : nil
         try TaskOwnership.commit {
             defer { if let originalPointer { CGWarpMouseCursorPosition(originalPointer) } }
+            try validateEventGeometry(on: display)
             let events = [move, down, dragged, up]
             for (index, event) in events.enumerated() {
                 if useHID { event.post(tap: .cghidEventTap) } else { event.postToPid(pid) }
@@ -3067,8 +3095,10 @@ final class AccessibilityController {
                            mouseCursorPosition: resolvedPoint, mouseButton: .left)
         try TaskOwnership.commit {
             defer { if let originalPointer { CGWarpMouseCursorPosition(originalPointer) } }
+            try validateEventGeometry(on: display)
             move?.post(tap: .cgSessionEventTap)
             Thread.sleep(forTimeInterval: 0.025)
+            try validateEventGeometry(on: display)
             event.location = resolvedPoint
             event.post(tap: .cgSessionEventTap)
         }

@@ -10,6 +10,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import openclaw_runtime as runtime
+from coordinate_fixtures import fixture_coordinates
 from expected_effects import ExpectedEffect, validate_expectation
 from response_validation import validate_response, ResponseValidationError
 from task_evidence import TaskEvidenceLedger
@@ -298,7 +299,7 @@ class ExpectedTaskLoopTests(unittest.TestCase):
                     methods.append(method)
                     if method == 'observe':
                         frame_number[0] += 1; revision = str(frame_number[0]); image = Path(directory) / (revision + '.png'); image.write_bytes(b'fixture')
-                        return {'ok': True, 'result': {'task_generation_id': generation, 'observation_revision': revision, 'screenshot_path': str(image),
+                        return {'ok': True, 'result': {**fixture_coordinates(revision), 'task_generation_id': generation, 'observation_revision': revision, 'screenshot_path': str(image),
                             'applications': [{'pid': 42, 'name': 'Fixture'}], 'elements': [{'id': revision + ':save', 'pid': 42, 'role': 'AXButton', 'title': 'Save'}]}}
                     if method == 'act':
                         actions.append(params['action']); files[spec['path']] = 'wanted'

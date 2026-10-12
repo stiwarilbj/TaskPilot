@@ -12,6 +12,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import action_contract_generated as contract
 import openclaw_runtime as runtime
+from coordinate_fixtures import fixture_coordinates
 from command_intents import explicit_operation
 from response_validation import bind_command_outcomes, normalize_action, validate_response, ResponseValidationError
 from task_evidence import TaskEvidenceLedger
@@ -248,7 +249,7 @@ class CommandOperationTaskLoopTests(unittest.TestCase):
                     methods.append(method)
                     if method == 'observe':
                         frame[0] += 1; image = Path(directory) / (str(frame[0]) + '.png'); image.write_bytes(b'fixture')
-                        return {'ok': True, 'result': {'task_generation_id': generation, 'observation_revision': str(frame[0]),
+                        return {'ok': True, 'result': {**fixture_coordinates(str(frame[0])), 'task_generation_id': generation, 'observation_revision': str(frame[0]),
                                                       'screenshot_path': str(image), 'applications': [], 'elements': []}}
                     if method == 'act':
                         actions.append(params['action']); result = reply(params['action'], b'\0\xffexact')

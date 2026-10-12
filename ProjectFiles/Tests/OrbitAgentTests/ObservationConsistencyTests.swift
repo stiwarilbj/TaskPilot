@@ -62,6 +62,27 @@ final class ObservationConsistencyTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
     }
 
+    func testCaptureGeometryMismatchRefreshesWithoutPublishingWrongTargets() async throws {
+        let world = World()
+        world.onCapture = { if world.captures == 1 { throw ScreenCoordinateError.captureChanged } }
+        _ = try await world.collect()
+        XCTAssertEqual(world.captures, 2)
+        XCTAssertEqual(world.refreshes, [false, true])
+        XCTAssertEqual(world.summary.rejected["capture_geometry"], 1)
+        XCTAssertEqual(world.published, [3])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: world.images[0].path))
+    }
+
+    func testPersistentCaptureGeometryMismatchHasExistingBoundAndNoPublishedTargets() async {
+        let world = World()
+        world.onCapture = { throw ScreenCoordinateError.captureChanged }
+        do { _ = try await world.collect(budget: 0.25); XCTFail("Geometry must become stable") }
+        catch { XCTAssertTrue(error is ObservationConsistencyError) }
+        XCTAssertTrue(world.published.isEmpty)
+        XCTAssertLessThanOrEqual(world.summary.elapsedSeconds, 0.25)
+        XCTAssertTrue(world.images.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
     func testWindowChangeDuringCaptureDiscardsPixelsAndRefreshesMetadata() async throws {
         let world = World()
         world.onCapture = { if world.captures == 1 { world.scene = "window-2" } }

@@ -9,6 +9,7 @@ import math
 import re
 import unicodedata
 from typing import Any, Callable
+from screen_coordinates import CoordinateMappingError, action_global_point
 
 STOP_WORDS = set("a an the in on at with from to and then for please my me that this it of can could would using use do is as into".split())
 CONTROL_ROLES = {"AXApplication", "AXWindow", "AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton",
@@ -33,12 +34,8 @@ def ancestor_ids(element: dict[str, Any], by_id: dict[str, dict[str, Any]]) -> l
 
 def coordinate_targets(action: dict[str, Any], observation: dict[str, Any]) -> list[dict[str, Any]]:
     """Observed hit candidates; a label child is not a second actionable target."""
-    display = observation.get("display", {})
-    values = [display.get(k) for k in ("x", "y", "width", "height")] + [action.get("x"), action.get("y")]
-    if any(type(v) not in {int, float} or not math.isfinite(v) for v in values): return []
-    x, y, width, height, ax, ay = values
-    if width <= 0 or height <= 0: return []
-    point = (x + ax / 1000 * width, y + ay / 1000 * height)
+    try: point = action_global_point(action, observation)
+    except CoordinateMappingError: return []
     targets = []
     for element in observation.get("elements", []):
         if not isinstance(element, dict) or element.get("pid") != action.get("pid") or element.get("role") in POINTER_CONTAINERS: continue

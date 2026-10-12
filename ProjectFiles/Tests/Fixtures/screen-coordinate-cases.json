@@ -1,0 +1,383 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "retina_main",
+      "display": {
+        "id": 1,
+        "x": 0,
+        "y": 0,
+        "width": 1440,
+        "height": 900
+      },
+      "observation_revision": "fixture:accepted",
+      "coordinate_mapping": {
+        "version": 1,
+        "display_id": 1,
+        "observation_revision": "fixture:accepted",
+        "axes": "quartz_top_left",
+        "normalized_extent": 1000,
+        "display_bounds": {
+          "x": 0,
+          "y": 0,
+          "width": 1440,
+          "height": 900
+        },
+        "full_image_size": {
+          "width": 2880,
+          "height": 1800
+        },
+        "source_rect": {
+          "x": 0,
+          "y": 0,
+          "width": 2880,
+          "height": 1800
+        },
+        "image_size": {
+          "width": 2880,
+          "height": 1800
+        },
+        "normalized_to_global": {
+          "x_scale": 1.44,
+          "y_scale": 0.9,
+          "x_offset": 0,
+          "y_offset": 0
+        },
+        "image_to_global": {
+          "x_scale": 0.5,
+          "y_scale": 0.5,
+          "x_offset": 0,
+          "y_offset": 0
+        },
+        "edge_inset_points": 0.5
+      },
+      "normalized": [
+        500,
+        500
+      ],
+      "global": [
+        720,
+        450
+      ],
+      "pixel": [
+        1440,
+        900
+      ]
+    },
+    {
+      "name": "resized_left_display",
+      "display": {
+        "id": 2,
+        "x": -1920,
+        "y": 120,
+        "width": 1920,
+        "height": 1080
+      },
+      "observation_revision": "fixture:accepted",
+      "coordinate_mapping": {
+        "version": 1,
+        "display_id": 2,
+        "observation_revision": "fixture:accepted",
+        "axes": "quartz_top_left",
+        "normalized_extent": 1000,
+        "display_bounds": {
+          "x": -1920,
+          "y": 120,
+          "width": 1920,
+          "height": 1080
+        },
+        "full_image_size": {
+          "width": 1280,
+          "height": 720
+        },
+        "source_rect": {
+          "x": 0,
+          "y": 0,
+          "width": 1280,
+          "height": 720
+        },
+        "image_size": {
+          "width": 1280,
+          "height": 720
+        },
+        "normalized_to_global": {
+          "x_scale": 1.92,
+          "y_scale": 1.08,
+          "x_offset": -1920,
+          "y_offset": 120
+        },
+        "image_to_global": {
+          "x_scale": 1.5,
+          "y_scale": 1.5,
+          "x_offset": -1920,
+          "y_offset": 120
+        },
+        "edge_inset_points": 0.5
+      },
+      "normalized": [
+        250,
+        750
+      ],
+      "global": [
+        -1440,
+        930
+      ],
+      "pixel": [
+        320,
+        540
+      ]
+    },
+    {
+      "name": "display_above_main",
+      "display": {
+        "id": 3,
+        "x": 400,
+        "y": -1440,
+        "width": 2560,
+        "height": 1440
+      },
+      "observation_revision": "fixture:accepted",
+      "coordinate_mapping": {
+        "version": 1,
+        "display_id": 3,
+        "observation_revision": "fixture:accepted",
+        "axes": "quartz_top_left",
+        "normalized_extent": 1000,
+        "display_bounds": {
+          "x": 400,
+          "y": -1440,
+          "width": 2560,
+          "height": 1440
+        },
+        "full_image_size": {
+          "width": 2048,
+          "height": 1152
+        },
+        "source_rect": {
+          "x": 0,
+          "y": 0,
+          "width": 2048,
+          "height": 1152
+        },
+        "image_size": {
+          "width": 2048,
+          "height": 1152
+        },
+        "normalized_to_global": {
+          "x_scale": 2.56,
+          "y_scale": 1.44,
+          "x_offset": 400,
+          "y_offset": -1440
+        },
+        "image_to_global": {
+          "x_scale": 1.25,
+          "y_scale": 1.25,
+          "x_offset": 400,
+          "y_offset": -1440
+        },
+        "edge_inset_points": 0.5
+      },
+      "normalized": [
+        250,
+        750
+      ],
+      "global": [
+        1040,
+        -360
+      ],
+      "pixel": [
+        512,
+        864
+      ]
+    },
+    {
+      "name": "independently_rounded_dimensions",
+      "display": {
+        "id": 4,
+        "x": 90,
+        "y": -70,
+        "width": 1440,
+        "height": 900
+      },
+      "observation_revision": "fixture:accepted",
+      "coordinate_mapping": {
+        "version": 1,
+        "display_id": 4,
+        "observation_revision": "fixture:accepted",
+        "axes": "quartz_top_left",
+        "normalized_extent": 1000,
+        "display_bounds": {
+          "x": 90,
+          "y": -70,
+          "width": 1440,
+          "height": 900
+        },
+        "full_image_size": {
+          "width": 1171,
+          "height": 731
+        },
+        "source_rect": {
+          "x": 0,
+          "y": 0,
+          "width": 1171,
+          "height": 731
+        },
+        "image_size": {
+          "width": 1171,
+          "height": 731
+        },
+        "normalized_to_global": {
+          "x_scale": 1.44,
+          "y_scale": 0.9,
+          "x_offset": 90,
+          "y_offset": -70
+        },
+        "image_to_global": {
+          "x_scale": 1.2297181895815543,
+          "y_scale": 1.231190150478796,
+          "x_offset": 90,
+          "y_offset": -70
+        },
+        "edge_inset_points": 0.5
+      },
+      "normalized": [
+        500,
+        500
+      ],
+      "global": [
+        810,
+        380
+      ],
+      "pixel": [
+        585.5,
+        365.5
+      ]
+    },
+    {
+      "name": "resized_crop",
+      "display": {
+        "id": 5,
+        "x": -2560,
+        "y": -500,
+        "width": 2560,
+        "height": 1600
+      },
+      "observation_revision": "fixture:accepted",
+      "coordinate_mapping": {
+        "version": 1,
+        "display_id": 5,
+        "observation_revision": "fixture:accepted",
+        "axes": "quartz_top_left",
+        "normalized_extent": 1000,
+        "display_bounds": {
+          "x": -2560,
+          "y": -500,
+          "width": 2560,
+          "height": 1600
+        },
+        "full_image_size": {
+          "width": 2048,
+          "height": 1280
+        },
+        "source_rect": {
+          "x": 512,
+          "y": 320,
+          "width": 1024,
+          "height": 640
+        },
+        "image_size": {
+          "width": 512,
+          "height": 320
+        },
+        "normalized_to_global": {
+          "x_scale": 2.56,
+          "y_scale": 1.6,
+          "x_offset": -2560,
+          "y_offset": -500
+        },
+        "image_to_global": {
+          "x_scale": 2.5,
+          "y_scale": 2.5,
+          "x_offset": -1920,
+          "y_offset": -100
+        },
+        "edge_inset_points": 0.5
+      },
+      "normalized": [
+        375,
+        375
+      ],
+      "global": [
+        -1600,
+        100
+      ],
+      "pixel": [
+        128,
+        80
+      ]
+    },
+    {
+      "name": "fractional_crop_origin",
+      "display": {
+        "id": 6,
+        "x": -1000,
+        "y": 600,
+        "width": 1920,
+        "height": 1080
+      },
+      "observation_revision": "fixture:accepted",
+      "coordinate_mapping": {
+        "version": 1,
+        "display_id": 6,
+        "observation_revision": "fixture:accepted",
+        "axes": "quartz_top_left",
+        "normalized_extent": 1000,
+        "display_bounds": {
+          "x": -1000,
+          "y": 600,
+          "width": 1920,
+          "height": 1080
+        },
+        "full_image_size": {
+          "width": 1920,
+          "height": 1080
+        },
+        "source_rect": {
+          "x": 311.5,
+          "y": 211.25,
+          "width": 500.5,
+          "height": 400.75
+        },
+        "image_size": {
+          "width": 1001,
+          "height": 802
+        },
+        "normalized_to_global": {
+          "x_scale": 1.92,
+          "y_scale": 1.08,
+          "x_offset": -1000,
+          "y_offset": 600
+        },
+        "image_to_global": {
+          "x_scale": 0.5,
+          "y_scale": 0.49968827930174564,
+          "x_offset": -688.5,
+          "y_offset": 811.25
+        },
+        "edge_inset_points": 0.5
+      },
+      "normalized": [
+        292.578125,
+        381.13425925925924
+      ],
+      "global": [
+        -438.25,
+        1011.625
+      ],
+      "pixel": [
+        500.5,
+        401
+      ]
+    }
+  ]
+}

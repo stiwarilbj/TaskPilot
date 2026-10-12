@@ -30,6 +30,11 @@ enum ScreenCaptureAuthorization: Equatable {
     case unavailable(String)
 }
 
+struct CapturedScreen {
+    let url: URL
+    let coordinates: ScreenCoordinateMapping
+}
+
 actor ScreenCaptureService {
     static let maximumVisionWidth = 2048.0
     static let maximumVisionHeight = 1280.0
@@ -102,20 +107,24 @@ actor ScreenCaptureService {
         await authorizationStatus(verifyPixels: false) == .authorized
     }
 
-    func capture(display: DisplayDescriptor, forceRefresh: Bool = false) async throws -> URL {
+    func capture(display: DisplayDescriptor, forceRefresh: Bool = false) async throws -> CapturedScreen {
         try await TaskOwnership.checkpoint()
         guard Self.preflightAuthorizationStatus() == .authorized else {
             throw ScreenCaptureError.permissionDenied("Screen capture is not authorized for this TaskPilot process")
         }
-        let content: SCShareableContent
+        var content: SCShareableContent
         do {
             content = try await shareableContent(forceRefresh: forceRefresh)
         } catch {
             throw permissionError(for: error)
         }
+        if content.displays.first(where: { $0.displayID == display.id })?.frame != display.frame {
+            content = try await shareableContent(forceRefresh: true)
+        }
         guard let scDisplay = content.displays.first(where: { $0.displayID == display.id }) else {
             throw ScreenCaptureError.displayUnavailable
         }
+        guard scDisplay.frame == display.frame else { throw ScreenCoordinateError.captureChanged }
 
         let excludedApps = controllerApplications(in: content)
         let filter = SCContentFilter(
@@ -129,13 +138,11 @@ actor ScreenCaptureService {
         // Preserve small status-bar numbers and canvas/game text for OpenClaw.
         // The previous 1440×900 ceiling could shrink an 856-point game window
         // to less than 500 pixels on a high-resolution virtual display.
-        let scale = min(
-            1.0,
-            Self.maximumVisionWidth / sourceWidth,
-            Self.maximumVisionHeight / sourceHeight
-        )
-        configuration.width = max(1, Int((sourceWidth * scale).rounded()))
-        configuration.height = max(1, Int((sourceHeight * scale).rounded()))
+        let fitted = try ScreenCoordinateMapping.fittedImageSize(
+            source: CGSize(width: sourceWidth, height: sourceHeight),
+            maximum: CGSize(width: Self.maximumVisionWidth, height: Self.maximumVisionHeight))
+        configuration.width = Int(fitted.width)
+        configuration.height = Int(fitted.height)
         configuration.showsCursor = false
         configuration.capturesAudio = false
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
@@ -152,6 +159,9 @@ actor ScreenCaptureService {
             throw permissionError(for: error)
         }
         try await TaskOwnership.checkpoint()
+        guard CGDisplayBounds(display.id) == display.frame else { throw ScreenCoordinateError.captureChanged }
+        let coordinates = try ScreenCoordinateMapping(displayID: display.id, displayBounds: display.frame,
+            imageSize: CGSize(width: image.width, height: image.height))
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("OrbitAgent", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -170,7 +180,7 @@ actor ScreenCaptureService {
         }
         do { try TaskOwnership.check(); try TaskOwnership.current?.ownArtifact(url) }
         catch { try? FileManager.default.removeItem(at: url); throw error }
-        return url
+        return CapturedScreen(url: url, coordinates: coordinates)
     }
 
     /// Captures a local-only viewer frame. Unlike the OpenClaw frame, this keeps
@@ -195,14 +205,12 @@ actor ScreenCaptureService {
                                      exceptingWindows: [])
         let sourceWidth = Double(scDisplay.width)
         let sourceHeight = Double(scDisplay.height)
-        let scale = min(
-            1.0,
-            Self.maximumPreviewWidth / sourceWidth,
-            Self.maximumPreviewHeight / sourceHeight
-        )
+        let fitted = try ScreenCoordinateMapping.fittedImageSize(
+            source: CGSize(width: sourceWidth, height: sourceHeight),
+            maximum: CGSize(width: Self.maximumPreviewWidth, height: Self.maximumPreviewHeight))
         let configuration = SCStreamConfiguration()
-        configuration.width = max(1, Int((sourceWidth * scale).rounded()))
-        configuration.height = max(1, Int((sourceHeight * scale).rounded()))
+        configuration.width = Int(fitted.width)
+        configuration.height = Int(fitted.height)
         configuration.showsCursor = false
         configuration.capturesAudio = false
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
