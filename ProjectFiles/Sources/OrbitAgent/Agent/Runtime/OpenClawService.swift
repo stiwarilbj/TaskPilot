@@ -267,46 +267,53 @@ final class OpenClawService {
         )
     }
 
-    private struct CommandResult {
+    struct CommandResult {
         let status: Int32
         let output: String
     }
 
-    private static func run(
+    static func run(
         executable: URL,
         arguments: [String],
         timeout: TimeInterval
     ) -> CommandResult {
         let process = Process()
-        let output = Pipe()
-        process.executableURL = executable
-        process.arguments = arguments
-        process.standardOutput = output
-        process.standardError = output
         do {
+            // Spool while the child runs: leaving a pipe unread until exit can
+            // fill it and prevent the exit notification from ever arriving.
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("taskpilot-status-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                    attributes: [.posixPermissions: 0o700])
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let outputURL = directory.appendingPathComponent("output")
+            guard FileManager.default.createFile(atPath: outputURL.path, contents: nil,
+                                                  attributes: [.posixPermissions: 0o600]) else {
+                return CommandResult(status: -1, output: "Could not capture OpenClaw status output")
+            }
+            let output = try FileHandle(forWritingTo: outputURL)
+            defer { try? output.close() }
+            process.executableURL = executable
+            process.arguments = arguments
+            process.standardOutput = output
+            process.standardError = output
+            let exit = ProcessExitNotification(process)
+            defer { process.terminationHandler = nil }
             try process.run()
+            _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
+            let status = waitForCommand(process, exit: exit, timeout: timeout)
+            try output.synchronize()
+            let data = try Data(contentsOf: outputURL)
+            if status == -2 { return CommandResult(status: status, output: "OpenClaw status check timed out") }
+            return CommandResult(status: status,
+                output: String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
         } catch {
             return CommandResult(status: -1, output: error.localizedDescription)
         }
-
-        let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-        if process.isRunning {
-            process.terminate()
-            return CommandResult(status: -2, output: "OpenClaw status check timed out")
-        }
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        return CommandResult(
-            status: process.terminationStatus,
-            output: String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        )
     }
 
     /// Runs commands whose output may contain an authenticated local URL.
     /// Neither stdout nor stderr is captured, logged, or surfaced by TaskPilot.
-    private static func runDiscardingOutput(
+    static func runDiscardingOutput(
         executable: URL,
         arguments: [String],
         timeout: TimeInterval
@@ -316,21 +323,30 @@ final class OpenClawService {
         process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
+        let exit = ProcessExitNotification(process)
+        defer { process.terminationHandler = nil }
         do {
             try process.run()
+            _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
         } catch {
             return -1
         }
 
-        let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning && Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.05)
+        return waitForCommand(process, exit: exit, timeout: timeout)
+    }
+
+    private static func waitForCommand(_ process: Process, exit: ProcessExitNotification, timeout: TimeInterval) -> Int32 {
+        if case .exited(let status) = exit.wait(until: .now() + timeout) { return status }
+        if process.isRunning { process.terminate() }
+        _ = exit.waitForExit(until: .now() + 1)
+        // Descendants may outlive a terminated shell; clean up the owned group.
+        if Darwin.kill(-process.processIdentifier, SIGKILL) != 0, process.isRunning {
+            Darwin.kill(process.processIdentifier, SIGKILL)
         }
-        if process.isRunning {
-            process.terminate()
-            return -2
-        }
-        return process.terminationStatus
+        // A timed-out process still owns its output until its actual exit.
+        // Never publish a result or release its handles while it can write.
+        _ = exit.waitForExit()
+        return -2
     }
 
     private func consumeAutomatedSetupOutput(_ data: Data) {

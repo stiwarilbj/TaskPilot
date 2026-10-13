@@ -12,6 +12,7 @@ final class TaskLease: @unchecked Sendable {
     private var suspensions = 0
     private var artifacts: Set<URL> = []
     private var screenText: (revision: String, suspension: Int, snapshot: ScreenTextSnapshot)?
+    private var revocationObservers: [UUID: @Sendable () -> Void] = [:]
     init(id: String = UUID().uuidString) {
         self.id = id; self.actionReceipts = ActionReceiptStore(generation: id)
     }
@@ -20,7 +21,25 @@ final class TaskLease: @unchecked Sendable {
     var suspensionRevision: Int { lock.lock(); defer { lock.unlock() }; return suspensions }
     func pause() { lock.lock(); defer { lock.unlock() }; if value == .running { value = .paused; suspensions += 1 } }
     func resume() { lock.lock(); defer { lock.unlock() }; if value == .paused { value = .running } }
-    func revoke() { lock.lock(); defer { lock.unlock() }; if value != .retired { value = .draining } }
+    func revoke() {
+        lock.lock()
+        if value != .retired { value = .draining }
+        let observers = Array(revocationObservers.values); revocationObservers.removeAll()
+        lock.unlock()
+        for observer in observers { observer() }
+    }
+    func observeRevocation(_ observer: @escaping @Sendable () -> Void) -> UUID {
+        let token = UUID()
+        lock.lock()
+        let revoked = value == .draining || value == .retired
+        if !revoked { revocationObservers[token] = observer }
+        lock.unlock()
+        if revoked { observer() }
+        return token
+    }
+    func removeRevocationObserver(_ token: UUID) {
+        lock.lock(); revocationObservers.removeValue(forKey: token); lock.unlock()
+    }
     func ownArtifact(_ url: URL) throws {
         lock.lock(); defer { lock.unlock() }
         guard value == .running || value == .paused else { try? FileManager.default.removeItem(at: url); throw CancellationError() }
@@ -41,7 +60,9 @@ final class TaskLease: @unchecked Sendable {
         return screenText?.snapshot
     }
     func retire() {
-        lock.lock(); value = .retired; let files = artifacts; artifacts.removeAll(); screenText = nil; lock.unlock()
+        lock.lock(); value = .retired; let files = artifacts; artifacts.removeAll(); screenText = nil
+        let observers = Array(revocationObservers.values); revocationObservers.removeAll(); lock.unlock()
+        for observer in observers { observer() }
         actionReceipts.discard()
         for url in files { try? FileManager.default.removeItem(at: url) }
     }

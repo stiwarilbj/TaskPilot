@@ -39,6 +39,7 @@ final class TaskToolExecutor {
     static let maximumCommandTimeout = TimeInterval(ActionContract.limit("command_timeout"))
     private let commandLock = NSLock()
     private var activeCommand: Process?
+    private var activeCommandExit: ProcessExitNotification?
     private var commandCancelled = false
     private var commandPaused = false
     private let capabilityLock = NSLock()
@@ -68,14 +69,16 @@ final class TaskToolExecutor {
     /// can acknowledge delivery of the original command or prove its outcome.
     func inspectCommand(action input: [String: Any]) async throws -> [String: Any] {
         try await TaskOwnership.checkpoint()
-        return try TaskOwnership.$actionReceipt.withValue(nil) {
-            var probes = 0, hits = 0
-            do { return try prepareCommand(input, diagnostics: { probes = $0; hits = $1 }).result }
-            catch let error as TaskToolError {
-                return ["ready": false, "error_code": error.code, "message": error.localizedDescription,
-                        "capability_version": CommandCapabilities.version, "probes": probes, "cache_hits": hits]
+        return try await withTaskCancellationHandler {
+            try TaskOwnership.$actionReceipt.withValue(nil) {
+                var probes = 0, hits = 0
+                do { return try prepareCommand(input, diagnostics: { probes = $0; hits = $1 }).result }
+                catch let error as TaskToolError {
+                    return ["ready": false, "error_code": error.code, "message": error.localizedDescription,
+                            "capability_version": CommandCapabilities.version, "probes": probes, "cache_hits": hits]
+                }
             }
-        }
+        } onCancel: { self.cancelActiveCommand() }
     }
 
     func perform(action input: [String: Any], commandBindingID: String? = nil) async throws -> [String: Any] {
@@ -86,7 +89,10 @@ final class TaskToolExecutor {
         switch ActionKind(rawValue: action["type"] as! String)! {
         case .read_file: return try readFile(action)
         case .write_file: return try writeFile(action)
-        case .run_command: return try runCommand(action, bindingID: commandBindingID)
+        case .run_command:
+            return try await withTaskCancellationHandler {
+                try runCommand(action, bindingID: commandBindingID)
+            } onCancel: { self.cancelActiveCommand() }
         case .none, .press, .focus, .set_value, .click, .double_click, .type_text, .key, .scroll, .launch_app, .open_route, .wait, .navigate_browser:
             throw TaskToolError.invalidAction("Unsupported task tool: \(action["type"]!)")
         }
@@ -144,19 +150,22 @@ final class TaskToolExecutor {
     }
 
     func pauseActiveCommand() {
-        commandLock.lock(); commandPaused = true; commandLock.unlock()
-        signalActiveCommand(SIGSTOP)
+        commandLock.lock(); commandPaused = true; let process = activeCommand; commandLock.unlock()
+        Self.signal(process, SIGSTOP)
     }
 
     func resumeActiveCommand() {
-        commandLock.lock(); commandPaused = false; commandLock.unlock()
-        signalActiveCommand(SIGCONT)
+        commandLock.lock(); commandPaused = false; let process = activeCommand; commandLock.unlock()
+        Self.signal(process, SIGCONT)
     }
 
     func cancelActiveCommand() {
-        commandLock.lock(); commandCancelled = true; commandLock.unlock()
-        signalActiveCommand(SIGCONT)
-        signalActiveCommand(SIGTERM)
+        commandLock.lock(); commandCancelled = true
+        let process = activeCommand, exit = activeCommandExit
+        commandLock.unlock()
+        exit?.interrupt()
+        Self.signal(process, SIGCONT)
+        Self.signal(process, SIGTERM)
     }
 
     private func readFile(_ action: [String: Any]) throws -> [String: Any] {
@@ -551,6 +560,13 @@ final class TaskToolExecutor {
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = stdoutHandle
         process.standardError = stderrHandle
+        let exit = ProcessExitNotification(process)
+        defer { process.terminationHandler = nil }
+        let lease = TaskOwnership.current
+        let revocation = lease?.observeRevocation { exit.interrupt() }
+        defer { if let revocation { lease?.removeRevocationObserver(revocation) } }
+        let outputMonitor = probe ? CommandOutputLimitMonitor(handles: [stdoutHandle, stderrHandle], exit: exit) : nil
+        defer { outputMonitor?.stop() }
 
         // Always acquire the ownership gate before the command lock. Pause
         // cannot strand a launcher holding the lock Resume needs.
@@ -563,6 +579,7 @@ final class TaskToolExecutor {
                 catch { throw TaskToolError.operationFailed("Could not start the command: \(error.localizedDescription)") }
                 _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
                 activeCommand = process
+                activeCommandExit = exit
                 if commandPaused, Darwin.kill(-process.processIdentifier, SIGSTOP) != 0 {
                     Darwin.kill(process.processIdentifier, SIGSTOP)
                 }
@@ -575,44 +592,35 @@ final class TaskToolExecutor {
         else { try launch() }
         defer {
             commandLock.lock()
-            if activeCommand === process { activeCommand = nil }
+            if activeCommand === process { activeCommand = nil; activeCommandExit = nil }
             commandLock.unlock()
         }
-        let deadline = ProcessInfo.processInfo.systemUptime + timeout
-        var outputExceeded = false
-        while process.isRunning && ProcessInfo.processInfo.systemUptime < deadline {
-            if Task.isCancelled || (TaskOwnership.current?.state == .draining) || (TaskOwnership.current?.state == .retired) { cancelActiveCommand() }
-            commandLock.lock(); let cancelled = commandCancelled; commandLock.unlock()
-            if cancelled { break }
-            if probe {
-                let size = [stdoutURL, stderrURL].reduce(0) { total, url in
-                    total + ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue ?? 0)
-                }
-                if size > CommandCapabilities.outputLimit { outputExceeded = true; break }
-            }
-            Thread.sleep(forTimeInterval: 0.025)
+        let interrupted: Bool
+        switch exit.wait(until: .now() + timeout) {
+        case .exited: interrupted = false
+        case .interrupted, .timedOut: interrupted = true
         }
-        let timedOut = process.isRunning || outputExceeded
+        let timedOut = interrupted || outputMonitor?.exceeded == true
         if timedOut {
-            signalActiveCommand(SIGCONT)
-            signalActiveCommand(SIGTERM)
-            let terminationDeadline = Date().addingTimeInterval(1)
-            while process.isRunning && Date() < terminationDeadline { Thread.sleep(forTimeInterval: 0.025) }
+            Self.signal(process, SIGCONT)
+            Self.signal(process, SIGTERM)
+            _ = exit.waitForExit(until: .now() + 1)
             // Also kill children that outlive their shell.
             if Darwin.kill(-process.processIdentifier, SIGKILL) != 0, process.isRunning {
                 Darwin.kill(process.processIdentifier, SIGKILL)
             }
         }
-        process.waitUntilExit()
+        let status = exit.waitForExit()!
+        outputMonitor?.stop()
         if probe { _ = Darwin.kill(-process.processIdentifier, SIGKILL) }
         commandLock.lock(); let cancelled = commandCancelled; commandLock.unlock()
-        if cancelled || Task.isCancelled {
+        if cancelled || Task.isCancelled || lease?.state == .draining || lease?.state == .retired {
             Darwin.kill(-process.processIdentifier, SIGKILL)
             throw CancellationError()
         }
         try? stdoutHandle.synchronize(); try? stderrHandle.synchronize()
         do {
-            return (process.terminationStatus, timedOut, try Self.boundedText(from: stdoutURL), try Self.boundedText(from: stderrURL))
+            return (status, timedOut, try Self.boundedText(from: stdoutURL), try Self.boundedText(from: stderrURL))
         } catch {
             if probe || prefix == "syntax" { throw TaskToolError.operationFailed("Preflight output could not be read; the command was not executed") }
             throw TaskToolError.uncertainDelivery("The command ended, but its output could not be read; inspect its effects before running it again")
@@ -657,10 +665,7 @@ final class TaskToolExecutor {
         )
     }
 
-    private func signalActiveCommand(_ signal: Int32) {
-        commandLock.lock()
-        let process = activeCommand
-        commandLock.unlock()
+    private static func signal(_ process: Process?, _ signal: Int32) {
         guard let process, process.isRunning else { return }
         if Darwin.kill(-process.processIdentifier, signal) != 0 {
             Darwin.kill(process.processIdentifier, signal)
@@ -668,4 +673,50 @@ final class TaskToolExecutor {
     }
 
 
+}
+
+/// Probe output is capped through file-change notifications, independently of
+/// process lifetime. A final size check covers coalesced or delayed events.
+private final class CommandOutputLimitMonitor {
+    private let queue = DispatchQueue(label: "com.orbitagent.command-output-limit")
+    private let cancellations = DispatchGroup()
+    private let descriptors: [Int32]
+    private var sources: [DispatchSourceFileSystemObject] = []
+    private var stopped = false
+
+    init(handles: [FileHandle], exit: ProcessExitNotification) {
+        descriptors = handles.map(\.fileDescriptor)
+        for descriptor in descriptors {
+            let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: descriptor, eventMask: [.write, .extend], queue: queue)
+            source.setEventHandler { [weak self] in
+                guard let self, !self.stopped else { return }
+                if self.outputExceeded() { exit.interrupt() }
+            }
+            cancellations.enter()
+            source.setCancelHandler { [cancellations] in cancellations.leave() }
+            sources.append(source)
+            source.resume()
+        }
+    }
+
+    private func outputExceeded() -> Bool {
+        let size = descriptors.reduce(Int64(0)) { total, descriptor in
+            var info = stat()
+            return total + (Darwin.fstat(descriptor, &info) == 0 ? info.st_size : 0)
+        }
+        return size > CommandCapabilities.outputLimit
+    }
+
+    var exceeded: Bool { queue.sync { outputExceeded() } }
+
+    func stop() {
+        queue.sync {
+            guard !stopped else { return }
+            stopped = true
+            for source in sources { source.cancel() }
+            sources.removeAll()
+        }
+        // A descriptor cannot be closed/reused until its source has retired.
+        cancellations.wait()
+    }
 }
