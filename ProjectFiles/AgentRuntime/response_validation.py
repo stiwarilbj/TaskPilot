@@ -10,13 +10,14 @@ from expected_effects import validate_expectation, ExpectedEffectError
 from command_intents import explicit_operation, matches_explicit_request
 from local_text_recognition import coordinate_text_target, TextRecognitionError
 from task_inputs import InputReferenceError, reject_unbound_references
+from evidence_consistency import validate_disagreement
 
 from action_contract_generated import (
     CONTRACT_HASH, CONTRACT_VERSION, VALID_ACTIONS, KEYS,
     ActionContractError, validate_action,
 )
 
-VALIDATION_VERSION = 10
+VALIDATION_VERSION = 11
 
 
 class ResponseValidationError(RuntimeError):
@@ -133,6 +134,8 @@ def validate_response(value: dict[str, Any], purpose: str, observation: dict[str
         else: reject_unbound_references(value)
     except InputReferenceError as error: raise ResponseValidationError(str(error)) from error
     result = dict(value)
+    if 'evidence_disagreement' in result:
+        validate_disagreement(result['evidence_disagreement'], observation, ledger, fail)
     for key in ("summary", "context_used", "visual_evidence", "intended_target", "output", "output_title", "reason", "message", "title", "check"):
         if key in result: string(result[key], key)
     if 'expected_result' in result:

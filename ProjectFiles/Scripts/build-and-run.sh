@@ -52,6 +52,7 @@ if [[ ! -x "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/local_text_recognition.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/screen_coordinates.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/expected_effects.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
+      || "$PROJECT_FILES_DIR/AgentRuntime/evidence_consistency.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/command_intents.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/prompt_compiler.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/request_policy.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
@@ -65,6 +66,10 @@ mkdir -p "$APP_MACOS" "$APP_RESOURCES"
 cp "$BUILD_BINARY" "$APP_BINARY"
 cp -R "$RUNTIME_SOURCE" "$RUNTIME_DESTINATION"
 cp -R "$OPENCLAW_RESOURCES" "$APP_RESOURCES/OpenClaw"
+# Offline setup checks may create ignored Python caches beside the sources.
+# Do not seal files that are absent from GitHub's source checkout/ZIP.
+find "$APP_RESOURCES/OpenClaw" -type d -name __pycache__ -prune -exec rm -rf {} +
+find "$APP_RESOURCES/OpenClaw" -type f -name '*.pyc' -delete
 chmod +x \
   "$APP_BINARY" \
   "$RUNTIME_DESTINATION/orbit_openclaw_runtime" \

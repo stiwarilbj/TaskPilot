@@ -57,6 +57,84 @@ final class LocalTextRecognitionTests: XCTestCase {
         XCTAssertTrue(result.targets.isEmpty); XCTAssertTrue(result.crops.isEmpty)
     }
 
+    func testConflictingExposedLabelsAreRetainedButNormalAgreementsStayNative() async throws {
+        let row: [String: Any] = ["pid": 42, "id": "ax:save", "role": "AXButton", "title": "Save",
+            "actions": ["AXPress"], "frame": ["x": 90, "y": 90, "width": 120, "height": 50]]
+        for text in ["Delete", "Save"] {
+            let result = try await LocalTextRecognition.supplement(image: image(), coordinates: mapping(),
+                snapshot: snapshot(elements: [row]), scene: scene(), keywords: [], budget: 1,
+                recognize: { _, _, _ in [self.match(text: text)] })
+            XCTAssertEqual(result.targets.count, text == "Delete" ? 1 : 0)
+            if let target = result.targets.first { XCTAssertEqual(target.match.text, "Delete") }
+        }
+    }
+
+    func testTargetedInspectionIncludesBothOpposingAndAgreeingLabelsInCompleteTree() async throws {
+        let row: [String: Any] = ["pid": 42, "id": "ax:save", "role": "AXButton", "title": "Save",
+            "actions": ["AXPress"], "frame": ["x": 90, "y": 90, "width": 120, "height": 50]]
+        for text in ["Delete", "Save"] {
+            var calls = 0
+            let result = try await LocalTextRecognition.supplement(image: image(), coordinates: mapping(),
+                snapshot: snapshot(elements: [row], available: true, partial: false), scene: scene(), keywords: [],
+                budget: 1, inspectionPID: 42, recognize: { _, _, _ in calls += 1; return [self.match(text: text)] })
+            XCTAssertEqual(calls, 1); XCTAssertEqual(result.targets.count, 1)
+            let metadata = try result.metadata(revision: "fresh", coordinates: mapping())
+            let target = try XCTUnwrap((metadata["targets"] as? [[String: Any]])?.first)
+            XCTAssertEqual(target["text"] as? String, text)
+            XCTAssertEqual(target["provisional"] as? Bool, true)
+            XCTAssertNil(target["element_id"])
+        }
+    }
+
+    func testForcedInspectionCannotIncludeSecureAppsOrInventMissingPID() async throws {
+        for (pid, rows) in [(42, [["pid": 42, "role": "AXSecureTextField"] as [String: Any]]),
+                            (43, [["pid": 42, "role": "AXButton"] as [String: Any]])] {
+            var calls = 0
+            let result = try await LocalTextRecognition.supplement(image: image(), coordinates: mapping(),
+                snapshot: snapshot(elements: rows, available: true, partial: false), scene: scene(), keywords: [],
+                budget: 1, inspectionPID: pid, recognize: { _, _, _ in calls += 1; return [self.match()] })
+            XCTAssertEqual(calls, 0); XCTAssertTrue(result.targets.isEmpty)
+        }
+    }
+
+    func testControlEvidenceRequiresWholeBoundsKnownRoleAndHighConfidence() {
+        let row: [String: Any] = ["role": "AXButton", "title": "Save",
+            "frame": ["x": 90, "y": 90, "width": 120, "height": 50]]
+        XCTAssertTrue(ControlEvidencePolicy.disagrees(match(text: "Delete"), with: row))
+        XCTAssertFalse(ControlEvidencePolicy.disagrees(match(text: "Save…"), with: row))
+        XCTAssertFalse(ControlEvidencePolicy.disagrees(match(text: "Save"), with: ["title": "Save Report", "role": "AXButton", "frame": row["frame"]!]))
+        XCTAssertFalse(ControlEvidencePolicy.disagrees(match(text: "Delete", confidence: 0.89), with: row))
+        XCTAssertFalse(ControlEvidencePolicy.disagrees(match(text: "Delete", x: 200), with: row))
+        XCTAssertFalse(ControlEvidencePolicy.disagrees(match(text: "Delete"), with: ["role": "AXWindow", "title": "Save", "frame": row["frame"]!]))
+        XCTAssertFalse(ControlEvidencePolicy.disagrees(match(text: "Delete"), with: ["role": "AXButton", "frame": row["frame"]!]))
+        XCTAssertEqual(ControlEvidencePolicy.normalized("  ＳＡＶＥ… "), "save")
+        XCTAssertEqual(ControlEvidencePolicy.normalized("Straße"), ControlEvidencePolicy.normalized("STRASSE"))
+        XCTAssertEqual(ControlEvidencePolicy.normalized(".Save."), ".save")
+    }
+
+    func testInspectionPIDIsPrivateStrictMetadata() throws {
+        XCTAssertEqual(ControlEvidencePolicy.version, 1)
+        XCTAssertNil(try ControlEvidencePolicy.inspectionPID(nil))
+        XCTAssertEqual(try ControlEvidencePolicy.inspectionPID(NSNumber(value: 42)), 42)
+        for invalid: Any in [true, false, "42", 0, -1, 1.5, Double.infinity, Double.nan, Double(Int32.max) + 1, NSNull()] {
+            XCTAssertThrowsError(try ControlEvidencePolicy.inspectionPID(invalid))
+        }
+    }
+
+    func testConflictingLabelSurvivesTargetLimitAheadOfMisleadingTaskKeyword() async throws {
+        let matches = (0..<60).map { i in ScreenTextMatch(text: "Save", confidence: 0.99,
+            frame: CGRect(x: 100 + i % 10 * 80, y: 50 + i / 10 * 40, width: 60, height: 20)) } +
+            [ScreenTextMatch(text: "Delete", confidence: 0.99, frame: CGRect(x: 850, y: 450, width: 60, height: 20))]
+        let row: [String: Any] = ["pid": 42, "role": "AXButton", "title": "Save", "actions": ["AXPress"],
+            "frame": ["x": 840, "y": 440, "width": 100, "height": 50]]
+        let result = try await LocalTextRecognition.supplement(image: image(), coordinates: mapping(),
+            snapshot: snapshot(elements: [row]), scene: scene(), keywords: ["save"], budget: 1,
+            recognize: { _, _, _ in matches })
+        XCTAssertEqual(result.targets.count, 48)
+        XCTAssertEqual(result.targets.first?.match.text, "Delete")
+        XCTAssertEqual(result.state, "partial")
+    }
+
     func testWindowRaiseAndMenuBarActionsDoNotHideAPoorlyExposedCanvas() {
         let rows: [[String: Any]] = [["pid": 42, "role": "AXWindow", "actions": ["AXRaise"]],
                                     ["pid": 42, "role": "AXMenuBarItem", "actions": ["AXPress"]]]

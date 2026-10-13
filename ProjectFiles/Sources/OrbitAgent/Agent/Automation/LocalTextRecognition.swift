@@ -136,9 +136,15 @@ enum LocalTextRecognition {
     /// No extra capture, model call, synthesized PID or executable element ID.
     static func supplement(image: CGImage, coordinates: ScreenCoordinateMapping,
                            snapshot: AccessibilitySnapshot, scene: String, keywords: [String],
-                           budget: TimeInterval, recognize: Recognizer = recognize) async throws -> ScreenTextSnapshot {
+                           budget: TimeInterval, inspectionPID: Int? = nil,
+                           recognize: Recognizer = recognize) async throws -> ScreenTextSnapshot {
         try await TaskOwnership.checkpoint()
-        let needed = neededPIDs(snapshot)
+        var needed = neededPIDs(snapshot)
+        if let inspectionPID, snapshot.applications.contains(where: { $0["pid"] as? Int == inspectionPID }),
+           !snapshot.elements.contains(where: { $0["pid"] as? Int == inspectionPID &&
+               (AutomationTextEntryPolicy.isSecure(role: $0["role"] as? String ?? "", subrole: $0["subrole"] as? String ?? "") || $0["value"] as? String == "[secure]") }) {
+            needed.insert(inspectionPID)
+        }
         guard !needed.isEmpty else { return ScreenTextSnapshot() }
         var result = ScreenTextSnapshot(state: "partial")
         let allWindows = windows(scene: scene)
@@ -151,6 +157,7 @@ enum LocalTextRecognition {
             window.layer == 0 && needed.contains(window.pid) && window.frame.intersects(coordinates.displayBounds) &&
                 !allWindows.contains { securePIDs.contains($0.pid) && $0.frame.intersects(window.frame) }
         }.sorted { a, b in
+            if (a.pid == inspectionPID) != (b.pid == inspectionPID) { return a.pid == inspectionPID }
             let aIndex = appOrder.firstIndex(of: a.pid) ?? Int.max
             let bIndex = appOrder.firstIndex(of: b.pid) ?? Int.max
             return aIndex == bIndex ? allWindows.firstIndex(of: a)! < allWindows.firstIndex(of: b)! : aIndex < bIndex
@@ -178,28 +185,44 @@ enum LocalTextRecognition {
                 // the entire label, not just a guessed application rectangle.
                 let points = [center, match.frame.origin, CGPoint(x: match.frame.maxX - 0.01, y: match.frame.maxY - 0.01)]
                 guard points.allSatisfy({ point in allWindows.first { $0.frame.contains(point) } == window }) else { continue }
-                let exposed = snapshot.elements.contains { row in
+                let exposed = snapshot.elements.filter { row in
                     guard row["pid"] as? Int == window.pid,
                           (row["actions"] as? [String])?.contains("AXPress") == true,
                           !["AXWindow", "AXApplication", "AXGroup", "AXWebArea", "AXScrollArea"].contains(row["role"] as? String ?? ""),
                           let f = frame(row["frame"]) else { return false }
                     return f.contains(center)
                 }
-                guard !exposed else { continue } // Prefer the existing native control.
+                // Preserve an actual disagreement. Native controls still own
+                // execution; neither label silently replaces the other.
+                if !exposed.isEmpty && window.pid != inspectionPID &&
+                    !exposed.contains(where: { ControlEvidencePolicy.disagrees(match, with: $0) }) { continue }
                 result.targets.append(ScreenTextTarget(match: match, window: window))
             }
         }
         let tokens = Set(keywords.map { $0.lowercased() })
-        result.targets.sort { a, b in
-            func score(_ target: ScreenTextTarget) -> Int {
-                let words = Set(target.match.text.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init))
-                return words.intersection(tokens).count
-            }
-            if score(a) != score(b) { return score(a) > score(b) }
-            if a.window != b.window { return selected.firstIndex(of: a.window)! < selected.firstIndex(of: b.window)! }
-            if a.match.frame.minY != b.match.frame.minY { return a.match.frame.minY < b.match.frame.minY }
-            return a.match.frame.minX < b.match.frame.minX
+        let nativeLabels = snapshot.elements.compactMap { row -> (Int, CGRect, [String: Any])? in
+            guard let pid = row["pid"] as? Int, ControlEvidencePolicy.labelRoles.contains(row["role"] as? String ?? ""),
+                  let bounds = frame(row["frame"]) else { return nil }
+            return (pid, bounds, row)
         }
+        // Compute priority once, rather than re-reading every native frame
+        // inside the sort. Opposing labels must survive the bounded list even
+        // when an agreeing task keyword would otherwise outrank them.
+        result.targets = result.targets.enumerated().map { index, target in
+            let conflict = nativeLabels.contains { pid, bounds, row in
+                pid == target.window.pid && bounds.contains(target.match.frame) &&
+                    ControlEvidencePolicy.disagrees(target.match, with: row)
+            }
+            let words = Set(target.match.text.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init))
+            return (target: target, conflict: conflict, score: words.intersection(tokens).count, index: index)
+        }.sorted { a, b in
+            if a.conflict != b.conflict { return a.conflict }
+            if a.score != b.score { return a.score > b.score }
+            if a.target.window != b.target.window { return selected.firstIndex(of: a.target.window)! < selected.firstIndex(of: b.target.window)! }
+            if a.target.match.frame.minY != b.target.match.frame.minY { return a.target.match.frame.minY < b.target.match.frame.minY }
+            if a.target.match.frame.minX != b.target.match.frame.minX { return a.target.match.frame.minX < b.target.match.frame.minX }
+            return a.index < b.index
+        }.map(\.target)
         let total = result.targets.count
         result.targets = Array(result.targets.prefix(maximumTargets))
         result.state = finished == selected.count && total <= maximumTargets ? "recognized" : "partial"

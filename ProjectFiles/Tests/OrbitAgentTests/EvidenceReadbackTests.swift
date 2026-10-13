@@ -110,6 +110,8 @@ final class EvidenceReadbackTests: XCTestCase {
         XCTAssertNil(try JSONDecoder().decode(AgentRequestMetrics.self, from: legacy).evidenceChecks)
         XCTAssertNil(try JSONDecoder().decode(AgentRequestMetrics.self, from: legacy).dependencyChecks)
         XCTAssertNil(try JSONDecoder().decode(AgentRequestMetrics.self, from: legacy).dependencyRejections)
+        XCTAssertNil(try JSONDecoder().decode(AgentRequestMetrics.self, from: legacy).conflictInspections)
+        XCTAssertNil(try JSONDecoder().decode(AgentRequestMetrics.self, from: legacy).evidenceConflicts)
         let current = Data("{\"planning\":1,\"verification\":1,\"retries\":0,\"modelSwitches\":0,\"cacheHits\":0,\"reconnects\":0,\"evidenceChecks\":2,\"coverageRejections\":1,\"requirementsProven\":3}".utf8)
         let result = try JSONDecoder().decode(AgentRequestMetrics.self, from: current)
         XCTAssertEqual(result.evidenceChecks, 2)
@@ -122,5 +124,10 @@ final class EvidenceReadbackTests: XCTestCase {
         XCTAssertEqual(guarded.dependencyChecks, 2)
         XCTAssertEqual(guarded.dependencyRejections, 1)
         XCTAssertEqual(guarded.summary, "1 TaskPilot calls · 1 planning · 0 verification · 0 retries · 0 switches · 0 reused · 0 reconnects · provider retry count unavailable")
+        let conflicts = Data("{\"planning\":1,\"verification\":0,\"retries\":0,\"model_switches\":0,\"cache_hits\":0,\"reconnects\":0,\"conflict_inspections\":2,\"evidence_conflicts\":1}".utf8)
+        let inspected = try decoder.decode(AgentRequestMetrics.self, from: conflicts)
+        XCTAssertEqual(inspected.conflictInspections, 2)
+        XCTAssertEqual(inspected.evidenceConflicts, 1)
+        XCTAssertEqual(inspected.summary, guarded.summary)
     }
 }

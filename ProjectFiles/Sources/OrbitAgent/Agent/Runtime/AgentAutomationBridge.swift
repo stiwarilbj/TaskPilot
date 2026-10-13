@@ -98,6 +98,7 @@ final class AgentAutomationBridge {
 
             switch method {
             case "observe":
+                let inspectionPID = try ControlEvidencePolicy.inspectionPID(params["evidence_inspection_pid"])
                 // The visual pointer is an action-only indicator. Hide it
                 // before every screenshot so an idle cursor never obscures
                 // page text or becomes part of the model's visual context.
@@ -151,7 +152,7 @@ final class AgentAutomationBridge {
                             screenText = try await LocalTextRecognition.supplement(image: captured.image,
                                 coordinates: captured.coordinates, snapshot: snapshot,
                                 scene: self.accessibility.observationScene(on: observationDisplay), keywords: keywords,
-                                budget: recognitionDeadline - ProcessInfo.processInfo.systemUptime)
+                                budget: recognitionDeadline - ProcessInfo.processInfo.systemUptime, inspectionPID: inspectionPID)
                         } catch { lease.discardArtifact(captured.url); throw error }
                         return captured.url
                     },

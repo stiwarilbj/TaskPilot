@@ -59,8 +59,9 @@ from observation_completeness import (OBSERVATION_COMPLETENESS_VERSION, Observat
 from local_text_recognition import (TEXT_RECOGNITION_VERSION, TextRecognitionError,
                                     validate_text_recognition, prompt_text_recognition, detail_images)
 from task_evidence import TaskEvidenceLedger, CHECKLIST_VERSION, LARGEST_PATTERN, digest as evidence_digest
-from expected_effects import ExpectedEffect, EXPECTED_EFFECT_VERSION, FILE_EFFECTS
+from expected_effects import ExpectedEffect, EXPECTED_EFFECT_VERSION, FILE_EFFECTS, path_key
 from task_inputs import TASK_INPUT_VERSION, input_reference_rules
+from evidence_consistency import EvidenceConsistency, EVIDENCE_CONSISTENCY_VERSION
 
 from response_validation import (
     VALIDATION_VERSION, ResponseValidationError, extract_json_object, bind_command_outcomes,
@@ -2189,10 +2190,13 @@ def verification_checklist_instruction(ledger: TaskEvidenceLedger) -> str:
 
 def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int,
                            history: list[dict[str, Any]], router: TaskModelRouter,
-                           client: ACPClient, ledger: TaskEvidenceLedger) -> bool:
+                           client: ACPClient, ledger: TaskEvidenceLedger,
+                           evidence_guard: EvidenceConsistency | None = None) -> bool:
     emit("status", message="Checking evidence for every requested requirement…")
+    evidence_guard = evidence_guard or EvidenceConsistency()
     rechecks = ledger.recheck_actions()
     effect_checks = ledger.recheck_effects()
+    prior_evidence = [e for e in ledger.evidence.values() if e["valid"] and e["mutable"]]
     ledger.invalidate(lambda e: e["mutable"])
     for action in rechecks:
         try:
@@ -2202,10 +2206,25 @@ def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int
             # A failed readback leaves its requirements unproven. No mutation
             # or command is repeated to obtain proof.
             continue
+        known = set(ledger.evidence)
         ledger.record_action(action, result, recheck=True)
+        for check, actual in zip(result.get("requested_checks", []), result.get("checks", [])):
+            prior = next((e for e in reversed(prior_evidence) if ledger.matches(check, {**e, "valid": True})), None)
+            evidence_guard.note_native_check(check, {"requested_checks": [check], "checks": [actual]}, prior)
+        if action.get("type") == "read_file":
+            fresh = next((e for key, e in reversed(list(ledger.evidence.items())) if key not in known and e["valid"] and e["fact"].get("type") == "file_read"), None)
+            prior = next((e for e in reversed(prior_evidence) if e["fact"].get("path") == path_key(action["path"]) and e["fact"].get("content_sha256")), None)
+            evidence_guard.note_native_read(action, prior, fresh)
     for check in effect_checks:
         effect = ExpectedEffect(check, {})
-        checked = effect.wait_file(lambda value: bridge_call('check_effect', display_id, check=value), timeout=0)
+        captured = []
+        def read_check(value):
+            raw = bridge_call('check_effect', display_id, check=value)
+            captured.append(raw)
+            return raw
+        checked = effect.wait_file(read_check, timeout=0)
+        prior = next((e for e in reversed(prior_evidence) if ledger.matches(check, {**e, "valid": True})), None)
+        if captured: evidence_guard.note_native_check(check, captured[-1], prior)
         router.metrics['effect_checks'] = router.metrics.get('effect_checks', 0) + 1
         if checked['outcome'] == 'verified': ledger.record_effect(check, checked['evidence'])
     observation = bridge_call("observe", display_id)
@@ -2213,9 +2232,21 @@ def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int
     try:
         if not path.is_file(): raise RuntimeError(f"{PRODUCT_NAME} could not capture the completion check")
         ledger.observe(observation)
+        conflicts = evidence_guard.conflicts({"status": "done"}, observation, ledger)
+        if conflicts:
+            fresh, report = inspect_evidence(evidence_guard, conflicts, observation, display_id, ledger, router.metrics)
+            discard_observation_image(fresh)
+            history.append({"action": "evidence_inspection", "result": report})
+            return False  # Reconsider; never certify a conflicted candidate.
         verification = routed_json_prompt(router, client,
             verification_instruction(task, candidate, observation, history, ledger), path,
             purpose="verification", observation=observation, ledger=ledger)
+        conflicts = evidence_guard.conflicts(verification, observation, ledger)
+        if conflicts:
+            fresh, report = inspect_evidence(evidence_guard, conflicts, observation, display_id, ledger, router.metrics)
+            discard_observation_image(fresh)
+            history.append({"action": "evidence_inspection", "result": report})
+            return False
     finally:
         path.unlink(missing_ok=True)
     if not ledger.audit(verification):
@@ -2237,7 +2268,7 @@ def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int
 
 
 def prepare_dependency_action(decision: dict, display_id: int, ledger: TaskEvidenceLedger,
-                              metrics: dict) -> dict | None:
+                              metrics: dict, evidence_guard: EvidenceConsistency | None = None) -> dict | None:
     """Read-only prerequisite preflight; no model request or action receipt."""
     identifiers = ledger.action_requirements(decision)
     direct = {ref for identifier in identifiers for ref in ledger.requirements[identifier].get("depends_on", [])}
@@ -2251,12 +2282,31 @@ def prepare_dependency_action(decision: dict, display_id: int, ledger: TaskEvide
         check = requirement["check"]
         if check["type"] not in FILE_EFFECTS or evidence_digest(check) in seen: continue
         seen.add(evidence_digest(check))
+        prior = next((e for e in reversed(list(ledger.evidence.values())) if e["mutable"] and ledger.matches(check, e)), None)
         ledger.invalidate(lambda e: e["mutable"] and ledger.matches(check, e))
-        checked = ExpectedEffect(check, {}).wait_file(
-            lambda value: bridge_call("check_effect", display_id, check=value), timeout=0)
+        captured = []
+        def read_check(value):
+            raw = bridge_call("check_effect", display_id, check=value)
+            captured.append(raw)
+            return raw
+        checked = ExpectedEffect(check, {}).wait_file(read_check, timeout=0)
+        if evidence_guard and captured: evidence_guard.note_native_check(check, captured[-1], prior)
         metrics["dependency_checks"] = metrics.get("dependency_checks", 0) + 1
         if checked["outcome"] == "verified": ledger.record_effect(check, checked["evidence"])
     return ledger.check_prerequisites(decision, retain=True)
+
+
+def inspect_evidence(guard: EvidenceConsistency, conflicts: list, observation: dict,
+                     display_id: int, ledger: TaskEvidenceLedger, metrics: dict) -> tuple[dict, dict]:
+    def observe(pid, budget):
+        return bridge_call("observe", display_id, consistency_budget_ms=budget,
+                           **({"evidence_inspection_pid": pid} if pid is not None else {}))
+    fresh, report = guard.inspect(conflicts, observation, ledger, observe=observe,
+        readback=lambda method, payload: bridge_call(method, display_id,
+            **{"action" if method == "recheck" else "check": payload}),
+        discard=discard_observation_image, now=time.monotonic, sleep=time.sleep)
+    metrics.update(conflict_inspections=guard.inspections, evidence_conflicts=guard.rejections)
+    return fresh, report
 
 
 def publish_task_metrics(router: TaskModelRouter, client: ACPClient, ledger: TaskEvidenceLedger) -> None:
@@ -2351,7 +2401,7 @@ def routed_json_prompt(
     observation: dict[str, Any] | None = None,
     ledger: TaskEvidenceLedger | None = None,
 ) -> dict[str, Any]:
-    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, PROMPT_COMPILER_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, TASK_INPUT_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation)], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
+    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, PROMPT_COMPILER_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION, TASK_INPUT_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation)], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
     cached = getattr(client, "decision_cache", {})
     if cached.get("key") == key:
         value = validate_response(json.loads(json.dumps(cached["decision"])), purpose, observation, ledger)
@@ -2430,9 +2480,29 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
     loading_pid: int | None = None
     loading_waits = 0
     consecutive_dependency_blocks = 0
+    evidence_guard = EvidenceConsistency()
+    consecutive_evidence_conflicts = 0
+    def defer_for_evidence(decision: dict, observation: dict, step: int) -> bool:
+        nonlocal pending_observation, consecutive_evidence_conflicts
+        conflicts = evidence_guard.conflicts(decision, observation, ledger)
+        if not conflicts: return False
+        pending_observation, report = inspect_evidence(evidence_guard, conflicts, observation, display_id, ledger, model_router.metrics)
+        history.append({"step": step, "action": "evidence_inspection", "result": report})
+        consecutive_evidence_conflicts += 1
+        if consecutive_evidence_conflicts >= 3:
+            raise RuntimeError("TaskPilot could not reconcile the target's conflicting evidence after three fresh decisions; no dependent action was dispatched")
+        emit("status", message="Inspecting conflicting evidence before continuing…")
+        return True
+    def completion_rejected() -> None:
+        nonlocal consecutive_evidence_conflicts
+        if history and isinstance(history[-1].get("result"), dict) and history[-1]["result"].get("error_code") == "evidence_conflict":
+            consecutive_evidence_conflicts += 1
+            if consecutive_evidence_conflicts >= 3:
+                raise RuntimeError("TaskPilot could not reconcile completion evidence after three fresh decisions; completion remains unconfirmed")
     def defer_for_dependencies(decision: dict, observation: dict, step: int) -> bool:
         nonlocal consecutive_dependency_blocks
-        blocked = prepare_dependency_action(decision, display_id, ledger, model_router.metrics)
+        blocked = prepare_dependency_action(decision, display_id, ledger, model_router.metrics, evidence_guard)
+        if defer_for_evidence(decision, observation, step): return True
         if blocked is None:
             consecutive_dependency_blocks = 0
             return False
@@ -2515,6 +2585,8 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
             summary = str(decision.get("summary") or "OpenClaw inspected the screen")
             emit("status", message=summary)
 
+            if defer_for_evidence(decision, observation, step): continue
+
             if status == "needs_user":
                 if defer_for_dependencies(decision, observation, step): continue
                 input_target = decision_user_input_target(decision)
@@ -2550,8 +2622,9 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                     raise RuntimeError(reason)
 
             if status == "done":
-                if verify_task_completion(task, decision, display_id, history, model_router, client, ledger):
+                if verify_task_completion(task, decision, display_id, history, model_router, client, ledger, evidence_guard):
                     return
+                completion_rejected()
                 continue
 
             if status != "act":
@@ -2592,6 +2665,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
             if recovered_result:
                 result_message = recovered_result
                 consecutive_action_failures = 0
+                consecutive_evidence_conflicts = 0
             elif action_type == "wait":
                 seconds = float(action.get("seconds", action_default("wait", "seconds")))
                 pending_observation, settling = wait_for_screen_change(
@@ -2651,6 +2725,8 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                     continue
                 consecutive_action_failures = 0
                 action = bind_command_outcomes(action, result)
+                consecutive_evidence_conflicts = 0
+                evidence_guard.remember_native(action, observation, result)
                 result_message = result
                 model_router.metrics["action_deliveries"] += 1
                 pending_observation, result_message = verify_expected_effect(
@@ -2681,8 +2757,9 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                     and isinstance(result_message, dict) and result_message.get('verification_scope') != 'expected_effect_unconfirmed'):
                 discard_observation_image(pending_observation)
                 pending_observation = None
-                if verify_task_completion(task, decision, display_id, history, model_router, client, ledger):
+                if verify_task_completion(task, decision, display_id, history, model_router, client, ledger, evidence_guard):
                     return
+                completion_rejected()
         raise RuntimeError(f"{PRODUCT_NAME} reached its {MAX_STEPS}-step safety limit")
     except Exception:
         state.invalidate()
@@ -2740,6 +2817,8 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
             raise RuntimeError("TaskPilot observation completeness versions do not match; rebuild the bundled components together")
         if type(configuration.get("text_recognition_version")) is not int or configuration["text_recognition_version"] != TEXT_RECOGNITION_VERSION:
             raise RuntimeError("TaskPilot text recognition versions do not match; rebuild the bundled components together")
+        if type(configuration.get("evidence_consistency_version")) is not int or configuration["evidence_consistency_version"] != EVIDENCE_CONSISTENCY_VERSION:
+            raise RuntimeError("TaskPilot evidence inspection versions do not match; rebuild the bundled components together")
     api_key = configuration.get("gemini_api_key")
     if not isinstance(api_key, str):
         raise RuntimeError(f"{PRODUCT_NAME} did not provide the secure runtime configuration")

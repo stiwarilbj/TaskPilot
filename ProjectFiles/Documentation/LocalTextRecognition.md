@@ -13,7 +13,10 @@ Recognition runs off the main thread against the same captured image bracketed
 by Accessibility and Core Graphics checks. It returns word locations, confidence,
 surrounding line text, native app/window ownership, and repeated-label counts.
 Word boxes avoid placing a line's midpoint between neighboring buttons.
-Occluded labels and controls already supporting AXPress are excluded. Text is
+Occluded labels are excluded. Agreeing labels over controls already supporting
+AXPress normally stay native; high-confidence opposing labels remain visible.
+[Conflict inspection](EvidenceConsistency.md) retains both agreeing and opposing
+labels to reconcile the target locally. Text is
 untrusted observation data, never a control role or an executable element ID.
 No recognition result establishes that a control is enabled, focused, or that
 an action succeeded.
