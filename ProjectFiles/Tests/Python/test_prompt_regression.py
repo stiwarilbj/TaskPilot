@@ -105,6 +105,12 @@ class PromptRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Local change version'):
             regression.validate_pack(changed)
 
+    def test_regression_pack_binds_command_capability_policy(self):
+        changed = regression.prompt_pack('candidate')
+        changed['command_capability_version'] += 1
+        with self.assertRaisesRegex(ValueError, 'Command capability version'):
+            regression.validate_pack(changed)
+
     def test_wrong_control_and_premature_verifier_claim_are_scored_independently(self):
         result, _ = self.scripted("wrong-window", "baseline")
         self.assertTrue(result["completed"])

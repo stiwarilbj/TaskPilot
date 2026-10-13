@@ -175,7 +175,8 @@ final class AgentRuntimeProcess {
                 "coordinate_mapping_version": ScreenCoordinateMapping.version,
                 "observation_completeness_version": ObservationCollection<Int>.version,
                 "text_recognition_version": LocalTextRecognition.version,
-                "evidence_consistency_version": ControlEvidencePolicy.version
+                "evidence_consistency_version": ControlEvidencePolicy.version,
+                "command_capability_version": CommandCapabilities.version
             ])
             configuration.append(0x0A)
             try input.fileHandleForWriting.write(contentsOf: configuration)

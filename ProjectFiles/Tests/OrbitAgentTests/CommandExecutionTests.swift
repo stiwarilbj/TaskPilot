@@ -44,7 +44,7 @@ final class CommandExecutionTests: XCTestCase {
             _ = try await TaskToolExecutor().perform(action: ["type": "run_command", "command": script, "working_directory": root.path])
             XCTFail("Invalid shell source ran")
         } catch let error as TaskToolError {
-            XCTAssertEqual(error.code, "invalid_action")
+            XCTAssertEqual(error.code, "command_syntax")
             XCTAssertTrue(error.localizedDescription.contains("syntax check failed before execution"))
         }
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [])
@@ -69,7 +69,9 @@ final class CommandExecutionTests: XCTestCase {
             var action: [String: Any] = ["type": "run_command", "argv": ["/usr/bin/touch", root.appendingPathComponent("unexpected").path], "working_directory": root.path]
             action.merge(parameters) { _, value in value }
             do { _ = try await TaskToolExecutor().perform(action: action); XCTFail("Accepted \(parameters)") }
-            catch let error as TaskToolError { XCTAssertEqual(error.code, "invalid_action") }
+            catch let error as TaskToolError {
+                XCTAssertEqual(error.code, (parameters["argv"] as? [String]) == ["/missing/executable"] ? "command_tool_missing" : "invalid_action")
+            }
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("unexpected").path))
     }

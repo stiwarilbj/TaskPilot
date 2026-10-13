@@ -7,6 +7,7 @@ import CryptoKit
 /// pass through a shell; shell source is preserved and checked separately.
 struct CommandExecutionPolicy {
     let workingDirectory: URL
+    let workingDirectoryInput: URL
     let executable: URL
     let arguments: [String]
     let shellSource: String?
@@ -66,8 +67,9 @@ struct CommandExecutionPolicy {
     }
 
     init(action: [String: Any], environment: [String: String]) throws {
-        workingDirectory = try Self.absolutePath(action["working_directory"] ?? FileManager.default.homeDirectoryForCurrentUser.path,
-                                                 field: "working_directory").resolvingSymlinksInPath()
+        workingDirectoryInput = try Self.absolutePath(action["working_directory"] ?? FileManager.default.homeDirectoryForCurrentUser.path,
+                                                      field: "working_directory")
+        workingDirectory = workingDirectoryInput.resolvingSymlinksInPath()
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: workingDirectory.path, isDirectory: &isDirectory),
               isDirectory.boolValue, Darwin.access(workingDirectory.path, R_OK | X_OK) == 0 else {
@@ -127,7 +129,7 @@ struct CommandExecutionPolicy {
         return TaskToolExecutor.expandedFileURL(path)
     }
 
-    private static func resolveExecutable(_ name: String, cwd: URL, environment: [String: String]) throws -> URL {
+    static func resolveExecutable(_ name: String, cwd: URL, environment: [String: String]) throws -> URL {
         let candidates: [URL]
         if name.hasPrefix("/") || name.hasPrefix("~/") {
             candidates = [TaskToolExecutor.expandedFileURL(name)]
@@ -145,6 +147,6 @@ struct CommandExecutionPolicy {
                 return candidate
             }
         }
-        throw TaskToolError.invalidAction("argv[0] must identify an existing executable")
+        throw TaskToolError.commandCapability("command_tool_missing", "Executable '\(name)' was not found in the inspected PATH or working directory")
     }
 }

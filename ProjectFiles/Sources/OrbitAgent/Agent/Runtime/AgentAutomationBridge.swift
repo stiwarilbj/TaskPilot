@@ -17,6 +17,7 @@ final class AgentAutomationBridge {
         try lease.check()
         guard activeLease == nil || activeLease?.state == .retired else { throw RuntimeProcessError.alreadyRunning }
         activeLease = lease
+        taskTools.resetCommandCapabilities()
         observationDiagnostics = ObservationConsistencyDiagnostics()
     }
     private func owns(_ lease: TaskLease) -> Bool {
@@ -62,6 +63,13 @@ final class AgentAutomationBridge {
                 throw BridgeError.invalidRequest("Missing bridge method")
             }
             let params = request["params"] as? [String: Any] ?? [:]
+            if method == "inspect_command" {
+                guard let action = params["action"] as? [String: Any] else { throw BridgeError.invalidRequest("Missing command inspection payload") }
+                let result = try await taskTools.inspectCommand(action: action)
+                try lease.check()
+                return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
+                        "ok": true, "result": result]
+            }
             if method == "wait_file_effect" {
                 guard let input = params["check"] else { throw BridgeError.invalidRequest("Missing expected effect check") }
                 let check = try ActionContract.validateOutcomeCheck(input)
@@ -226,6 +234,7 @@ final class AgentAutomationBridge {
                 result = [
                     "task_generation_id": lease.id,
                     "local_change_notifications": true,
+                    "command_capability_version": CommandCapabilities.version,
                     "observation_revision": snapshot.revision,
                     "screenshot_path": screenshotURL.path,
                     "display": displayDictionary(observationDisplay),
@@ -259,7 +268,7 @@ final class AgentAutomationBridge {
                 let kind = ActionKind(rawValue: action["type"] as! String)!
                 result = try await TaskOwnership.$actionReceipt.withValue(receiptToken) {
                     if kind.owner == .task_tool {
-                        return try await taskTools.perform(action: action)
+                        return try await taskTools.perform(action: action, commandBindingID: params["command_inspection_id"] as? String)
                     } else {
                         guard kind.owner == .desktop else {
                             throw BridgeError.invalidRequest("Runtime-local actions cannot be dispatched to the native bridge")

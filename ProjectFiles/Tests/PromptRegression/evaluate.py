@@ -202,6 +202,7 @@ def prompt_pack(label="current", **rules):
             "recovery_cycle_version": RECOVERY_CYCLE_VERSION,
             "verification_session_version": runtime.VERIFICATION_SESSION_VERSION,
             "local_change_version": runtime.LOCAL_CHANGE_VERSION,
+            "command_capability_version": runtime.COMMAND_CAPABILITY_VERSION,
             **{field: rules.get(field) for field in RULE_FIELDS.values()}}
 
 
@@ -217,6 +218,8 @@ def validate_pack(pack):
         raise ValueError("Verification session version does not match")
     if type(pack.get("local_change_version")) is not int or pack["local_change_version"] != runtime.LOCAL_CHANGE_VERSION:
         raise ValueError("Local change version does not match")
+    if type(pack.get("command_capability_version")) is not int or pack["command_capability_version"] != runtime.COMMAND_CAPABILITY_VERSION:
+        raise ValueError("Command capability version does not match")
     for field in RULE_FIELDS.values():
         value = pack.get(field)
         if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > 16000):
@@ -289,6 +292,7 @@ class World:
             elements.append(element)
         windows = sorted({e.get("window_title", "Draft") for e in elements}) or ["Draft"]
         self.latest = {"observation_revision": revision, "screenshot_path": str(image), "local_change_notifications": True,
+                       "command_capability_version": runtime.COMMAND_CAPABILITY_VERSION,
                        "applications": [{"pid": 42, "name": "Fixture App", "active": True, "topmost_on_agent_screen": True,
                                          "windows": [{"title": w, "window_id": revision + ":window-" + w,
                                                       "focused": w == frame.get("active_window", "Draft"),
@@ -302,6 +306,11 @@ class World:
     def bridge(self, method, _display, **params):
         if method == "observe":
             return self.observe()
+        if method == 'inspect_command':
+            # Offline fixture only: no executable, help probe or provider call.
+            return {'ready': True, 'capability_version': runtime.COMMAND_CAPABILITY_VERSION,
+                    'inspection_id': '62139534-725a-4c0c-a521-8b525adfa074', 'tools': [],
+                    'resolution_complete': True, 'probes': 0, 'cache_hits': 0}
         if method == "wait_for_change":
             deadline = self.now + params['timeout_ms'] / 1000
             self.advance(min(params.get('minimum_delay_ms', 0) / 1000, deadline - self.now))

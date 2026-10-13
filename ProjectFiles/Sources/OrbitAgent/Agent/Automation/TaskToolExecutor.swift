@@ -6,12 +6,14 @@ enum TaskToolError: LocalizedError {
     case invalidAction(String)
     case operationFailed(String)
     case uncertainDelivery(String)
+    case commandCapability(String, String)
 
     var code: String {
         switch self {
         case .invalidAction: return "invalid_action"
         case .operationFailed: return "delivery_rejected"
         case .uncertainDelivery: return "delivery_uncertain"
+        case .commandCapability(let code, _): return code
         }
     }
 
@@ -19,6 +21,7 @@ enum TaskToolError: LocalizedError {
         switch self {
         case .invalidAction(let message), .operationFailed(let message), .uncertainDelivery(let message):
             return message
+        case .commandCapability(_, let message): return message
         }
     }
 }
@@ -38,8 +41,44 @@ final class TaskToolExecutor {
     private var activeCommand: Process?
     private var commandCancelled = false
     private var commandPaused = false
+    private let capabilityLock = NSLock()
+    private var commandBindings: [String: CommandCapabilities.Binding] = [:]
+    private var helpCache: [String: (created: TimeInterval, result: [String: Any])] = [:]
+    private let profileProvider: (String, [String?]) -> CommandCapabilities.Profile?
 
-    func perform(action input: [String: Any]) async throws -> [String: Any] {
+    init(profileProvider: @escaping (String, [String?]) -> CommandCapabilities.Profile? = CommandCapabilities.profile) {
+        self.profileProvider = profileProvider
+    }
+
+    func resetCommandCapabilities() {
+        capabilityLock.withLock { commandBindings.removeAll(); helpCache.removeAll() }
+    }
+
+    static func commandEnvironment() -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        let fallback = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        var seen: Set<String> = []
+        environment["PATH"] = [environment["PATH"] ?? "", fallback].joined(separator: ":").split(separator: ":")
+            .map(String.init).filter { $0.hasPrefix("/") && seen.insert($0).inserted }.joined(separator: ":")
+        environment["TERM"] = "dumb"
+        return environment
+    }
+
+    /// A probe has no action receipt: neither syntax checking nor help output
+    /// can acknowledge delivery of the original command or prove its outcome.
+    func inspectCommand(action input: [String: Any]) async throws -> [String: Any] {
+        try await TaskOwnership.checkpoint()
+        return try TaskOwnership.$actionReceipt.withValue(nil) {
+            var probes = 0, hits = 0
+            do { return try prepareCommand(input, diagnostics: { probes = $0; hits = $1 }).result }
+            catch let error as TaskToolError {
+                return ["ready": false, "error_code": error.code, "message": error.localizedDescription,
+                        "capability_version": CommandCapabilities.version, "probes": probes, "cache_hits": hits]
+            }
+        }
+    }
+
+    func perform(action input: [String: Any], commandBindingID: String? = nil) async throws -> [String: Any] {
         try await TaskOwnership.checkpoint()
         let action: [String: Any]
         do { action = try ActionContract.validate(input) }
@@ -47,7 +86,7 @@ final class TaskToolExecutor {
         switch ActionKind(rawValue: action["type"] as! String)! {
         case .read_file: return try readFile(action)
         case .write_file: return try writeFile(action)
-        case .run_command: return try runCommand(action)
+        case .run_command: return try runCommand(action, bindingID: commandBindingID)
         case .none, .press, .focus, .set_value, .click, .double_click, .type_text, .key, .scroll, .launch_app, .open_route, .wait, .navigate_browser:
             throw TaskToolError.invalidAction("Unsupported task tool: \(action["type"]!)")
         }
@@ -269,22 +308,182 @@ final class TaskToolExecutor {
         ]
     }
 
-    private func runCommand(_ action: [String: Any]) throws -> [String: Any] {
+    private func prepareCommand(_ input: [String: Any], diagnostics: ((Int, Int) -> Void)? = nil) throws -> CommandCapabilities.Binding {
+        var probes = 0, cacheHits = 0
+        defer { diagnostics?(probes, cacheHits) }
+        try TaskOwnership.check()
+        let generation = TaskOwnership.current?.id
+        let suspension = TaskOwnership.current?.suspensionRevision ?? 0
+        let action = try ActionContract.validate(input)
+        guard action["type"] as? String == "run_command", action["operation"] == nil else {
+            throw TaskToolError.invalidAction("Capability inspection requires a general run_command action")
+        }
+        commandLock.withLock { commandCancelled = false }
+        var environment = Self.commandEnvironment()
+        let policy = try CommandExecutionPolicy(action: action, environment: environment)
+        let directoryIdentity = try CommandCapabilities.Identity(policy.workingDirectoryInput, directory: true)
+        let shellIdentity = policy.shellSource == nil ? nil : try CommandCapabilities.Identity(policy.executable)
+        environment["PWD"] = policy.workingDirectory.path
+        let key = try CommandCapabilities.digest(["action": action, "environment": environment])
+        let existing = capabilityLock.withLock { commandBindings.values.first { $0.actionKey == key && $0.generation == TaskOwnership.current?.id } }
+        if let existing, (try? existing.validate()) != nil {
+            cacheHits += 1
+            var result = existing.result
+            result["cache_hit"] = true; result["probes"] = 0; result["cache_hits"] = 0
+            return .init(id: existing.id, created: existing.created, actionKey: key, generation: existing.generation, suspension: existing.suspension,
+                policy: existing.policy, environment: existing.environment, directory: existing.directory, shell: existing.shell,
+                tools: existing.tools, source: existing.source, result: result)
+        }
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("taskpilot-probe-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let deadline = ProcessInfo.processInfo.systemUptime + CommandCapabilities.probeBudget
+        if let source = policy.shellSource {
+            let syntax = try executeProcess(executable: policy.executable, arguments: ["-f", "-n", "-c", source],
+                policy: policy, environment: environment, directory: temporary, prefix: "syntax",
+                timeout: CommandCapabilities.probeBudget, probe: true)
+            guard !syntax.timedOut, syntax.status == 0 else {
+                throw TaskToolError.commandCapability("command_syntax", "Shell syntax check failed before execution: " + syntax.stderr.text)
+            }
+        }
+        var source = CommandCapabilities.source(policy)
+        if policy.shellSource != nil, source.complete, !source.invocations.isEmpty {
+            // Ask the same shell about literal heads. PATH lookup alone cannot
+            // distinguish a builtin/alias/function from an external program.
+            let names = source.invocations.map(\.name)
+            if names.contains(where: { $0.contains("\n") }) || deadline <= ProcessInfo.processInfo.systemUptime {
+                source = .init(invocations: [], complete: false, builtinOnly: false, characters: source.characters)
+            } else {
+                let resolution = try executeProcess(executable: policy.executable,
+                    arguments: ["-f", "-c", "builtin whence -w -- \"$@\"", "taskpilot-command-inspection"] + names,
+                    policy: policy, environment: environment, directory: temporary, prefix: "resolution",
+                    timeout: min(0.8, deadline - ProcessInfo.processInfo.systemUptime), probe: true)
+                var lines = resolution.stdout.text.split(separator: "\n").map(String.init)
+                if !resolution.timedOut, !resolution.stdout.truncated, lines.count == names.count {
+                    for index in names.indices where lines[index] == names[index] + ": none" {
+                        // Inline PATH prefixes are resolved separately below;
+                        // they cannot turn a builtin into an external command.
+                        if source.invocations[index].overrides["PATH"] != nil {
+                            lines[index] = names[index] + ": command"
+                        } else {
+                            throw TaskToolError.commandCapability("command_tool_missing", "Executable '\(names[index])' was not found by the inspected shell")
+                        }
+                    }
+                }
+                if resolution.timedOut || resolution.stdout.truncated || lines != names.map({ $0 + ": command" }) {
+                    // Preserve shell behavior whenever resolution is ambiguous
+                    // or a builtin/function/alias must retain its semantics.
+                    source = .init(invocations: [], complete: false, builtinOnly: false, characters: source.characters)
+                }
+            }
+        }
+        var tools: [CommandCapabilities.Tool] = [], unsupported: [String] = []
+        for invocation in source.invocations {
+            try TaskOwnership.check()
+            var toolEnvironment = environment
+            toolEnvironment.merge(invocation.overrides) { _, new in new }
+            let executable = try CommandExecutionPolicy.resolveExecutable(invocation.name, cwd: policy.workingDirectory, environment: toolEnvironment)
+            let identity = try CommandCapabilities.Identity(executable)
+            var summary: [String: Any] = ["name": invocation.name, "executable": identity.path,
+                "option_status": "unverified", "reason": "No established help-only probe is available for this tool"]
+            if let profile = profileProvider(identity.path, invocation.arguments) {
+                let cacheKey = try CommandCapabilities.digest(["path": identity.path, "device": identity.device, "inode": identity.inode,
+                    "size": identity.size, "modified": [identity.modified.tv_sec, identity.modified.tv_nsec],
+                    "changed": [identity.changed.tv_sec, identity.changed.tv_nsec], "environment": toolEnvironment,
+                    "directory": policy.workingDirectory.path, "probe": profile.arguments])
+                let cached = capabilityLock.withLock { helpCache[cacheKey] }
+                if let cached, ProcessInfo.processInfo.systemUptime - cached.created < 120 {
+                    summary.merge(cached.result) { _, new in new }; cacheHits += 1
+                } else if deadline > ProcessInfo.processInfo.systemUptime {
+                    probes += 1
+                    let result = try executeProcess(executable: URL(fileURLWithPath: identity.path), arguments: profile.arguments,
+                        policy: policy, environment: toolEnvironment, directory: temporary, prefix: "probe-\(probes)",
+                        timeout: min(0.8, deadline - ProcessInfo.processInfo.systemUptime), probe: true)
+                    let help = result.stdout.text + "\n" + result.stderr.text
+                    let flags = CommandCapabilities.longOptions(help).sorted()
+                    let shortFlags = CommandCapabilities.shortOptions(help).sorted()
+                    let helpExit = result.status == 0 || (URL(fileURLWithPath: identity.path).lastPathComponent == "git" && profile.context != "global" && result.status == 129 && help.contains("usage:"))
+                    let rejectedHelp = help.range(of: "unknown option|unrecognized option|illegal option|invalid option|unsupported option", options: [.regularExpression, .caseInsensitive]) != nil
+                    let complete = helpExit && !rejectedHelp && !result.timedOut && !result.stdout.truncated && !result.stderr.truncated && !help.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    let probed: [String: Any] = ["context": profile.context, "option_status": complete ? "inspected" : "unverified",
+                        "supported_long_options": Array(flags.prefix(256)), "help_excerpt": String(help.prefix(1800)),
+                        "supported_short_options": Array(shortFlags.prefix(128)),
+                        "value_options": CommandCapabilities.valueOptions(help),
+                        "help_truncated": !complete || help.count > 1800, "probe_exit_code": Int(result.status),
+                        "complete_option_list": complete && profile.exhaustiveLongOptions && !flags.isEmpty && flags.count <= 256,
+                        "reason": complete ? "Options observed through the resolved executable's help interface" : "Help probe was incomplete; do not infer missing options"]
+                    summary.merge(probed) { _, new in new }
+                    if complete {
+                        capabilityLock.withLock {
+                            if helpCache.count >= CommandCapabilities.maximumBindings { helpCache.removeAll() }
+                            helpCache[cacheKey] = (ProcessInfo.processInfo.systemUptime, probed)
+                        }
+                    }
+                } else { summary["reason"] = "The shared local probe deadline elapsed; options remain unverified" }
+            }
+            // Only exhaustive, complete interfaces justify a negative claim.
+            // Dynamic arguments and interpreter/script flags are never guessed.
+            if summary["complete_option_list"] as? Bool == true, invocation.arguments.allSatisfy({ $0 != nil }) {
+                let known = Set(summary["supported_long_options"] as? [String] ?? [])
+                let missing = CommandCapabilities.requestedLongOptions(invocation.arguments, takingValues: summary["value_options"] as? [String: Int] ?? [:]).subtracting(known)
+                if !missing.isEmpty { summary["unadvertised_options"] = missing.sorted(); unsupported.append(contentsOf: missing.sorted()) }
+            }
+            guard try CommandCapabilities.Identity(executable) == identity else {
+                throw TaskToolError.commandCapability("command_capabilities_changed", "The executable changed while its options were being inspected; no command was delivered")
+            }
+            tools.append(.init(invocation: invocation, identity: identity, environment: toolEnvironment, summary: summary))
+        }
+        let id = UUID().uuidString
+        let result: [String: Any] = ["ready": unsupported.isEmpty, "inspection_id": id,
+            "capability_version": CommandCapabilities.version, "tools": tools.map(\.summary),
+            "resolution_complete": source.complete, "builtin_only": source.builtinOnly,
+            "message": unsupported.isEmpty ? "Command tools inspected; unverified capabilities remain explicit" : "Options are not advertised by the inspected tool: " + unsupported.joined(separator: ", "),
+            "error_code": unsupported.isEmpty ? "" : "command_options_unverified",
+            "probes": probes, "cache_hits": cacheHits, "cache_hit": false,
+            "limitations": source.complete ? [] : ["Dynamic or unsupported shell structure: only the outer shell is bound; child executable resolution and options remain unverified"]]
+        let binding = CommandCapabilities.Binding(id: id, created: ProcessInfo.processInfo.systemUptime, actionKey: key, generation: generation,
+            suspension: suspension, policy: policy, environment: environment,
+            directory: directoryIdentity, shell: shellIdentity,
+            tools: tools, source: source, result: result)
+        try binding.validate()
+        capabilityLock.withLock {
+            if commandBindings.count >= CommandCapabilities.maximumBindings { commandBindings.removeAll() }
+            commandBindings[id] = binding
+        }
+        return binding
+    }
+
+    private func runCommand(_ action: [String: Any], bindingID: String?) throws -> [String: Any] {
         try TaskOwnership.check()
         commandLock.lock(); commandCancelled = false; commandLock.unlock()
         try Task.checkCancellation()
-        var environment = ProcessInfo.processInfo.environment
-        let fallbackPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        environment["PATH"] = [environment["PATH"], fallbackPath].compactMap { $0 }.joined(separator: ":")
-        environment["TERM"] = "dumb"
-        let policy = try CommandExecutionPolicy(action: action, environment: environment)
+        let binding: CommandCapabilities.Binding?
+        if action["operation"] != nil { binding = nil }
+        else if let bindingID {
+            guard let owned = capabilityLock.withLock({ commandBindings[bindingID] }) else {
+                throw TaskToolError.commandCapability("command_capabilities_changed", "No matching command inspection belongs to this task; inspect again")
+            }
+            var currentEnvironment = Self.commandEnvironment(); currentEnvironment["PWD"] = owned.policy.workingDirectory.path
+            guard try CommandCapabilities.digest(["action": action, "environment": currentEnvironment]) == owned.actionKey else {
+                throw TaskToolError.commandCapability("command_capabilities_changed", "The command or environment differs from its inspection; no command was delivered")
+            }
+            binding = owned
+        } else {
+            binding = try TaskOwnership.$actionReceipt.withValue(nil) { try prepareCommand(action) }
+        }
+        if let binding, binding.result["ready"] as? Bool != true {
+            throw TaskToolError.commandCapability("command_options_unverified", binding.result["message"] as? String ?? "Inspect the requested command options before execution")
+        }
+        try binding?.validate()
+        var environment = binding?.environment ?? Self.commandEnvironment()
+        let policy = try binding?.policy ?? CommandExecutionPolicy(action: action, environment: environment)
         environment["PWD"] = policy.workingDirectory.path
         let temporaryDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("orbit-command-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
 
-        if let source = policy.shellSource {
+        if binding == nil, let source = policy.shellSource {
             // -n parses the complete source without executing substitutions or
             // earlier statements. -f avoids user startup scripts in both phases.
             let syntax = try executeProcess(executable: policy.executable, arguments: ["-f", "-n", "-c", source],
@@ -294,9 +493,10 @@ final class TaskToolExecutor {
                 throw TaskToolError.invalidAction("Shell syntax check failed before execution: " + syntax.stderr.text)
             }
         }
-        let execution = try executeProcess(executable: policy.executable, arguments: policy.arguments,
+        let execution = try executeProcess(executable: binding?.executable ?? policy.executable, arguments: binding?.arguments ?? policy.arguments,
                                            policy: policy, environment: environment,
-                                           directory: temporaryDirectory, prefix: "command", timeout: policy.timeout)
+                                           directory: temporaryDirectory, prefix: "command", timeout: policy.timeout,
+                                           validate: { try binding?.validate() })
         let checks = policy.checks.map { $0.evaluate(stdout: execution.stdout.text, stdoutTruncated: execution.stdout.truncated) }
         let executed = !execution.timedOut && execution.status == 0
         let verified = executed && !checks.isEmpty && checks.allSatisfy { $0["verified"] as? Bool == true }
@@ -325,11 +525,16 @@ final class TaskToolExecutor {
             result["command_operation"] = operation
             result["outcome_checks"] = policy.outcomeChecks
         }
+        if let binding {
+            // This summary proves inspection only, never a requested effect.
+            result["command_capabilities"] = binding.result.filter { !["inspection_id"].contains($0.key) }
+        }
         return result
     }
 
     private func executeProcess(executable: URL, arguments: [String], policy: CommandExecutionPolicy,
-                                environment: [String: String], directory: URL, prefix: String, timeout: TimeInterval)
+                                environment: [String: String], directory: URL, prefix: String, timeout: TimeInterval,
+                                probe: Bool = false, validate: () throws -> Void = {})
         throws -> (status: Int32, timedOut: Bool, stdout: (text: String, truncated: Bool), stderr: (text: String, truncated: Bool)) {
         let stdoutURL = directory.appendingPathComponent(prefix + "-stdout")
         let stderrURL = directory.appendingPathComponent(prefix + "-stderr")
@@ -349,30 +554,45 @@ final class TaskToolExecutor {
 
         // Always acquire the ownership gate before the command lock. Pause
         // cannot strand a launcher holding the lock Resume needs.
-        try TaskOwnership.commit {
-            commandLock.lock(); defer { commandLock.unlock() }
-            if commandCancelled { throw CancellationError() }
-            do { try process.run() }
-            catch { throw TaskToolError.operationFailed("Could not start the command: \(error.localizedDescription)") }
-            _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
-            activeCommand = process
-            if commandPaused, Darwin.kill(-process.processIdentifier, SIGSTOP) != 0 {
-                Darwin.kill(process.processIdentifier, SIGSTOP)
+        func launch() throws {
+            try validate()
+            try TaskOwnership.commit {
+                commandLock.lock(); defer { commandLock.unlock() }
+                if commandCancelled { throw CancellationError() }
+                do { try process.run() }
+                catch { throw TaskToolError.operationFailed("Could not start the command: \(error.localizedDescription)") }
+                _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
+                activeCommand = process
+                if commandPaused, Darwin.kill(-process.processIdentifier, SIGSTOP) != 0 {
+                    Darwin.kill(process.processIdentifier, SIGSTOP)
+                }
             }
         }
+        // Resolve identity inside the lease boundary, before receipt dispatch.
+        // This catches observed replacement; filesystem actors are not atomic
+        // with Process.run and can still race a later child executable lookup.
+        if let lease = TaskOwnership.current { try lease.commit { try launch() } }
+        else { try launch() }
         defer {
             commandLock.lock()
             if activeCommand === process { activeCommand = nil }
             commandLock.unlock()
         }
-        let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning && Date() < deadline {
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        var outputExceeded = false
+        while process.isRunning && ProcessInfo.processInfo.systemUptime < deadline {
             if Task.isCancelled || (TaskOwnership.current?.state == .draining) || (TaskOwnership.current?.state == .retired) { cancelActiveCommand() }
             commandLock.lock(); let cancelled = commandCancelled; commandLock.unlock()
             if cancelled { break }
+            if probe {
+                let size = [stdoutURL, stderrURL].reduce(0) { total, url in
+                    total + ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue ?? 0)
+                }
+                if size > CommandCapabilities.outputLimit { outputExceeded = true; break }
+            }
             Thread.sleep(forTimeInterval: 0.025)
         }
-        let timedOut = process.isRunning
+        let timedOut = process.isRunning || outputExceeded
         if timedOut {
             signalActiveCommand(SIGCONT)
             signalActiveCommand(SIGTERM)
@@ -384,6 +604,7 @@ final class TaskToolExecutor {
             }
         }
         process.waitUntilExit()
+        if probe { _ = Darwin.kill(-process.processIdentifier, SIGKILL) }
         commandLock.lock(); let cancelled = commandCancelled; commandLock.unlock()
         if cancelled || Task.isCancelled {
             Darwin.kill(-process.processIdentifier, SIGKILL)
@@ -393,7 +614,7 @@ final class TaskToolExecutor {
         do {
             return (process.terminationStatus, timedOut, try Self.boundedText(from: stdoutURL), try Self.boundedText(from: stderrURL))
         } catch {
-            if prefix == "syntax" { throw TaskToolError.operationFailed("Shell syntax-check output could not be read; the command was not executed") }
+            if probe || prefix == "syntax" { throw TaskToolError.operationFailed("Preflight output could not be read; the command was not executed") }
             throw TaskToolError.uncertainDelivery("The command ended, but its output could not be read; inspect its effects before running it again")
         }
     }

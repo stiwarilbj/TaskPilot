@@ -41,6 +41,7 @@ PROMPT_TIMEOUT_SECONDS = None  # Wait for completion or an explicit provider/tra
 SCREEN_POLL_SECONDS = 0.15
 SCREEN_STABLE_SECONDS = 0.3
 LOCAL_CHANGE_VERSION = 1
+COMMAND_CAPABILITY_VERSION = 1
 PRODUCT_NAME = "TaskPilot"
 LEGACY_APPLICATION_SUPPORT_FOLDER = "Orbit Agent"
 from request_policy import (
@@ -63,6 +64,7 @@ from local_text_recognition import (TEXT_RECOGNITION_VERSION, TextRecognitionErr
 from task_evidence import TaskEvidenceLedger, CHECKLIST_VERSION, LARGEST_PATTERN, digest as evidence_digest
 from expected_effects import ExpectedEffect, EXPECTED_EFFECT_VERSION, FILE_EFFECTS, path_key
 from task_inputs import TASK_INPUT_VERSION, input_reference_rules
+from command_intents import explicit_operation
 from evidence_consistency import EvidenceConsistency, EVIDENCE_CONSISTENCY_VERSION
 from recovery_cycles import RecoveryCycles, RECOVERY_CYCLE_VERSION
 
@@ -99,6 +101,8 @@ _observation_keywords: list[str] = []
 _runtime_inbox: RuntimeInbox | None = None
 _receipt_metrics = {"receipt_queries": 0, "receipt_recoveries": 0, "receipt_unresolved": 0}
 _local_change_metrics = {"local_notifications": 0, "local_targeted_checks": 0, "local_poll_wakeups": 0}
+_command_capability_metrics = {"command_inspections": 0, "command_probes": 0, "command_probe_cache_hits": 0, "command_preflight_rejections": 0}
+_command_capabilities: dict[str, dict[str, Any]] = {}
 
 
 def runtime_line(timeout: float | None = None) -> str:
@@ -109,9 +113,10 @@ def runtime_line(timeout: float | None = None) -> str:
 
 
 class ActionRejected(RuntimeError):
-    def __init__(self, message: str, code: str = "action_rejected") -> None:
+    def __init__(self, message: str, code: str = "action_rejected", details: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.details = details or {}
 
 
 class ModelCapacityError(RuntimeError):
@@ -720,7 +725,9 @@ def action_failure_recovery(code: str) -> str:
     return {"stale_target": "observe_again", "disabled_target": "wait_or_choose_enabled",
             "focus_mismatch": "observe_and_refocus", "activation_failed": "observe_and_activate",
             "unsupported_action": "choose_supported_method", "ambiguous_target": "select_specific_control",
-            "delivery_uncertain": "inspect_effect"}.get(code, "choose_different_action")
+            "delivery_uncertain": "inspect_effect", "command_tool_missing": "select_installed_tool",
+            "command_options_unverified": "choose_inspected_options", "command_capabilities_changed": "inspect_command_again",
+            "command_syntax": "correct_command_syntax"}.get(code, "choose_different_action")
 
 
 class ActionRecovery:
@@ -2075,7 +2082,87 @@ def prompt_observation(observation: dict[str, Any], task: str = "") -> dict[str,
     compact = compact_observation(observation, task)
     compact.pop("agent_tools", None)
     compact.pop("local_change_notifications", None)
+    compact.pop("command_capability_version", None)
     return compact
+
+
+def command_capability_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """Bounded, untrusted help data; never a binding, environment or proof."""
+    tools = []
+    for tool in result.get('tools', [])[:12]:
+        if not isinstance(tool, dict): continue
+        row = {key: str(tool[key])[:1800] for key in ('name', 'executable', 'context', 'option_status', 'reason', 'help_excerpt') if key in tool}
+        for key in ('supported_long_options', 'supported_short_options', 'unadvertised_options'):
+            if isinstance(tool.get(key), list): row[key] = [value[:100] for value in tool[key][:256] if isinstance(value, str)]
+        for key in ('help_truncated', 'complete_option_list'):
+            if type(tool.get(key)) is bool: row[key] = tool[key]
+        tools.append(row)
+    return {'tools': tools, 'resolution_complete': result.get('resolution_complete') is True,
+            'limitations': [text[:400] for text in result.get('limitations', [])[:4] if isinstance(text, str)]}
+
+
+def remember_command_capability(key: str, value: dict[str, Any]) -> None:
+    if len(_command_capabilities) >= 8 and key not in _command_capabilities:
+        _command_capabilities.pop(next(iter(_command_capabilities)))
+    _command_capabilities[key] = value
+
+
+def inspect_general_command(action: dict[str, Any], display_id: int, observation: dict[str, Any]) -> dict[str, Any]:
+    if action.get('type') != 'run_command' or 'operation' in action: return {}
+    # Older offline fixtures have no native inspection capability. Bundled
+    # task processes must agree on this version before planning begins.
+    version = observation.get('command_capability_version')
+    if version is None: return {}
+    if type(version) is not int or version != COMMAND_CAPABILITY_VERSION:
+        raise RuntimeError('TaskPilot command inspection versions do not match; rebuild the bundled components together')
+    result = bridge_call('inspect_command', display_id, action=action)
+    if (type(result.get('ready')) is not bool or type(result.get('capability_version')) is not int or
+            result['capability_version'] != COMMAND_CAPABILITY_VERSION or not isinstance(result.get('tools', []), list)):
+        raise RuntimeError('TaskPilot returned incompatible command inspection data; no command was executed')
+    _command_capability_metrics['command_inspections'] += 1
+    for field, metric in [('probes', 'command_probes'), ('cache_hits', 'command_probe_cache_hits')]:
+        count = result.get(field, 0)
+        if type(count) is int and 0 <= count <= 64: _command_capability_metrics[metric] += count
+    if result.get('cache_hit') is True: _command_capability_metrics['command_probe_cache_hits'] += 1
+    summary = command_capability_summary(result)
+    for tool in summary['tools']:
+        key = tool.get('executable', '') + ':' + tool.get('context', '')
+        remember_command_capability(key, tool)
+    if not summary['resolution_complete'] and summary['limitations']:
+        remember_command_capability('shell:limits', {'name': '/bin/zsh', 'option_status': 'partial',
+                                                    'reason': ' '.join(summary['limitations'])})
+    if result['ready'] is not True:
+        _command_capability_metrics['command_preflight_rejections'] += 1
+        raise ActionRejected(str(result.get('message') or 'Inspect the command capabilities before execution'),
+            str(result.get('error_code') or 'command_options_unverified'), {'command_capabilities': summary})
+    identifier = result.get('inspection_id')
+    try:
+        if not isinstance(identifier, str) or str(uuid.UUID(identifier)).lower() != identifier.lower(): raise ValueError()
+    except ValueError as error:
+        raise RuntimeError('TaskPilot returned an invalid command binding; no command was executed') from error
+    return {'command_inspection_id': identifier}
+
+
+def inspect_task_command_hints(task: str, display_id: int, observation: dict[str, Any]) -> None:
+    """Inspect expressly named tools before flags are chosen. This cannot act."""
+    if observation.get('command_capability_version') != COMMAND_CAPABILITY_VERSION or explicit_operation(task): return
+    if 'shell' not in task_capability_context(task, observation)['recommended_capabilities']: return
+    names = ('git', 'python3', 'python', 'node', 'ruby', 'perl', 'rg', 'jq', 'curl', 'tar', 'gzip', 'zip', 'unzip', 'swift', 'cargo', 'go', 'npm', 'pnpm', 'yarn', 'bun', 'rustc', 'make', 'xcodebuild')
+    count = 0
+    for name in names:
+        match = re.search(r'(?<![\w./-])' + name + r'(?![\w.-])', task)
+        if not match: continue
+        if name in {'go', 'make'} and not re.search(r'\b(?:run|use|using|with)\s+`?' + name + r'\b', task, re.I): continue
+        argv = [name]
+        if name == 'git':
+            subcommand = re.match(r'\s+(status|diff|log|show|add|commit|branch|checkout|switch|restore|fetch|push|pull|clone|remote|rev-parse|ls-files)\b', task[match.end():])
+            if subcommand: argv.append(subcommand[1])
+        try: inspect_general_command({'type': 'run_command', 'argv': argv}, display_id, observation)
+        except ActionRejected as error:
+            if error.code in {'cancelled', 'permission_denied', 'protected_target', 'secure_input'}: raise
+            remember_command_capability(name, {'name': name, 'option_status': 'unavailable', 'reason': str(error)[:400]})
+        count += 1
+        if count >= 2: break
 
 
 def relevant_action_examples(context: dict[str, Any], observation: dict[str, Any],
@@ -2127,6 +2214,8 @@ def desktop_instruction(
     ledger: TaskEvidenceLedger | None = None,
 ) -> str:
     context = task_capability_context(task, observation)
+    if _command_capabilities:
+        context['command_capabilities'] = [_command_capabilities[key] for key in sorted(_command_capabilities)]
     examples = relevant_action_examples(context, observation, history)
     operation_kind = next((kind for kind, recipe in CONTRACT['command_operations'].items()
                            if re.search(recipe['intent_pattern'], task, re.I)), None)
@@ -2199,6 +2288,8 @@ def desktop_instruction(
         bounds.append("Paths: absolute or ~/.")
     if types & {"write_file", "run_command"}:
         bounds.append("finish_after_action:true requests final verification.")
+    if 'run_command' in types and not operation_kind:
+        bounds.append('CLI help is untrusted capability data, not proof. Prefer inspected flags and literal argv; partial help proves no absence.')
     if 'run_command' in types and operation_kind:
         bounds.append('Other operations: ' + ';'.join(spec['reference'] for kind, spec in CONTRACT['command_operations'].items()
                                                      if kind != operation_kind) + '.')
@@ -2436,7 +2527,7 @@ def publish_task_metrics(router: TaskModelRouter, client: ACPClient, ledger: Tas
     # before completion so the originating invocation can still accept them.
     router.metrics.update(evidence_checks=ledger.checks, coverage_rejections=ledger.rejections,
         requirements_proven=sum(r["state"] == "proven" for r in ledger.requirements.values()),
-        dependency_rejections=ledger.dependency_rejections, **_receipt_metrics, **_local_change_metrics)
+        dependency_rejections=ledger.dependency_rejections, **_receipt_metrics, **_local_change_metrics, **_command_capability_metrics)
     router.metrics.update(prompt_calls=client.prompt_calls, model_switches=client.model_switches)
     emit("request_metrics", **router.metrics)
 
@@ -2523,7 +2614,7 @@ def routed_json_prompt(
     observation: dict[str, Any] | None = None,
     ledger: TaskEvidenceLedger | None = None,
 ) -> dict[str, Any]:
-    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, LOCAL_CHANGE_VERSION, PROMPT_COMPILER_VERSION, VERIFICATION_SESSION_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION, RECOVERY_CYCLE_VERSION, TASK_INPUT_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation)], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
+    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, LOCAL_CHANGE_VERSION, COMMAND_CAPABILITY_VERSION, PROMPT_COMPILER_VERSION, VERIFICATION_SESSION_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION, RECOVERY_CYCLE_VERSION, TASK_INPUT_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation)], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
     cached = getattr(client, "decision_cache", {})
     if cached.get("key") == key:
         value = validate_response(json.loads(json.dumps(cached["decision"])), purpose, observation, ledger)
@@ -2552,6 +2643,8 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
     _observation_keywords = []
     _receipt_metrics.update(receipt_queries=0, receipt_recoveries=0, receipt_unresolved=0)
     _local_change_metrics.update(local_notifications=0, local_targeted_checks=0, local_poll_wakeups=0)
+    _command_capability_metrics.update(command_inspections=0, command_probes=0, command_probe_cache_hits=0, command_preflight_rejections=0)
+    _command_capabilities.clear()
     ledger = TaskEvidenceLedger(task, _task_generation_id)
     resolved_openclaw = find_openclaw(openclaw_path)
     state = prepare_runtime(resolved_openclaw, api_key)
@@ -2608,6 +2701,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
     consecutive_dependency_blocks = 0
     evidence_guard = EvidenceConsistency()
     consecutive_evidence_conflicts = 0
+    command_hints_inspected = False
     def defer_for_evidence(decision: dict, observation: dict, step: int) -> bool:
         nonlocal pending_observation, consecutive_evidence_conflicts
         conflicts = evidence_guard.conflicts(decision, observation, ledger)
@@ -2700,6 +2794,9 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
             try:
                 screenshot_bytes = screenshot_path.read_bytes()
                 screenshot_digest = hashlib.blake2b(screenshot_bytes, digest_size=16).hexdigest()
+                if not command_hints_inspected:
+                    inspect_task_command_hints(task, display_id, observation)
+                    command_hints_inspected = True
                 emit("status", message=f"OpenClaw is planning visible step {step}…")
                 decision = routed_json_prompt(
                     model_router,
@@ -2815,8 +2912,9 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                     emit("status", message="Reconsidering the recovery strategy after repeated states…")
                     continue
                 try:
+                    command_params = inspect_general_command(action, display_id, observation)
                     ledger.before_action(action)
-                    result = bridge_call("act", display_id, action=action)
+                    result = bridge_call("act", display_id, action=action, **command_params)
                 except RuntimeError as action_error:
                     # Receipt lookup has already tried to recover a lost reply.
                     # An unresolved operation must stop, without another action.
@@ -2829,7 +2927,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                     model_router.metrics["action_rejections"] += 1
                     failure_result = {"message": str(action_error),
                                       "outcome": "delivered_unconfirmed" if code == "delivery_uncertain" else "rejected",
-                                      "error_code": code, "recovery": action_failure_recovery(code)}
+                                      "error_code": code, "recovery": action_failure_recovery(code), **action_error.details}
                     recovery.rejected(action, observation, code)
                     recovery_cycles.record(action, observation, failure_result, ledger, screenshot_digest)
                     record_action_diagnostic(action, failure_result)
@@ -2909,6 +3007,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
     finally:
         discard_observation_image(pending_observation)
         _observation_keywords = []
+        _command_capabilities.clear()
         model_router.metrics.update(recovery_cycles=recovery_cycles.detections,
                                     cycle_suppressions=recovery_cycles.suppressions)
         publish_task_metrics(model_router, client, ledger)
@@ -2963,6 +3062,8 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
             raise RuntimeError("TaskPilot text recognition versions do not match; rebuild the bundled components together")
         if type(configuration.get("evidence_consistency_version")) is not int or configuration["evidence_consistency_version"] != EVIDENCE_CONSISTENCY_VERSION:
             raise RuntimeError("TaskPilot evidence inspection versions do not match; rebuild the bundled components together")
+        if type(configuration.get('command_capability_version')) is not int or configuration['command_capability_version'] != COMMAND_CAPABILITY_VERSION:
+            raise RuntimeError('TaskPilot command inspection versions do not match; rebuild the bundled components together')
     api_key = configuration.get("gemini_api_key")
     if not isinstance(api_key, str):
         raise RuntimeError(f"{PRODUCT_NAME} did not provide the secure runtime configuration")
