@@ -644,25 +644,24 @@ final class AccessibilityController {
         let focusedElement = node.focusedElement, ownerWindow = node.ownerWindow, windowRecords = node.windowRecords
         let depth = entry.scope.depth, parentID = entry.scope.parentID
 
-        let identityFailures = ObservationAccessibilityReads.current?.failures
-        guard let role = stringAttribute(element, kAXRoleAttribute), !role.isEmpty else {
+        let attributes = try ObservationControlAttributes.read(element, pid: pid, context: ObservationAccessibilityReads.current!)
+        guard let role = attributes.role else {
             return .init(included: false) // Required role failure is already reported; no value or executable ID.
         }
         // Closed menu trees expose commands with zero bounds. They consume the
         // observation budget and can be mistaken for currently usable controls.
         if role == "AXMenu" {
-            guard let bounds = frame(of: element), bounds.width > 0, bounds.height > 0 else {
+            guard let bounds = attributes.bounds, bounds.width > 0, bounds.height > 0 else {
                 return .init(included: false)
             }
         }
-        let subrole = stringAttribute(element, kAXSubroleAttribute) ?? ""
-        let secure = AutomationTextEntryPolicy.isSecure(role: role, subrole: subrole)
-            || ObservationAccessibilityReads.current?.failures != identityFailures
-        let title = elementTitle(element)
-        let bounds = frame(of: element)
+        let subrole = attributes.subrole
+        let secure = attributes.requiresSecureMask
+        let title = attributes.title
+        let bounds = attributes.bounds
         let value = secure ? nil : attribute(element, kAXValueAttribute)
         let rawValue = secure ? "[secure]" : printableValue(value)
-        let focused = boolAttribute(element, kAXFocusedAttribute) == true
+        let focused = attributes.focused
             || focusedElement.map { CFEqual($0, element) } == true
         let actions = actionNames(element)
         let selection = secure || !AutomationTextEntryPolicy.inputRoles.contains(role) ? nil : selectedTextRange(element)
@@ -684,7 +683,7 @@ final class AccessibilityController {
             "app": appName,
             "role": role,
             "depth": depth,
-            "enabled": boolAttribute(element, kAXEnabledAttribute) ?? true
+            "enabled": attributes.enabled
         ]
         row["focused"] = focused
         if let title = map[id]?.identity.windowTitle { row["window_title"] = clipped(title) }
