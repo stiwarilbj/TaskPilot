@@ -146,7 +146,6 @@ struct AgentTaskLedgerStore: Sendable {
     private let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .millisecondsSince1970
-        encoder.outputFormatting = [.sortedKeys]
         return encoder
     }()
 

@@ -54,7 +54,7 @@ enum AutomationIntegrationBridge {
                         ownedRequest["task_generation_id"] = placements.lease?.id
                         result = await bridge.handleOwned(ownedRequest, lease: placements.lease)
                     }
-                    if let output = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]) {
+                    if let output = try? JSONSerialization.data(withJSONObject: result) {
                         FileHandle.standardOutput.write(output)
                         FileHandle.standardOutput.write(Data([10]))
                     }

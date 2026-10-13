@@ -11,14 +11,18 @@ final class ConfiguredJSONCodecTests: XCTestCase {
         return root.appendingPathComponent(name)
     }
 
-    private func ledgerEncoder() -> JSONEncoder {
+    private func legacyLedgerEncoder() -> JSONEncoder {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .millisecondsSince1970
         encoder.outputFormatting = [.sortedKeys]
         return encoder
     }
 
-    func testRepeatedLedgerWritesKeepExistingBytesDateUnitsAndMetricKeys() throws {
+    private func jsonObject(_ data: Data) throws -> NSDictionary {
+        try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? NSDictionary)
+    }
+
+    func testRepeatedLedgerWritesKeepStoredValuesDateUnitsAndMetricKeys() throws {
         let file = try fixtureFile("ledger.json"), store = AgentTaskLedgerStore(fileURL: file)
         let taskID = UUID(), historyID = UUID()
         let metrics = AgentRequestMetrics(planning: 2, verification: 1, retries: 0, modelSwitches: 3,
@@ -32,7 +36,8 @@ final class ConfiguredJSONCodecTests: XCTestCase {
                 finishedAt: Date(timeIntervalSince1970: 501.5), wasQueued: true, requestMetrics: metrics)])
             try store.save(queue: snapshot.queue, history: snapshot.history)
             let bytes = try Data(contentsOf: file)
-            XCTAssertEqual(bytes, try ledgerEncoder().encode(snapshot))
+            let legacyBytes = try legacyLedgerEncoder().encode(snapshot)
+            XCTAssertEqual(try jsonObject(bytes), try jsonObject(legacyBytes))
             XCTAssertEqual(try store.load(), snapshot)
             let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: bytes) as? [String: Any])
             let queue = try XCTUnwrap(json["queue"] as? [[String: Any]])
@@ -41,6 +46,8 @@ final class ConfiguredJSONCodecTests: XCTestCase {
             let encodedMetrics = try XCTUnwrap(history[0]["requestMetrics"] as? [String: Any])
             XCTAssertEqual(encodedMetrics["modelSwitches"] as? Int, 3)
             XCTAssertNil(encodedMetrics["model_switches"])
+            try legacyBytes.write(to: file, options: .atomic)
+            XCTAssertEqual(try store.load(), snapshot)
         }
     }
 
@@ -109,7 +116,7 @@ final class ConfiguredJSONCodecTests: XCTestCase {
         }
     }
 
-    func testRepeatedProfileSavesKeepCanonicalArchiveBytesAndReloadBehavior() throws {
+    func testRepeatedProfileSavesKeepStoredValuesAndLegacyReloadBehavior() throws {
         struct Method: Encodable { let evidence: String; let observedAt: Double }
         struct Profile: Encodable { let revision: String; let methods: [String: Method]; let lastUsed: Double }
         struct Archive: Encodable { let version: Int; let environment: String; let profiles: [String: Profile] }
@@ -123,13 +130,17 @@ final class ConfiguredJSONCodecTests: XCTestCase {
         for evidence in [ControlCompatibilityProfiles.Evidence.verified, .unsupported, .supported, .unconfirmed, .verified] {
             date += 0.5
             profiles.record(evidence, method: .process_event, for: key)
-            let fresh = JSONEncoder(); fresh.outputFormatting = [.sortedKeys]
+            let legacy = JSONEncoder(); legacy.outputFormatting = [.sortedKeys]
             let expected = Archive(version: 1, environment: environment, profiles: [key.subject: Profile(
                 revision: key.revision, methods: ["process_event": Method(evidence: evidence.rawValue, observedAt: date.timeIntervalSince1970)],
                 lastUsed: date.timeIntervalSince1970)])
-            XCTAssertEqual(try Data(contentsOf: file), try fresh.encode(expected))
+            let legacyBytes = try legacy.encode(expected)
+            XCTAssertEqual(try jsonObject(Data(contentsOf: file)), try jsonObject(legacyBytes))
             let reloaded = ControlCompatibilityProfiles(fileURL: file, environment: environment, now: { date })
             XCTAssertEqual(reloaded.evidence(for: key, method: .process_event), evidence)
+            try legacyBytes.write(to: file, options: .atomic)
+            let legacyReloaded = ControlCompatibilityProfiles(fileURL: file, environment: environment, now: { date })
+            XCTAssertEqual(legacyReloaded.evidence(for: key, method: .process_event), evidence)
         }
     }
 

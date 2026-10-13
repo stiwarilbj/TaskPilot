@@ -67,11 +67,7 @@ final class ControlCompatibilityProfiles {
     private struct Archive: Codable { let version: Int; let environment: String; let profiles: [String: Profile] }
     private let lock = NSLock()
     private let codingQueue = DispatchQueue(label: "com.orbitagent.control-compatibility-json")
-    private let archiveEncoder: JSONEncoder = {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return encoder
-    }()
+    private let archiveEncoder = JSONEncoder()
     private let fileURL: URL?
     private let now: () -> Date
     private var environment: String
