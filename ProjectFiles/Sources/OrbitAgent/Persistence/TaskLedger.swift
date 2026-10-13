@@ -135,6 +135,21 @@ struct AgentTaskLedgerStore: Sendable {
 
     let fileURL: URL
 
+    // Copies of this Sendable store share the queue as well as its codecs.
+    // Configuration is fixed before publication; all coding uses this queue.
+    private let codingQueue = DispatchQueue(label: "com.orbitagent.task-ledger-json")
+    private let decoder: JSONDecoder = {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        return decoder
+    }()
+    private let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
+
     init(fileURL: URL? = nil) {
         self.fileURL = fileURL ?? Self.defaultFileURL()
     }
@@ -151,12 +166,8 @@ struct AgentTaskLedgerStore: Sendable {
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             return AgentTaskLedgerSnapshot()
         }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .millisecondsSince1970
-        return try decoder.decode(
-            AgentTaskLedgerSnapshot.self,
-            from: Data(contentsOf: fileURL)
-        )
+        let data = try Data(contentsOf: fileURL)
+        return try codingQueue.sync { try decoder.decode(AgentTaskLedgerSnapshot.self, from: data) }
     }
 
     func save(
@@ -175,12 +186,9 @@ struct AgentTaskLedgerStore: Sendable {
             ofItemAtPath: directory.path
         )
 
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .millisecondsSince1970
-        encoder.outputFormatting = [.sortedKeys]
-        let data = try encoder.encode(
-            AgentTaskLedgerSnapshot(queue: queue, history: history)
-        )
+        let data = try codingQueue.sync {
+            try encoder.encode(AgentTaskLedgerSnapshot(queue: queue, history: history))
+        }
         try data.write(to: fileURL, options: .atomic)
         try fileManager.setAttributes(
             [.posixPermissions: Self.filePermissions],

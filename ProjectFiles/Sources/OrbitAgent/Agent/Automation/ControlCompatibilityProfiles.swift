@@ -48,10 +48,12 @@ final class ControlCompatibilityProfiles {
         init(appID: String, bundlePath: String, version: String, build: String, executableRevision: String,
              role: String, subrole: String, action: ActionKind, capabilities: [String: Bool],
              hid: Bool, mainDisplay: Bool, environment: String) {
-            subject = ControlCompatibilityProfiles.fingerprint([appID, bundlePath, role, subrole, action.rawValue])
+            // Both hashes belong to this synchronous key-construction invocation.
+            let encoder = JSONEncoder()
+            subject = ControlCompatibilityProfiles.fingerprint([appID, bundlePath, role, subrole, action.rawValue], encoder: encoder)
             revision = ControlCompatibilityProfiles.fingerprint([version, build, executableRevision,
                 capabilities.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: ","),
-                String(hid), String(mainDisplay), environment])
+                String(hid), String(mainDisplay), environment], encoder: encoder)
             self.environment = environment; self.action = action
             pressAdvertised = capabilities["press"] == true
         }
@@ -64,6 +66,12 @@ final class ControlCompatibilityProfiles {
     }
     private struct Archive: Codable { let version: Int; let environment: String; let profiles: [String: Profile] }
     private let lock = NSLock()
+    private let codingQueue = DispatchQueue(label: "com.orbitagent.control-compatibility-json")
+    private let archiveEncoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
     private let fileURL: URL?
     private let now: () -> Date
     private var environment: String
@@ -92,7 +100,10 @@ final class ControlCompatibilityProfiles {
     }
 
     static func fingerprint(_ metadata: [String]) -> String {
-        let bytes = try! JSONEncoder().encode(metadata)
+        fingerprint(metadata, encoder: JSONEncoder())
+    }
+    private static func fingerprint(_ metadata: [String], encoder: JSONEncoder) -> String {
+        let bytes = try! encoder.encode(metadata)
         return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
     static func owned<T>(_ operation: () throws -> T) throws -> T {
@@ -176,9 +187,10 @@ final class ControlCompatibilityProfiles {
         guard let fileURL else { return }
         if let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
            attributes[.type] as? FileAttributeType != .typeRegular { return }
-        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
-        guard let bytes = try? encoder.encode(Archive(version: Self.policyVersion, environment: environment,
-                profiles: profiles.filter { !$0.value.methods.isEmpty })), bytes.count <= Self.maximumFileBytes else { return }
+        let archive = Archive(version: Self.policyVersion, environment: environment,
+                              profiles: profiles.filter { !$0.value.methods.isEmpty })
+        guard let bytes = try? codingQueue.sync(execute: { try archiveEncoder.encode(archive) }),
+              bytes.count <= Self.maximumFileBytes else { return }
         // Cache failure only discards a hint; it never fails a desktop action.
         do {
             try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true,

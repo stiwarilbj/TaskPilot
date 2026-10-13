@@ -279,4 +279,48 @@ final class TaskOwnershipTests: XCTestCase {
         XCTAssertEqual(bridgeCalls, 0)
     }
 
+    @MainActor func testMetricsCodecKeepsSnakeCaseAndRecoversAcrossMessagesAndInvocations() async throws {
+        let first = try helper("""
+        fields = dict(verification=2, retries=0, model_switches=3, cache_hits=4, reconnects=0)
+        for i in range(120):
+            if i % 17 == 0: emit('request_metrics', planning='invalid', **fields)
+            emit('request_metrics', planning=i, repairs=1, command_probe_cache_hits=i, local_targeted_checks=1, **fields)
+        emit('complete', message='first')
+        """)
+        let next = try helper("emit('request_metrics', planning=7, verification=1, retries=0, model_switches=0, cache_hits=0, reconnects=0)\nemit('complete', message='next')")
+        let firstComplete = expectation(description: "Repeated metrics decoded")
+        let nextComplete = expectation(description: "Next invocation decoded legacy metrics")
+        var metrics: [AgentRequestMetrics] = []
+        let runtime = AgentRuntimeProcess(bridge: bridge())
+        runtime.onEvent = { event in
+            if case .diagnostics(let value) = event { metrics.append(value) }
+            if case .completed = event { firstComplete.fulfill() }
+            if case .failed(let message) = event { XCTFail(message); firstComplete.fulfill() }
+        }
+        try runtime.start(task: "fixture", display: display, runtimeURL: first, openClawURL: first, geminiAPIKey: "")
+        await fulfillment(of: [firstComplete], timeout: 5)
+        XCTAssertEqual(metrics.count, 120)
+        for (index, value) in metrics.enumerated() {
+            XCTAssertEqual(value.planning, index)
+            XCTAssertEqual(value.modelSwitches, 3)
+            XCTAssertEqual(value.cacheHits, 4)
+            XCTAssertEqual(value.commandProbeCacheHits, index)
+            XCTAssertEqual(value.localTargetedChecks, 1)
+            XCTAssertEqual(value.repairs, 1)
+            XCTAssertNil(value.providerRetries)
+        }
+        metrics.removeAll()
+        runtime.onEvent = { event in
+            if case .diagnostics(let value) = event { metrics.append(value) }
+            if case .completed = event { nextComplete.fulfill() }
+            if case .failed(let message) = event { XCTFail(message); nextComplete.fulfill() }
+        }
+        try runtime.start(task: "fixture", display: display, runtimeURL: next, openClawURL: next, geminiAPIKey: "")
+        await fulfillment(of: [nextComplete], timeout: 5)
+        XCTAssertEqual(metrics.count, 1)
+        XCTAssertEqual(metrics.first?.planning, 7)
+        XCTAssertNil(metrics.first?.repairs)
+        XCTAssertNil(metrics.first?.commandProbeCacheHits)
+    }
+
 }

@@ -80,6 +80,7 @@ final class AgentRuntimeProcess {
         let process: Process
         let input: Pipe
         let handler: (@MainActor (RuntimeEvent) -> Void)?
+        let metricsDecoder: JSONDecoder
         var outputBuffer = RuntimeLineBuffer()
         var lastErrorLine = ""
         var requestedStop = false
@@ -93,6 +94,9 @@ final class AgentRuntimeProcess {
         var drainReported = false
         init(lease: TaskLease, process: Process, input: Pipe, handler: (@MainActor (RuntimeEvent) -> Void)?) {
             self.lease = lease; self.process = process; self.input = input; self.handler = handler
+            // Decode only on the owning runtime's serialized I/O queue.
+            metricsDecoder = JSONDecoder()
+            metricsDecoder.keyDecodingStrategy = .convertFromSnakeCase
         }
     }
     private var invocation: Invocation?
@@ -308,9 +312,7 @@ final class AgentRuntimeProcess {
         case "model_health":
             emit(.modelHealth(message["model"] as? String ?? "", message["state"] as? String ?? "repair", message["detail"] as? String ?? ""), for: run)
         case "request_metrics":
-            let decoder = JSONDecoder()
-            decoder.keyDecodingStrategy = .convertFromSnakeCase
-            if let metrics = try? decoder.decode(AgentRequestMetrics.self, from: data) { emit(.diagnostics(metrics), for: run) }
+            if let metrics = try? run.metricsDecoder.decode(AgentRequestMetrics.self, from: data) { emit(.diagnostics(metrics), for: run) }
         case "bridge_request":
             let operationID = UUID()
             let operation = Task { [weak self] in
