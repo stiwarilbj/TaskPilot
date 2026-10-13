@@ -7,6 +7,7 @@ interpolate shell source, or grant permission to execute anything.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 import hashlib
 import json
 import re
@@ -151,8 +152,16 @@ class TaskInputBindings:
         return {"version": TASK_INPUT_VERSION, "values": values, **({"omitted": self.omitted} if self.omitted else {})}
 
     def fingerprint(self) -> str:
-        return hashlib.sha256(json.dumps([TASK_INPUT_VERSION, [(e.identifier, e.value, e.sources) for e in self.entries],
-                                          self.omitted], ensure_ascii=True).encode()).hexdigest()
+        return self._fingerprint
+
+    @cached_property
+    def _canonical(self) -> str:
+        return json.dumps([TASK_INPUT_VERSION, [(e.identifier, e.value, e.sources) for e in self.entries],
+                           self.omitted], ensure_ascii=True)
+
+    @cached_property
+    def _fingerprint(self) -> str:
+        return hashlib.sha256(self._canonical.encode()).hexdigest()
 
     def resolve(self, response: dict) -> dict:
         return self._transform(response, resolve=True)

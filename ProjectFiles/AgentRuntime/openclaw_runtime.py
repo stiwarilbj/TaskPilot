@@ -62,7 +62,8 @@ from observation_completeness import (OBSERVATION_COMPLETENESS_VERSION, Observat
                                       validate_completeness, prompt_coverage, coverage_cache_input)
 from local_text_recognition import (TEXT_RECOGNITION_VERSION, TextRecognitionError,
                                     validate_text_recognition, prompt_text_recognition, detail_images)
-from task_evidence import TaskEvidenceLedger, CHECKLIST_VERSION, LARGEST_PATTERN, digest as evidence_digest
+from task_evidence import (TaskEvidenceLedger, RevisionedJSONState, CHECKLIST_VERSION,
+                           LARGEST_PATTERN, digest as evidence_digest)
 from expected_effects import ExpectedEffect, EXPECTED_EFFECT_VERSION, FILE_EFFECTS, path_key
 from task_inputs import TASK_INPUT_VERSION, input_reference_rules
 from command_intents import explicit_operation
@@ -77,6 +78,7 @@ from response_validation import (
 MAX_COMPACT_ELEMENTS = 360
 MAX_RECENT_ACTIONS = 8
 VERIFICATION_SESSION_VERSION = 1
+STATE_FINGERPRINT_VERSION = 1
 from action_contract_generated import (
     TASK_PROTOCOL_VERSION,
     CONTRACT_HASH, CONTRACT_VERSION, VALID_ACTIONS, TRUSTED_NATIVE_ACTIONS,
@@ -868,6 +870,11 @@ def record_action_diagnostic(action: dict[str, Any], result: dict[str, Any]) -> 
 
 
 def observation_progress_signature(observation: dict[str, Any], pid: int | None = None) -> str:
+    state = observation_state(observation)
+    return state.memoize(("progress", pid), lambda: _observation_progress_signature(observation, pid))
+
+
+def _observation_progress_signature(observation: dict[str, Any], pid: int | None = None) -> str:
     """Ignore revision churn, foreground restoration and tree enumeration order."""
     apps = []
     for app in observation.get("applications", []):
@@ -918,6 +925,19 @@ class ScreenshotBuffers:
         self.generation = generation
         self.images: dict[tuple[Path, str | None], ScreenshotBuffer] = {}
         self.current: dict[Path, tuple[Path, str | None]] = {}
+        self.states: dict[tuple[Path, str | None], RevisionedJSONState] = {}
+
+    def observation(self, observation: dict[str, Any]) -> RevisionedJSONState:
+        if self.generation != _task_generation_id:
+            raise ActionRejected("Observation belongs to another task", "cancelled")
+        path = Path(str(observation.get("screenshot_path") or "")).absolute()
+        key = (path, observation.get("observation_revision"))
+        if key not in self.states: self.states[key] = RevisionedJSONState()
+        state = self.states[key]
+        # Accepted observations are read-only in the loop. The content guard also
+        # detects accidental edits and reused revisions without serializing them.
+        state.update(coverage_cache_input(observation))
+        return state
 
     def image(self, path: Path, revision: str | None = None) -> ScreenshotBuffer:
         if self.generation != _task_generation_id:
@@ -931,6 +951,9 @@ class ScreenshotBuffers:
 
     def discard(self, path: Path, revision: str | None = None) -> bool:
         path = path.absolute()
+        for key in list(self.states):
+            if key[0] == path and (revision is None or key[1] == revision):
+                self.states.pop(key).clear()
         keys = [(path, revision)] if revision is not None else [key for key in self.images if key[0] == path]
         for key in keys:
             image = self.images.pop(key, None)
@@ -940,13 +963,15 @@ class ScreenshotBuffers:
                 self.current.pop(path, None)
         # Native captures have unique paths. If a path was reused, discarding
         # an older revision must not unlink another live revision's image.
-        return not any(key[0] == path for key in self.images)
+        return not any(key[0] == path for key in self.images) and not any(key[0] == path for key in self.states)
 
     def clear(self) -> None:
         for image in self.images.values():
             image.discard()
         self.images.clear()
         self.current.clear()
+        for state in self.states.values(): state.clear()
+        self.states.clear()
 
 
 @contextmanager
@@ -963,6 +988,15 @@ def screenshot_buffer_scope():
 def screenshot_buffer(path: Path, revision: str | None = None) -> ScreenshotBuffer:
     images = _screenshot_buffers.get()
     return images.image(path, revision) if images is not None else ScreenshotBuffer(path)
+
+
+def observation_state(observation: dict[str, Any] | None) -> RevisionedJSONState:
+    images = _screenshot_buffers.get()
+    if images is not None and observation is not None:
+        return images.observation(observation)
+    state = RevisionedJSONState()
+    state.update(coverage_cache_input(observation))
+    return state
 
 
 def observation_image_digest(observation: dict[str, Any]) -> str | None:
@@ -2583,8 +2617,10 @@ def prepare_dependency_action(decision: dict, display_id: int, ledger: TaskEvide
                     for e in ledger.evidence.values())):
             continue
         check = requirement["check"]
-        if check["type"] not in FILE_EFFECTS or evidence_digest(check) in seen: continue
-        seen.add(evidence_digest(check))
+        if check["type"] not in FILE_EFFECTS: continue
+        fingerprint = evidence_digest(check)
+        if fingerprint in seen: continue
+        seen.add(fingerprint)
         prior = next((e for e in reversed(list(ledger.evidence.values())) if e["mutable"] and ledger.matches(check, e)), None)
         ledger.invalidate(lambda e: e["mutable"] and ledger.matches(check, e))
         captured = []
@@ -2705,7 +2741,18 @@ def routed_json_prompt(
     ledger: TaskEvidenceLedger | None = None,
 ) -> dict[str, Any]:
     image = screenshot_buffer(screenshot_path, (observation or {}).get("observation_revision"))
-    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, LOCAL_CHANGE_VERSION, COMMAND_CAPABILITY_VERSION, PROMPT_COMPILER_VERSION, VERIFICATION_SESSION_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION, RECOVERY_CYCLE_VERSION, TASK_INPUT_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation), image.digest], sort_keys=True).encode()).hexdigest()
+    identity = (STATE_FINGERPRINT_VERSION, _task_generation_id, VALIDATION_VERSION, CONTRACT_HASH,
+        CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, LOCAL_CHANGE_VERSION, COMMAND_CAPABILITY_VERSION,
+        PROMPT_COMPILER_VERSION, VERIFICATION_SESSION_VERSION, COORDINATE_MAPPING_VERSION,
+        OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION,
+        RECOVERY_CYCLE_VERSION, TASK_INPUT_VERSION, ledger.fingerprint() if ledger else None,
+        purpose, instruction, observation_state(observation).fingerprint, image.digest)
+    previous = getattr(client, "_decision_fingerprint", None)
+    if isinstance(previous, tuple) and len(previous) == 2 and previous[0] == identity:
+        key = previous[1]
+    else:
+        key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        client._decision_fingerprint = (identity, key)
     cached = getattr(client, "decision_cache", {})
     if cached.get("key") == key:
         value = validate_response(json.loads(json.dumps(cached["decision"])), purpose, observation, ledger)

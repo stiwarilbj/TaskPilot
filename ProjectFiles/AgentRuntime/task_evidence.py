@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 from copy import deepcopy
@@ -37,6 +38,51 @@ def fail(path: str, reason: str) -> None:
 def digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
                                     ensure_ascii=True).encode()).hexdigest()
+
+
+def same_json_state(first: Any, second: Any) -> bool:
+    """Compare without encoding, including distinctions Python equality hides."""
+    if first is second: return True
+    if type(first) is not type(second): return False
+    if isinstance(first, dict):
+        return first.keys() == second.keys() and all(same_json_state(value, second[key]) for key, value in first.items())
+    if isinstance(first, (list, tuple)):
+        return len(first) == len(second) and all(same_json_state(a, b) for a, b in zip(first, second))
+    if isinstance(first, float) and first == second == 0:
+        return math.copysign(1, first) == math.copysign(1, second)
+    return first == second
+
+
+class RevisionedJSONState:
+    """In-memory representations of one state revision, never a result cache."""
+    def __init__(self) -> None:
+        self.revision = 0
+        self._snapshot: Any = None
+        self._values: dict[Any, Any] = {}
+
+    def update(self, value: Any) -> None:
+        if not self.revision or not same_json_state(value, self._snapshot):
+            self._snapshot = deepcopy(value)
+            self.revision += 1
+            self._values.clear()
+
+    def memoize(self, key: Any, build):
+        if key not in self._values: self._values[key] = build()
+        return self._values[key]
+
+    @property
+    def canonical(self) -> str:
+        return self.memoize("canonical", lambda: json.dumps(self._snapshot, sort_keys=True,
+                           separators=(",", ":"), ensure_ascii=True))
+
+    @property
+    def fingerprint(self) -> str:
+        return self.memoize("fingerprint", lambda: hashlib.sha256(self.canonical.encode()).hexdigest())
+
+    def clear(self) -> None:
+        self._snapshot = None
+        self._values.clear()
+        self.revision = 0
 
 
 def path_key(path: str) -> str:
@@ -249,6 +295,7 @@ def validate_metadata(value: dict, purpose: str, ledger: TaskEvidenceLedger | No
 
 class TaskEvidenceLedger:
     def __init__(self, task: str, generation: str | None = None, *, input_scope: str | None = None) -> None:
+        self._state = RevisionedJSONState()
         self.task, self.generation = task, generation
         self.inputs = TaskInputBindings(task, scope=input_scope)
         self.requirements: dict[str, dict] = {}
@@ -688,6 +735,15 @@ class TaskEvidenceLedger:
                              for key, e in self.evidence.items() if e["valid"]}}
 
     def fingerprint(self) -> str:
-        return digest([CHECKLIST_VERSION, self.task, self.generation, self.inputs.fingerprint(), self.requirements,
+        self._sync_state()
+        return self._state.fingerprint
+
+    @property
+    def revision(self) -> int:
+        self._sync_state()
+        return self._state.revision
+
+    def _sync_state(self) -> None:
+        self._state.update([CHECKLIST_VERSION, self.task, self.generation, self.inputs.fingerprint(), self.requirements,
                        {key: [e["fact_fingerprint"], e["action_fingerprint"], e["valid"], e["mutable"], e["origin"], e.get('effect_check')]
                         for key, e in self.evidence.items()}, self.coverage_complete])
