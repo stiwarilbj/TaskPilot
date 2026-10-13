@@ -53,6 +53,7 @@ if [[ ! -x "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/screen_coordinates.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/expected_effects.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/evidence_consistency.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
+      || "$PROJECT_FILES_DIR/AgentRuntime/recovery_cycles.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/command_intents.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/prompt_compiler.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/request_policy.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \

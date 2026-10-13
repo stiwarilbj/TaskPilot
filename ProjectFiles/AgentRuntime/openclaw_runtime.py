@@ -62,6 +62,7 @@ from task_evidence import TaskEvidenceLedger, CHECKLIST_VERSION, LARGEST_PATTERN
 from expected_effects import ExpectedEffect, EXPECTED_EFFECT_VERSION, FILE_EFFECTS, path_key
 from task_inputs import TASK_INPUT_VERSION, input_reference_rules
 from evidence_consistency import EvidenceConsistency, EVIDENCE_CONSISTENCY_VERSION
+from recovery_cycles import RecoveryCycles, RECOVERY_CYCLE_VERSION
 
 from response_validation import (
     VALIDATION_VERSION, ResponseValidationError, extract_json_object, bind_command_outcomes,
@@ -2401,7 +2402,7 @@ def routed_json_prompt(
     observation: dict[str, Any] | None = None,
     ledger: TaskEvidenceLedger | None = None,
 ) -> dict[str, Any]:
-    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, PROMPT_COMPILER_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION, TASK_INPUT_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation)], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
+    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, PROMPT_COMPILER_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION, RECOVERY_CYCLE_VERSION, TASK_INPUT_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation)], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
     cached = getattr(client, "decision_cache", {})
     if cached.get("key") == key:
         value = validate_response(json.loads(json.dumps(cached["decision"])), purpose, observation, ledger)
@@ -2477,6 +2478,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
     blocked_recoveries = 0
     pending_observation: dict[str, Any] | None = None
     recovery = ActionRecovery()
+    recovery_cycles = RecoveryCycles(rejection_limit=MAX_IDENTICAL_ACTIONS)
     loading_pid: int | None = None
     loading_waits = 0
     consecutive_dependency_blocks = 0
@@ -2525,6 +2527,11 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
             if not screenshot_path.is_file():
                 raise RuntimeError(f"{PRODUCT_NAME} did not provide a readable screen image")
             ledger.observe(observation)
+            cycle_report = recovery_cycles.observe(observation, ledger)
+            model_router.metrics.update(recovery_cycles=recovery_cycles.detections,
+                                        cycle_suppressions=recovery_cycles.suppressions)
+            if cycle_report:
+                history.append({"step": step, "action": "recovery_cycle", "result": cycle_report})
 
             # Passwords and verification codes stay entirely on the private
             # TaskPilot runtime pipe. Detect a visible secure field before the
@@ -2675,6 +2682,14 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                 result_message = "No action was performed"
             else:
                 if defer_for_dependencies(decision, observation, step): continue
+                cycle_rejection = recovery_cycles.check(action, observation, ledger, screenshot_digest)
+                model_router.metrics.update(recovery_cycles=recovery_cycles.detections,
+                                            cycle_suppressions=recovery_cycles.suppressions)
+                if cycle_rejection:
+                    history.append({"step": step, "action": action, "result": cycle_rejection})
+                    record_action_diagnostic(action, cycle_rejection)
+                    emit("status", message="Reconsidering the recovery strategy after repeated states…")
+                    continue
                 try:
                     ledger.before_action(action)
                     result = bridge_call("act", display_id, action=action)
@@ -2692,6 +2707,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                                       "outcome": "delivered_unconfirmed" if code == "delivery_uncertain" else "rejected",
                                       "error_code": code, "recovery": action_failure_recovery(code)}
                     recovery.rejected(action, observation, code)
+                    recovery_cycles.record(action, observation, failure_result, ledger, screenshot_digest)
                     record_action_diagnostic(action, failure_result)
                     if code == "delivery_uncertain":
                         model_router.metrics["unconfirmed_actions"] += 1
@@ -2753,6 +2769,8 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                 effect_proof = result_message.get('expected_effect', {})
                 if effect_proof.get('outcome') == 'verified' and effect_proof.get('check') in FILE_EFFECTS:
                     ledger.record_effect(decision['expected_result'], effect_proof['evidence'], action)
+                if not recovered_result:
+                    recovery_cycles.record(action, observation, result_message, ledger, screenshot_digest)
             if (decision.get("finish_after_action") is True and action_type in {"write_file", "run_command"}
                     and isinstance(result_message, dict) and result_message.get('verification_scope') != 'expected_effect_unconfirmed'):
                 discard_observation_image(pending_observation)
@@ -2767,6 +2785,8 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
     finally:
         discard_observation_image(pending_observation)
         _observation_keywords = []
+        model_router.metrics.update(recovery_cycles=recovery_cycles.detections,
+                                    cycle_suppressions=recovery_cycles.suppressions)
         publish_task_metrics(model_router, client, ledger)
         client.close()
 

@@ -20,6 +20,8 @@ struct AgentRequestMetrics: Codable, Equatable {
     var dependencyRejections: Int? = nil
     var conflictInspections: Int? = nil
     var evidenceConflicts: Int? = nil
+    var recoveryCycles: Int? = nil
+    var cycleSuppressions: Int? = nil
     var receiptQueries: Int? = nil
     var receiptRecoveries: Int? = nil
     var effectChecks: Int? = nil

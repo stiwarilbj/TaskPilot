@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-PROMPT_COMPILER_VERSION = 6
+PROMPT_COMPILER_VERSION = 7
 PHASE_PREFIX = "EXECUTION PHASE: "
 REPAIR_HEADER = "RESPONSE FORMAT REPAIR:"
 EXAMPLE_MARKERS = {"planning": "RELEVANT ACTION EXAMPLES", "recovery": "RELEVANT ACTION EXAMPLES",
@@ -53,6 +53,7 @@ RECOVERY_CONDITIONS = {
     "completion_incomplete": "Fulfill the reported missing requirements; existing partial proof cannot authorize whole-task completion.",
     "prerequisite_unproven": "No dependent action was delivered. Prove the listed prerequisites using current local checks; select their prerequisite action instead. Never relabel the rejected action to bypass dependencies.",
     "evidence_conflict": "No action was dispatched. Compare the specific disagreement and refreshed evidence. Unresolved sources cannot authorize that target or completion. Select a consistent target or safe recovery; never replay a mutation or silently prefer one source.",
+    "recovery_cycle": "Use state_sequence and approaches_tried to leave the repeated recovery path. Do not alternate those methods in the same state or reopen/close the same panel again. Choose an untried supported strategy or read-only inspection; waiting, incidental movement and delivery acknowledgement do not prove task progress. Inspect uncertain mutations; blocked requires exhausted applicable recovery.",
 }
 COMPLETION_RULES = (
     "Act as TaskPilot's strict completion verifier. Do not call tools or propose executable actions. "

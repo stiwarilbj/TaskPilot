@@ -125,7 +125,7 @@ def seed_cases():
                      [act(), act(), act()], normal,
                      "test_action_recovery / do not replay an uncertain mutation")
     uncertain["task"] = "In Fixture App, submit the Draft exactly once and verify the receipt."
-    cases = deepcopy([healthy, wrong, stale, delayed, malformed, syntax, zero, early, uncertain, *file_coverage_cases()])
+    cases = deepcopy([healthy, wrong, stale, delayed, malformed, syntax, zero, early, uncertain, *file_coverage_cases(), *cycle_cases()])
     for item in cases:
         item["scripts"] = deepcopy(item["scripts"])
         requirements = [{"source": item["task"], "description": item["task"],
@@ -144,6 +144,27 @@ def seed_cases():
                 if isinstance(response, dict) and "status" in response:
                     response["requirements"] = deepcopy(requirements)
     return cases
+
+
+def cycle_cases():
+    opened = act(target="$open")
+    closed = act(target="$close")
+    saved = state(control("saved", "Draft saved", "AXStaticText"))
+    dialog = case("repeated-dialog", "recovery_cycles",
+        {"initial": state(control("open", "Open save dialog"), control("save", "Save using menu")),
+         "dialog": state(control("dialog", "Save Draft", "AXSheet"), control("close", "Cancel")), "saved": saved},
+        [transition("initial", opened["action"], "dialog"), transition("dialog", closed["action"], "initial"),
+         transition("initial", {"type": "press", "element_id": "$save"}, "saved", {"saved": 1})],
+        [opened, closed, opened, closed, opened, opened, opened],
+        [opened, closed, opened, closed, act(), DONE, YES], "repeated open/close recovery path")
+    methods = case("alternating-methods", "recovery_cycles",
+        {"initial": state(control("save", "Save"), control("menu", "Save using menu")), "saved": saved},
+        [transition("initial", {"type": "press", "element_id": "$save"}, "initial", error="unsupported_action"),
+         transition("initial", {"type": "click", "pid": 42, "x": 120, "y": 115}, "initial", error="delivery_rejected"),
+         transition("initial", {"type": "press", "element_id": "$menu"}, "saved", {"saved": 1})],
+        [act(), act("click", None, pid=42, x=120, y=115), act(), act("click", None, pid=42, x=120, y=115), act()],
+        [act(), act("click", None, pid=42, x=120, y=115), act(), act(target="$menu"), DONE, YES], "unsuccessful AX/coordinate method alternation")
+    return [dialog, methods]
 
 
 def file_coverage_cases():

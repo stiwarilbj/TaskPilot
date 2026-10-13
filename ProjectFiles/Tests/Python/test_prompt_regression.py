@@ -38,7 +38,7 @@ class PromptRegressionTests(unittest.TestCase):
     def test_all_failure_categories_have_sanitized_reproductions_and_healthy_control(self):
         regression.validate_corpus(self.corpus)
         self.assertTrue(regression.CATEGORIES <= {c["category"] for c in self.corpus["cases"]})
-        self.assertEqual(len(self.corpus["cases"]), 11)
+        self.assertEqual(len(self.corpus["cases"]), 13)
         self.assertTrue(all(c["provenance"]["kind"] != "sanitized_recording" for c in self.corpus["cases"]))
 
     def test_candidate_controls_reach_all_independent_postconditions(self):
@@ -227,8 +227,10 @@ class PromptRegressionTests(unittest.TestCase):
                                     env={**os.environ, "PYTHONHASHSEED": "2"}, capture_output=True, text=True)
             self.assertEqual(replay.returncode, 1, replay.stderr)
             comparison = json.loads(replay.stdout)
-            self.assertEqual(comparison["candidate"]["successes"], 11)
-            self.assertEqual(comparison["candidate"]["requests"], 39)
+            self.assertEqual(comparison["candidate"]["successes"], 13)
+            self.assertEqual(comparison["candidate"]["requests"], 52)
+            self.assertEqual(comparison["candidate"]["recovery_cycles"], 2)
+            self.assertEqual(comparison["candidate"]["cycle_suppressions"], 1)
             self.assertEqual(comparison["baseline"]["successes"], 2)
             self.assertNotIn("invalid_or_incomplete_recording", comparison["reasons"])
 
@@ -251,7 +253,7 @@ class PromptRegressionTests(unittest.TestCase):
         self.assertIn("scripted_responses_do_not_measure_prompt_quality", comparison["reasons"])
         self.assertIn("insufficient_paired_trials", comparison["reasons"])
         self.assertEqual(comparison["baseline"]["successes"], 2)
-        self.assertEqual(comparison["candidate"]["successes"], 11)
+        self.assertEqual(comparison["candidate"]["successes"], 13)
         self.assertFalse(comparison["automatic_adoption"])
 
     def reports_for_gate(self):

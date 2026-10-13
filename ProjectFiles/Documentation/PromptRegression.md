@@ -27,11 +27,12 @@ Use `--private-dir /absolute/private/directory` before the subcommand for a
 separate experiment. Symlinks and destinations inside the repository are
 rejected.
 
-Eleven sanitized cases cover a healthy control, the wrong window with an identical
+Thirteen sanitized cases cover a healthy control, the wrong window with an identical
 button label, a moved control, a delayed dialog, an invalid text parameter,
 command syntax failure, exit zero without the requested file result, premature
 completion, an uncertain submission, partial multi-file completion, and a
-successful write with incorrect contents. Outcomes use independent state and
+successful write with incorrect contents, a repeated open/cancel dialog path,
+and alternating unsuccessful delivery methods. Outcomes use independent state and
 exact counters, so a model's completion claim does not establish success. A
 repeated mutation also fails an exactly-once requirement.
 
@@ -51,7 +52,7 @@ and `candidate-prompt.json` identify the executor revision and rule sections.
 `recovery_rules` and `verification_rules` strings replace only their matching
 phase's rule section while preserving the phase, task evidence, examples and
 validated history. Planning overrides do not replace recovery rules. Packs
-also bind the prompt compiler version. This tool does
+also bind the prompt compiler and recovery-cycle policy versions. This tool does
 not load or execute candidate Python code. A changed executor needs a new
 experiment; do not compare different executor versions as a prompt-only change.
 

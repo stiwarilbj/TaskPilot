@@ -34,7 +34,7 @@
 		</data>
 		<key>Resources/AgentRuntime/_internal/base_library.zip</key>
 		<data>
-		8bh04BNfVfASlx3ncNU7evqQdqo=
+		MMRXOLxdW1URoANbfj272568vkM=
 		</data>
 		<key>Resources/AgentRuntime/_internal/libcrypto.3.dylib</key>
 		<data>
@@ -238,7 +238,7 @@
 		</data>
 		<key>Resources/AgentRuntime/orbit_openclaw_runtime</key>
 		<data>
-		VTyCSKPcDmRqGX7a70HEfC6ADy0=
+		HQlvvesgFPY0PDZKABENjT/pv/c=
 		</data>
 		<key>Resources/OpenClaw/action-contract.sh</key>
 		<data>
@@ -312,7 +312,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			A60qLc5KDPoM6lvSXR+vrF+VvXdzSQXPyPWJ39zxbWM=
+			q1YQdR/QgYcQvg5Zp6bO+2oz6w6e8bxTp6cc12IP7jc=
 			</data>
 		</dict>
 		<key>Resources/AgentRuntime/_internal/libcrypto.3.dylib</key>
@@ -669,7 +669,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			EXmPt6qNDHu+YKCeflhOxg9bg4bc2WKdPBuduk9Zd4c=
+			XiAbuchpoRmWfFAKCjC1dx9ZK+vXMidmZtfwJ01w3h0=
 			</data>
 		</dict>
 		<key>Resources/OpenClaw/action-contract.sh</key>

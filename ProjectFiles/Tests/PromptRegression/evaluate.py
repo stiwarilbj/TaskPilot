@@ -30,10 +30,11 @@ from provider_errors import ProviderRequestError
 from response_validation import extract_json_object, ResponseValidationError
 from action_contract_generated import CONTRACT_HASH
 from prompt_compiler import PROMPT_COMPILER_VERSION, EXAMPLE_MARKERS, REPAIR_HEADER, phase_header, prompt_phase
+from recovery_cycles import RECOVERY_CYCLE_VERSION
 from fixtures import seed_cases
 
 VERSION = 1
-CATEGORIES = {"wrong_clicks", "delayed_screens", "malformed_json", "command_errors", "premature_completion"}
+CATEGORIES = {"wrong_clicks", "delayed_screens", "malformed_json", "command_errors", "premature_completion", "recovery_cycles"}
 REPO = Path(__file__).resolve().parents[3]
 DEFAULT_ROOT = Path.home() / "Library/Application Support/TaskPilot/PromptRegression"
 SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
@@ -198,6 +199,7 @@ def validate_corpus(corpus):
 def prompt_pack(label="current", **rules):
     return {"version": VERSION, "label": checked_slug(label), "runtime_revision": runtime_revision(),
             "prompt_compiler_version": PROMPT_COMPILER_VERSION,
+            "recovery_cycle_version": RECOVERY_CYCLE_VERSION,
             **{field: rules.get(field) for field in RULE_FIELDS.values()}}
 
 
@@ -207,6 +209,8 @@ def validate_pack(pack):
         raise ValueError("Prompt pack was built for another runtime; compare with the same executor version")
     if type(pack.get("prompt_compiler_version")) is not int or pack["prompt_compiler_version"] != PROMPT_COMPILER_VERSION:
         raise ValueError("Prompt compiler version does not match")
+    if type(pack.get("recovery_cycle_version")) is not int or pack["recovery_cycle_version"] != RECOVERY_CYCLE_VERSION:
+        raise ValueError("Recovery cycle version does not match")
     for field in RULE_FIELDS.values():
         value = pack.get(field)
         if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > 16000):
@@ -496,6 +500,8 @@ def replay_case(case, pack, requests=None, script=None):
                   "verification": router.metrics["verification"], "repairs": router.metrics["repairs"],
                   "retries": router.metrics["retries"], "model_switches": client.model_switches,
                   "provider_retries": router.metrics["provider_retries"],
+                  "recovery_cycles": router.metrics.get("recovery_cycles", 0),
+                  "cycle_suppressions": router.metrics.get("cycle_suppressions", 0),
                   "recorded_response_seconds": round(response_seconds, 3),
                   "local_wait_seconds": round(world.now - response_seconds, 3),
                   "task_seconds": round(world.now, 3), "replay_wall_seconds": round(time.perf_counter() - started, 3)}
@@ -570,6 +576,7 @@ def totals(runs):
     times = sorted(r["task_seconds"] for r in runs)
     return {"runs": len(runs), "successes": sum(r["success"] for r in runs),
             **{key: sum(r[key] for r in runs) for key in ("incorrect_actions", "incorrect_action_attempts", "duplicate_actions", "requests", "planning", "verification", "repairs", "retries", "model_switches", "premature_completion")},
+            **{key: sum(r.get(key, 0) for r in runs) for key in ("recovery_cycles", "cycle_suppressions")},
             "provider_retries": sum(r["provider_retries"] for r in runs) if runs and all(r["provider_retries"] is not None for r in runs) else None,
             "median_task_seconds": round(statistics.median(times), 3) if times else None,
             "p95_task_seconds": times[math.ceil(len(times)*0.95)-1] if times else None}

@@ -112,6 +112,8 @@ final class EvidenceReadbackTests: XCTestCase {
         XCTAssertNil(try JSONDecoder().decode(AgentRequestMetrics.self, from: legacy).dependencyRejections)
         XCTAssertNil(try JSONDecoder().decode(AgentRequestMetrics.self, from: legacy).conflictInspections)
         XCTAssertNil(try JSONDecoder().decode(AgentRequestMetrics.self, from: legacy).evidenceConflicts)
+        XCTAssertNil(try JSONDecoder().decode(AgentRequestMetrics.self, from: legacy).recoveryCycles)
+        XCTAssertNil(try JSONDecoder().decode(AgentRequestMetrics.self, from: legacy).cycleSuppressions)
         let current = Data("{\"planning\":1,\"verification\":1,\"retries\":0,\"modelSwitches\":0,\"cacheHits\":0,\"reconnects\":0,\"evidenceChecks\":2,\"coverageRejections\":1,\"requirementsProven\":3}".utf8)
         let result = try JSONDecoder().decode(AgentRequestMetrics.self, from: current)
         XCTAssertEqual(result.evidenceChecks, 2)
@@ -129,5 +131,10 @@ final class EvidenceReadbackTests: XCTestCase {
         XCTAssertEqual(inspected.conflictInspections, 2)
         XCTAssertEqual(inspected.evidenceConflicts, 1)
         XCTAssertEqual(inspected.summary, guarded.summary)
+        let cycles = Data("{\"planning\":1,\"verification\":0,\"retries\":0,\"model_switches\":0,\"cache_hits\":0,\"reconnects\":0,\"recovery_cycles\":2,\"cycle_suppressions\":1}".utf8)
+        let recovered = try decoder.decode(AgentRequestMetrics.self, from: cycles)
+        XCTAssertEqual(recovered.recoveryCycles, 2)
+        XCTAssertEqual(recovered.cycleSuppressions, 1)
+        XCTAssertEqual(recovered.summary, guarded.summary)
     }
 }
