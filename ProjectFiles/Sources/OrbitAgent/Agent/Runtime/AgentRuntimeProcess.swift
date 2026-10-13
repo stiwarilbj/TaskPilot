@@ -80,7 +80,7 @@ final class AgentRuntimeProcess {
         let process: Process
         let input: Pipe
         let handler: (@MainActor (RuntimeEvent) -> Void)?
-        var outputBuffer = Data()
+        var outputBuffer = RuntimeLineBuffer()
         var lastErrorLine = ""
         var requestedStop = false
         var receivedTerminalEvent = false
@@ -287,20 +287,8 @@ final class AgentRuntimeProcess {
 
     // Also used after process exit; the final event need not end with a newline.
     private func appendOutput(_ data: Data, for run: Invocation, flush: Bool = false) {
-        run.outputBuffer.append(data)
-        let lines = Self.extractOutputLines(from: &run.outputBuffer, flush: flush)
+        let lines = run.outputBuffer.append(data, flush: flush)
         for line in lines { processLine(line, for: run) }
-    }
-
-    static func extractOutputLines(from buffer: inout Data, flush: Bool = false) -> [Data] {
-        var lines: [Data] = []
-        while let newline = buffer.firstIndex(of: 0x0A) {
-            let line = Data(buffer[..<newline])
-            buffer.removeSubrange(...newline)
-            if !line.isEmpty { lines.append(line) }
-        }
-        if flush, !buffer.isEmpty { lines.append(buffer); buffer.removeAll() }
-        return lines
     }
 
     private func processLine(_ data: Data, for run: Invocation) {

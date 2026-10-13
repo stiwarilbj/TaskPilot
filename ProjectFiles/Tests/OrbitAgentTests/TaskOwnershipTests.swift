@@ -252,4 +252,31 @@ final class TaskOwnershipTests: XCTestCase {
         await fulfillment(of: [failed], timeout: 3)
     }
 
+    @MainActor func testStreamedBurstAndExitTailDeliverEachEventOnceInOrder() async throws {
+        let helper = try helper("""
+        messages = [dict(kind='status', task_generation_id=config['task_generation_id'], message=str(i) + ': ☃ 🧭') for i in range(1200)]
+        payload = ''.join(json.dumps(message, ensure_ascii=False) + '\\n' for message in messages)
+        payload += json.dumps(dict(kind='complete', task_generation_id=config['task_generation_id'], message='burst finished'))
+        encoded = payload.encode('utf-8')
+        for offset in range(0, len(encoded), 317):
+            sys.stdout.buffer.write(encoded[offset:offset + 317]); sys.stdout.buffer.flush()
+        """)
+        let complete = expectation(description: "Burst and final tail drained")
+        var messages: [String] = [], terminalCount = 0, bridgeCalls = 0
+        let runtime = AgentRuntimeProcess(bridge: bridge()) { _ in bridgeCalls += 1; return [:] }
+        runtime.onEvent = { event in
+            if case .status(let message) = event { messages.append(message) }
+            if case .completed(let message) = event {
+                XCTAssertEqual(message, "burst finished")
+                terminalCount += 1; complete.fulfill()
+            }
+            if case .failed(let message) = event { XCTFail(message); complete.fulfill() }
+        }
+        try runtime.start(task: "fixture", display: display, runtimeURL: helper, openClawURL: helper, geminiAPIKey: "")
+        await fulfillment(of: [complete], timeout: 5)
+        XCTAssertEqual(messages, (0..<1200).map { "\($0): ☃ 🧭" })
+        XCTAssertEqual(terminalCount, 1)
+        XCTAssertEqual(bridgeCalls, 0)
+    }
+
 }

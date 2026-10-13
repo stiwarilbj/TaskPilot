@@ -213,13 +213,13 @@ final class TaskPilotTests: XCTestCase {
     }
 
     func testExitDrainPreservesTheLastCompletionLineWithoutANewline() {
-        var buffer = Data("{\"kind\":\"status\",\"message\":\"working\"}\n{\"kind\":\"comp".utf8)
-        XCTAssertEqual(AgentRuntimeProcess.extractOutputLines(from: &buffer).count, 1)
-        buffer.append(Data("lete\",\"message\":\"Done\"}".utf8))
-        let lines = AgentRuntimeProcess.extractOutputLines(from: &buffer, flush: true)
+        var buffer = RuntimeLineBuffer()
+        XCTAssertEqual(buffer.append(Data("{\"kind\":\"status\",\"message\":\"working\"}\n{\"kind\":\"comp".utf8)).count, 1)
+        let lines = buffer.append(Data("lete\",\"message\":\"Done\"}".utf8), flush: true)
         XCTAssertEqual(lines.count, 1)
         XCTAssertTrue(String(data: lines[0], encoding: .utf8)!.contains("complete"))
-        XCTAssertTrue(buffer.isEmpty)
+        XCTAssertEqual(buffer.pendingByteCount, 0)
+        XCTAssertEqual(buffer.retainedByteCount, 0)
     }
 
     func testGeminiAPIKeyPersistsInPrivateApplicationSupportData() throws {
