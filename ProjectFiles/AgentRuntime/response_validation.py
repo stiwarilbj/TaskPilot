@@ -5,7 +5,7 @@ import json
 import math
 from typing import Any
 from task_evidence import EvidenceValidationError, validate_metadata
-from observation_context import coordinates_are_ambiguous
+from observation_context import coordinates_are_ambiguous, observation_indexes
 from expected_effects import validate_expectation, ExpectedEffectError
 from command_intents import explicit_operation, matches_explicit_request
 from local_text_recognition import coordinate_text_target, TextRecognitionError
@@ -86,19 +86,19 @@ def normalize_action(value: Any, observation: dict[str, Any] | None = None) -> d
         raise ResponseValidationError(str(error)) from error
     kind = action["type"]
     if observation is not None:
-        elements = {e["id"]: e for e in observation.get("elements", []) if isinstance(e, dict) and "id" in e}
+        indexes = observation_indexes(observation)
         if "element_id" in action:
-            element = elements.get(action["element_id"])
+            element = indexes.element(action["element_id"], last=True)
             if element is None: fail("action.element_id", "must reference the current observation")
             if "pid" in action and action["pid"] != element.get("pid"): fail("action.pid", "must match the selected element's app")
         elif "pid" in action:
-            if action["pid"] not in {app.get("pid") for app in observation.get("applications", []) if isinstance(app, dict)}:
+            if action["pid"] not in indexes.applications_by_pid:
                 fail("action.pid", "must reference an app in the current observation")
         if kind == "open_route":
             routes = observation.get("system_context", {}).get("task_routes", [])
             if action["route_id"] not in {r.get("route_id") for r in routes if isinstance(r, dict)}:
                 fail("action.route_id", "must reference a supplied task route")
-        if coordinates_are_ambiguous(action, observation):
+        if coordinates_are_ambiguous(action, observation, indexes):
             fail("action.element_id", "must select one observed control; these coordinates overlap multiple unrelated controls")
         try: coordinate_text_target(action, observation)
         except TextRecognitionError as error: raise ResponseValidationError(str(error)) from error
@@ -174,7 +174,7 @@ def validate_response(value: dict[str, Any], purpose: str, observation: dict[str
         for key in ("element_id", "pid"):
             if key not in action: fail(f"action.{key}", "is required for secure input")
         if observation is not None:
-            element = next(e for e in observation.get("elements", []) if e.get("id") == action["element_id"])
+            element = observation_indexes(observation).element(action["element_id"])
             if element.get("role") not in {"AXTextField", "AXTextArea", "AXSecureTextField", "AXComboBox"}:
                 fail("action.element_id", "must reference an observed text input for secure input")
             if element.get("enabled") is False:

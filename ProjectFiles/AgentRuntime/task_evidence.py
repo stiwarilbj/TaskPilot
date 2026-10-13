@@ -17,7 +17,7 @@ from typing import Any
 from action_contract_generated import CONTRACT, ActionContractError, _field, validate_action, validate_outcome_check
 from task_inputs import TaskInputBindings
 from expected_effects import ExpectedEffect, ExpectedEffectError, validate_expectation
-from observation_context import coordinate_targets
+from observation_context import coordinate_targets, observation_indexes
 
 CHECKLIST_VERSION = 4
 FILE_CHECKS = {"file_exists", "directory_exists", "path_absent", "file_contents"}
@@ -360,7 +360,7 @@ class TaskEvidenceLedger:
             if check["type"] not in OBSERVATION_CHECKS or identifier in self.observation_checks: continue
             try:
                 if check["type"] == "field_value": validate_expectation(check, observation)
-                elif check["pid"] not in {a.get("pid") for a in observation.get("applications", [])}:
+                elif check["pid"] not in observation_indexes(observation).applications_by_pid:
                     fail(f"requirements.{identifier}.check.pid", "must reference an app in the current observation")
             except ExpectedEffectError as error:
                 raise EvidenceValidationError(str(error).replace("expected_result", f"requirements.{identifier}.check", 1)) from error
@@ -371,7 +371,7 @@ class TaskEvidenceLedger:
             check = entry["check"]
             if check["type"] not in OBSERVATION_CHECKS or identifier in self.observation_checks: continue
             if check["type"] == "window_active":
-                app = next((a for a in observation.get("applications", []) if a.get("pid") == check["pid"]), None)
+                app = observation_indexes(observation).application(check["pid"])
                 if app: self.observation_checks[identifier] = {k: app.get(k) for k in ("pid", "name", "bundle_id")}
             else:
                 before = observation if check["type"] == "field_value" else {**observation, "elements": []}
@@ -385,10 +385,10 @@ class TaskEvidenceLedger:
             check = self.requirements[identifier]["check"]
             if isinstance(pinned, ExpectedEffect):
                 proof = pinned.observe(observation)
-                element = next((e for e in observation.get("elements", []) if e.get("id") == proof.get("element_id")), {})
+                element = observation_indexes(observation).element(proof.get("element_id")) or {}
                 proven = proof["outcome"] == "verified" and element.get("enabled") is True
             else:
-                app = next((a for a in observation.get("applications", []) if a.get("pid") == check["pid"]), {})
+                app = observation_indexes(observation).application(check["pid"]) or {}
                 native_windows = app.get("windows", [])
                 if not any("title" in w for w in native_windows):
                     native_windows = [{**w, "topmost_on_agent_screen": index == 0}

@@ -8,7 +8,7 @@ import time
 from typing import Any, Callable
 
 from action_contract_generated import ActionContractError, validate_contract_field, validate_outcome_check
-from observation_context import structural_identity
+from observation_context import structural_identity, observation_indexes
 
 EXPECTED_EFFECT_VERSION = 1
 FILE_EFFECTS = {"file_contents", "file_exists", "directory_exists", "path_absent"}
@@ -45,13 +45,13 @@ def validate_expectation(value: Any, observation: dict | None = None) -> Any:
     if kind == 'dialog_appeared':
         field('element_id', value['title'], 'expected_result.title')
         if 'window_title' in value: field('text', value['window_title'], 'expected_result.window_title')
-        if observation is not None and value['pid'] not in {a.get('pid') for a in observation.get('applications', []) if isinstance(a, dict)}:
+        if observation is not None and value['pid'] not in observation_indexes(observation).applications_by_pid:
             fail('expected_result.pid', 'must reference an app in the current observation')
     else:
         field('element_id', value['element_id'], 'expected_result.element_id')
         field('text', value['value'], 'expected_result.value')
         if observation is not None:
-            target = next((e for e in observation.get('elements', []) if e.get('id') == value['element_id']), None)
+            target = observation_indexes(observation).element(value['element_id'])
             if target is None: fail('expected_result.element_id', 'must reference the current observation')
             if target.get('role') not in FIELD_ROLES or 'secure' in str(target.get('subrole', '')).casefold():
                 fail('expected_result.element_id', 'must reference a nonsecure observed text field')
@@ -72,10 +72,11 @@ class ExpectedEffect:
         self.spec = validate_expectation(value, before) if value is not None else None
         self.kind = self.spec.get('type') if isinstance(self.spec, dict) else None
         self.supported = self.kind in FILE_EFFECTS | {'dialog_appeared', 'field_value'}
-        self.target = next((e for e in before.get('elements', []) if e.get('id') == (self.spec or {}).get('element_id')), None) if self.kind == 'field_value' else None
+        indexes = observation_indexes(before) if self.supported else None
+        self.target = indexes.element(self.spec.get('element_id')) if self.kind == 'field_value' else None
         self.before = before
         pid = self.target.get('pid') if self.target else self.spec.get('pid') if self.supported and isinstance(self.spec, dict) else None
-        self.application = next((a for a in before.get('applications', []) if a.get('pid') == pid), None)
+        self.application = indexes.application(pid) if indexes else None
         self.baseline_dialogs = self.dialogs(before) if self.kind == 'dialog_appeared' else []
 
     def result(self, verified=False, reason=None, **evidence):
@@ -86,8 +87,8 @@ class ExpectedEffect:
     def unknown(self): return self.result(reason='unsupported_expectation' if self.spec is not None else 'expectation_not_supplied')
 
     def dialogs(self, observation):
-        return [e for e in observation.get('elements', []) if e.get('pid') == self.spec['pid']
-                and (e.get('role') in {'AXSheet', 'AXDialog'} or e.get('subrole') == 'AXDialog')
+        return [e for e in observation_indexes(observation).elements_by_pid.get(self.spec['pid'], ())
+                if (e.get('role') in {'AXSheet', 'AXDialog'} or e.get('subrole') == 'AXDialog')
                 and e.get('title') == self.spec['title']
                 and ('window_title' not in self.spec or e.get('window_title') == self.spec['window_title'])]
 
@@ -99,14 +100,16 @@ class ExpectedEffect:
         """Identity matching shared by effect checks and prerequisite guards."""
         target = self.target
         if not target: return []
+        indexes, before_indexes = observation_indexes(observation), observation_indexes(self.before)
         if self.application:
-            current = next((a for a in observation.get('applications', []) if a.get('pid') == self.application['pid']), {})
+            current = indexes.application(self.application['pid']) or {}
             if any(current.get(k) != self.application.get(k) for k in ('pid', 'name', 'bundle_id')): return []
-        return [e for e in observation.get('elements', []) if e.get('pid') == target.get('pid')
-                and e.get('role') == target.get('role') and e.get('title') == target.get('title')
+        identity = structural_identity(target, self.before, before_indexes)
+        return [e for e in indexes.elements_by_pid.get(target.get('pid'), ())
+                if e.get('role') == target.get('role') and e.get('title') == target.get('title')
                 and e.get('window_title') == target.get('window_title')
                 and ('secure' not in str(e.get('subrole', '')).casefold())
-                and structural_identity(e, observation) == structural_identity(target, self.before)
+                and structural_identity(e, observation, indexes) == identity
                 and (not target.get('native_identity') or e.get('native_identity') == target['native_identity'])]
 
     def observe(self, observation: dict) -> dict:
@@ -115,7 +118,7 @@ class ExpectedEffect:
         if self.before.get('task_generation_id') and observation.get('task_generation_id') != self.before['task_generation_id']:
             return self.result(reason='foreign_observation')
         if self.application:
-            current = next((a for a in observation.get('applications', []) if a.get('pid') == self.application['pid']), {})
+            current = observation_indexes(observation).application(self.application['pid']) or {}
             if any(current.get(k) != self.application.get(k) for k in ('pid', 'name', 'bundle_id')):
                 return self.result(reason='application_changed')
         if self.kind == 'dialog_appeared':

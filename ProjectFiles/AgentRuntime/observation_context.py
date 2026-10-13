@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import base64
 from collections import Counter, defaultdict
+from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
 import hashlib
 import json
 import math
 import re
 import unicodedata
+from types import MappingProxyType
 from typing import Any, Callable
 from screen_coordinates import CoordinateMappingError, action_global_point
 
@@ -18,13 +22,15 @@ CONTROL_ROLES = {"AXApplication", "AXWindow", "AXButton", "AXCheckBox", "AXRadio
 LABEL_ROLES = {"AXStaticText", "AXHeading", "AXRow", "AXGroup", "AXCell", "AXColumn", "AXWindow", "AXSheet"}
 MAX_PROGRESS_CHARACTERS = 16000
 RELATIONSHIPS_VERSION = 1
+OBSERVATION_INDEX_VERSION = 1
 POINTER_CONTAINERS = {"AXApplication", "AXWindow", "AXGroup", "AXScrollArea", "AXSplitGroup",
                       "AXWebArea", "AXLayoutArea", "AXMenuBar", "unknown"}
 
 
 def ancestor_ids(element: dict[str, Any], by_id: dict[str, dict[str, Any]]) -> list[str]:
-    chain, seen, parent = [], {element.get("id")}, element.get("parent_id")
-    while parent in by_id and parent not in seen and len(chain) < 24:
+    identity = element.get("id")
+    chain, seen, parent = [], {identity} if isinstance(identity, str) else set(), element.get("parent_id")
+    while isinstance(parent, str) and parent in by_id and parent not in seen and len(chain) < 24:
         node = by_id[parent]
         if element.get("pid") != node.get("pid"): break
         if element.get("window_id") and node.get("window_id") and element["window_id"] != node["window_id"]: break
@@ -32,12 +38,111 @@ def ancestor_ids(element: dict[str, Any], by_id: dict[str, dict[str, Any]]) -> l
     return chain
 
 
-def coordinate_targets(action: dict[str, Any], observation: dict[str, Any]) -> list[dict[str, Any]]:
+def _immutable(*args, **kwargs):
+    raise TypeError("Observation indexes are read-only")
+
+
+class _IndexedDict(dict):
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _immutable
+    def __deepcopy__(self, memo): return deepcopy(dict(self), memo)
+
+
+class _IndexedList(list):
+    __setitem__ = __delitem__ = append = clear = extend = insert = pop = remove = reverse = sort = __iadd__ = __imul__ = _immutable
+    def __deepcopy__(self, memo): return deepcopy(list(self), memo)
+
+
+def _freeze(value):
+    if isinstance(value, dict): return _IndexedDict({k: _freeze(v) for k, v in value.items()})
+    if isinstance(value, list): return _IndexedList(_freeze(v) for v in value)
+    return value
+
+
+def _group(rows, key):
+    groups = defaultdict(list)
+    for row in rows:
+        identity = key(row)
+        try: hash(identity)
+        except TypeError: continue
+        groups[identity].append(row)
+    return MappingProxyType({identity: tuple(values) for identity, values in groups.items()})
+
+
+class ObservationIndexes:
+    """Immutable lookups for one accepted observation, never executable targets.
+
+    Copies isolate cached rows from caller edits and equivalent observation
+    copies. The runtime owns reuse/invalidation through its existing state guard.
+    Preserve row order and duplicates; callers choose the same first/last match
+    as their former scans, and ambiguity checks still see every candidate.
+    """
+    def __init__(self, observation: dict[str, Any]):
+        self.elements = tuple(_freeze(e) for e in observation.get("elements", []) if isinstance(e, dict))
+        self.applications = tuple(_freeze(a) for a in observation.get("applications", []) if isinstance(a, dict))
+        self.rows = tuple(e for e in self.elements if isinstance(e.get("id"), str))
+        self.elements_by_id = _group(self.rows, lambda e: e["id"])
+        self.by_id = MappingProxyType({identity: rows[-1] for identity, rows in self.elements_by_id.items()})
+        self.elements_by_pid = _group(self.elements, lambda e: e.get("pid"))
+        self.applications_by_pid = _group(self.applications, lambda a: a.get("pid"))
+        self.positions = MappingProxyType({e["id"]: i for i, e in enumerate(self.rows)})
+        self.ancestors = MappingProxyType({identity: tuple(ancestor_ids(e, self.by_id)) for identity, e in self.by_id.items()})
+        self.scopes = MappingProxyType({identity: (e.get("pid"), e.get("window_id") or
+            next((self.by_id[p]["id"] for p in self.ancestors[identity] if self.by_id[p].get("role") == "AXWindow"), None)
+            or e.get("window_title")) for identity, e in self.by_id.items()})
+        self.children = _group((e for e in self.rows if isinstance(e.get("parent_id"), str) and e["parent_id"] in self.by_id),
+                               lambda e: e["parent_id"])
+        self.canonical_children = _group(self.by_id.values(), lambda e: (e.get("pid"), e.get("parent_id")))
+        # Keep AX and graphics window namespaces distinct, including app PID.
+        # Store per-app tables to retain first/last application scan semantics.
+        self.windows = tuple(_group((w for w in a.get("windows", []) if isinstance(w, dict)),
+                                    lambda w: w.get("window_id") or w.get("title")) for a in self.applications)
+        self.graphics_windows = tuple(_group((w for w in a.get("graphics_windows", []) if isinstance(w, dict)),
+                                             lambda w: w.get("id")) for a in self.applications)
+        self._app_positions = _group(range(len(self.applications)), lambda i: self.applications[i].get("pid"))
+
+    def element(self, identity, *, last=False):
+        rows = self.elements_by_id.get(identity, ()) if isinstance(identity, str) else ()
+        return rows[-1 if last else 0] if rows else None
+
+    def application(self, pid, *, last=False):
+        rows = self.applications_by_pid.get(pid, ())
+        return rows[-1 if last else 0] if rows else None
+
+    def window_candidates(self, pid, identity, *, graphics=False, application_last=False):
+        positions = self._app_positions.get(pid, ())
+        if not positions: return ()
+        tables = self.graphics_windows if graphics else self.windows
+        return tables[positions[-1 if application_last else 0]].get(identity, ())
+
+    def ancestor_ids(self, element):
+        identity = element.get("id")
+        if isinstance(identity, str) and self.by_id.get(identity) is element: return self.ancestors[identity]
+        # A pinned target or a duplicate row must retain its own parent scope.
+        return tuple(ancestor_ids(element, self.by_id))
+
+
+_index_provider = ContextVar("observation_index_provider", default=None)
+
+
+@contextmanager
+def observation_index_scope(provider):
+    token = _index_provider.set(provider)
+    try: yield
+    finally: _index_provider.reset(token)
+
+
+def observation_indexes(observation: dict[str, Any]) -> ObservationIndexes:
+    provider = _index_provider.get()
+    return provider(observation) if provider is not None else ObservationIndexes(observation)
+
+
+def coordinate_targets(action: dict[str, Any], observation: dict[str, Any], indexes: ObservationIndexes | None = None) -> list[dict[str, Any]]:
     """Observed hit candidates; a label child is not a second actionable target."""
     try: point = action_global_point(action, observation)
     except CoordinateMappingError: return []
     targets = []
-    for element in observation.get("elements", []):
+    indexes = indexes or observation_indexes(observation)
+    for element in indexes.elements_by_pid.get(action.get("pid"), ()):
         if not isinstance(element, dict) or element.get("pid") != action.get("pid") or element.get("role") in POINTER_CONTAINERS: continue
         frame = element.get("frame", {})
         values = [frame.get(k) for k in ("x", "y", "width", "height")]
@@ -50,23 +155,23 @@ def coordinate_targets(action: dict[str, Any], observation: dict[str, Any]) -> l
                   e["frame"]["width"] * e["frame"]["height"], -e.get("depth", 0)))
 
 
-def coordinates_are_ambiguous(action: dict[str, Any], observation: dict[str, Any]) -> bool:
+def coordinates_are_ambiguous(action: dict[str, Any], observation: dict[str, Any], indexes: ObservationIndexes | None = None) -> bool:
     if action.get("element_id") or action.get("type") not in {"click", "double_click"}: return False
-    targets = coordinate_targets(action, observation)
-    by_id = {e["id"]: e for e in observation.get("elements", []) if isinstance(e, dict) and isinstance(e.get("id"), str)}
+    indexes = indexes or observation_indexes(observation)
+    targets = coordinate_targets(action, observation, indexes)
     return any(not (first.get("native_identity") and first.get("native_identity") == second.get("native_identity"))
-               and first.get("id") not in ancestor_ids(second, by_id) and second.get("id") not in ancestor_ids(first, by_id)
+               and first.get("id") not in indexes.ancestor_ids(second) and second.get("id") not in indexes.ancestor_ids(first)
                for i, first in enumerate(targets) for second in targets[i + 1:])
 
 
-def structural_identity(target: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any]:
+def structural_identity(target: dict[str, Any], observation: dict[str, Any], indexes: ObservationIndexes | None = None) -> dict[str, Any]:
     """Semantic context across revisions, used only by bounded replay protection."""
-    by_id = {e["id"]: e for e in observation.get("elements", []) if isinstance(e, dict) and isinstance(e.get("id"), str)}
-    chain = ancestor_ids(target, by_id)
-    labels = sorted({element_text(e) for e in by_id.values() if e.get("pid") == target.get("pid")
-                     and target.get("parent_id") and e.get("parent_id") == target.get("parent_id")
+    indexes = indexes or observation_indexes(observation)
+    chain = indexes.ancestor_ids(target)
+    labels = sorted({element_text(e) for e in indexes.canonical_children.get((target.get("pid"), target.get("parent_id")), ())
+                     if target.get("parent_id") and e.get("parent_id") == target.get("parent_id")
                      and e.get("role") in {"AXStaticText", "AXHeading"} and element_text(e)})
-    return {"containers": [{k: by_id[p].get(k) for k in ("role", "title")} for p in reversed(chain)], "labels": labels}
+    return {"containers": [{k: indexes.by_id[p].get(k) for k in ("role", "title")} for p in reversed(chain)], "labels": labels}
 
 
 def words(value: str) -> set[str]:
@@ -84,21 +189,10 @@ def element_text(element: dict[str, Any]) -> str:
     return " ".join(element[k][:4096] for k in keys if isinstance(element.get(k), str))
 
 
-def select_elements(observation: dict[str, Any], task: str, limit: int) -> list[dict[str, Any]]:
-    rows = [e for e in observation.get("elements", []) if isinstance(e, dict) and isinstance(e.get("id"), str)]
-    by_id = {e["id"]: e for e in rows}
-    indices = {e["id"]: i for i, e in enumerate(rows)}
-    ancestors: dict[str, list[str]] = {}
-    for e in rows:
-        ancestors[e["id"]] = ancestor_ids(e, by_id)
-
-    def scope(e):
-        window = e.get("window_id") or next((by_id[p]["id"] for p in ancestors[e["id"]]
-                                            if by_id[p].get("role") == "AXWindow"), None) or e.get("window_title")
-        return e.get("pid"), window
-
-    scopes = {e["id"]: scope(e) for e in rows}
-    applications = [a for a in observation.get("applications", []) if isinstance(a, dict)]
+def select_elements(observation: dict[str, Any], task: str, limit: int, indexes: ObservationIndexes | None = None) -> list[dict[str, Any]]:
+    indexes = indexes or observation_indexes(observation)
+    rows, by_id, indices = indexes.rows, indexes.by_id, indexes.positions
+    ancestors, scopes, applications = indexes.ancestors, indexes.scopes, indexes.applications
     primary = next((a for a in applications if a.get("topmost_on_agent_screen") is True), None)
     primary = primary or next((a for a in applications if a.get("active") is True), {})
     primary_pid = primary.get("pid")
@@ -119,10 +213,9 @@ def select_elements(observation: dict[str, Any], task: str, limit: int) -> list[
         return sum(1 + math.log1p(len(rows) / max(1, frequencies[w])) for w in values & tokens)
 
     matches = {identity: relevance(values) for identity, values in own.items()}
-    siblings = defaultdict(list)
+    siblings = {parent: [e["id"] for e in children] for parent, children in indexes.children.items()}
     scope_labels = defaultdict(list)
     for e in rows:
-        if e.get("parent_id") in by_id: siblings[e["parent_id"]].append(e["id"])
         if e.get("role") in LABEL_ROLES and element_text(e): scope_labels[scopes[e["id"]]].append(e["id"])
 
     def proximity(a, b):

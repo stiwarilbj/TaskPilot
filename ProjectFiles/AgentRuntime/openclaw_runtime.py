@@ -56,7 +56,8 @@ from prompt_compiler import (
     decision_rules, compile_prompt, compile_repair,
 )
 
-from observation_context import select_elements, historical_progress, coordinate_targets, structural_identity, RELATIONSHIPS_VERSION, words
+from observation_context import (select_elements, historical_progress, coordinate_targets, structural_identity, RELATIONSHIPS_VERSION, words,
+                                 ObservationIndexes, OBSERVATION_INDEX_VERSION, observation_indexes, observation_index_scope)
 from screen_coordinates import COORDINATE_MAPPING_VERSION, CoordinateMappingError, validate_observation_mapping
 from observation_completeness import (OBSERVATION_COMPLETENESS_VERSION, ObservationCompletenessError,
                                       validate_completeness, prompt_coverage, coverage_cache_input)
@@ -665,11 +666,11 @@ def effective_decision_status(decision: dict[str, Any]) -> str:
 def action_identity(action: dict[str, Any], observation: dict[str, Any]) -> str:
     """Identify an action independently of per-observation element IDs."""
     identity = {k: v for k, v in action.items() if k not in {"element_id", "observation_revision"}}
-    element = next((e for e in observation.get("elements", [])
-                    if isinstance(e, dict) and action.get("element_id") and e.get("id") == action.get("element_id")), None)
+    indexes = observation_indexes(observation)
+    element = indexes.element(action.get("element_id"))
     if element:
         identity["target"] = {k: element.get(k) for k in ("pid", "role", "title")}
-        identity["target"]["structure"] = structural_identity(element, observation)
+        identity["target"]["structure"] = structural_identity(element, observation, indexes)
     return json.dumps(identity, sort_keys=True, separators=(",", ":"))
 
 
@@ -685,8 +686,7 @@ def action_may_mutate(action: dict[str, Any], observation: dict[str, Any]) -> bo
         return not (key in {"a", "c", "f", "l"} and modifiers in ({"command"}, {"cmd"}))
     if kind not in {"press", "click", "double_click"}:
         return False
-    element = next((e for e in observation.get("elements", [])
-                    if isinstance(e, dict) and action.get("element_id") and e.get("id") == action.get("element_id")), {})
+    element = observation_indexes(observation).element(action.get("element_id")) or {}
     label = str(element.get("title") or "")
     # Treat unknown controls as mutations. Only explicit navigation affordances
     # may be repeated after verified nonexecution; labels alone cannot prove
@@ -698,17 +698,17 @@ def action_may_mutate(action: dict[str, Any], observation: dict[str, Any]) -> bo
 
 
 def action_target(action: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any] | None:
-    elements = [e for e in observation.get("elements", []) if isinstance(e, dict)]
+    indexes = observation_indexes(observation)
     if action.get("element_id"):
-        return next((e for e in elements if e.get("id") == action["element_id"]), None)
+        return indexes.element(action["element_id"])
     pid = action.get("pid")
     if action.get("type") in {"type_text", "key"}:
-        fields = [e for e in elements if e.get("pid") == pid and e.get("focused") is True
+        fields = [e for e in indexes.elements_by_pid.get(pid, ()) if e.get("focused") is True
                   and e.get("role") in {"AXTextField", "AXTextArea", "AXComboBox", "AXSecureTextField"}]
         return fields[0] if len(fields) == 1 else None
     if "x" not in action or "y" not in action:
         return None
-    targets = coordinate_targets(action, observation)
+    targets = coordinate_targets(action, observation, indexes)
     return targets[0] if targets else None
 
 
@@ -949,6 +949,12 @@ class ScreenshotBuffers:
         self.current[path] = key
         return self.images[key]
 
+    def indexes(self, observation: dict[str, Any]) -> ObservationIndexes:
+        if self.generation is not None and observation.get("task_generation_id") not in (None, self.generation):
+            raise ActionRejected("Observation indexes belong to another task", "cancelled")
+        state = self.observation(observation)
+        return state.memoize(("lookup_indexes", OBSERVATION_INDEX_VERSION), lambda: ObservationIndexes(observation))
+
     def discard(self, path: Path, revision: str | None = None) -> bool:
         path = path.absolute()
         for key in list(self.states):
@@ -979,7 +985,8 @@ def screenshot_buffer_scope():
     images = ScreenshotBuffers(_task_generation_id)
     token = _screenshot_buffers.set(images)
     try:
-        yield images
+        with observation_index_scope(images.indexes):
+            yield images
     finally:
         images.clear()
         _screenshot_buffers.reset(token)
@@ -1426,8 +1433,7 @@ def compact_observation(observation: dict[str, Any], task: str = "") -> dict[str
 def action_history_context(decision: dict[str, Any], action: dict[str, Any],
                            observation: dict[str, Any]) -> dict[str, Any]:
     context = {key: decision[key] for key in ("intended_target", "expected_result") if key in decision}
-    element = next((e for e in observation.get("elements", [])
-                    if isinstance(e, dict) and e.get("id") == action.get("element_id")), None)
+    element = observation_indexes(observation).element(action.get("element_id"))
     if element:
         context["target"] = {key: element[key] for key in ("app", "window_title", "title", "role", "subrole") if key in element}
     elif action.get("app") or action.get("bundle_id"):

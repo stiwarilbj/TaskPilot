@@ -10,6 +10,7 @@ import math
 import struct
 
 from screen_coordinates import rectangle, pixels, transform, apply, validate_observation_mapping, CoordinateMappingError
+from observation_context import observation_indexes
 
 TEXT_RECOGNITION_VERSION = 1
 EXECUTION_CONFIDENCE = 0.8
@@ -46,7 +47,7 @@ def validate_text_recognition(observation: dict, *, required: bool = False) -> d
     image_matrix, normalized_matrix = transform(mapping['image_to_global']), transform(mapping['normalized_to_global'])
     display = rectangle(mapping['display_bounds'])
     size = pixels(mapping['image_size'])
-    apps = {a.get('pid'): a for a in observation.get('applications', []) if isinstance(a, dict)}
+    indexes = observation_indexes(observation)
     ids = set()
     try:
         for i, row in enumerate(rows):
@@ -61,11 +62,13 @@ def validate_text_recognition(observation: dict, *, required: bool = False) -> d
             if type(confidence) not in (int, float) or not math.isfinite(confidence) or not 0.45 <= confidence <= 1:
                 raise TextRecognitionError('Invalid text recognition confidence')
             pid, window = integer(row.get('pid')), integer(row.get('graphics_window_id'))
-            owner = next((w for w in apps.get(pid, {}).get('graphics_windows', []) if w.get('id') == window), None)
+            owners = indexes.window_candidates(pid, window, graphics=True, application_last=True)
+            owner = owners[0] if owners else None
             if owner is None:
                 raise TextRecognitionError('Recognized text lacks observed native window ownership')
-            secure = any(e.get('pid') == pid and (e.get('value') == '[secure]' or 'secure' in
-                         (str(e.get('role', '')) + str(e.get('subrole', ''))).casefold()) for e in observation.get('elements', []))
+            secure = any(e.get('value') == '[secure]' or 'secure' in
+                         (str(e.get('role', '')) + str(e.get('subrole', ''))).casefold()
+                         for e in indexes.elements_by_pid.get(pid, ()))
             if secure: raise TextRecognitionError('Secure app text cannot become recognition evidence')
             frame, image, normalized = (rectangle(row.get(k)) for k in ('frame', 'image_bounds', 'normalized_bounds'))
             window_bounds = rectangle(owner.get('frame'))

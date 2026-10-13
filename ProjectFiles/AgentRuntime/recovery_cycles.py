@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from observation_context import ancestor_ids, coordinate_targets, structural_identity
+from observation_context import coordinate_targets, structural_identity, observation_indexes
 
 RECOVERY_CYCLE_VERSION = 1
 HISTORY_LIMIT = 24
@@ -22,22 +22,21 @@ def digest(value: Any) -> str:
 
 
 def target_for(action: dict, observation: dict) -> dict | None:
-    elements = [e for e in observation.get("elements", []) if isinstance(e, dict)]
+    indexes = observation_indexes(observation)
     if action.get("element_id"):
-        return next((e for e in elements if e.get("id") == action["element_id"]), None)
+        return indexes.element(action["element_id"])
     if action.get("type") in {"key", "type_text"}:
-        fields = [e for e in elements if e.get("pid") == action.get("pid") and e.get("focused") is True
+        fields = [e for e in indexes.elements_by_pid.get(action.get("pid"), ()) if e.get("focused") is True
                   and e.get("role") in {"AXTextField", "AXTextArea", "AXComboBox", "AXSecureTextField"}]
         return fields[0] if len(fields) == 1 else None
-    targets = coordinate_targets(action, observation)
+    targets = coordinate_targets(action, observation, indexes)
     return targets[0] if targets else None
 
 
 def state_key(observation: dict, pid: int | None, image_digest: str | None = None) -> str:
     """Compare semantic layouts, not image animation or revision-scoped IDs."""
-    elements = [e for e in observation.get("elements", []) if isinstance(e, dict)
-                and (pid is None or e.get("pid") == pid)]
-    by_id = {e["id"]: e for e in elements if isinstance(e.get("id"), str)}
+    indexes = observation_indexes(observation)
+    elements = indexes.elements if pid is None else indexes.elements_by_pid.get(pid, ())
     controls = []
     for element in elements:
         row = {k: element[k] for k in ("pid", "role", "subrole", "title", "label", "window_title", "frame",
@@ -47,8 +46,8 @@ def state_key(observation: dict, pid: int | None, image_digest: str | None = Non
             row.update({k: element[k] for k in ("value", "value_complete") if k in element})
         if isinstance(element.get("actions"), list):
             row["actions"] = sorted(value for value in element["actions"] if isinstance(value, str))
-        row["parents"] = [{k: by_id[p].get(k) for k in ("role", "title", "frame")}
-                          for p in reversed(ancestor_ids(element, by_id))]
+        row["parents"] = [{k: indexes.by_id[p].get(k) for k in ("role", "title", "frame")}
+                          for p in reversed(indexes.ancestor_ids(element))]
         controls.append(row)
     apps = []
     for app in observation.get("applications", []):

@@ -13,7 +13,7 @@ import unicodedata
 from action_contract_generated import validate_action, ActionContractError
 from expected_effects import ExpectedEffect, FIELD_ROLES, FILE_EFFECTS, path_key
 from local_text_recognition import validate_text_recognition
-from observation_context import coordinate_targets, structural_identity, words
+from observation_context import coordinate_targets, structural_identity, words, observation_indexes
 from screen_coordinates import rectangle, CoordinateMappingError
 
 EVIDENCE_CONSISTENCY_VERSION = 1
@@ -67,17 +67,17 @@ def text_for(element, observation):
     if not report or secure(element): return []
     try: bounds = rectangle(element.get("frame"))
     except CoordinateMappingError: return []
-    app = next((a for a in observation.get("applications", []) if a.get("pid") == element.get("pid")), {})
-    windows = {w.get("id"): w for w in app.get("graphics_windows", [])}
+    indexes = observation_indexes(observation)
+    others = [e for e in indexes.elements_by_pid.get(element.get("pid"), ()) if
+              e.get("role") in LABEL_ROLES | FIELD_ROLES and not secure(e) and e.get("id") != element.get("id")]
     matches = []
     for row in report["targets"]:
-        owner = windows.get(row["graphics_window_id"], {})
+        windows = indexes.window_candidates(element.get("pid"), row["graphics_window_id"], graphics=True)
+        owner = windows[-1] if windows else {}
         if row["pid"] != element.get("pid") or row["confidence"] < 0.9: continue
         if element.get("window_title") and owner.get("title") and element["window_title"] != owner["title"]: continue
         if not contained(rectangle(row["frame"]), bounds): continue
         # Nested/overlapping controls do not establish one label's ownership.
-        others = [e for e in observation.get("elements", []) if e.get("pid") == row["pid"] and
-                  e.get("role") in LABEL_ROLES | FIELD_ROLES and not secure(e) and e.get("id") != element.get("id")]
         ambiguous = False
         for other in others:
             try: frame = rectangle(other.get("frame"))
@@ -112,7 +112,7 @@ def validate_disagreement(value, observation, ledger, fail):
     identifier = value.get("element_id")
     if not isinstance(identifier, str) or not identifier.strip():
         fail("evidence_disagreement.element_id", "must reference a current nonsecure control")
-    target = next((e for e in (observation or {}).get("elements", []) if e.get("id") == identifier), None)
+    target = observation_indexes(observation or {}).element(identifier)
     if target is None or secure(target): fail("evidence_disagreement.element_id", "must reference a current nonsecure control")
     text = value.get("screenshot_text")
     if not isinstance(text, str) or not text.strip() or len(text) > 256:
@@ -135,26 +135,29 @@ class EvidenceConsistency:
 
     @staticmethod
     def candidates(pinned, before, observation):
-        app = next((a for a in before.get("applications", []) if a.get("pid") == pinned.get("pid")), {})
-        current = next((a for a in observation.get("applications", []) if a.get("pid") == pinned.get("pid")), {})
+        indexes, before_indexes = observation_indexes(observation), observation_indexes(before)
+        app = before_indexes.application(pinned.get("pid")) or {}
+        current = indexes.application(pinned.get("pid")) or {}
         if any(app.get(k) != current.get(k) for k in ("pid", "name", "bundle_id")): return []
-        return [e for e in observation.get("elements", []) if not secure(e) and e.get("pid") == pinned.get("pid") and
+        identity = structural_identity(pinned, before, before_indexes)
+        return [e for e in indexes.elements_by_pid.get(pinned.get("pid"), ()) if not secure(e) and
                 e.get("role") == pinned.get("role") and e.get("window_title") == pinned.get("window_title") and
                 ((pinned.get("native_identity") and e.get("native_identity") == pinned["native_identity"]) or
                  (not pinned.get("native_identity") and e.get("title") == pinned.get("title") and
-                  structural_identity(e, observation) == structural_identity(pinned, before)))]
+                  structural_identity(e, observation, indexes) == identity))]
 
     def targets(self, decision, observation, ledger):
         action = decision.get("action", {})
-        elements = observation.get("elements", [])
+        indexes = observation_indexes(observation)
+        elements = indexes.elements
         targets = []
         if decision.get("evidence_disagreement"):
             ids = [decision["evidence_disagreement"]["element_id"]]
         elif action.get("element_id"): ids = [action["element_id"]]
         elif action.get("type") in {"click", "double_click"}:
-            targets = coordinate_targets(action, observation); ids = []
+            targets = coordinate_targets(action, observation, indexes); ids = []
         elif action.get("type") in {"key", "type_text"}:
-            ids = [e.get("id") for e in elements if e.get("pid") == action.get("pid") and e.get("focused") is True]
+            ids = [e.get("id") for e in indexes.elements_by_pid.get(action.get("pid"), ()) if e.get("focused") is True]
         elif decision.get("status") == "done" or "verified" in decision:
             ids = [e.get("id") for e in elements if e.get("role") in LABEL_ROLES and words(e.get("title", "")) & words(ledger.task)]
             ids += [c.get("id") for check in ledger.observation_checks.values()
@@ -169,7 +172,7 @@ class EvidenceConsistency:
                 check = ledger.observation_checks.get(ref)
                 if isinstance(check, ExpectedEffect) and check.kind == "field_value":
                     ids += [c.get("id") for c in check.field_candidates(observation)]
-        targets += [e for identifier in dict.fromkeys(ids) for e in elements if e.get("id") == identifier and not secure(e)]
+        targets += [e for identifier in dict.fromkeys(ids) for e in indexes.elements_by_id.get(identifier, ()) if not secure(e)]
         return targets
 
     def note_native_check(self, check, checked, prior):
