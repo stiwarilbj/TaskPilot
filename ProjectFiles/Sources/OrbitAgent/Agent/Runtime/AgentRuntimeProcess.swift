@@ -318,7 +318,9 @@ final class AgentRuntimeProcess {
             let operation = Task { [weak self] in
                 guard let self else { return }
                 let response = await TaskOwnership.$current.withValue(run.lease) {
-                    if let handler = self.bridgeHandler { return await handler(message) }
+                    if let handler = self.bridgeHandler {
+                        return await TaskOwnership.withCancellationWakeup { await handler(message) }
+                    }
                     return await self.bridge.handle(message)
                 }
                 self.ioQueue.async {

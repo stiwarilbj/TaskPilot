@@ -69,6 +69,7 @@ final class TaskToolExecutor {
     /// can acknowledge delivery of the original command or prove its outcome.
     func inspectCommand(action input: [String: Any]) async throws -> [String: Any] {
         try await TaskOwnership.checkpoint()
+        let lease = TaskOwnership.current
         return try await withTaskCancellationHandler {
             try TaskOwnership.$actionReceipt.withValue(nil) {
                 var probes = 0, hits = 0
@@ -78,10 +79,16 @@ final class TaskToolExecutor {
                             "capability_version": CommandCapabilities.version, "probes": probes, "cache_hits": hits]
                 }
             }
-        } onCancel: { self.cancelActiveCommand() }
+        } onCancel: { lease?.wakePausedWorkers(); self.cancelActiveCommand() }
     }
 
     func perform(action input: [String: Any], commandBindingID: String? = nil) async throws -> [String: Any] {
+        try await TaskOwnership.withCancellationWakeup {
+            try await performOwned(action: input, commandBindingID: commandBindingID)
+        }
+    }
+
+    private func performOwned(action input: [String: Any], commandBindingID: String?) async throws -> [String: Any] {
         try await TaskOwnership.checkpoint()
         let action: [String: Any]
         do { action = try ActionContract.validate(input) }

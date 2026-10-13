@@ -18,6 +18,18 @@ cannot deliver. The task-local context follows asynchronous Swift operations.
 Dispatch callbacks capture the lease explicitly. Existing Accessibility identity,
 focus, window, permission, protected-target, and secure-input checks still apply.
 
+Paused asynchronous checkpoints park in checked continuations; background native
+commits park in one-shot semaphore waits. Registration shares the lease's lock
+with state transitions, preventing missed Resume or Stop signals. Resume wakes
+all registered workers. Revocation and retirement wake them to reject further
+work. Cancellation removes an asynchronous wait directly; the bridge and task
+tool entry points also install cancellation wakeups for synchronous commits.
+Workers recheck their own cancellation and ownership after every wake, including
+spurious wakeups or an immediate new Pause. No Pause timers or periodic wakeups
+remain. The main run loop still rejects a paused commit instead of blocking, and
+the recursive delivery lock still protects nested native mutations. Private wait
+counts contain no task inputs and are not persisted in history.
+
 Runtime pipes, buffers, event handlers, terminal state, and pending bridge tasks
 belong to one invocation. Stop revokes its lease before cancelling workers and
 terminating command groups. A non-cancellable macOS operation may settle later;
@@ -39,3 +51,9 @@ startup failure, duplicate completion, Stop during queued output, and drainage
 before handoff. Controlled callbacks model macOS operations; they do not establish
 live desktop accuracy. Do not launch the fixer, live-control tester, Chrome, or a
 live desktop task to validate this change.
+
+Pause regressions cover mixed workers parking once, Resume during registration,
+Stop and retirement, cancellation before and after parking, concurrent wakeups,
+reparking without authority, generation isolation, nested delivery, bridge
+cancellation, and cancellation between command preflight and native launch. The
+fixtures add no provider requests and do not interact with live desktop apps.

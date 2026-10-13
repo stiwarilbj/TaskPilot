@@ -29,6 +29,17 @@ final class TaskOwnershipTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
         return url
     }
+    // A nonisolated native fixture; a closure declared in a @MainActor test
+    // would inherit that actor and intentionally reject Pause without parking.
+    private func pausedNativeHandler(_ request: [String: Any]) async -> [String: Any] {
+        let owner = TaskOwnership.current!
+        XCTAssertFalse(Thread.isMainThread)
+        owner.pause() // Pause after the bridge's async entry, before delivery.
+        do { try TaskOwnership.commit { XCTFail("Paused delivery escaped") } }
+        catch { XCTAssertTrue(error is CancellationError) }
+        return ["kind": "bridge_response", "task_generation_id": owner.id,
+                "request_id": request["request_id"]!, "ok": false, "error_code": "cancelled"]
+    }
     func testRevokedLeaseRejectsEveryDeliveryAndNestedCallback() throws {
         let old = TaskLease(), newer = TaskLease()
         var effects = 0
@@ -171,6 +182,27 @@ final class TaskOwnershipTests: XCTestCase {
         try runtime.start(task: "fixture", display: display, runtimeURL: helper, openClawURL: helper, geminiAPIKey: "")
         await fulfillment(of: [failed], timeout: 3)
         XCTAssertEqual(calls, 0)
+    }
+    @MainActor func testStopDrainsAnAlreadyParkedNativeWorker() async throws {
+        let lease = TaskLease(), stopped = expectation(description: "Paused native worker drained")
+        let helper = try helper("emit('bridge_request', request_id='parked', method='fixture')\ntime.sleep(20)")
+        var terminalCount = 0
+        let runtime = AgentRuntimeProcess(bridge: bridge(), bridgeHandler: pausedNativeHandler)
+        runtime.onEvent = { event in
+            if case .stopped = event { terminalCount += 1; stopped.fulfill() }
+            if case .completed = event { XCTFail("Stopped task completed") }
+            if case .failed(let message) = event { XCTFail(message) }
+        }
+        defer { runtime.stop() }
+        try runtime.start(task: "fixture", display: display, runtimeURL: helper, openClawURL: helper, geminiAPIKey: "", lease: lease)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while lease.pauseWaiterCount == 0, ContinuousClock.now < deadline { await Task.yield() }
+        XCTAssertEqual(lease.pauseWaiterCount, 1)
+        runtime.stop()
+        await fulfillment(of: [stopped], timeout: 3)
+        XCTAssertEqual(terminalCount, 1)
+        XCTAssertEqual(lease.pauseWaiterCount, 0)
+        XCTAssertEqual(lease.state, .retired)
     }
     @MainActor func testOldSecureInputCannotReachNewTaskPipe() async throws {
         let helper = try helper("emit('user_input_required', request_id='same')\nreply=json.loads(sys.stdin.readline())\nassert reply['value']=='current'\nassert reply['task_generation_id']==config['task_generation_id']\nemit('complete', message='secure')")

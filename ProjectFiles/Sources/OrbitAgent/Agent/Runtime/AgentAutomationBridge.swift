@@ -53,6 +53,10 @@ final class AgentAutomationBridge {
     }
 
     func handle(_ request: [String: Any]) async -> [String: Any] {
+        await TaskOwnership.withCancellationWakeup { await handleRequest(request) }
+    }
+
+    private func handleRequest(_ request: [String: Any]) async -> [String: Any] {
         let requestID = request["request_id"] as? String ?? UUID().uuidString
         let lease = TaskOwnership.current
         var receiptToken: ActionReceiptStore.Token?
