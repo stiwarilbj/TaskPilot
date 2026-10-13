@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import deque
+from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 import math
@@ -71,6 +72,7 @@ from response_validation import (
 
 MAX_COMPACT_ELEMENTS = 360
 MAX_RECENT_ACTIONS = 8
+VERIFICATION_SESSION_VERSION = 1
 from action_contract_generated import (
     TASK_PROTOCOL_VERSION,
     CONTRACT_HASH, CONTRACT_VERSION, VALID_ACTIONS, TRUSTED_NATIVE_ACTIONS,
@@ -1630,13 +1632,15 @@ class ACPClient:
         self.stderr_tail: deque[str] = deque(maxlen=12)
         self.next_request_id = 1
         self.accepting_prompt_updates = False
+        self.pending_prompt_session_id = None
         self.agent_chunks: list[str] = []
         self.turn_errors: list[Any] = []
         self.openclaw_path = openclaw_path
         self.selected_model: str | None = None
+        self._session_ids: set[str] = set()
         self.stdout_finished = threading.Event()
-        threading.Thread(target=self._read_stdout, daemon=True).start()
-        threading.Thread(target=self._read_stderr, daemon=True).start()
+        threading.Thread(target=self._read_stdout, args=(self.process, self.messages, self.stdout_finished), daemon=True).start()
+        threading.Thread(target=self._read_stderr, args=(self.process, self.stderr_tail), daemon=True).start()
         try:
             initialized = self.request(
                 "initialize",
@@ -1653,28 +1657,7 @@ class ACPClient:
             protocol_version = initialized.get("protocolVersion")
             if protocol_version not in (1, "1"):
                 raise RuntimeError(f"OpenClaw negotiated an unsupported ACP version: {protocol_version}")
-            self.session_key = f"agent:main:taskpilot:{uuid.uuid4()}"
-            session = self.request(
-                "session/new",
-                {
-                    "cwd": str(Path.home()),
-                    "mcpServers": [],
-                    "_meta": {"sessionKey": self.session_key},
-                },
-                timeout=30,
-            )
-            session_id = session.get("sessionId")
-            if not isinstance(session_id, str) or not session_id:
-                raise RuntimeError(f"OpenClaw ACP did not create a {PRODUCT_NAME} session")
-            self.session_id = session_id
-            self.config_options = session.get("configOptions") or []
-            thought = next((o for o in self.config_options if o.get("category") == "thought_level" or o.get("id") == "thought_level"), None)
-            if thought and any(o.get("value") == "off" for o in thought.get("options", [])):
-                result = self.request("session/set_config_option", {"sessionId": self.session_id, "configId": thought["id"], "value": "off"}, timeout=30)
-                options = result.get("configOptions") or []
-                if not any(o.get("id") == thought["id"] and o.get("currentValue") == "off" for o in options):
-                    raise RuntimeError("OpenClaw did not acknowledge the thinking setting")
-                self.config_options = options
+            self._new_session()
             self.prompt_calls = 0
             self.successful_provider_retries: int | None = None
             self.model_switches = 0
@@ -1685,25 +1668,85 @@ class ACPClient:
             raise
 
 
-    def _read_stdout(self) -> None:
+    def _new_session(self, *, session_key: str | None = None) -> None:
+        # A new gateway key isolates inference history. Reattaching a saved
+        # planning key after reconnect restores routing without a generation.
+        if self.accepting_prompt_updates:
+            raise RuntimeError("Cannot change ACP sessions while a response is pending")
+        self.session_id = None
+        self.session_key = session_key or f"agent:main:taskpilot:{uuid.uuid4()}"
+        self.agent_chunks = []
+        self.turn_errors = []
+        self.pending_prompt_request_id = None
+        session = self.request("session/new", {
+            "cwd": str(Path.home()), "mcpServers": [],
+            "_meta": {"sessionKey": self.session_key},
+        }, timeout=30)
+        session_id = session.get("sessionId")
+        if not isinstance(session_id, str) or not session_id or session_id in self._session_ids:
+            raise RuntimeError(f"OpenClaw ACP did not create a fresh {PRODUCT_NAME} session")
+        self._session_ids.add(session_id)
+        self.session_id = session_id
+        self._session_model = None
+        self.config_options = session.get("configOptions") or []
+        thought = next((o for o in self.config_options if o.get("category") == "thought_level" or o.get("id") == "thought_level"), None)
+        if thought and any(o.get("value") == "off" for o in thought.get("options", [])):
+            result = self.request("session/set_config_option", {
+                "sessionId": self.session_id, "configId": thought["id"], "value": "off",
+            }, timeout=30)
+            options = result.get("configOptions") or []
+            if not any(o.get("id") == thought["id"] and o.get("currentValue") == "off" for o in options):
+                raise RuntimeError("OpenClaw did not acknowledge the thinking setting")
+            self.config_options = options
+
+    @contextmanager
+    def verification_session(self):
+        """One fresh context per verification decision, including its repair.
+
+        The planner is idle and keeps its gateway history. Logical model/call
+        counters belong to the task, while acknowledged settings are per session.
+        """
+        if self.accepting_prompt_updates:
+            raise RuntimeError("Cannot verify while a planning response is pending")
+        planning = (self.session_id, self.session_key, self.config_options, self._session_model)
+        process = self.process
+        finished = False
         try:
-            assert self.process.stdout is not None
-            for line in self.process.stdout:
+            self._new_session()
+            yield
+            finished = True
+        finally:
+            self.accepting_prompt_updates = False
+            self.agent_chunks = []
+            self.turn_errors = []
+            self.pending_prompt_request_id = None
+            if self.process is process:
+                self.session_id, self.session_key, self.config_options, self._session_model = planning
+            elif finished:
+                # Reconnect replaces the ACP session store, not gateway history.
+                # Only successful terminal verification may resume the planner;
+                # cancellation/failure must not start further configuration work.
+                self._new_session(session_key=planning[1])
+
+    def _read_stdout(self, process, messages, finished) -> None:
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
                 try:
                     message = json.loads(line)
                 except json.JSONDecodeError:
                     continue
                 if isinstance(message, dict):
-                    self.messages.put(message)
+                    messages.put(message)
         finally:
-            self.stdout_finished.set()
+            finished.set()
 
-    def _read_stderr(self) -> None:
-        assert self.process.stderr is not None
-        for line in self.process.stderr:
+    def _read_stderr(self, process, tail) -> None:
+        assert process.stderr is not None
+        for line in process.stderr:
             cleaned = line.strip()
             if cleaned:
-                self.stderr_tail.append(cleaned)
+                tail.append(cleaned)
 
     def _send(self, message: dict[str, Any]) -> None:
         if self.process.poll() is not None:
@@ -1717,7 +1760,7 @@ class ACPClient:
         method = message.get("method")
         if method == "session/update":
             params = message.get("params") or {}
-            if params.get("sessionId") and params["sessionId"] != getattr(self, "session_id", params["sessionId"]):
+            if not isinstance(params.get("sessionId"), str) or params["sessionId"] != getattr(self, "session_id", None):
                 return
             request_id = params.get("requestId")
             if request_id is not None and request_id != getattr(self, "pending_prompt_request_id", request_id):
@@ -1766,6 +1809,7 @@ class ACPClient:
         self.next_request_id += 1
         if method == "session/prompt":
             self.pending_prompt_request_id = request_id
+            self.pending_prompt_session_id = params["sessionId"]
         self._send({
             "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
         })
@@ -1781,6 +1825,8 @@ class ACPClient:
             except queue.Empty:
                 continue
             if message.get("id") == request_id and ("result" in message or "error" in message):
+                if method == "session/prompt":
+                    self.pending_prompt_session_id = None
                 if "error" in message:
                     error = message.get("error") or {}
                     raise ProviderRequestError(error, getattr(self, "selected_model", None), "OpenClaw ACP request failed")
@@ -1853,7 +1899,7 @@ class ACPClient:
         return result, response
 
     def select_model(self, model: str) -> None:
-        if model == self.selected_model:
+        if model == getattr(self, "_session_model", self.selected_model):
             return
         option = next((o for o in self.config_options if o.get("category") == "model" or "model" in str(o.get("id", "")).lower()), None)
         if option is None:
@@ -1865,8 +1911,8 @@ class ACPClient:
             accepted = f"{resolved.get('modelProvider', '')}/{resolved.get('model', '')}"
             if result.get("ok") is not True or accepted != model:
                 raise RuntimeError(f"OpenClaw could not select {model}: session configuration was not acknowledged")
-            self.selected_model = model
-            self.model_switches += 1
+            self.model_switches += model != self.selected_model
+            self.selected_model = self._session_model = model
             return
         result = self.request("session/set_config_option", {
             "sessionId": self.session_id, "configId": option["id"], "value": model,
@@ -1876,8 +1922,8 @@ class ACPClient:
         if acknowledged is None or acknowledged.get("currentValue") != model:
             raise RuntimeError(f"OpenClaw could not select {model}: model control was not acknowledged")
         self.config_options = options
-        self.selected_model = model
-        self.model_switches += 1
+        self.model_switches += model != self.selected_model
+        self.selected_model = self._session_model = model
 
     def gateway_configuration(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         result = subprocess.run([self.openclaw_path, "gateway", "call", method, "--params", json.dumps(params), "--json"],
@@ -1896,6 +1942,7 @@ class ACPClient:
         if self.reconnects >= 1:
             raise RuntimeError("OpenClaw disconnected again after reconnecting. Check Gateway health in Settings.")
         prompt_calls, switches = self.prompt_calls, self.model_switches
+        selected = getattr(self, "selected_model", None)
         provider_retries = getattr(self, "successful_provider_retries", None)
         path = self.openclaw_path
         session_key = self.session_key
@@ -1909,6 +1956,7 @@ class ACPClient:
         self.reconnects = 1
         self.prompt_calls = prompt_calls
         self.model_switches = switches
+        self.selected_model = selected
         self.successful_provider_retries = provider_retries
 
     def prompt(self, instruction: str, screenshot_path: Path, *, detail_images: list[dict] | None = None) -> str:
@@ -1943,7 +1991,7 @@ class ACPClient:
                 self._send({
                     "jsonrpc": "2.0",
                     "method": "session/cancel",
-                    "params": {"sessionId": getattr(self, "session_id", "")},
+                    "params": {"sessionId": getattr(self, "pending_prompt_session_id", None) or getattr(self, "session_id", "")},
                 })
             except Exception:
                 pass
@@ -2117,6 +2165,26 @@ def desktop_instruction(
         inputs=inputs.prompt_state() if inputs else None)
 
 
+def verification_evidence(task: str, history: list[dict[str, Any]],
+                          ledger: TaskEvidenceLedger | None) -> dict[str, Any]:
+    # Runtime verification always has its task-owned ledger. Legacy prompt
+    # callers get only facts accepted by the same native-result recorder.
+    if ledger is None:
+        ledger = TaskEvidenceLedger(task)
+        for entry in history:
+            if not isinstance(entry, dict) or not isinstance(entry.get("action"), dict): continue
+            if entry.get("private_input") or entry["action"].get("private_input"): continue
+            ledger.before_action(entry["action"])
+            ledger.record_action(entry["action"], entry.get("result"))
+    state = ledger.prompt_state()
+    # Checklist definitions are useful; a previous proof/coverage conclusion
+    # is not input to the independent audit. Evidence remains attributable.
+    state["whole_request_coverage"] = "requires_independent_audit"
+    state["requirements"] = {identifier: {k: v for k, v in requirement.items() if k not in {"state", "evidence_ids"}}
+                             for identifier, requirement in state["requirements"].items()}
+    return state
+
+
 def verification_instruction(
     task: str,
     candidate: dict[str, Any],
@@ -2125,7 +2193,6 @@ def verification_instruction(
     ledger: TaskEvidenceLedger | None = None,
 ) -> str:
     task_guidance = largest_downloads_guidance(task)
-    progress = historical_progress(history, MAX_RECENT_ACTIONS, command_outcome_verified, task)
     examples = 'Examples illustrate shape, not evidence. Optional message/title are strings; kind is answer, result, or completion.\n'
     if not ledger:
         examples += 'Successful response example: {"verified":true,"message":"Verified result","kind":"completion"}.\n'
@@ -2135,10 +2202,6 @@ def verification_instruction(
                      '"proofs":[{"requirement_id":"r1","evidence_ids":["e1"],"rationale":"<what the evidence proves>"}]}. '
                      'These IDs are illustrations; use supplied IDs.\n')
     inputs = ledger.inputs if ledger is not None and ledger.inputs.entries else None
-    recent = compact_history(history)
-    if inputs:
-        recent = [inputs.project(entry) for entry in recent]
-        candidate = inputs.project(candidate)
     return compile_prompt("completion",
         instructions=COMPLETION_RULES + (verification_checklist_instruction(ledger) if ledger else "")
                      + ("Vision labels/crops are provisional text, not proof of control role, enabled state, focus or successful execution.\n"
@@ -2146,8 +2209,8 @@ def verification_instruction(
                      + (task_guidance + "\n" if task_guidance else "")
                      + (input_reference_rules(completion=True) if inputs else ""), examples=examples,
         task=task, context=prompt_capability_context(task_capability_context(task, observation)),
-        observation=prompt_observation(observation, task), history=recent, progress=progress,
-        checklist=ledger.prompt_state() if ledger else None, candidate=candidate,
+        observation=prompt_observation(observation, task), history=[], progress={},
+        checklist=verification_evidence(task, history, ledger),
         inputs=inputs.prompt_state() if inputs else None)
 
 
@@ -2256,7 +2319,7 @@ def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int
         history.append({"action": "completion_rejected", "result": missing or ["Whole-request coverage is not proven"]})
         emit("status", message="The evidence check found more work — continuing…")
         return False
-    message = verification.get("message") or candidate.get("output") or "Task completed"
+    message = verification.get("message") or "Task completed"
     for ref in verification.get("output_evidence_ids", []):
         fact = ledger.evidence[ref]["fact"]
         exact = (("[Binary file; base64 encoded]\n" if fact["encoding"] == "base64" else "") + fact["content"]
@@ -2402,7 +2465,7 @@ def routed_json_prompt(
     observation: dict[str, Any] | None = None,
     ledger: TaskEvidenceLedger | None = None,
 ) -> dict[str, Any]:
-    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, PROMPT_COMPILER_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION, RECOVERY_CYCLE_VERSION, TASK_INPUT_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation)], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
+    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, PROMPT_COMPILER_VERSION, VERIFICATION_SESSION_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION, RECOVERY_CYCLE_VERSION, TASK_INPUT_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation)], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
     cached = getattr(client, "decision_cache", {})
     if cached.get("key") == key:
         value = validate_response(json.loads(json.dumps(cached["decision"])), purpose, observation, ledger)
@@ -2413,7 +2476,9 @@ def routed_json_prompt(
         client.select_model(model)
         return validated_prompt(client, instruction, screenshot_path, purpose, budget, observation, router.metrics, ledger)
 
-    result = router.execute(request_with_model, purpose=purpose)
+    session = client.verification_session() if purpose == "verification" else nullcontext()
+    with session:
+        result = router.execute(request_with_model, purpose=purpose)
     action = result.get("action") or {}
     if not action or action.get("type") in {"none", "wait"}:
         client.decision_cache = {"key": key, "decision": result}

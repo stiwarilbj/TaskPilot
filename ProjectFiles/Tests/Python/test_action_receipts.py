@@ -12,6 +12,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import openclaw_runtime as runtime
+from evidence_fixtures import VerificationSessions
 from coordinate_fixtures import fixture_coordinates
 from action_receipts import BridgeReplyLost, RuntimeInbox
 
@@ -206,7 +207,7 @@ class ActionReceiptTests(unittest.TestCase):
         task = 'Append X once to /fixture/note.'
         native_receipts, delivered, events = {}, [], []
         router = runtime.AdaptiveModelRouter(lambda *a, **k: None)
-        class Client:
+        class Client(VerificationSessions):
             prompt_calls = 0
             model_switches = 0
             selected_model = None

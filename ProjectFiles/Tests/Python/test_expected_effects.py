@@ -10,6 +10,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import openclaw_runtime as runtime
+from evidence_fixtures import VerificationSessions
 from coordinate_fixtures import fixture_coordinates
 from expected_effects import ExpectedEffect, validate_expectation
 from response_validation import validate_response, ResponseValidationError
@@ -278,7 +279,7 @@ class ExpectedTaskLoopTests(unittest.TestCase):
                 files, frame_number = {}, [0]
                 generation = str(uuid.uuid4())
                 router = runtime.AdaptiveModelRouter(lambda *a, **k: None)
-                class Client:
+                class Client(VerificationSessions):
                     prompt_calls = 0; model_switches = 0; selected_model = None; decisions = 0
                     def select_model(client, model): client.selected_model = model
                     def prompt(client, instruction, image):

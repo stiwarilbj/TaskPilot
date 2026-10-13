@@ -10,6 +10,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import openclaw_runtime as runtime
+from evidence_fixtures import VerificationSessions
 from response_validation import ResponseValidationError, validate_response
 from task_evidence import TaskEvidenceLedger, content_hash, validate_metadata
 
@@ -283,7 +284,7 @@ class EvidenceTaskLoopTests(unittest.TestCase):
             if action['type'] == 'read_file': return read_result(action['path'], files[action['path']])
             files[action['path']] = action['content']; return written(action)
         test = self
-        class Client:
+        class Client(VerificationSessions):
             prompt_calls = model_switches = reconnects = 0
             successful_provider_retries = None
             selected_model = None
@@ -316,6 +317,7 @@ class EvidenceTaskLoopTests(unittest.TestCase):
         self.assertEqual(sum(kind == 'complete' for kind, _ in self.events), 1)
         self.assertEqual(client.prompt_calls, 4)
         self.assertEqual((router.metrics['planning'], router.metrics['verification'], router.metrics['repairs']), (2, 2, 0))
+        self.assertEqual(client.verification_sessions, 2)
         self.assertEqual(router.metrics['evidence_checks'], 3)
         self.assertEqual(router.metrics['coverage_rejections'], 1)
 

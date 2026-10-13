@@ -274,7 +274,7 @@ class ProviderErrorTests(unittest.TestCase):
         client = self.client()
         client.messages.put({'id': 1, 'error': {'code': 401, 'message': 'stale'}})
         client.messages.put({'id': 2, 'error': {'code': -32000, 'data': quota()}})
-        with self.assertRaises(errors.ProviderRequestError) as caught: client.request('session/prompt', {}, timeout=None)
+        with self.assertRaises(errors.ProviderRequestError) as caught: client.request('session/prompt', {'sessionId': 'current'}, timeout=None)
         failure = self.failure(caught.exception.payload)
         self.assertEqual((failure.code, failure.rpc_code, failure.scope), (429, -32000, 'credential'))
 

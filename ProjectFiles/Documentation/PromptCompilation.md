@@ -18,14 +18,19 @@ existing executor; a prompt cannot override them.
 
 Completion uses its own proof contract and response examples, without executable
 action examples or recovery instructions. It audits the complete original task
-against the requirement/evidence ledger. Delivery acknowledgement and an
-unrelated screen change remain insufficient proof of the intended outcome.
+against the requirement/evidence ledger in a [fresh ACP session](CompletionVerification.md).
+Its curated input contains checklist definitions and valid, scoped evidence;
+planner narratives and earlier completion conclusions are excluded. Delivery
+acknowledgement and an unrelated screen change remain insufficient proof of the
+intended outcome.
 
 All templates use a fixed order: phase instructions, response examples, original
 task, optional [exact task-input catalogue](TaskInputs.md), capability context,
-current observation, phase-specific failed condition or
-completion claim, recent validated results, checklist evidence, then earlier
-confirmed facts. Task and data sections use canonical JSON serialization, with
+current observation, phase-specific failed condition, recent validated results,
+checklist evidence, then earlier confirmed facts. Completion omits failed
+conditions, planning history and candidate claims, supplying only the original
+request, current observation, exact inputs and curated ledger evidence. Task and
+data sections use canonical JSON serialization, with
 sorted object keys and preserved array order and contents. Embedded newlines or
 instruction-like screen text cannot introduce raw instruction sections. Labels,
 window relationships, routes, task wording and validated evidence are preserved.

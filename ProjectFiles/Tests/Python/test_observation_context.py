@@ -135,7 +135,8 @@ class HistoricalProgressTests(unittest.TestCase):
     def read(self, step=1, content='Quarterly revenue: 42'):
         return {'step': step, 'action': {'type': 'read_file', 'path': f'/tmp/report-{step}.txt'},
                 'result': {'path': f'/tmp/report-{step}.txt', 'content': content, 'encoding': 'utf-8',
-                           'bytes_returned': len(content), 'truncated': False}}
+                           'bytes_returned': len(content), 'truncated': False,
+                           'content_sha256': hashlib.sha256(content.encode()).hexdigest()}}
 
     def tail(self):
         return [{'step': 20 + n, 'action': {'type': 'wait'}, 'result': {'message': 'waited'}} for n in range(8)]
@@ -150,7 +151,8 @@ class HistoricalProgressTests(unittest.TestCase):
         for prompt in [runtime.desktop_instruction('Compare quarterly revenue', {'elements': []}, history),
                        runtime.verification_instruction('Compare quarterly revenue', {}, {'elements': []}, history)]:
             self.assertIn('Quarterly revenue: 42', prompt)
-            self.assertIn('historical; recheck mutable state and use current IDs', prompt)
+        self.assertIn('historical; recheck mutable state and use current IDs', runtime.desktop_instruction('Compare quarterly revenue', {}, history))
+        self.assertNotIn('EARLIER CONFIRMED TASK FACTS', runtime.verification_instruction('Compare quarterly revenue', {}, {}, history))
 
     def test_claims_delivery_attempts_and_zero_exit_are_not_verified_progress(self):
         entries = [{'step': 1, 'action': button('old'), 'result': {'outcome': 'delivered_unconfirmed'},

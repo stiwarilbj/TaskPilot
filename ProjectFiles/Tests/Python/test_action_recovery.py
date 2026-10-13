@@ -7,7 +7,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import openclaw_runtime as runtime
-from evidence_fixtures import with_requirements, proof_response
+from evidence_fixtures import VerificationSessions, with_requirements, proof_response
 
 
 class ActionRecoveryTests(unittest.TestCase):
@@ -39,7 +39,7 @@ class ActionRecoveryTests(unittest.TestCase):
         current = None
         state = mock.Mock()
         test = self
-        class Client:
+        class Client(VerificationSessions):
             prompt_calls = 0
             model_switches = 0
             selected_model = None

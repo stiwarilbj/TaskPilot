@@ -12,6 +12,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import action_contract_generated as contract
 import openclaw_runtime as runtime
+from evidence_fixtures import VerificationSessions
 from coordinate_fixtures import fixture_coordinates
 from command_intents import explicit_operation
 from response_validation import bind_command_outcomes, normalize_action, validate_response, ResponseValidationError
@@ -230,7 +231,7 @@ class CommandOperationTaskLoopTests(unittest.TestCase):
                 task = 'Copy /fixture/a to /fixture/b'; operation = explicit_operation(task)
                 generation = str(uuid.uuid4()); events, actions, methods, receipts = [], [], [], {}
                 frame = [0]; router = runtime.AdaptiveModelRouter(lambda *a, **k: None)
-                class Client:
+                class Client(VerificationSessions):
                     selected_model = None; model_switches = 0; prompt_calls = 0
                     def select_model(client, model): client.selected_model = model
                     def prompt(client, instruction, image):

@@ -7,7 +7,7 @@ exercise the evaluator, but never authorize adoption of a prompt change.
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 import hashlib
 import json
@@ -200,6 +200,7 @@ def prompt_pack(label="current", **rules):
     return {"version": VERSION, "label": checked_slug(label), "runtime_revision": runtime_revision(),
             "prompt_compiler_version": PROMPT_COMPILER_VERSION,
             "recovery_cycle_version": RECOVERY_CYCLE_VERSION,
+            "verification_session_version": runtime.VERIFICATION_SESSION_VERSION,
             **{field: rules.get(field) for field in RULE_FIELDS.values()}}
 
 
@@ -211,6 +212,8 @@ def validate_pack(pack):
         raise ValueError("Prompt compiler version does not match")
     if type(pack.get("recovery_cycle_version")) is not int or pack["recovery_cycle_version"] != RECOVERY_CYCLE_VERSION:
         raise ValueError("Recovery cycle version does not match")
+    if type(pack.get("verification_session_version")) is not int or pack["verification_session_version"] != runtime.VERIFICATION_SESSION_VERSION:
+        raise ValueError("Verification session version does not match")
     for field in RULE_FIELDS.values():
         value = pack.get(field)
         if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > 16000):
@@ -386,6 +389,17 @@ class RecordedClient:
         self.selected_model = None
         self.model_switches = self.prompt_calls = self.reconnects = 0
         self.successful_provider_retries = None
+        self.session_id = "planning"
+        self.verification_sessions = 0
+
+    @contextmanager
+    def verification_session(self):
+        self.verification_sessions += 1
+        self.session_id = f"verification-{self.verification_sessions}"
+        try:
+            yield
+        finally:
+            self.session_id = "planning"
 
     def select_model(self, model):
         self.model_switches += self.selected_model != model
@@ -398,6 +412,8 @@ class RecordedClient:
         pass
 
     def prompt(self, instruction, image):
+        if self.purpose == "verification" and self.session_id == "planning":
+            raise RecordingMismatch("verification_session_not_isolated")
         index = self.prompt_calls
         fields = {"purpose": self.purpose, "repair": instruction.startswith(REPAIR_HEADER),
                   "model": self.selected_model, "instruction_sha256": hashlib.sha256(instruction.encode()).hexdigest(),

@@ -93,6 +93,12 @@ class PromptRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Prompt compiler version'):
             regression.validate_pack(changed)
 
+    def test_regression_pack_binds_verification_isolation_policy(self):
+        changed = regression.prompt_pack('candidate')
+        changed['verification_session_version'] += 1
+        with self.assertRaisesRegex(ValueError, 'Verification session version'):
+            regression.validate_pack(changed)
+
     def test_wrong_control_and_premature_verifier_claim_are_scored_independently(self):
         result, _ = self.scripted("wrong-window", "baseline")
         self.assertTrue(result["completed"])

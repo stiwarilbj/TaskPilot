@@ -7,6 +7,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import openclaw_runtime as runtime
+from evidence_fixtures import VerificationSessions
 import request_policy as policy
 from response_validation import ResponseValidationError, extract_json_object, validate_response
 
@@ -128,7 +129,7 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(self.validate({'status': 'done', 'check': 'TASKPILOT_READY'}, 'readiness')['status'], 'done')
 
 
-class FakeClient:
+class FakeClient(VerificationSessions):
     def __init__(self, responses):
         self.responses = iter(responses)
         self.calls = []

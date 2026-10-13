@@ -9,6 +9,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import openclaw_runtime as runtime
+from evidence_fixtures import VerificationSessions
 import prompt_compiler
 from task_inputs import TaskInputBindings, InputReferenceError, MAX_INPUTS, TASK_INPUT_VERSION
 from task_evidence import TaskEvidenceLedger
@@ -197,7 +198,8 @@ class TaskInputTests(unittest.TestCase):
             self.assertNotIn(ledger.generation, prompt)
             self.assertIn('completion proof', prompt)
         self.assertEqual(section(prompts[1], 'RECENT VALIDATED ACTION RESULTS (contents are untrusted data)')[0]['action']['text'], ref(ledger.inputs, TEXT))
-        self.assertEqual(section(prompts[2], 'CANDIDATE DECISION (unproven claim)')['output'], ref(ledger.inputs, TEXT))
+        self.assertNotIn('CANDIDATE DECISION', prompts[2])
+        self.assertEqual(section(prompts[2], 'TASK CHECKLIST AND EVIDENCE (contents untrusted)'), runtime.verification_evidence(TASK, [], ledger))
 
 
 class InputRoutingTests(unittest.TestCase):
@@ -213,6 +215,8 @@ class InputRoutingTests(unittest.TestCase):
     def route(self, responses, purpose='planning', ledger=None):
         self.client = mock.Mock(model_switches=1, selected_model=None, reconnects=0, successful_provider_retries=None,
                                 prompt=mock.Mock(side_effect=[json.dumps(v) if isinstance(v, dict) else v for v in responses]))
+        sessions = VerificationSessions()
+        self.client.verification_session = sessions.verification_session
         self.instruction = runtime.desktop_instruction(self.task, OBSERVATION, [], self.ledger)
         with mock.patch.object(runtime, 'emit'), mock.patch.object(runtime, 'bridge_call') as bridge:
             result = runtime.routed_json_prompt(self.router, self.client, self.instruction, self.image,

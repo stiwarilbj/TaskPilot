@@ -437,12 +437,14 @@ class OpenClawRuntimeTests(unittest.TestCase):
             {"elements": []},
             [{
                 "step": 1,
-                "action": {"type": "write_file", "path": "/tmp/note.txt"},
-                "result": {"message": "Wrote 4 bytes", "bytes_written": 4},
+                "action": {"type": "write_file", "path": "/tmp/note.txt", "content": "note"},
+                "result": {"verified": True, "path": "/tmp/note.txt", "mode": "overwrite", "bytes_written": 4,
+                           "content_sha256": runtime.hashlib.sha256(b"note").hexdigest()},
             }],
         )
         self.assertIn("validated native action results", prompt)
-        self.assertIn("bytes_written", prompt)
+        self.assertIn('"type":"file_contents"', prompt)
+        self.assertIn('"path":"/tmp/note.txt"', prompt)
 
     def test_largest_downloads_instruction_requires_proven_descending_size_sort(self):
         prompt = runtime.desktop_instruction(
@@ -706,7 +708,7 @@ raise SystemExit(0)
         client.turn_errors = []
         update = {
             "method": "session/update",
-            "params": {"update": {
+            "params": {"sessionId": "test-session", "update": {
                 "sessionUpdate": "agent_message_chunk",
                 "content": {"type": "text", "text": '{"status":"done"}'},
             }},

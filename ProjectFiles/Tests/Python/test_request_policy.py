@@ -7,6 +7,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import request_policy as policy
 import openclaw_runtime as runtime
+from evidence_fixtures import VerificationSessions
 
 
 class RequestPolicyTests(unittest.TestCase):
@@ -135,7 +136,7 @@ class RequestPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / 'image.png'
             image.write_bytes(b'image')
-            class Client:
+            class Client(VerificationSessions):
                 model_switches = 0
                 def select_model(self, model): self.selected_model = model
                 prompt = mock.Mock(return_value='{"status":"act","action":{"type":"wait"}}')
@@ -156,7 +157,7 @@ class RequestPolicyTests(unittest.TestCase):
     def test_reconnect_once_replays_only_reasoning(self):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / 'image.png'; image.write_bytes(b'image')
-            class Client:
+            class Client(VerificationSessions):
                 model_switches = 0
                 reconnects = 0
                 def select_model(self, model): self.selected_model = model
@@ -172,7 +173,7 @@ class RequestPolicyTests(unittest.TestCase):
     def test_malformed_output_repairs_before_switching(self):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / 'image.png'; image.write_bytes(b'image')
-            class Client:
+            class Client(VerificationSessions):
                 model_switches = 0
                 def select_model(self, model): self.selected_model = model
                 prompt = mock.Mock(side_effect=['partial {', '{"status":"done"}'])
@@ -321,7 +322,7 @@ class RequestPolicyTests(unittest.TestCase):
     def test_string_false_does_not_pass_visual_verification(self):
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / 'image.png'; image.write_bytes(b'image')
-            class Client:
+            class Client(VerificationSessions):
                 model_switches = 0
                 def select_model(self, model): self.selected_model = model
                 prompt = mock.Mock(side_effect=['{"verified":"false"}', '{"verified":false}'])
