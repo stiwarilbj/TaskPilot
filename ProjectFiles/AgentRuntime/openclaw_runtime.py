@@ -40,6 +40,7 @@ MAX_IDENTICAL_ACTIONS = 3
 PROMPT_TIMEOUT_SECONDS = None  # Wait for completion or an explicit provider/transport error.
 SCREEN_POLL_SECONDS = 0.15
 SCREEN_STABLE_SECONDS = 0.3
+LOCAL_CHANGE_VERSION = 1
 PRODUCT_NAME = "TaskPilot"
 LEGACY_APPLICATION_SUPPORT_FOLDER = "Orbit Agent"
 from request_policy import (
@@ -97,6 +98,7 @@ _task_generation_id: str | None = None
 _observation_keywords: list[str] = []
 _runtime_inbox: RuntimeInbox | None = None
 _receipt_metrics = {"receipt_queries": 0, "receipt_recoveries": 0, "receipt_unresolved": 0}
+_local_change_metrics = {"local_notifications": 0, "local_targeted_checks": 0, "local_poll_wakeups": 0}
 
 
 def runtime_line(timeout: float | None = None) -> str:
@@ -920,12 +922,45 @@ def wait_for_screen_change(display_id: int, before: dict[str, Any], action: dict
     changed = False
     polls = 0
     effect_result = expected_effect.unknown() if expected_effect else None
+    notifications = before.get("local_change_notifications") is True
     try:
         while True:
             remaining = deadline - time.monotonic()
+            used_notification_wait = False
             if latest is not None and remaining <= 0:
                 reason = "bounded_wait_elapsed"
                 break
+            # Reserve time for an accepted screenshot/control pair at the end
+            # of the bound. Watchers never leave planning with unpaired evidence.
+            if notifications and remaining > 0.5 and latest is not None:
+                current_target = latest or before
+                check = None
+                if expected_effect and expected_effect.kind == 'field_value':
+                    matches = expected_effect.unique(expected_effect.field_candidates(current_target))
+                    if len(matches) == 1:
+                        check = {**expected_effect.spec, 'element_id': matches[0]['id'], 'pid': matches[0]['pid']}
+                elif expected_effect and expected_effect.kind == 'dialog_appeared':
+                    check = expected_effect.spec
+                delay = max(0.05, SCREEN_STABLE_SECONDS - (time.monotonic() - stable_since)) if latest is not None else 0.05
+                params = {'observation_revision': current_target.get('observation_revision'),
+                          'timeout_ms': max(1, min(500, math.floor((remaining - 0.5) * 1000))),
+                          'minimum_delay_ms': min(300, math.ceil(delay * 1000))}
+                if pid is not None: params['pid'] = pid
+                if check:
+                    params['expected_result'] = check
+                    params['pid'] = check.get('pid', params.get('pid'))
+                try:
+                    wake = bridge_call('wait_for_change', display_id, **params)
+                    used_notification_wait = True
+                    record_local_wake(wake)
+                    if check and wake.get('effect_ready') is False and time.monotonic() < deadline:
+                        continue  # A spurious notification is not a screen change.
+                except ActionRejected as error:
+                    if error.code == 'stale_target': pass  # Refresh; no action is replayed.
+                    elif error.code in {'invalid_action', 'action_rejected'}:
+                        notifications = False  # Unsupported native watcher; bounded polling.
+                    else: raise
+                remaining = deadline - time.monotonic()
             # The native consistency loop shares this wait's remaining budget.
             # An unstable capture is not a provider failure or permission to use
             # an older revision (native observation authority was invalidated).
@@ -968,13 +1003,27 @@ def wait_for_screen_change(display_id: int, before: dict[str, Any], action: dict
             if now >= deadline:
                 reason = "bounded_wait_elapsed"
                 break
-            time.sleep(min(SCREEN_POLL_SECONDS, deadline - now))
+            if not used_notification_wait:
+                time.sleep(min(SCREEN_POLL_SECONDS, deadline - now))
         return latest, {"reason": reason, "changed": changed, "polls": polls,
                         **({'expected_effect': effect_result} if effect_result else {}),
                         "elapsed_seconds": round(time.monotonic() - start, 3)}
     except BaseException:
         discard_observation_image(latest)
         raise
+
+
+def record_local_wake(wake: dict[str, Any]) -> None:
+    """Aggregate diagnostics only; notifications never enter prompts or proof."""
+    for field, metric in [('notifications', 'local_notifications'), ('targeted_checks', 'local_targeted_checks')]:
+        count = wake.get(field)
+        if type(count) is int and 0 <= count <= 10000:
+            _local_change_metrics[metric] += count
+    polls = wake.get('poll_wakeups')
+    if type(polls) is int and 0 <= polls <= 10000:
+        _local_change_metrics['local_poll_wakeups'] += polls
+    elif polls is None and wake.get('reason') == 'poll_timeout':
+        _local_change_metrics['local_poll_wakeups'] += 1
 
 
 def command_outcome_verified(action: dict[str, Any], result: dict[str, Any]) -> bool:
@@ -1005,7 +1054,15 @@ def verify_expected_effect(display_id: int, before: dict[str, Any], action: dict
         checked = effect.reuse_native(action, result)
         if not checked or checked['outcome'] != 'verified':
             def count(): metrics['effect_checks'] = metrics.get('effect_checks', 0) + 1
-            checked = effect.wait_file(lambda check: bridge_call('check_effect', display_id, check=check), count=count)
+            if before.get('local_change_notifications') is True:
+                response = bridge_call('wait_file_effect', display_id, check=effect.spec, timeout_ms=2000)
+                wake = response.get('local_wait', {})
+                record_local_wake(wake)
+                checks = wake.get('targeted_checks')
+                metrics['effect_checks'] = metrics.get('effect_checks', 0) + (checks if type(checks) is int and 0 <= checks <= 10000 else 1)
+                checked = effect.native_check(response)
+            else:
+                checked = effect.wait_file(lambda check: bridge_call('check_effect', display_id, check=check), count=count)
     screen_limit = screen_wait_limit(str(action.get('type')))
     if screen_limit > 0 or effect.kind in {'dialog_appeared', 'field_value'}:
         observation, settling = wait_for_screen_change(display_id, before, action, baseline_image,
@@ -2017,6 +2074,7 @@ def prompt_capability_context(context: dict[str, Any]) -> dict[str, Any]:
 def prompt_observation(observation: dict[str, Any], task: str = "") -> dict[str, Any]:
     compact = compact_observation(observation, task)
     compact.pop("agent_tools", None)
+    compact.pop("local_change_notifications", None)
     return compact
 
 
@@ -2378,7 +2436,7 @@ def publish_task_metrics(router: TaskModelRouter, client: ACPClient, ledger: Tas
     # before completion so the originating invocation can still accept them.
     router.metrics.update(evidence_checks=ledger.checks, coverage_rejections=ledger.rejections,
         requirements_proven=sum(r["state"] == "proven" for r in ledger.requirements.values()),
-        dependency_rejections=ledger.dependency_rejections, **_receipt_metrics)
+        dependency_rejections=ledger.dependency_rejections, **_receipt_metrics, **_local_change_metrics)
     router.metrics.update(prompt_calls=client.prompt_calls, model_switches=client.model_switches)
     emit("request_metrics", **router.metrics)
 
@@ -2465,7 +2523,7 @@ def routed_json_prompt(
     observation: dict[str, Any] | None = None,
     ledger: TaskEvidenceLedger | None = None,
 ) -> dict[str, Any]:
-    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, PROMPT_COMPILER_VERSION, VERIFICATION_SESSION_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION, RECOVERY_CYCLE_VERSION, TASK_INPUT_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation)], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
+    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, LOCAL_CHANGE_VERSION, PROMPT_COMPILER_VERSION, VERIFICATION_SESSION_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION, RECOVERY_CYCLE_VERSION, TASK_INPUT_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation)], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
     cached = getattr(client, "decision_cache", {})
     if cached.get("key") == key:
         value = validate_response(json.loads(json.dumps(cached["decision"])), purpose, observation, ledger)
@@ -2493,6 +2551,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
     global _observation_keywords
     _observation_keywords = []
     _receipt_metrics.update(receipt_queries=0, receipt_recoveries=0, receipt_unresolved=0)
+    _local_change_metrics.update(local_notifications=0, local_targeted_checks=0, local_poll_wakeups=0)
     ledger = TaskEvidenceLedger(task, _task_generation_id)
     resolved_openclaw = find_openclaw(openclaw_path)
     state = prepare_runtime(resolved_openclaw, api_key)

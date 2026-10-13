@@ -62,6 +62,29 @@ final class AgentAutomationBridge {
                 throw BridgeError.invalidRequest("Missing bridge method")
             }
             let params = request["params"] as? [String: Any] ?? [:]
+            if method == "wait_file_effect" {
+                guard let input = params["check"] else { throw BridgeError.invalidRequest("Missing expected effect check") }
+                let check = try ActionContract.validateOutcomeCheck(input)
+                guard let path = check["path"] as? String else { throw BridgeError.invalidRequest("A local wait requires a file check") }
+                let budget = try localWaitMilliseconds(params["timeout_ms"], maximum: 2000, defaultValue: 2000)
+                let deadline = ProcessInfo.processInfo.systemUptime + Double(budget) / 1000
+                let signal = LocalChangeSignal(lease: lease)
+                let source = await NativeChangeSubscription.file(TaskToolExecutor.expandedFileURL(path), signal: signal)
+                var last: [String: Any] = [:]
+                let wait = try await LocalChangeWait.run(signal: signal, source: source, deadline: deadline, check: {
+                    last = try await self.taskTools.checkOutcome(check)
+                    return (last["checks"] as? [[String: Any]])?.first?["verified"] as? Bool == true
+                })
+                try lease.check()
+                if wait.reason == "resumed" {
+                    // A readback completed across Pause/Resume cannot become
+                    // current proof. Reconcile afresh; never replay the action.
+                    last = ["requested_checks": [check], "checks": [["type": check["type"]!,
+                        "path": TaskToolExecutor.expandedFileURL(path).path, "verified": false]]]
+                }
+                return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
+                        "ok": true, "result": last.merging(["local_wait": wait.dictionary]) { _, new in new }]
+            }
             // Lookup and replay never require a connected display or a current
             // element map, and never dispatch the original operation again.
             if method == "action_receipt" {
@@ -97,6 +120,17 @@ final class AgentAutomationBridge {
             let result: [String: Any]
 
             switch method {
+            case "wait_for_change":
+                let budget = try localWaitMilliseconds(params["timeout_ms"], maximum: 500, defaultValue: 500)
+                let delay = try localWaitMilliseconds(params["minimum_delay_ms"], maximum: 300, defaultValue: 50, allowZero: true)
+                let deadline = ProcessInfo.processInfo.systemUptime + Double(budget) / 1000
+                let target = try accessibility.localChangeTarget(params)
+                let signal = LocalChangeSignal(lease: lease)
+                let source = await NativeChangeSubscription.accessibility(pid: target.pid, elements: target.elements, signal: signal, deadline: deadline)
+                let wait = try await LocalChangeWait.run(signal: signal, source: source, deadline: deadline,
+                    minimumDelay: Double(delay) / 1000, check: { try target.check() })
+                result = wait.dictionary
+
             case "observe":
                 let inspectionPID = try ControlEvidencePolicy.inspectionPID(params["evidence_inspection_pid"])
                 // The visual pointer is an action-only indicator. Hide it
@@ -191,6 +225,7 @@ final class AgentAutomationBridge {
                 observationLogger.debug("Local text candidates: \(screenText.targets.count), detail crops: \(screenText.crops.count)")
                 result = [
                     "task_generation_id": lease.id,
+                    "local_change_notifications": true,
                     "observation_revision": snapshot.revision,
                     "screenshot_path": screenshotURL.path,
                     "display": displayDictionary(observationDisplay),
@@ -350,6 +385,16 @@ final class AgentAutomationBridge {
             preferred: display,
             availableDisplays: displays
         )
+    }
+
+    private func localWaitMilliseconds(_ input: Any?, maximum: Int, defaultValue: Int, allowZero: Bool = false) throws -> Int {
+        guard let input else { return defaultValue }
+        guard let number = input as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite, number.doubleValue.rounded() == number.doubleValue,
+              ((allowZero ? 0 : 1)...maximum).contains(number.intValue) else {
+            throw BridgeError.invalidRequest("Local wait milliseconds must be an integer from \(allowZero ? 0 : 1) to \(maximum)")
+        }
+        return number.intValue
     }
 
     private func displayDictionary(_ display: DisplayDescriptor) -> [String: Any] {

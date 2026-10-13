@@ -28,6 +28,9 @@ struct AgentRequestMetrics: Codable, Equatable {
     var verifiedEffects: Int? = nil
     var unconfirmedEffects: Int? = nil
     var receiptUnresolved: Int? = nil
+    var localNotifications: Int? = nil
+    var localTargetedChecks: Int? = nil
+    var localPollWakeups: Int? = nil
 
     var summary: String {
         "\(promptCalls ?? planning + verification) TaskPilot calls · \(planning) planning · \(verification) verification · \(retries) retries · \(modelSwitches) switches · \(cacheHits) reused · \(reconnects) reconnects" +

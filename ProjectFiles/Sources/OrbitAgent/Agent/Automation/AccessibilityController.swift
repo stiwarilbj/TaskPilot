@@ -778,6 +778,99 @@ final class AccessibilityController {
         }
     }
 
+    /// A read-only hint for deciding when a complete, consistent observation is
+    /// worth collecting. Only the subsequent accepted observation proves the
+    /// effect; these probes never publish elements or authorize delivery.
+    func localChangeTarget(_ params: [String: Any]) throws -> (pid: pid_t?, elements: [AXUIElement], check: () throws -> Bool?) {
+        try validateObservation(params["observation_revision"] as? String)
+        let pid: pid_t?
+        if let value = params["pid"] {
+            guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue.isFinite, number.doubleValue.rounded() == number.doubleValue,
+                  (1...Double(Int32.max)).contains(number.doubleValue) else {
+                throw AccessibilityActionError.invalidAction("pid must be a positive integer")
+            }
+            pid = number.int32Value
+        } else { pid = nil }
+        let application = lock.withLock { pid.flatMap { observedApplications[$0] } }
+        if let pid, application == nil || pid == controllerPID { throw AccessibilityActionError.staleObservation }
+        let effect = params["expected_result"] as? [String: Any]
+        if let effectPID = effect?["pid"] {
+            guard let number = effectPID as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue.isFinite, number.doubleValue == Double(pid ?? 0) else {
+                throw AccessibilityActionError.invalidAction("Local check pid must match the observed app")
+            }
+        }
+        if params["expected_result"] != nil && effect == nil {
+            throw AccessibilityActionError.invalidAction("Local screen check must be an object")
+        }
+        let kind = effect?["type"] as? String
+        var record: ElementRecord?
+        if kind == "field_value" {
+            guard let effect, Set(effect.keys).isSubset(of: ["type", "element_id", "value", "pid"]),
+                  let id = effect["element_id"] as? String, let value = effect["value"] as? String,
+                  value.utf8.count <= TaskToolExecutor.maximumWriteBytes else {
+                throw AccessibilityActionError.invalidAction("Invalid local field check")
+            }
+            record = try self.record(for: ["element_id": id])
+            guard let record, record.pid == pid, ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"].contains(record.role),
+                  !AutomationTextEntryPolicy.isSecure(role: record.role, subrole: record.identity.subrole) else {
+                throw AccessibilityActionError.staleObservation
+            }
+        } else if kind == "dialog_appeared" {
+            guard let effect, Set(effect.keys).isSubset(of: ["type", "pid", "title", "window_title"]),
+                  let title = effect["title"] as? String, !title.isEmpty, title.utf8.count <= 2_097_152,
+                  effect["window_title"] == nil || effect["window_title"] is String else {
+                throw AccessibilityActionError.invalidAction("Invalid local dialog check")
+            }
+        } else if effect != nil { throw AccessibilityActionError.invalidAction("Unsupported local screen check") }
+        let elements = record.map { [$0.element] + ($0.window.map { [$0] } ?? []) } ?? []
+        let probe: () throws -> Bool? = { [self] in
+            try TaskOwnership.check()
+            if let pid, let application {
+                guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated,
+                      applicationIdentity(app) == application else { return nil }
+            }
+            if let record, let expected = effect?["value"] as? String {
+                let window = accessibilityElement(record.element, kAXWindowAttribute)
+                guard elementTitle(record.element) == record.identity.label,
+                      stringAttribute(record.element, kAXSubroleAttribute) ?? "" == record.identity.subrole,
+                      record.window.map({ expected in window.map { CFEqual(expected, $0) } ?? false }) ?? (window == nil) else {
+                    return nil
+                }
+                return readableTextValue(record).map { $0 == expected }
+            }
+            if kind == "dialog_appeared", let pid, let title = effect?["title"] as? String {
+                // Search only the specified app's window/dialog subtree, with
+                // strict local limits. Incomplete reads fall back to capture.
+                let deadline = ProcessInfo.processInfo.systemUptime + 0.1
+                var nodes = windows(of: pid).map { ($0, elementTitle($0), 0) }
+                var visited: Set<UInt> = []
+                while let (element, windowTitle, depth) = nodes.popLast() {
+                    if ProcessInfo.processInfo.systemUptime >= deadline || visited.count >= 200 { return nil }
+                    guard visited.insert(CFHash(element)).inserted else { continue }
+                    guard let role = stringAttribute(element, kAXRoleAttribute) else { return nil }
+                    if (["AXSheet", "AXDialog"].contains(role) || stringAttribute(element, kAXSubroleAttribute) == "AXDialog"),
+                       elementTitle(element) == title,
+                       effect?["window_title"] == nil || effect?["window_title"] as? String == windowTitle { return true }
+                    if depth >= 12 { return nil }
+                    if let children = attribute(element, kAXChildrenAttribute) as? [AXUIElement] {
+                        if children.count + nodes.count + visited.count > 200 { return nil }
+                        nodes.append(contentsOf: children.map { ($0, windowTitle, depth + 1) })
+                    }
+                }
+                return false
+            }
+            return nil
+        }
+        return (pid, elements, {
+            let context = ObservationAccessibilityReads.Context(deadline: ProcessInfo.processInfo.systemUptime + 0.1,
+                now: { ProcessInfo.processInfo.systemUptime }, report: { _, _, _ in }, retried: {}, shouldRetry: { false })
+            let candidate = try ObservationAccessibilityReads.$current.withValue(context) { try probe() }
+            return context.failures > 0 ? nil : candidate
+        })
+    }
+
     func bindCoordinates(_ coordinates: ScreenCoordinateMapping, revision: String, on display: DisplayDescriptor) throws {
         try coordinates.validate(display: display)
         try validateObservation(revision)
@@ -2533,12 +2626,13 @@ final class AccessibilityController {
             waitForMatch: { matches in
                 guard !self.inputIsCancelled() else { throw AccessibilityActionError.cancelled }
                 try Task.checkCancellation()
-                let deadline = ContinuousClock.now.advanced(by: .seconds(2))
-                while !matches(), ContinuousClock.now < deadline {
+                let deadline = ProcessInfo.processInfo.systemUptime + 2
+                let signal = LocalChangeSignal()
+                let source = await NativeChangeSubscription.accessibility(pid: record.pid, elements: [record.element], signal: signal, deadline: deadline)
+                _ = try await LocalChangeWait.run(signal: signal, source: source, deadline: deadline, check: {
                     guard !self.inputIsCancelled() else { throw AccessibilityActionError.cancelled }
-                    try Task.checkCancellation()
-                    try await Task.sleep(for: .milliseconds(50))
-                }
+                    return matches()
+                })
                 guard !self.inputIsCancelled() else { throw AccessibilityActionError.cancelled }
                 try Task.checkCancellation()
             })

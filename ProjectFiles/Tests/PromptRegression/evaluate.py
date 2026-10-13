@@ -201,6 +201,7 @@ def prompt_pack(label="current", **rules):
             "prompt_compiler_version": PROMPT_COMPILER_VERSION,
             "recovery_cycle_version": RECOVERY_CYCLE_VERSION,
             "verification_session_version": runtime.VERIFICATION_SESSION_VERSION,
+            "local_change_version": runtime.LOCAL_CHANGE_VERSION,
             **{field: rules.get(field) for field in RULE_FIELDS.values()}}
 
 
@@ -214,6 +215,8 @@ def validate_pack(pack):
         raise ValueError("Recovery cycle version does not match")
     if type(pack.get("verification_session_version")) is not int or pack["verification_session_version"] != runtime.VERIFICATION_SESSION_VERSION:
         raise ValueError("Verification session version does not match")
+    if type(pack.get("local_change_version")) is not int or pack["local_change_version"] != runtime.LOCAL_CHANGE_VERSION:
+        raise ValueError("Local change version does not match")
     for field in RULE_FIELDS.values():
         value = pack.get(field)
         if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > 16000):
@@ -285,7 +288,7 @@ class World:
                 element.setdefault("value_complete", True)
             elements.append(element)
         windows = sorted({e.get("window_title", "Draft") for e in elements}) or ["Draft"]
-        self.latest = {"observation_revision": revision, "screenshot_path": str(image),
+        self.latest = {"observation_revision": revision, "screenshot_path": str(image), "local_change_notifications": True,
                        "applications": [{"pid": 42, "name": "Fixture App", "active": True, "topmost_on_agent_screen": True,
                                          "windows": [{"title": w, "window_id": revision + ":window-" + w,
                                                       "focused": w == frame.get("active_window", "Draft"),
@@ -299,6 +302,44 @@ class World:
     def bridge(self, method, _display, **params):
         if method == "observe":
             return self.observe()
+        if method == "wait_for_change":
+            deadline = self.now + params['timeout_ms'] / 1000
+            self.advance(min(params.get('minimum_delay_ms', 0) / 1000, deadline - self.now))
+            check = params.get('expected_result')
+            checks = notifications = 0
+            reason = 'condition_candidate'
+            def candidate():
+                controls = self.case['states'][self.state]['controls']
+                if not check: return None
+                if check['type'] == 'field_value':
+                    key = check['element_id'].split(':', 1)[1]
+                    targets = [c for c in controls if c['key'] == key and c.get('pid') == params.get('pid')]
+                    return len(targets) == 1 and targets[0].get('value') == check['value']
+                if check['type'] == 'dialog_appeared':
+                    return any(c.get('pid') == check['pid'] and c.get('title') == check['title'] and
+                               (c.get('role') in {'AXSheet', 'AXDialog'} or c.get('subrole') == 'AXDialog') for c in controls)
+                return None
+            ready = candidate(); checks += ready is not None
+            while ready is not True and self.now < deadline:
+                end = min(deadline, self.now + 0.5)
+                event = self.pending and self.pending[0] <= end
+                if event:
+                    self.advance(max(0, self.pending[0] - self.now))
+                    self.advance(min(0.05, max(0, deadline - self.now)))
+                    notifications += 1; reason = 'change_notification'
+                else:
+                    self.advance(end - self.now); reason = 'poll_timeout'
+                ready = candidate(); checks += ready is not None
+                if ready is None: break
+            return {'effect_ready': ready, 'targeted_checks': checks, 'notifications': notifications,
+                    'reason': reason, 'notification_supported': True}
+        if method == "wait_file_effect":
+            deadline = self.now + params['timeout_ms'] / 1000; checks = 0
+            while True:
+                result = self.bridge('check_effect', _display, check=params['check']); checks += 1
+                if result['checks'][0]['verified'] or self.now >= deadline: break
+                self.advance(min(0.5, deadline - self.now))
+            return {**result, 'local_wait': {'targeted_checks': checks, 'notifications': 0, 'reason': 'poll_timeout'}}
         if method == "check_effect":
             check = params["check"]
             content = self.files.get(check["path"])
