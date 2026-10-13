@@ -13,6 +13,7 @@ import argparse
 import base64
 from collections import deque
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 import hashlib
 import json
 import math
@@ -103,6 +104,7 @@ _receipt_metrics = {"receipt_queries": 0, "receipt_recoveries": 0, "receipt_unre
 _local_change_metrics = {"local_notifications": 0, "local_targeted_checks": 0, "local_poll_wakeups": 0}
 _command_capability_metrics = {"command_inspections": 0, "command_probes": 0, "command_probe_cache_hits": 0, "command_preflight_rejections": 0}
 _command_capabilities: dict[str, dict[str, Any]] = {}
+_screenshot_buffers = ContextVar("task_screenshot_buffers", default=None)
 
 
 def runtime_line(timeout: float | None = None) -> str:
@@ -229,6 +231,11 @@ def synthetic_check_image(path: Path) -> None:
 
 
 def check_models(path: str, key: str, read_only: bool = False) -> bool:
+    with screenshot_buffer_scope():
+        return _check_models(path, key, read_only)
+
+
+def _check_models(path: str, key: str, read_only: bool = False) -> bool:
     state = RuntimeState(runtime_fingerprint(key), openclaw_version(path), configuration=model_configuration_fingerprint()) if read_only else prepare_runtime(path, key)
     checks = {m: {"model": m, "state": "configured", "detail": "Configured; not verified through TaskPilot"} for m in ALL_MODELS}
     for model in ALL_MODELS:
@@ -880,14 +887,97 @@ def observation_progress_signature(observation: dict[str, Any], pid: int | None 
                        "elements": sorted(elements, key=lambda item: json.dumps(item, sort_keys=True))}, sort_keys=True)
 
 
+class ScreenshotBuffer:
+    """One immutable image read, with a lazy encoding for ACP requests only."""
+    def __init__(self, path: Path) -> None:
+        self._data: bytes | None = path.read_bytes()
+        self._digest = hashlib.blake2b(self._data, digest_size=16).hexdigest()
+        self._base64: str | None = None
+
+    @property
+    def digest(self) -> str:
+        if self._data is None:
+            raise RuntimeError("The observation image has been discarded")
+        return self._digest
+
+    @property
+    def base64(self) -> str:
+        if self._data is None:
+            raise RuntimeError("The observation image has been discarded")
+        if self._base64 is None:
+            self._base64 = base64.b64encode(self._data).decode("ascii")
+        return self._base64
+
+    def discard(self) -> None:
+        self._data = self._base64 = None
+        self._digest = ""
+
+
+class ScreenshotBuffers:
+    def __init__(self, generation: str | None) -> None:
+        self.generation = generation
+        self.images: dict[tuple[Path, str | None], ScreenshotBuffer] = {}
+        self.current: dict[Path, tuple[Path, str | None]] = {}
+
+    def image(self, path: Path, revision: str | None = None) -> ScreenshotBuffer:
+        if self.generation != _task_generation_id:
+            raise ActionRejected("Observation image belongs to another task", "cancelled")
+        path = path.absolute()
+        key = (path, revision) if revision is not None else self.current.get(path, (path, None))
+        if key not in self.images:
+            self.images[key] = ScreenshotBuffer(path)
+        self.current[path] = key
+        return self.images[key]
+
+    def discard(self, path: Path, revision: str | None = None) -> bool:
+        path = path.absolute()
+        keys = [(path, revision)] if revision is not None else [key for key in self.images if key[0] == path]
+        for key in keys:
+            image = self.images.pop(key, None)
+            if image is not None:
+                image.discard()
+            if self.current.get(path) == key:
+                self.current.pop(path, None)
+        # Native captures have unique paths. If a path was reused, discarding
+        # an older revision must not unlink another live revision's image.
+        return not any(key[0] == path for key in self.images)
+
+    def clear(self) -> None:
+        for image in self.images.values():
+            image.discard()
+        self.images.clear()
+        self.current.clear()
+
+
+@contextmanager
+def screenshot_buffer_scope():
+    images = ScreenshotBuffers(_task_generation_id)
+    token = _screenshot_buffers.set(images)
+    try:
+        yield images
+    finally:
+        images.clear()
+        _screenshot_buffers.reset(token)
+
+
+def screenshot_buffer(path: Path, revision: str | None = None) -> ScreenshotBuffer:
+    images = _screenshot_buffers.get()
+    return images.image(path, revision) if images is not None else ScreenshotBuffer(path)
+
+
 def observation_image_digest(observation: dict[str, Any]) -> str | None:
     path = Path(str(observation.get("screenshot_path") or ""))
-    return hashlib.blake2b(path.read_bytes(), digest_size=16).hexdigest() if path.is_file() else None
+    if not path.is_file():
+        return None
+    return screenshot_buffer(path, observation.get("observation_revision")).digest
 
 
 def discard_observation_image(observation: dict[str, Any] | None) -> None:
     if observation:
         path = Path(str(observation.get("screenshot_path") or ""))
+        images = _screenshot_buffers.get()
+        if images is not None and not images.discard(path, observation.get("observation_revision")):
+            return
         if path.is_file():
             path.unlink(missing_ok=True)
 
@@ -2025,7 +2115,7 @@ class ACPClient:
 
     def prompt(self, instruction: str, screenshot_path: Path, *, detail_images: list[dict] | None = None) -> str:
         self.prompt_calls = getattr(self, "prompt_calls", 0) + 1
-        image_data = base64.b64encode(screenshot_path.read_bytes()).decode("ascii")
+        image_data = screenshot_buffer(screenshot_path).base64
         mime_type = image_mime_type(screenshot_path)
         content = [
                 {"type": "text", "text": instruction},
@@ -2461,7 +2551,7 @@ def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int
             history.append({"action": "evidence_inspection", "result": report})
             return False
     finally:
-        path.unlink(missing_ok=True)
+        discard_observation_image(observation)
     if not ledger.audit(verification):
         missing = verification.get("missing") or []
         missing += [r["description"] for r in ledger.requirements.values() if r["state"] != "proven"]
@@ -2614,7 +2704,8 @@ def routed_json_prompt(
     observation: dict[str, Any] | None = None,
     ledger: TaskEvidenceLedger | None = None,
 ) -> dict[str, Any]:
-    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, LOCAL_CHANGE_VERSION, COMMAND_CAPABILITY_VERSION, PROMPT_COMPILER_VERSION, VERIFICATION_SESSION_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION, RECOVERY_CYCLE_VERSION, TASK_INPUT_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation)], sort_keys=True).encode() + screenshot_path.read_bytes()).hexdigest()
+    image = screenshot_buffer(screenshot_path, (observation or {}).get("observation_revision"))
+    key = hashlib.sha256(json.dumps([VALIDATION_VERSION, CONTRACT_HASH, CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, LOCAL_CHANGE_VERSION, COMMAND_CAPABILITY_VERSION, PROMPT_COMPILER_VERSION, VERIFICATION_SESSION_VERSION, COORDINATE_MAPPING_VERSION, OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION, RECOVERY_CYCLE_VERSION, TASK_INPUT_VERSION, ledger.fingerprint() if ledger else None, purpose, instruction, coverage_cache_input(observation), image.digest], sort_keys=True).encode()).hexdigest()
     cached = getattr(client, "decision_cache", {})
     if cached.get("key") == key:
         value = validate_response(json.loads(json.dumps(cached["decision"])), purpose, observation, ledger)
@@ -2639,6 +2730,11 @@ def routed_json_prompt(
 
 
 def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str) -> None:
+    with screenshot_buffer_scope():
+        _run_task(task, display_id, openclaw_path, api_key)
+
+
+def _run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str) -> None:
     global _observation_keywords
     _observation_keywords = []
     _receipt_metrics.update(receipt_queries=0, receipt_recoveries=0, receipt_unresolved=0)
@@ -2757,7 +2853,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
             # native app collect the value locally.
             automatic_input_target = secure_input_target(observation, history)
             if automatic_input_target is not None:
-                screenshot_path.unlink(missing_ok=True)
+                discard_observation_image(observation)
                 emit("status", message=f"{PRODUCT_NAME} paused because the waiting app needs secure input…")
                 ledger.before_action({"type": "type_text"})
                 secure_result = request_and_enter_user_input(
@@ -2792,8 +2888,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                 loading_pid, loading_waits = None, 0
 
             try:
-                screenshot_bytes = screenshot_path.read_bytes()
-                screenshot_digest = hashlib.blake2b(screenshot_bytes, digest_size=16).hexdigest()
+                screenshot_digest = observation_image_digest(observation)
                 if not command_hints_inspected:
                     inspect_task_command_hints(task, display_id, observation)
                     command_hints_inspected = True
@@ -2806,7 +2901,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                     observation=observation, ledger=ledger,
                 )
             finally:
-                screenshot_path.unlink(missing_ok=True)
+                discard_observation_image(observation)
 
             ledger.accept_plan(decision, observation)
             status = effective_decision_status(decision)
