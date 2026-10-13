@@ -21,28 +21,42 @@ signals stay with the worker's captured process. Stop, Pause and Resume capture
 the process under the existing command lock, so later signals cannot look up a
 different invocation.
 
-Probe output limits use file-write/extend notifications on the two existing
-output files, with a final size check for delayed or coalesced events. Monitoring
-stops before handles close. Normal task stdout/stderr are synchronized and read
-after exit, including final writes from a termination handler. Timeout or
-cancellation cannot turn those writes into a successful command result.
+Task commands and syntax/help probes drain both pipes continuously on an
+invocation-owned queue. Each stream retains up to 32 KiB in memory, creating a
+private spill directory (0700) and file (0600) only when needed. Task output
+retains the existing 64 KiB per-stream limit; excess bytes are drained and
+discarded without growing memory or files. Help probes count all drained bytes
+against their existing combined limit and interrupt the owning wait when it is
+exceeded. Storage errors also wake that wait while readers continue draining.
 
-OpenClaw status output now spools into a private temporary directory (0700) and
-file (0600), preventing a verbose status command from filling an unread pipe.
-After actual exit, the file is synchronized and read before returning; every
-path removes the temporary resources. Dashboard output continues going directly
-to the null device, so authenticated local URLs are not captured or surfaced.
-Existing exit-code, timeout and outcome-check semantics remain unchanged.
+After actual exit, a final nonblocking drain collects terminal writes before
+readers retire. Cancellation handlers close their readers and acknowledge
+retirement before descriptors can be reused. An inherited writer cannot hold
+teardown open: an unclosed stream is marked incomplete and cannot prove an exact
+stdout outcome. Spills are
+synchronized and read before returning and removed on every cleanup path.
+Timeout or cancellation cannot turn captured output into a successful command.
+
+OpenClaw's local status helper uses the same buffering with a single merged pipe,
+preserving combined stdout/stderr order and its existing full-output behavior.
+Short status output needs no temporary files. Incomplete status output is an
+error. Dashboard output still goes directly to the null device, so authenticated
+local URLs are not captured or surfaced. Exit codes and outcome checks are
+unchanged.
 
 Native regression fixtures cover immediate exits, retained notifications,
 terminal stdout/stderr, graceful and forced timeout, cancellation without an
 explicit executor stop, paused lease revocation, removed observers, large
-status output, launch failure and later executor reuse. Existing probe-limit,
-receipt, command outcome and runtime-drain checks also remain in the suites.
+status output, launch failure and later executor reuse. Buffer fixtures cover
+memory/spill boundaries, simultaneous noisy streams, retention caps, UTF-8,
+private file permissions, spill failure, inherited writers and resource cleanup.
+Existing probe-limit, receipt, command outcome and runtime-drain checks also
+remain in the suites.
 These tests use disposable local processes and files; no fixer, live-control
 tester, Chrome, live desktop task or provider request is run. Live accuracy
 validation remains incomplete.
 
-This removes periodic process-status wakeups; it does not add model requests,
-change prompts, model defaults, the action contract, permissions, setup, cleanup
+This avoids temporary output files for short commands and periodic process-status
+wakeups; it does not add model requests or change prompts, model defaults, the
+action contract, permissions, setup, cleanup
 preferences or the interface. Task-level performance is not benchmarked here.

@@ -275,37 +275,29 @@ final class OpenClawService {
     static func run(
         executable: URL,
         arguments: [String],
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        outputSpillRoot: URL = FileManager.default.temporaryDirectory
     ) -> CommandResult {
         let process = Process()
         do {
-            // Spool while the child runs: leaving a pipe unread until exit can
-            // fill it and prevent the exit notification from ever arriving.
-            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("taskpilot-status-\(UUID().uuidString)")
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
-                                                    attributes: [.posixPermissions: 0o700])
-            defer { try? FileManager.default.removeItem(at: directory) }
-            let outputURL = directory.appendingPathComponent("output")
-            guard FileManager.default.createFile(atPath: outputURL.path, contents: nil,
-                                                  attributes: [.posixPermissions: 0o600]) else {
-                return CommandResult(status: -1, output: "Could not capture OpenClaw status output")
-            }
-            let output = try FileHandle(forWritingTo: outputURL)
-            defer { try? output.close() }
             process.executableURL = executable
             process.arguments = arguments
-            process.standardOutput = output
-            process.standardError = output
             let exit = ProcessExitNotification(process)
             defer { process.terminationHandler = nil }
+            let capture = try BufferedProcessOutput(merged: true, spillRoot: outputSpillRoot,
+                                                   onInterruption: { exit.interrupt() })
+            defer { capture.close() }
+            process.standardOutput = capture.stdout
+            process.standardError = capture.stderr
             try process.run()
             _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
+            capture.closeWriters()
             let status = waitForCommand(process, exit: exit, timeout: timeout)
-            try output.synchronize()
-            let data = try Data(contentsOf: outputURL)
+            let output = try capture.finish().stdout
             if status == -2 { return CommandResult(status: status, output: "OpenClaw status check timed out") }
+            guard !output.truncated else { return CommandResult(status: -1, output: "OpenClaw status output was incomplete") }
             return CommandResult(status: status,
-                output: String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+                output: String(data: output.data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
         } catch {
             return CommandResult(status: -1, output: error.localizedDescription)
         }

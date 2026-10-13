@@ -46,9 +46,12 @@ final class TaskToolExecutor {
     private var commandBindings: [String: CommandCapabilities.Binding] = [:]
     private var helpCache: [String: (created: TimeInterval, result: [String: Any])] = [:]
     private let profileProvider: (String, [String?]) -> CommandCapabilities.Profile?
+    private let outputSpillRoot: URL
 
-    init(profileProvider: @escaping (String, [String?]) -> CommandCapabilities.Profile? = CommandCapabilities.profile) {
+    init(profileProvider: @escaping (String, [String?]) -> CommandCapabilities.Profile? = CommandCapabilities.profile,
+         outputSpillRoot: URL = FileManager.default.temporaryDirectory) {
         self.profileProvider = profileProvider
+        self.outputSpillRoot = outputSpillRoot
     }
 
     func resetCommandCapabilities() {
@@ -350,13 +353,10 @@ final class TaskToolExecutor {
                 policy: existing.policy, environment: existing.environment, directory: existing.directory, shell: existing.shell,
                 tools: existing.tools, source: existing.source, result: result)
         }
-        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("taskpilot-probe-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false)
-        defer { try? FileManager.default.removeItem(at: temporary) }
         let deadline = ProcessInfo.processInfo.systemUptime + CommandCapabilities.probeBudget
         if let source = policy.shellSource {
             let syntax = try executeProcess(executable: policy.executable, arguments: ["-f", "-n", "-c", source],
-                policy: policy, environment: environment, directory: temporary, prefix: "syntax",
+                policy: policy, environment: environment, prefix: "syntax",
                 timeout: CommandCapabilities.probeBudget, probe: true)
             guard !syntax.timedOut, syntax.status == 0 else {
                 throw TaskToolError.commandCapability("command_syntax", "Shell syntax check failed before execution: " + syntax.stderr.text)
@@ -372,7 +372,7 @@ final class TaskToolExecutor {
             } else {
                 let resolution = try executeProcess(executable: policy.executable,
                     arguments: ["-f", "-c", "builtin whence -w -- \"$@\"", "taskpilot-command-inspection"] + names,
-                    policy: policy, environment: environment, directory: temporary, prefix: "resolution",
+                    policy: policy, environment: environment, prefix: "resolution",
                     timeout: min(0.8, deadline - ProcessInfo.processInfo.systemUptime), probe: true)
                 var lines = resolution.stdout.text.split(separator: "\n").map(String.init)
                 if !resolution.timedOut, !resolution.stdout.truncated, lines.count == names.count {
@@ -413,7 +413,7 @@ final class TaskToolExecutor {
                 } else if deadline > ProcessInfo.processInfo.systemUptime {
                     probes += 1
                     let result = try executeProcess(executable: URL(fileURLWithPath: identity.path), arguments: profile.arguments,
-                        policy: policy, environment: toolEnvironment, directory: temporary, prefix: "probe-\(probes)",
+                        policy: policy, environment: toolEnvironment, prefix: "probe-\(probes)",
                         timeout: min(0.8, deadline - ProcessInfo.processInfo.systemUptime), probe: true)
                     let help = result.stdout.text + "\n" + result.stderr.text
                     let flags = CommandCapabilities.longOptions(help).sorted()
@@ -494,24 +494,19 @@ final class TaskToolExecutor {
         var environment = binding?.environment ?? Self.commandEnvironment()
         let policy = try binding?.policy ?? CommandExecutionPolicy(action: action, environment: environment)
         environment["PWD"] = policy.workingDirectory.path
-        let temporaryDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("orbit-command-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: false)
-        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
-
         if binding == nil, let source = policy.shellSource {
             // -n parses the complete source without executing substitutions or
             // earlier statements. -f avoids user startup scripts in both phases.
             let syntax = try executeProcess(executable: policy.executable, arguments: ["-f", "-n", "-c", source],
                                             policy: policy, environment: environment,
-                                            directory: temporaryDirectory, prefix: "syntax", timeout: min(5, policy.timeout))
+                                            prefix: "syntax", timeout: min(5, policy.timeout))
             guard !syntax.timedOut, syntax.status == 0 else {
                 throw TaskToolError.invalidAction("Shell syntax check failed before execution: " + syntax.stderr.text)
             }
         }
         let execution = try executeProcess(executable: binding?.executable ?? policy.executable, arguments: binding?.arguments ?? policy.arguments,
                                            policy: policy, environment: environment,
-                                           directory: temporaryDirectory, prefix: "command", timeout: policy.timeout,
+                                           prefix: "command", timeout: policy.timeout,
                                            validate: { try binding?.validate() })
         let checks = policy.checks.map { $0.evaluate(stdout: execution.stdout.text, stdoutTruncated: execution.stdout.truncated) }
         let executed = !execution.timedOut && execution.status == 0
@@ -549,31 +544,31 @@ final class TaskToolExecutor {
     }
 
     private func executeProcess(executable: URL, arguments: [String], policy: CommandExecutionPolicy,
-                                environment: [String: String], directory: URL, prefix: String, timeout: TimeInterval,
+                                environment: [String: String], prefix: String, timeout: TimeInterval,
                                 probe: Bool = false, validate: () throws -> Void = {})
         throws -> (status: Int32, timedOut: Bool, stdout: (text: String, truncated: Bool), stderr: (text: String, truncated: Bool)) {
-        let stdoutURL = directory.appendingPathComponent(prefix + "-stdout")
-        let stderrURL = directory.appendingPathComponent(prefix + "-stderr")
-        FileManager.default.createFile(atPath: stdoutURL.path, contents: nil)
-        FileManager.default.createFile(atPath: stderrURL.path, contents: nil)
-        let stdoutHandle = try FileHandle(forWritingTo: stdoutURL)
-        let stderrHandle = try FileHandle(forWritingTo: stderrURL)
-        defer { try? stdoutHandle.close(); try? stderrHandle.close() }
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments
         process.currentDirectoryURL = policy.workingDirectory
         process.environment = environment
         process.standardInput = FileHandle.nullDevice
-        process.standardOutput = stdoutHandle
-        process.standardError = stderrHandle
         let exit = ProcessExitNotification(process)
         defer { process.terminationHandler = nil }
+        let capture: BufferedProcessOutput
+        do {
+            capture = try BufferedProcessOutput(maximumBytes: Self.maximumCommandOutputBytes,
+                combinedLimit: probe ? CommandCapabilities.outputLimit : nil,
+                spillRoot: outputSpillRoot, onInterruption: { exit.interrupt() })
+        } catch {
+            throw TaskToolError.operationFailed("Could not prepare command output; the command was not executed")
+        }
+        defer { capture.close() }
+        process.standardOutput = capture.stdout
+        process.standardError = capture.stderr
         let lease = TaskOwnership.current
         let revocation = lease?.observeRevocation { exit.interrupt() }
         defer { if let revocation { lease?.removeRevocationObserver(revocation) } }
-        let outputMonitor = probe ? CommandOutputLimitMonitor(handles: [stdoutHandle, stderrHandle], exit: exit) : nil
-        defer { outputMonitor?.stop() }
 
         // Always acquire the ownership gate before the command lock. Pause
         // cannot strand a launcher holding the lock Resume needs.
@@ -597,6 +592,7 @@ final class TaskToolExecutor {
         // with Process.run and can still race a later child executable lookup.
         if let lease = TaskOwnership.current { try lease.commit { try launch() } }
         else { try launch() }
+        capture.closeWriters()
         defer {
             commandLock.lock()
             if activeCommand === process { activeCommand = nil; activeCommandExit = nil }
@@ -607,7 +603,7 @@ final class TaskToolExecutor {
         case .exited: interrupted = false
         case .interrupted, .timedOut: interrupted = true
         }
-        let timedOut = interrupted || outputMonitor?.exceeded == true
+        var timedOut = interrupted || capture.statistics.limitExceeded
         if timedOut {
             Self.signal(process, SIGCONT)
             Self.signal(process, SIGTERM)
@@ -618,16 +614,18 @@ final class TaskToolExecutor {
             }
         }
         let status = exit.waitForExit()!
-        outputMonitor?.stop()
         if probe { _ = Darwin.kill(-process.processIdentifier, SIGKILL) }
         commandLock.lock(); let cancelled = commandCancelled; commandLock.unlock()
         if cancelled || Task.isCancelled || lease?.state == .draining || lease?.state == .retired {
             Darwin.kill(-process.processIdentifier, SIGKILL)
             throw CancellationError()
         }
-        try? stdoutHandle.synchronize(); try? stderrHandle.synchronize()
         do {
-            return (status, timedOut, try Self.boundedText(from: stdoutURL), try Self.boundedText(from: stderrURL))
+            let output = try capture.finish()
+            // A fast exit can precede its last read notification. The final
+            // drain still enforces the aggregate help-probe budget.
+            timedOut = timedOut || capture.statistics.limitExceeded
+            return (status, timedOut, (output.stdout.text, output.stdout.truncated), (output.stderr.text, output.stderr.truncated))
         } catch {
             if probe || prefix == "syntax" { throw TaskToolError.operationFailed("Preflight output could not be read; the command was not executed") }
             throw TaskToolError.uncertainDelivery("The command ended, but its output could not be read; inspect its effects before running it again")
@@ -661,69 +659,10 @@ final class TaskToolExecutor {
         return type == .typeSymbolicLink
     }
 
-    private static func boundedText(from url: URL) throws -> (text: String, truncated: Bool) {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        let data = try handle.read(upToCount: maximumCommandOutputBytes + 1) ?? Data()
-        let truncated = data.count > maximumCommandOutputBytes
-        return (
-            String(decoding: data.prefix(maximumCommandOutputBytes), as: UTF8.self),
-            truncated
-        )
-    }
-
     private static func signal(_ process: Process?, _ signal: Int32) {
         guard let process, process.isRunning else { return }
         if Darwin.kill(-process.processIdentifier, signal) != 0 {
             Darwin.kill(process.processIdentifier, signal)
         }
-    }
-
-
-}
-
-/// Probe output is capped through file-change notifications, independently of
-/// process lifetime. A final size check covers coalesced or delayed events.
-private final class CommandOutputLimitMonitor {
-    private let queue = DispatchQueue(label: "com.orbitagent.command-output-limit")
-    private let cancellations = DispatchGroup()
-    private let descriptors: [Int32]
-    private var sources: [DispatchSourceFileSystemObject] = []
-    private var stopped = false
-
-    init(handles: [FileHandle], exit: ProcessExitNotification) {
-        descriptors = handles.map(\.fileDescriptor)
-        for descriptor in descriptors {
-            let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: descriptor, eventMask: [.write, .extend], queue: queue)
-            source.setEventHandler { [weak self] in
-                guard let self, !self.stopped else { return }
-                if self.outputExceeded() { exit.interrupt() }
-            }
-            cancellations.enter()
-            source.setCancelHandler { [cancellations] in cancellations.leave() }
-            sources.append(source)
-            source.resume()
-        }
-    }
-
-    private func outputExceeded() -> Bool {
-        let size = descriptors.reduce(Int64(0)) { total, descriptor in
-            var info = stat()
-            return total + (Darwin.fstat(descriptor, &info) == 0 ? info.st_size : 0)
-        }
-        return size > CommandCapabilities.outputLimit
-    }
-
-    var exceeded: Bool { queue.sync { outputExceeded() } }
-
-    func stop() {
-        queue.sync {
-            guard !stopped else { return }
-            stopped = true
-            for source in sources { source.cancel() }
-            sources.removeAll()
-        }
-        // A descriptor cannot be closed/reused until its source has retired.
-        cancellations.wait()
     }
 }
