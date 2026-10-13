@@ -15,9 +15,12 @@ from typing import Any
 
 from action_contract_generated import CONTRACT, ActionContractError, _field, validate_action, validate_outcome_check
 from task_inputs import TaskInputBindings
+from expected_effects import ExpectedEffect, ExpectedEffectError, validate_expectation
+from observation_context import coordinate_targets
 
-CHECKLIST_VERSION = 3
+CHECKLIST_VERSION = 4
 FILE_CHECKS = {"file_exists", "directory_exists", "path_absent", "file_contents"}
+OBSERVATION_CHECKS = {"window_active", "field_value", "dialog_present"}
 READ_PATTERN = r'\s*(?:read|show|print)\s+(?:the\s+)?(?:contents of\s+)?file\s+(["`\'])((?:/|~/)(?:(?!\1)[^\n])+)\1\s*[.!]?\s*'
 LARGEST_PATTERN = (r"\s*(?:(?:what(?:['’]s| is)|which is) (?:the |my )?|(?:find|tell me|show me) (?:the )?)"
                    r"largest file (?:in|inside) (?:my |the |your )?downloads(?: folder)?\s*[?.!]?\s*")
@@ -60,11 +63,15 @@ def nonempty(value: Any, path: str) -> None:
 
 def validate_requirement(value: Any, task: str | None, path: str) -> dict:
     if not isinstance(value, dict): fail(path, "must be an object")
-    if set(value) - {"source", "description", "check"}: fail(path, "contains unsupported fields")
+    if set(value) - {"source", "description", "check", "depends_on", "scope"}: fail(path, "contains unsupported fields")
     for key in ("source", "description"):
         nonempty(value.get(key), f"{path}.{key}")
     if task is not None and value["source"] not in task:
         fail(path + ".source", "must quote the original request exactly")
+    if "depends_on" in value:
+        requirement_refs(value["depends_on"], path + ".depends_on", empty=True)
+    if "scope" in value and value["scope"] not in ("outcome", "prerequisite"):
+        fail(path + ".scope", "must be outcome or prerequisite")
     check = value.get("check")
     if not isinstance(check, dict): fail(path + ".check", "must be an object")
     kind = check.get("type")
@@ -84,6 +91,14 @@ def validate_requirement(value: Any, task: str | None, path: str) -> dict:
         elif kind == 'command_operation':
             if set(check) != {'type', 'operation'}: fail(path + '.check', 'requires only type and operation')
             validate_action({'type': 'run_command', 'operation': check.get('operation')})
+        elif kind in OBSERVATION_CHECKS:
+            if kind == "window_active":
+                if set(check) != {"type", "pid", "title"}: fail(path + ".check", "requires only type, pid and title")
+                from action_contract_generated import validate_contract_field
+                validate_contract_field("pid", check["pid"], path + ".check.pid")
+                validate_contract_field("element_id", check["title"], path + ".check.title")
+            else:
+                validate_expectation({**check, "type": "dialog_appeared" if kind == "dialog_present" else kind})
         elif kind in {"visual", "answer"}:
             if set(check) != {"type", "expected"}: fail(path + ".check", "requires only type and expected")
             nonempty(check.get("expected"), path + ".check.expected")
@@ -91,16 +106,87 @@ def validate_requirement(value: Any, task: str | None, path: str) -> dict:
             fail(path + ".check.type", "must be a supported proof type")
     except ActionContractError as error:
         raise EvidenceValidationError(str(error).replace("action", path + ".check", 1).replace(".check_list[0]", ".check")) from error
+    except ExpectedEffectError as error:
+        raise EvidenceValidationError(str(error).replace("expected_result", path + ".check", 1)) from error
     return deepcopy(value)
 
 
-def validate_metadata(value: dict, purpose: str, ledger: TaskEvidenceLedger | None = None) -> None:
+def requirement_refs(value: Any, path: str, *, empty=False) -> None:
+    if (not isinstance(value, list) or (not empty and not value) or
+            any(not isinstance(ref, str) or not re.fullmatch(r"r[1-9][0-9]*", ref) for ref in value) or
+            len(set(value)) != len(value)):
+        fail(path, "must be a " + ("" if empty else "nonempty ") + "list of unique requirement IDs")
+
+
+def dependency_order(requirements: dict) -> list[str]:
+    remaining, ordered = dict(requirements), []
+    while remaining:
+        ready = [identifier for identifier, entry in remaining.items()
+                 if all(ref in ordered for ref in entry.get("depends_on", []))]
+        if not ready: fail("requirements.depends_on", "must form an acyclic graph")
+        for identifier in ready:
+            ordered.append(identifier)
+            del remaining[identifier]
+    return ordered
+
+
+def project_requirements(existing: dict, entries: list[dict], task: str, path="requirements") -> dict:
+    """Validate the entire proposed graph transactionally; IDs never renumber."""
+    result, origins = deepcopy(existing), {}
+    for index, entry in enumerate(entries):
+        field_path = f"{path}[{index}]"
+        entry = validate_requirement(entry, task, field_path)
+        matching = [key for key, old in result.items() if old["source"] == entry["source"] and old["check"] == entry["check"]]
+        identifier = next((key for key in matching if entry.get("scope", result[key].get("scope", "outcome")) == result[key].get("scope", "outcome")),
+                          matching[0] if matching else None)
+        # The final auditor may require a current outcome in addition to an
+        # already-recorded historical precondition; it cannot replace either.
+        if (identifier and path == "uncovered_requirements" and entry.get("scope") == "outcome" and
+                result[identifier].get("scope") == "prerequisite"):
+            identifier = next((key for key, old in result.items() if old["source"] == entry["source"] and
+                               old["check"] == entry["check"] and old.get("scope") == "outcome"), None)
+        if identifier:
+            old = result[identifier]
+            if "scope" in entry and entry["scope"] != old.get("scope", "outcome"):
+                fail(field_path + ".scope", "cannot change an existing requirement's proof scope")
+            old["depends_on"] = list(dict.fromkeys(old.get("depends_on", []) + entry.get("depends_on", [])))
+        else:
+            identifier = f"r{len(result) + 1}"
+            result[identifier] = {**entry, "scope": entry.get("scope", "outcome"),
+                                  "depends_on": entry.get("depends_on", []), "state": "pending", "evidence_ids": []}
+        origins[identifier] = field_path
+    for identifier, entry in result.items():
+        for ref in entry.get("depends_on", []):
+            field_path = origins.get(identifier, f"requirements.{identifier}") + ".depends_on"
+            if ref == identifier: fail(field_path, "cannot include the requirement itself")
+            if ref not in result: fail(field_path, "must reference this task's checklist")
+    dependency_order(result)
+    return result
+
+
+def validate_metadata(value: dict, purpose: str, ledger: TaskEvidenceLedger | None = None,
+                      observation: dict | None = None) -> None:
+    proposed = ledger.requirements if ledger else {}
     for key in ("requirements", "uncovered_requirements"):
         if key in value:
             entries = value[key]
             if not isinstance(entries, list): fail(key, "must be a list")
             for index, entry in enumerate(entries):
                 validate_requirement(entry, ledger.task if ledger else None, f"{key}[{index}]")
+            if ledger:
+                proposed = project_requirements(proposed, ledger.canonical_entries(entries, observation), ledger.task, key)
+            elif any(entry.get("depends_on") for entry in entries):
+                fail(key + ".depends_on", "requires a current task checklist")
+    if ledger: ledger.validate_observation_checks(proposed, observation)
+    if "requirement_ids" in value:
+        requirement_refs(value["requirement_ids"], "requirement_ids")
+        if ledger is None or any(ref not in proposed for ref in value["requirement_ids"]):
+            fail("requirement_ids", "must reference this task's checklist")
+    if (purpose == "planning" and any(r.get("depends_on") for r in proposed.values()) and
+            value.get("status") in {"act", "needs_user", "blocked"} and
+            isinstance(value.get("action"), dict) and value["action"].get("type") not in {"none", "wait"} and
+            not value.get("requirement_ids")):
+        fail("requirement_ids", "must identify the requirements advanced by this action when dependencies exist")
     if "coverage_complete" in value and type(value["coverage_complete"]) is not bool:
         fail("coverage_complete", "must be a boolean")
     if "output_evidence_ids" in value:
@@ -133,7 +219,7 @@ def validate_metadata(value: dict, purpose: str, ledger: TaskEvidenceLedger | No
                     evidence = ledger.evidence.get(ref)
                     if evidence is None or not evidence["valid"]:
                         fail(path + ".evidence_ids", "must reference current evidence from this task")
-                if not any(ledger.matches(requirement["check"], ledger.evidence[ref], semantic=True) for ref in refs):
+                if not any(ledger.requirement_matches(proof["requirement_id"], ledger.evidence[ref], semantic=True) for ref in refs):
                     fail(path + ".evidence_ids", "do not prove the requirement's target and outcome")
     if ledger is None: return
     if purpose == "planning" and not ledger.requirements and value.get("status") in {"act", "done"}:
@@ -170,6 +256,9 @@ class TaskEvidenceLedger:
         self.coverage_complete = False
         self.local_complete_grammar = False
         self.observation_id: str | None = None
+        self.current_observation: dict | None = None
+        self.observation_checks: dict[str, ExpectedEffect | dict] = {}
+        self.dependency_rejections = 0
         self.rejections = self.checks = 0
         self.action_sequence = 0
         self.readback = False
@@ -183,19 +272,169 @@ class TaskEvidenceLedger:
             self.add_requirements([{"source": task, "description": "Return the exact largest top-level Downloads file and size",
                                     "check": {"type": "answer", "expected": task}}])
 
-    def add_requirements(self, entries: list[dict]) -> bool:
-        added = False
-        for entry in entries:
-            entry = validate_requirement(entry, self.task, "requirements")
-            if any(all(r[k] == entry[k] for k in entry) for r in self.requirements.values()): continue
-            self.requirements[f"r{len(self.requirements) + 1}"] = {**entry, "state": "pending", "evidence_ids": []}
-            added = True
-        if added: self.coverage_complete = False
+    def add_requirements(self, entries: list[dict], observation: dict | None = None, *, path="requirements") -> bool:
+        proposed = project_requirements(self.requirements, self.canonical_entries(entries, observation), self.task, path)
+        self.validate_observation_checks(proposed, observation)
+        changed = proposed != self.requirements
+        self.requirements = proposed
+        self.bind_observation_checks(observation or self.current_observation)
+        if changed: self.coverage_complete = False
+        self.record_observation_checks()
         self.refresh()
-        return added
+        return changed
 
-    def accept_plan(self, decision: dict) -> None:
-        self.add_requirements(decision.get("requirements", []))
+    def accept_plan(self, decision: dict, observation: dict | None = None) -> None:
+        self.add_requirements(decision.get("requirements", []), observation)
+
+    def canonical_entries(self, entries: list[dict], observation: dict | None = None) -> list[dict]:
+        """A fresh control ID may describe the same already-bound requirement."""
+        observation = observation or self.current_observation
+        result = deepcopy(entries)
+        if observation is None: return result
+        for entry in result:
+            if not isinstance(entry, dict): continue
+            check = entry.get("check", {})
+            if not isinstance(check, dict) or check.get("type") != "field_value" or not isinstance(entry.get("source"), str): continue
+            for identifier, pinned in self.observation_checks.items():
+                old = self.requirements[identifier]
+                if not isinstance(pinned, ExpectedEffect) or pinned.kind != "field_value" or old["source"] != entry["source"]: continue
+                if {k: v for k, v in old["check"].items() if k != "element_id"} != {k: v for k, v in check.items() if k != "element_id"}: continue
+                candidates = pinned.field_candidates(observation)
+                if len(pinned.unique(candidates)) == 1 and check.get("element_id") in {e.get("id") for e in candidates}:
+                    entry["check"] = deepcopy(old["check"])
+                    break
+        return result
+
+    def validate_observation_checks(self, proposed: dict, observation: dict | None = None) -> None:
+        observation = observation or self.current_observation
+        if observation is None: return
+        for identifier, entry in proposed.items():
+            check = entry["check"]
+            if check["type"] not in OBSERVATION_CHECKS or identifier in self.observation_checks: continue
+            try:
+                if check["type"] == "field_value": validate_expectation(check, observation)
+                elif check["pid"] not in {a.get("pid") for a in observation.get("applications", [])}:
+                    fail(f"requirements.{identifier}.check.pid", "must reference an app in the current observation")
+            except ExpectedEffectError as error:
+                raise EvidenceValidationError(str(error).replace("expected_result", f"requirements.{identifier}.check", 1)) from error
+
+    def bind_observation_checks(self, observation: dict | None) -> None:
+        if observation is None: return
+        for identifier, entry in self.requirements.items():
+            check = entry["check"]
+            if check["type"] not in OBSERVATION_CHECKS or identifier in self.observation_checks: continue
+            if check["type"] == "window_active":
+                app = next((a for a in observation.get("applications", []) if a.get("pid") == check["pid"]), None)
+                if app: self.observation_checks[identifier] = {k: app.get(k) for k in ("pid", "name", "bundle_id")}
+            else:
+                before = observation if check["type"] == "field_value" else {**observation, "elements": []}
+                self.observation_checks[identifier] = ExpectedEffect(
+                    {**check, "type": "dialog_appeared" if check["type"] == "dialog_present" else check["type"]}, before)
+
+    def record_observation_checks(self) -> None:
+        observation = self.current_observation
+        if observation is None: return
+        for identifier, pinned in self.observation_checks.items():
+            check = self.requirements[identifier]["check"]
+            if isinstance(pinned, ExpectedEffect):
+                proof = pinned.observe(observation)
+                element = next((e for e in observation.get("elements", []) if e.get("id") == proof.get("element_id")), {})
+                proven = proof["outcome"] == "verified" and element.get("enabled") is True
+            else:
+                app = next((a for a in observation.get("applications", []) if a.get("pid") == check["pid"]), {})
+                native_windows = app.get("windows", [])
+                if not any("title" in w for w in native_windows):
+                    native_windows = [{**w, "topmost_on_agent_screen": index == 0}
+                                      for index, w in enumerate(app.get("graphics_windows", []))]
+                windows = [w for w in native_windows if w.get("title") == check["title"]]
+                proven = (all(app.get(k) == v for k, v in pinned.items()) and
+                          app.get("topmost_on_agent_screen") is True and len(windows) == 1 and
+                          windows[0].get("topmost_on_agent_screen") is True)
+            if not proven: continue
+            fact = {"type": "requirement_observed", "requirement_id": identifier,
+                    "check_fingerprint": digest(check), "revision": observation["observation_revision"]}
+            if not any(e["valid"] and e["fact"] == fact for e in self.evidence.values()):
+                self.add_evidence(fact, mutable=True)
+
+    def requirement_matches(self, identifier: str, evidence: dict, *, semantic=False, current=False) -> bool:
+        requirement = self.requirements[identifier]
+        fact = evidence["fact"]
+        if (not current and requirement.get("scope") == "prerequisite" and evidence["valid"] and
+                evidence["generation"] == self.generation and fact.get("type") == "prerequisite_checked"):
+            return fact.get("requirement_id") == identifier and fact.get("check_fingerprint") == digest(requirement["check"])
+        return self.matches(requirement["check"], evidence, semantic=semantic)
+
+    def action_requirements(self, decision: dict) -> list[str]:
+        """Include deterministic effect matches even if a decision mislabels them."""
+        selected = list(decision.get("requirement_ids", []))
+        action = decision.get("action", {})
+        if not any(r.get("depends_on") for r in self.requirements.values()): return selected
+        for identifier, entry in self.requirements.items():
+            check = entry["check"]
+            matched = (action.get("type") == "write_file" and check["type"] in {"file_exists", "file_contents", "file_written", "file_append"} and
+                       path_key(check["path"]) == path_key(action["path"]) and
+                       ("content" not in check or content_hash(check) == content_hash(action)))
+            if action.get("type") == "run_command":
+                matched |= check == {"type": "command_executed", **{k: action[k] for k in ("argv", "command", "working_directory") if k in action}}
+                matched |= check.get("type") == "command_operation" and check.get("operation") == action.get("operation")
+                matched |= any(check == outcome for outcome in action.get("checks", []))
+            if check == decision.get("expected_result"): matched = True
+            if matched and identifier not in selected: selected.append(identifier)
+        return selected
+
+    def prerequisites(self, identifiers: list[str]) -> list[str]:
+        pending, required = list(identifiers), set()
+        while pending:
+            identifier = pending.pop()
+            for ref in self.requirements[identifier].get("depends_on", []):
+                if ref not in required:
+                    required.add(ref)
+                    pending.append(ref)
+        return [ref for ref in dependency_order(self.requirements) if ref in required]
+
+    def check_prerequisites(self, decision: dict, *, retain=False) -> dict | None:
+        identifiers = self.action_requirements(decision)
+        if any(r.get("depends_on") for r in self.requirements.values()) and not identifiers:
+            return {"blocked_by": [], "reason": "action_requirement_missing"}
+        required = self.prerequisites(identifiers)
+        direct = {ref for identifier in identifiers for ref in self.requirements[identifier].get("depends_on", [])}
+        self.refresh()
+        refs = {ref: [key for key, e in self.evidence.items() if self.requirement_matches(ref, e, current=ref in direct)]
+                for ref in required}
+        blocked = [ref for ref in required if not refs[ref] or self.requirements[ref]["state"] != "proven"]
+        if blocked: return {"blocked_by": blocked, "reason": "prerequisite_unproven"}
+        action = decision.get("action", {})
+        controls = (self.current_observation or {}).get("elements", [])
+        target = next((e for e in controls if e.get("id") == action.get("element_id")), None)
+        for ref in direct:
+            check = self.requirements[ref]["check"]
+            if check["type"] != "window_active" or action.get("type") not in {"press", "focus", "set_value", "type_text", "key", "click", "double_click", "scroll"}: continue
+            pid = target.get("pid") if target else action.get("pid")
+            candidates = [target] if target else coordinate_targets(action, self.current_observation or {})
+            if not candidates and action.get("type") in {"key", "type_text"}:
+                candidates = [e for e in controls if e.get("pid") == pid and e.get("focused") is True]
+            if pid != check["pid"] or any(e.get("window_title") and e["window_title"] != check["title"] for e in candidates):
+                return {"blocked_by": [ref], "reason": "prerequisite_target_mismatch"}
+        for identifier in identifiers:
+            check = self.requirements[identifier]["check"]
+            if action.get("type") == "write_file" and "path" in check and path_key(action["path"]) != path_key(check["path"]):
+                return {"blocked_by": [], "reason": "action_requirement_target_mismatch"}
+            target = self.observation_checks.get(identifier)
+            if isinstance(target, ExpectedEffect) and target.kind == "field_value":
+                if action.get("type") in {"type_text", "set_value", "focus", "press", "click", "double_click"}:
+                    candidates = target.field_candidates(self.current_observation or {})
+                    if len(target.unique(candidates)) != 1 or action.get("element_id") not in {e.get("id") for e in candidates}:
+                        return {"blocked_by": [], "reason": "action_requirement_target_mismatch"}
+        if retain:
+            for ref in required:
+                if self.requirements[ref].get("scope") != "prerequisite": continue
+                if any(self.evidence[key]["fact"].get("type") == "prerequisite_checked" for key in refs[ref]): continue
+                fact = {"type": "prerequisite_checked", "requirement_id": ref,
+                        "check_fingerprint": digest(self.requirements[ref]["check"]),
+                        "before_action": self.action_sequence + 1,
+                        "witnesses": [deepcopy(self.evidence[key]["fact"]) for key in refs[ref]]}
+                self.add_evidence(fact)
+        return None
 
     def add_evidence(self, fact: dict, *, mutable=False, action=None) -> str:
         identifier = f"e{len(self.evidence) + 1}"
@@ -213,7 +452,11 @@ class TaskEvidenceLedger:
         revision = observation.get("observation_revision")
         nonempty(revision, "observation.observation_revision")
         self.invalidate(lambda e: e["fact"]["type"] == "observation")
+        self.invalidate(lambda e: e["fact"]["type"] == "requirement_observed")
+        self.current_observation = observation
         self.observation_id = self.add_evidence({"type": "observation", "revision": revision})
+        self.bind_observation_checks(observation)
+        self.record_observation_checks()
 
     def invalidate(self, predicate) -> None:
         changed = False
@@ -339,6 +582,8 @@ class TaskEvidenceLedger:
         if kind == "visual": return semantic and fact["type"] == "observation"
         if kind == "answer":
             return semantic and fact["type"] in {"observation", "file_read", "stdout_equals", "local_answer"}
+        if kind in OBSERVATION_CHECKS:
+            return fact["type"] == "requirement_observed" and fact.get("check_fingerprint") == digest(check)
         if kind == "file_contents" and fact["type"] == "file_read":
             return path_key(check["path"]) == fact["path"] and content_hash(check) == fact["content_sha256"]
         if kind == "file_exists" and fact["type"] == "file_contents":
@@ -355,11 +600,14 @@ class TaskEvidenceLedger:
         return True
 
     def refresh(self) -> None:
-        for requirement in self.requirements.values():
-            refs = [ref for ref, e in self.evidence.items() if self.matches(requirement["check"], e)]
+        for identifier in dependency_order(self.requirements):
+            requirement = self.requirements[identifier]
+            refs = [ref for ref, e in self.evidence.items() if self.requirement_matches(identifier, e)]
             old = requirement["evidence_ids"]
             if requirement["check"]["type"] in {"visual", "answer"}:
-                refs = [ref for ref in old if self.matches(requirement["check"], self.evidence[ref], semantic=True)]
+                refs = [ref for ref in old if self.requirement_matches(identifier, self.evidence[ref], semantic=True)]
+            if any(self.requirements[ref]["state"] != "proven" for ref in requirement.get("depends_on", [])):
+                refs = []
             requirement["state"] = "proven" if refs else ("invalidated" if old or requirement["state"] == "invalidated" else "pending")
             requirement["evidence_ids"] = refs
 
@@ -374,7 +622,7 @@ class TaskEvidenceLedger:
 
     def audit(self, verification: dict) -> bool:
         validate_metadata(verification, "verification", self)
-        added = self.add_requirements(verification.get("uncovered_requirements", []))
+        added = self.add_requirements(verification.get("uncovered_requirements", []), path="uncovered_requirements")
         if added or verification.get("uncovered_requirements") or verification.get("verified") is not True or verification.get("coverage_complete") is not True:
             self.coverage_complete = False
             self.rejections += 1

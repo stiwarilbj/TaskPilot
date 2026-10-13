@@ -95,6 +95,20 @@ class ExpectedEffect:
     def unique(elements):
         return list({e.get('native_identity') or e.get('id'): e for e in elements}.values())
 
+    def field_candidates(self, observation: dict) -> list[dict]:
+        """Identity matching shared by effect checks and prerequisite guards."""
+        target = self.target
+        if not target: return []
+        if self.application:
+            current = next((a for a in observation.get('applications', []) if a.get('pid') == self.application['pid']), {})
+            if any(current.get(k) != self.application.get(k) for k in ('pid', 'name', 'bundle_id')): return []
+        return [e for e in observation.get('elements', []) if e.get('pid') == target.get('pid')
+                and e.get('role') == target.get('role') and e.get('title') == target.get('title')
+                and e.get('window_title') == target.get('window_title')
+                and ('secure' not in str(e.get('subrole', '')).casefold())
+                and structural_identity(e, observation) == structural_identity(target, self.before)
+                and (not target.get('native_identity') or e.get('native_identity') == target['native_identity'])]
+
     def observe(self, observation: dict) -> dict:
         if not self.supported: return self.unknown()
         if self.kind in FILE_EFFECTS: return self.result(reason='readback_required')
@@ -115,12 +129,7 @@ class ExpectedEffect:
         else:
             target = self.target
             if not target: return self.result(reason='target_missing')
-            candidates = [e for e in observation.get('elements', []) if e.get('pid') == target.get('pid')
-                          and e.get('role') == target.get('role') and e.get('title') == target.get('title')
-                          and e.get('window_title') == target.get('window_title')
-                          and ('secure' not in str(e.get('subrole', '')).casefold())
-                          and structural_identity(e, observation) == structural_identity(target, self.before)
-                          and (not target.get('native_identity') or e.get('native_identity') == target['native_identity'])]
+            candidates = self.field_candidates(observation)
             if len(self.unique(candidates)) != 1: return self.result(reason='ambiguous_target' if candidates else 'target_missing')
             complete = [e for e in candidates if e.get('value_complete') is True]
             if not complete or any(e.get('value', '') != self.spec['value'] for e in complete):

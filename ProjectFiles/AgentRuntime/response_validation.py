@@ -16,7 +16,7 @@ from action_contract_generated import (
     ActionContractError, validate_action,
 )
 
-VALIDATION_VERSION = 9
+VALIDATION_VERSION = 10
 
 
 class ResponseValidationError(RuntimeError):
@@ -177,7 +177,7 @@ def validate_response(value: dict[str, Any], purpose: str, observation: dict[str
             if element.get("enabled") is False:
                 fail("action.element_id", "must reference an enabled secure input target")
     try:
-        validate_metadata(result, purpose, ledger)
+        validate_metadata(result, purpose, ledger, observation)
     except EvidenceValidationError as error:
         raise ResponseValidationError(str(error)) from error
     return result

@@ -5,6 +5,53 @@ for the current task generation. The first planning response proposes all
 requirements, quoting the original request. Runtime-assigned IDs remain stable
 throughout the task. Model claims cannot create native proof.
 
+Requirements can include `depends_on`, an array of prerequisite IDs. New IDs
+are allocated as `r1`, `r2`, and so on in insertion order, including forward
+references in a first checklist. The complete proposed graph is validated
+before committing it: unknown IDs, self-dependencies, cycles, duplicate
+references and incorrect types are rejected through the existing one-repair
+budget. Repeated entries cannot remove an edge, change a proof scope or create
+a new identity by changing descriptive wording. Fresh IDs for the same bound
+field preserve the requirement's identity when native/structural checks match.
+
+Decisions advancing a checklist with dependencies supply `requirement_ids`
+outside the action object. Immediately before a new delivery, the runtime
+checks the applicable prerequisites. Exact native file/command effects also
+associate an action with matching requirements, so relabeling a file mutation
+cannot bypass its known guards. Window prerequisites reject controls in another
+document; field requirements retain their intended target. General visual
+associations still depend on model interpretation, and final coverage remains
+audited against the complete original request.
+
+`window_active(pid,title)`, `field_value(element_id,value[,pid])` and
+`dialog_present(pid,title[,window_title])` are read-only checklist checks, not new
+actions. Accepted observations establish unique window identity/title on the
+assigned display, complete nonsecure field values and unambiguous dialogs.
+Field identity checks reuse the existing expected-effect implementation,
+including app, role, label, native identity and surrounding structure. Core
+Graphics window metadata is supported when AX window titles are unavailable.
+Ambiguous, disabled, missing, changed or incomplete controls remain unproven.
+Relevant file prerequisites are rechecked through the existing native read-only
+path. Checks and graph selection add no model requests or action receipts.
+
+The default `scope` is `outcome`, requiring current proof. A setup condition may
+use `scope: "prerequisite"`: before its dependent action, the runtime retains
+an attributable historical witness of the proven condition. This allows a
+filled form to disappear after submission without losing proof that its fields
+were checked first. A later action directly depending on the same condition
+still needs fresh proof; historical witnesses cannot unlock another edit or
+submission. Transitive prerequisites retain ordering evidence. Only the final
+auditor may add a separate outcome requirement where historical proof was
+insufficient; it cannot replace or weaken an existing prerequisite.
+
+An unproven prerequisite yields `prerequisite_unproven` recovery with the
+specific pending IDs. No dependent action, native fallback, model switch or
+format repair occurs solely because a condition is unproven. Three consecutive
+blocked decisions stop safely; the existing cancellation, permission, secure
+input, receipt reconciliation and loop protections remain in force. General
+visual descriptions cannot unlock actions through a completion claim. Unknown
+conditions need a supported local check or remain unproven.
+
 Validated native results establish only their acknowledged scope: exact file
 paths and byte hashes, complete reads, individual command outcome checks, or
 historical execution. Exit zero alone establishes command execution. Desktop
@@ -35,6 +82,8 @@ ledger state participate in decision-cache and offline regression identities;
 the generated action contract remains unchanged. Only aggregate diagnostic
 counts are added to persisted task metrics. Evidence, task IDs, raw responses,
 commands, and credentials are not added to persistence.
+Dependency readback/rejection counts are private and decode compatibly with
+older history. They do not add controls or change the existing diagnostics text.
 
 Validation covers every completion path, exact contents and destinations,
 omitted requirements, forged references, freshness, complete output, long
@@ -42,6 +91,10 @@ histories, repair limits, and mutation execution once. Native readback tests
 cover UTF-8, binary and empty files, bounded reads, independent command checks,
 and revoked ownership. The offline fixtures include partial multi-file
 completion and successful writes with incorrect contents.
+Dependency fixtures also cover wrong documents, premature/duplicate submission,
+stale field IDs, incomplete/disabled controls, generation mismatches, additive
+graphs, scope preservation, destination readbacks and healthy request counts.
+These are deterministic fake executions, not measurements of live model accuracy.
 
 Live desktop accuracy remains unvalidated. This change was checked without
 the fixer, live-control tester, Chrome interaction, live desktop tasks, or

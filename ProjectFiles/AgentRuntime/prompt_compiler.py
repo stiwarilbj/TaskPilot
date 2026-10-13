@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-PROMPT_COMPILER_VERSION = 4
+PROMPT_COMPILER_VERSION = 5
 PHASE_PREFIX = "EXECUTION PHASE: "
 REPAIR_HEADER = "RESPONSE FORMAT REPAIR:"
 EXAMPLE_MARKERS = {"planning": "RELEVANT ACTION EXAMPLES", "recovery": "RELEVANT ACTION EXAMPLES",
@@ -25,7 +25,7 @@ DECISION_CONTRACT = (
     "Launch unopened apps; use supplied route IDs. blocked requires exhausted recovery.\n"
     "Fields: act(action,intended_target,expected_result); done(output,visual_evidence); "
     "needs_user(user_input.kind=password/verification_code/secret,action:focus,element_id,pid); blocked(reason,no action).\n"
-    "expected_result: check or unconfirmed text; screen change is no proof.\n"
+    "expected_result: check or unconfirmed text; change is no proof.\n"
 )
 PLANNING_RULES = "Choose the next unmet requirement using current evidence.\n"
 RECOVERY_RULES = (
@@ -51,6 +51,7 @@ RECOVERY_CONDITIONS = {
     "repeat_suppressed": "The previous action was suppressed to prevent repetition. Reconcile its effect or choose a distinct valid action.",
     "blocked": "Reconsider the reported blocker using available app launch, current targets and permitted tools; retain genuine safety stops.",
     "completion_incomplete": "Fulfill the reported missing requirements; existing partial proof cannot authorize whole-task completion.",
+    "prerequisite_unproven": "No dependent action was delivered. Prove the listed prerequisites using current local checks; select their prerequisite action instead. Never relabel the rejected action to bypass dependencies.",
 }
 COMPLETION_RULES = (
     "Act as TaskPilot's strict completion verifier. Do not call tools or propose executable actions. "

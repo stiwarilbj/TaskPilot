@@ -108,10 +108,19 @@ final class EvidenceReadbackTests: XCTestCase {
     func testPrivateEvidenceCountsDecodeWithoutChangingOldDiagnostics() throws {
         let legacy = Data("{\"planning\":1,\"verification\":0,\"retries\":0,\"modelSwitches\":0,\"cacheHits\":0,\"reconnects\":0}".utf8)
         XCTAssertNil(try JSONDecoder().decode(AgentRequestMetrics.self, from: legacy).evidenceChecks)
+        XCTAssertNil(try JSONDecoder().decode(AgentRequestMetrics.self, from: legacy).dependencyChecks)
+        XCTAssertNil(try JSONDecoder().decode(AgentRequestMetrics.self, from: legacy).dependencyRejections)
         let current = Data("{\"planning\":1,\"verification\":1,\"retries\":0,\"modelSwitches\":0,\"cacheHits\":0,\"reconnects\":0,\"evidenceChecks\":2,\"coverageRejections\":1,\"requirementsProven\":3}".utf8)
         let result = try JSONDecoder().decode(AgentRequestMetrics.self, from: current)
         XCTAssertEqual(result.evidenceChecks, 2)
         XCTAssertEqual(result.coverageRejections, 1)
         XCTAssertEqual(result.requirementsProven, 3)
+        let dependencies = Data("{\"planning\":1,\"verification\":0,\"retries\":0,\"model_switches\":0,\"cache_hits\":0,\"reconnects\":0,\"dependency_checks\":2,\"dependency_rejections\":1}".utf8)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let guarded = try decoder.decode(AgentRequestMetrics.self, from: dependencies)
+        XCTAssertEqual(guarded.dependencyChecks, 2)
+        XCTAssertEqual(guarded.dependencyRejections, 1)
+        XCTAssertEqual(guarded.summary, "1 TaskPilot calls · 1 planning · 0 verification · 0 retries · 0 switches · 0 reused · 0 reconnects · provider retry count unavailable")
     }
 }

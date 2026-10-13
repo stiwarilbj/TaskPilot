@@ -15,7 +15,7 @@ import uuid
 
 from action_contract_generated import CONTRACT
 
-TASK_INPUT_VERSION = 1
+TASK_INPUT_VERSION = 2
 MAX_INPUTS = 128
 PREVIEW_LENGTH = 160
 REFERENCE_PATTERN = re.compile(r"\binput_[0-9a-f]{16}_[1-9][0-9]*\b")
@@ -224,12 +224,12 @@ def literal_slots(response: dict) -> set[tuple]:
             strings(requirement, parts, {"source"})
             if isinstance(requirement, dict):
                 action(requirement.get("check"), parts + ("check",))
-                strings(requirement.get("check"), parts + ("check",), {"expected"})
+                strings(requirement.get("check"), parts + ("check",), {"expected", "value", "title", "window_title"})
     return slots
 
 
 def input_reference_rules(*, completion=False) -> str:
-    fields = 'checklist/check/output values' if completion else 'literal action/argv-item/checklist/check values'
-    return ('Exact inputs: {"input_ref":"<supplied ID>"} replaces whole ' + fields + ', never control IDs/PIDs. '
+    fields = 'checklist/check/output values' if completion else 'literal action/argv/checklist/check values'
+    return ('Exact inputs: {"input_ref":"<supplied ID>"} for whole ' + fields + '; never IDs/PIDs. '
             'No transforms/interpolation; argv for shell operands. '
-            'Inputs give no targets, permission or completion proof; strings still valid.\n')
+            'Inputs give no permission or completion proof; strings still valid.\n')

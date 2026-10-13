@@ -273,12 +273,16 @@ class World:
         for raw in frame["controls"]:
             element = {k: v for k, v in raw.items() if k != "key"}
             element.update(id=revision + ":" + raw["key"], window_id=revision + ":window-" + raw.get("window_title", "Draft"))
+            element.setdefault("native_identity", raw["key"])
+            if element.get("role") in {"AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"}:
+                element.setdefault("value_complete", True)
             elements.append(element)
         windows = sorted({e.get("window_title", "Draft") for e in elements}) or ["Draft"]
         self.latest = {"observation_revision": revision, "screenshot_path": str(image),
-                       "applications": [{"pid": 42, "name": "Fixture App", "active": True,
+                       "applications": [{"pid": 42, "name": "Fixture App", "active": True, "topmost_on_agent_screen": True,
                                          "windows": [{"title": w, "window_id": revision + ":window-" + w,
-                                                      "focused": w == "Draft"} for w in windows]}],
+                                                      "focused": w == frame.get("active_window", "Draft"),
+                                                      "topmost_on_agent_screen": w == frame.get("active_window", "Draft")} for w in windows]}],
                        "elements": elements}
         return deepcopy(self.latest)
 
@@ -288,6 +292,17 @@ class World:
     def bridge(self, method, _display, **params):
         if method == "observe":
             return self.observe()
+        if method == "check_effect":
+            check = params["check"]
+            content = self.files.get(check["path"])
+            actual = {"type": check["type"], "path": check["path"], "verified": False}
+            if check["type"] == "directory_exists":
+                actual["verified"] = check["path"] in self.case["states"][self.state].get("directories", [])
+            elif check["type"] == "file_exists": actual["verified"] = content is not None
+            elif check["type"] == "path_absent": actual["verified"] = content is None
+            elif check["type"] == "file_contents" and content == check["content"]:
+                actual.update(verified=True, content_sha256=hashlib.sha256(content.encode()).hexdigest())
+            return {"requested_checks": [check], "checks": [actual]}
         if method == "recheck":
             action = params["action"]
             checks = ([{"type": "file_contents", "path": action["path"], "content": action["content"],
@@ -347,7 +362,7 @@ def bind(value, observation, ledger=None):
         return [bind(item, observation, ledger) for item in value]
     if value == "$current_proofs":
         return [{"requirement_id": key, "evidence_ids": [next((ref for ref, evidence in reversed(list(ledger.evidence.items()))
-                 if ledger.matches(requirement["check"], evidence, semantic=True)), "unproven")],
+                 if ledger.requirement_matches(key, evidence, semantic=True)), "unproven")],
                  "rationale": "The cited fixture evidence shows this requested outcome"}
                 for key, requirement in ledger.requirements.items()]
     if isinstance(value, str) and value.startswith("$"):

@@ -58,7 +58,7 @@ from observation_completeness import (OBSERVATION_COMPLETENESS_VERSION, Observat
                                       validate_completeness, prompt_coverage, coverage_cache_input)
 from local_text_recognition import (TEXT_RECOGNITION_VERSION, TextRecognitionError,
                                     validate_text_recognition, prompt_text_recognition, detail_images)
-from task_evidence import TaskEvidenceLedger, CHECKLIST_VERSION, LARGEST_PATTERN
+from task_evidence import TaskEvidenceLedger, CHECKLIST_VERSION, LARGEST_PATTERN, digest as evidence_digest
 from expected_effects import ExpectedEffect, EXPECTED_EFFECT_VERSION, FILE_EFFECTS
 from task_inputs import TASK_INPUT_VERSION, input_reference_rules
 
@@ -2056,6 +2056,12 @@ def desktop_instruction(
         else:
             check = {"type": "visual", "expected": "<outcome>"}
         illustrated[0]["requirements"] = [{"source": "<quote>", "description": "<goal>", "check": check}]
+        if (first['type'] in {'press', 'focus', 'set_value', 'type_text', 'click', 'double_click', 'key', 'scroll'} and
+                any(w.get('title') for a in observation.get('applications', []) for w in a.get('windows', []))):
+            illustrated[0]['requirements'].insert(0, {'source': '<quote>', 'description': '<precondition>',
+                'scope': 'prerequisite', 'check': {'type': 'window_active', 'pid': 1, 'title': '<current window title>'}})
+            illustrated[0]['requirements'][1]['depends_on'] = ['r1']
+            illustrated[0]['requirement_ids'] = ['r2']
     fields = [e for e in observation.get("elements", []) if isinstance(e, dict)
               and e.get("role") in {"AXTextField", "AXTextArea", "AXComboBox", "AXSecureTextField"}]
     if fields and (any(e.get("role") == "AXSecureTextField" for e in fields) or
@@ -2086,8 +2092,9 @@ def desktop_instruction(
     if types & {"write_file", "run_command"}:
         bounds.append("finish_after_action:true requests final verification.")
     if 'run_command' in types and operation_kind:
-        bounds.append('operation types: ' + COMMAND_OPERATION_REFERENCE + '.')
-    reference = 'Other actions (examples are advisory): ' + ';'.join(
+        bounds.append('Other operations: ' + ';'.join(spec['reference'] for kind, spec in CONTRACT['command_operations'].items()
+                                                     if kind != operation_kind) + '.')
+    reference = 'Other actions: ' + ';'.join(
         spec['reference'] for kind, spec in CONTRACT['actions'].items() if kind not in types) + '.\n'
     if observation.get('applications') or observation.get('elements'):
         reference += ' Keys:' + ACTION_REFERENCE.split(' Keys:', 1)[1]
@@ -2101,7 +2108,7 @@ def desktop_instruction(
             condition = {**condition, "failed_action": recent[-1].get("action")}
     return compile_prompt("recovery" if condition else "planning",
         instructions=rules + (checklist_instruction(ledger) if ledger else "") + (guidance + "\n" if guidance else ""),
-        examples="Illustrations, PID 1/IDs are placeholders. Do not copy example inputs.\n"
+        examples="Illustrations: replace IDs/PID 1; examples are advisory. Do not copy example inputs.\n"
                  + "\n".join(json_data(example) for example in illustrated) + "\n" + " ".join(bounds) + "\n" + reference,
         task=task, context=prompt_capability_context(context), observation=prompt_observation(observation, task),
         history=recent, progress=progress, checklist=ledger.prompt_state() if ledger else None, condition=condition,
@@ -2149,12 +2156,19 @@ class ResponseRepairBudget:
 
 def checklist_instruction(ledger: TaskEvidenceLedger) -> str:
     contract = (
-        "\nCHECKLIST: First decision: ALL requirements(source task quote,description,check). "
+        "\nCHECKLIST: ALL requirements(source quote,description,check[,depends_on]). "
+        "IDs:r1,r2,...; with edges, use requirement_ids. "
+        "scope:prerequisite=setup; default:outcome. "
         "Checks: visual/answer(expected); file_read/file_exists/directory_exists/path_absent(path); "
         "final file_contents(path,content[,encoding]); historical file_written adds mode; stdout_equals(text); "
         "command_executed(argv or command[,working_directory]); command_operation(operation). "
 
-    ) if not ledger.requirements else "\nCHECKLIST: Fulfill every requirement; pending/invalidated entries need evidence, not repeated uncertain mutations. "
+    ) if not ledger.requirements else ("\nCHECKLIST: Fulfill every requirement; pending/invalidated entries need evidence, not repeated uncertain mutations. "
+        + ("Actions name requirement_ids; prove direct depends_on with fresh checks before acting. "
+           if any(r.get("depends_on") for r in ledger.requirements.values()) else ""))
+    if ledger.current_observation and ledger.current_observation.get("elements"):
+        contract += ("Local checks: window_active(pid,title), field_value(element_id,value[,pid]), "
+                     "dialog_present(pid,title[,window_title]). Preconditions must use local checks, not visual claims. ")
     return contract
 
 
@@ -2163,6 +2177,7 @@ def verification_checklist_instruction(ledger: TaskEvidenceLedger) -> str:
         "\nAudit the checklist against the COMPLETE ORIGINAL TASK, including destinations, contents, constraints, "
         "ordering, and requested returned output. If anything was omitted, return verified:false and "
         "uncovered_requirements in the planning checklist shape. Cite proof for EACH requirement using runtime IDs. "
+        "Audit prerequisite ordering and keep final outcomes distinct from historical preconditions. "
         "Native facts prove only their stated scope; "
         "a file existence check cannot prove contents, and delivery/focus cannot prove a save/send. "
         "Visual proof must cite the fresh observation; explain the visible outcome. An answer needs relevant "
@@ -2221,11 +2236,35 @@ def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int
     return True
 
 
+def prepare_dependency_action(decision: dict, display_id: int, ledger: TaskEvidenceLedger,
+                              metrics: dict) -> dict | None:
+    """Read-only prerequisite preflight; no model request or action receipt."""
+    identifiers = ledger.action_requirements(decision)
+    direct = {ref for identifier in identifiers for ref in ledger.requirements[identifier].get("depends_on", [])}
+    seen = set()
+    for ref in ledger.prerequisites(identifiers):
+        requirement = ledger.requirements[ref]
+        if (ref not in direct and requirement.get("scope") == "prerequisite" and
+                any(ledger.requirement_matches(ref, e) and e["fact"]["type"] == "prerequisite_checked"
+                    for e in ledger.evidence.values())):
+            continue
+        check = requirement["check"]
+        if check["type"] not in FILE_EFFECTS or evidence_digest(check) in seen: continue
+        seen.add(evidence_digest(check))
+        ledger.invalidate(lambda e: e["mutable"] and ledger.matches(check, e))
+        checked = ExpectedEffect(check, {}).wait_file(
+            lambda value: bridge_call("check_effect", display_id, check=value), timeout=0)
+        metrics["dependency_checks"] = metrics.get("dependency_checks", 0) + 1
+        if checked["outcome"] == "verified": ledger.record_effect(check, checked["evidence"])
+    return ledger.check_prerequisites(decision, retain=True)
+
+
 def publish_task_metrics(router: TaskModelRouter, client: ACPClient, ledger: TaskEvidenceLedger) -> None:
     # Terminal events revoke the native lease. Publish aggregate diagnostics
     # before completion so the originating invocation can still accept them.
     router.metrics.update(evidence_checks=ledger.checks, coverage_rejections=ledger.rejections,
-        requirements_proven=sum(r["state"] == "proven" for r in ledger.requirements.values()), **_receipt_metrics)
+        requirements_proven=sum(r["state"] == "proven" for r in ledger.requirements.values()),
+        dependency_rejections=ledger.dependency_rejections, **_receipt_metrics)
     router.metrics.update(prompt_calls=client.prompt_calls, model_switches=client.model_switches)
     emit("request_metrics", **router.metrics)
 
@@ -2390,6 +2429,23 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
     recovery = ActionRecovery()
     loading_pid: int | None = None
     loading_waits = 0
+    consecutive_dependency_blocks = 0
+    def defer_for_dependencies(decision: dict, observation: dict, step: int) -> bool:
+        nonlocal consecutive_dependency_blocks
+        blocked = prepare_dependency_action(decision, display_id, ledger, model_router.metrics)
+        if blocked is None:
+            consecutive_dependency_blocks = 0
+            return False
+        consecutive_dependency_blocks += 1
+        ledger.dependency_rejections += 1
+        history.append({"step": step, "action": decision.get("action"),
+                        "result": {"outcome": "rejected", "error_code": "prerequisite_unproven",
+                                   "message": "No action delivered; prove the prerequisite before advancing", **blocked},
+                        "requirement_ids": ledger.action_requirements(decision)})
+        if consecutive_dependency_blocks >= 3:
+            raise RuntimeError("TaskPilot could not prove the required prerequisites after three fresh decisions; no dependent action was delivered")
+        emit("status", message="Checking the required prerequisites before continuing…")
+        return True
     try:
         emit("status", message=f"OpenClaw is connecting to the {PRODUCT_NAME} screen…")
         for step in range(1, MAX_STEPS + 1):
@@ -2454,12 +2510,13 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
             finally:
                 screenshot_path.unlink(missing_ok=True)
 
-            ledger.accept_plan(decision)
+            ledger.accept_plan(decision, observation)
             status = effective_decision_status(decision)
             summary = str(decision.get("summary") or "OpenClaw inspected the screen")
             emit("status", message=summary)
 
             if status == "needs_user":
+                if defer_for_dependencies(decision, observation, step): continue
                 input_target = decision_user_input_target(decision)
                 emit("status", message=f"{PRODUCT_NAME} paused because the waiting app needs secure input…")
                 ledger.before_action({"type": "type_text"})
@@ -2543,6 +2600,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
             elif action_type == "none":
                 result_message = "No action was performed"
             else:
+                if defer_for_dependencies(decision, observation, step): continue
                 try:
                     ledger.before_action(action)
                     result = bridge_call("act", display_id, action=action)
