@@ -1,6 +1,7 @@
 # Swift Package Manager and Xcode build products
 .build/
 DerivedData/
+.taskpilot-build/
 
 # Python bytecode and caches
 __pycache__/
