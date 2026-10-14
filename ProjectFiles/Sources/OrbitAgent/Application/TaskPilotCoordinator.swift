@@ -300,6 +300,16 @@ final class TaskPilotCoordinator: ObservableObject {
         showingSetup = true
     }
 
+    func monitorReadiness() async {
+        while !Task.isCancelled {
+            // Quiet preflight only: explicit permission buttons still own
+            // prompts and pixel verification. No generation requests here.
+            await refreshReadiness()
+            do { try await HousekeepingSchedule.readiness.wait() }
+            catch { return }
+        }
+    }
+
     func refreshReadiness(
         showSetupWhenNeeded: Bool = false,
         verifyCapture: Bool = false
@@ -823,7 +833,8 @@ final class TaskPilotCoordinator: ObservableObject {
         permissionMonitorTask = Task { [weak self] in
             for _ in 0..<90 {
                 guard let self, !Task.isCancelled else { return }
-                try? await Task.sleep(for: .seconds(1))
+                do { try await HousekeepingSchedule.permissions.wait() }
+                catch { return }
                 guard !Task.isCancelled else { return }
 
                 let previousAccessibility = self.hasAccessibilityPermission

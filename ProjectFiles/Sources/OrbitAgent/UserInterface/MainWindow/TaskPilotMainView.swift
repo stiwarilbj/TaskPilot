@@ -72,12 +72,7 @@ struct TaskPilotMainView: View {
             Task { await model.refreshReadiness() }
         }
         .task {
-            while !Task.isCancelled {
-                await model.refreshReadiness()
-                // This is deliberately a quiet preflight poll. Explicit
-                // permission buttons own every prompt and pixel verification.
-                try? await Task.sleep(for: .seconds(5))
-            }
+            await model.monitorReadiness()
         }
     }
 
