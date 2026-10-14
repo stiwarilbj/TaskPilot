@@ -140,9 +140,10 @@ final class TaskOwnershipTests: XCTestCase {
     @MainActor func testDrainBlocksNextTaskAndDiscardsLateAction() async throws {
         let suspension = Suspension(), entered = expectation(description: "Native pending")
         let waiting = expectation(description: "Shutdown deadline reported"), stopped = expectation(description: "Stopped once")
+        let initialStatus = expectation(description: "Identical earlier status delivered")
         let lease = TaskLease()
-        let helper = try helper("emit('bridge_request', request_id='x', method='act', params={})\ntime.sleep(20)")
-        var effects = 0, terminalCount = 0
+        let helper = try helper("emit('status', message='Waiting for the previous task’s native work to finish safely…')\nemit('bridge_request', request_id='x', method='act', params={})\ntime.sleep(20)")
+        var effects = 0, terminalCount = 0, statusCount = 0
         let runtime = AgentRuntimeProcess(bridge: bridge(), drainReportingDelay: 0.05) { request in
             let owner = TaskOwnership.current!
             await suspension.wait(entered) // Models a non-cancellable OS completion.
@@ -150,7 +151,11 @@ final class TaskOwnershipTests: XCTestCase {
             return ["kind": "bridge_response", "task_generation_id": owner.id, "request_id": "x", "ok": true, "result": [:]]
         }
         runtime.onEvent = { event in
-            if case .status = event { waiting.fulfill() }
+            if case .status = event {
+                statusCount += 1
+                if statusCount == 1 { initialStatus.fulfill() }
+                else { waiting.fulfill() }
+            }
             if case .stopped = event {
                 terminalCount += 1
                 XCTAssertEqual(lease.state, .draining)
@@ -160,13 +165,14 @@ final class TaskOwnershipTests: XCTestCase {
             }
         }
         try runtime.start(task: "fixture", display: display, runtimeURL: helper, openClawURL: helper, geminiAPIKey: "", lease: lease)
-        await fulfillment(of: [entered], timeout: 3)
+        await fulfillment(of: [entered, initialStatus], timeout: 3)
         runtime.stop()
         await fulfillment(of: [waiting], timeout: 2)
         XCTAssertThrowsError(try runtime.start(task: "next", display: display, runtimeURL: helper, openClawURL: helper, geminiAPIKey: ""))
         await suspension.release()
         await fulfillment(of: [stopped], timeout: 3)
         XCTAssertEqual(effects, 0); XCTAssertEqual(terminalCount, 1); XCTAssertEqual(lease.state, .retired)
+        XCTAssertEqual(statusCount, 2)
         let next = try self.helper("emit('complete', message='next')")
         let complete = expectation(description: "Next generation completed")
         runtime.onEvent = { if case .completed = $0 { complete.fulfill() } }
@@ -309,6 +315,109 @@ final class TaskOwnershipTests: XCTestCase {
         XCTAssertEqual(messages, (0..<1200).map { "\($0): ☃ 🧭" })
         XCTAssertEqual(terminalCount, 1)
         XCTAssertEqual(bridgeCalls, 0)
+    }
+
+    @MainActor func testDuplicateRuntimeSnapshotsKeepTransitionsResultsAndNewInvocations() async throws {
+        let helper = try helper("""
+        fields = dict(verification=0, retries=0, model_switches=0, cache_hits=0, reconnects=0)
+        for _ in range(1000):
+            emit('status', message='Working')
+            emit('request_metrics', planning=1, **fields)
+        for message, count in [('Checking', 2), ('Working', 1)]:
+            emit('status', message=message)
+            emit('request_metrics', planning=count, **fields)
+        for i in range(2):
+            emit('output', title='Result', content='Saved', show_output=True)
+            emit('model_health', model='fixture', state='verified', detail='Ready')
+            emit('bridge_request', request_id=str(i), method='fixture', params={})
+            response=json.loads(sys.stdin.readline())
+            assert response['request_id']==str(i)
+        sys.stdout.write(json.dumps(dict(kind='complete', task_generation_id=config['task_generation_id'], message='finished')))
+        sys.stdout.flush()
+        """)
+        let next = try self.helper("emit('status', message='Working')\nemit('request_metrics', planning=1, verification=0, retries=0, model_switches=0, cache_hits=0, reconnects=0)\nemit('complete', message='next')")
+        let finished = expectation(description: "Filtered burst and final exit tail")
+        var events: [String] = [], bridgeCalls = 0
+        let runtime = AgentRuntimeProcess(bridge: bridge()) { request in
+            bridgeCalls += 1
+            return ["kind": "bridge_response", "task_generation_id": request["task_generation_id"]!,
+                    "request_id": request["request_id"]!, "ok": true, "result": [:]]
+        }
+        runtime.onEvent = { event in
+            switch event {
+            case .status(let value): events.append(value)
+            case .diagnostics(let value): events.append("metrics:\(value.planning)")
+            case .output: events.append("output")
+            case .modelHealth: events.append("health")
+            case .completed: events.append("complete"); finished.fulfill()
+            case .failed(let message): XCTFail(message); finished.fulfill()
+            default: XCTFail("Unexpected event")
+            }
+        }
+        defer { runtime.stop() }
+        try runtime.start(task: "fixture", display: display, runtimeURL: helper, openClawURL: helper, geminiAPIKey: "")
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(events, ["Working", "metrics:1", "Checking", "metrics:2", "Working", "metrics:1",
+                                "output", "health", "output", "health", "complete"])
+        XCTAssertEqual(bridgeCalls, 2)
+        let continued = expectation(description: "New task publishes identical initial snapshots")
+        events.removeAll()
+        runtime.onEvent = { event in
+            switch event {
+            case .status(let value): events.append(value)
+            case .diagnostics(let value): events.append("metrics:\(value.planning)")
+            case .completed: events.append("complete"); continued.fulfill()
+            case .failed(let message): XCTFail(message); continued.fulfill()
+            default: XCTFail("Unexpected event")
+            }
+        }
+        try runtime.start(task: "next", display: display, runtimeURL: next, openClawURL: next, geminiAPIKey: "")
+        await fulfillment(of: [continued], timeout: 3)
+        XCTAssertEqual(events, ["Working", "metrics:1", "complete"])
+    }
+
+    @MainActor func testStatusIsRepublishedAfterPauseResumeAndSecureInputReply() async throws {
+        let helper = try helper("""
+        emit('status', message='Working')
+        emit('bridge_request', request_id='pause', method='fixture', params={})
+        json.loads(sys.stdin.readline())
+        emit('status', message='Working')
+        emit('user_input_required', request_id='credential')
+        reply=json.loads(sys.stdin.readline())
+        assert reply['value']=='fixture'
+        emit('status', message='Working')
+        emit('complete', message='finished')
+        """)
+        let lease = TaskLease(), finished = expectation(description: "Status survives external transitions")
+        let firstStatus = expectation(description: "Initial status delivered")
+        let entered = expectation(description: "Fixture waits before its next status")
+        let suspension = Suspension()
+        var statuses = 0
+        let runtime = AgentRuntimeProcess(bridge: bridge()) { request in
+            await suspension.wait(entered)
+            return ["kind": "bridge_response", "task_generation_id": request["task_generation_id"]!,
+                    "request_id": request["request_id"]!, "ok": true, "result": [:]]
+        }
+        runtime.onEvent = { event in
+            switch event {
+            case .status(let message):
+                XCTAssertEqual(message, "Working")
+                statuses += 1
+                if statuses == 1 { firstStatus.fulfill() }
+            case .userInputRequired(let request):
+                runtime.submitUserInput(requestID: request.requestID, value: "fixture", taskGenerationID: lease.id)
+            case .completed: finished.fulfill()
+            case .failed(let message): XCTFail(message); finished.fulfill()
+            default: break
+            }
+        }
+        defer { runtime.stop() }
+        try runtime.start(task: "fixture", display: display, runtimeURL: helper, openClawURL: helper, geminiAPIKey: "", lease: lease)
+        await fulfillment(of: [firstStatus, entered], timeout: 3)
+        runtime.pause(); runtime.resume()
+        await suspension.release()
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(statuses, 3)
     }
 
     @MainActor func testMetricsCodecKeepsSnakeCaseAndRecoversAcrossMessagesAndInvocations() async throws {

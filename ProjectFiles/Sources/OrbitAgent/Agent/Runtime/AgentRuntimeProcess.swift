@@ -82,6 +82,7 @@ final class AgentRuntimeProcess {
         let handler: (@MainActor (RuntimeEvent) -> Void)?
         let metricsDecoder: JSONDecoder
         var outputBuffer = RuntimeLineBuffer()
+        var snapshots = RuntimeSnapshotFilter()
         var lastErrorLine = ""
         var requestedStop = false
         var receivedTerminalEvent = false
@@ -206,13 +207,19 @@ final class AgentRuntimeProcess {
     }
 
     func pause() {
-        ioQueue.sync { invocation?.lease.pause() }
+        ioQueue.sync {
+            invocation?.snapshots.invalidateStatus()
+            invocation?.lease.pause()
+        }
         bridge.pauseActiveTool()
         signalRuntime(SIGSTOP)
     }
 
     func resume() {
-        ioQueue.sync { invocation?.lease.resume() }
+        ioQueue.sync {
+            invocation?.snapshots.invalidateStatus()
+            invocation?.lease.resume()
+        }
         bridge.resumeActiveTool()
         signalRuntime(SIGCONT)
     }
@@ -238,6 +245,7 @@ final class AgentRuntimeProcess {
         let run = ioQueue.sync { () -> Invocation? in
             guard let run = invocation, run.pendingUserInputID == requestID, run.lease.accepts(taskGenerationID) else { return nil }
             run.pendingUserInputID = nil
+            run.snapshots.invalidateStatus()
             return run
         }
         guard let run, run.lease.accepts(taskGenerationID) else { return }
@@ -404,6 +412,9 @@ final class AgentRuntimeProcess {
     }
 
     private func emit(_ event: RuntimeEvent, for run: Invocation, terminal: Bool = false, retireAfterDelivery: Bool = false) {
+        // Suppress redundant snapshots before they allocate main-queue work.
+        // Invocation ownership and terminal delivery guards remain unchanged.
+        guard terminal || run.snapshots.shouldSchedule(event) else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             let delivery = self.ioQueue.sync {
