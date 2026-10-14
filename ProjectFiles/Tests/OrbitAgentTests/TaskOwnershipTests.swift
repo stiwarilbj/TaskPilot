@@ -317,6 +317,42 @@ final class TaskOwnershipTests: XCTestCase {
         XCTAssertEqual(bridgeCalls, 0)
     }
 
+    @MainActor func testPressureControlIsPrivateAndRequiresRuntimeNegotiation() async throws {
+        for version in ["None", "True", "0", "1"] {
+            let supported = version == "1", monitor = MemoryPressureMonitor(listen: false)
+            let helper = try helper("""
+            import select
+            version=\(version)
+            if version is not None: emit('runtime_ready', memory_pressure_version=version)
+            emit('status', message='ready')
+            readable=select.select([sys.stdin], [], [], \(supported ? "2" : "0.25"))[0]
+            assert bool(readable)==\(supported ? "True" : "False")
+            if readable:
+                control=json.loads(sys.stdin.readline())
+                assert control==dict(kind='memory_pressure', task_generation_id=config['task_generation_id'], level='warning')
+            emit('complete', message='finished')
+            """)
+            let complete = expectation(description: "Negotiated pressure control \(version)")
+            var statuses = 0, terminalCount = 0
+            let runtime = AgentRuntimeProcess(bridge: bridge(), memoryPressure: monitor)
+            runtime.onEvent = { event in
+                switch event {
+                case .status(let message):
+                    XCTAssertEqual(message, "ready"); statuses += 1
+                    monitor.receive(.critical)
+                case .completed: terminalCount += 1; complete.fulfill()
+                case .failed(let message): XCTFail(message); complete.fulfill()
+                default: XCTFail("Private control reached the event handler")
+                }
+            }
+            try runtime.start(task: "fixture", display: display, runtimeURL: helper, openClawURL: helper, geminiAPIKey: "")
+            await fulfillment(of: [complete], timeout: 4)
+            runtime.stop()
+            XCTAssertEqual(statuses, 1)
+            XCTAssertEqual(terminalCount, 1)
+        }
+    }
+
     @MainActor func testDuplicateRuntimeSnapshotsKeepTransitionsResultsAndNewInvocations() async throws {
         let helper = try helper("""
         fields = dict(verification=0, retries=0, model_switches=0, cache_hits=0, reconnects=0)

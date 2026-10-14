@@ -1,3 +1,4 @@
+import CoreFoundation
 import Darwin
 import Foundation
 
@@ -75,6 +76,7 @@ final class AgentRuntimeProcess {
     private let bridgeHandler: (([String: Any]) async -> [String: Any])?
     private let drainReportingDelay: TimeInterval
     private let ioQueue = DispatchQueue(label: "com.orbitagent.runtime-io")
+    private var pressureRegistration: MemoryPressureMonitor.Registration?
     private final class Invocation {
         let lease: TaskLease
         let process: Process
@@ -83,6 +85,7 @@ final class AgentRuntimeProcess {
         let metricsDecoder: JSONDecoder
         var outputBuffer = RuntimeLineBuffer()
         var snapshots = RuntimeSnapshotFilter()
+        var supportsMemoryPressure = false
         var lastErrorLine = ""
         var requestedStop = false
         var receivedTerminalEvent = false
@@ -102,10 +105,20 @@ final class AgentRuntimeProcess {
     }
     private var invocation: Invocation?
 
-    init(bridge: AgentAutomationBridge, drainReportingDelay: TimeInterval = 5, bridgeHandler: (([String: Any]) async -> [String: Any])? = nil) {
+    init(bridge: AgentAutomationBridge, drainReportingDelay: TimeInterval = 5, memoryPressure: MemoryPressureMonitor = .shared, bridgeHandler: (([String: Any]) async -> [String: Any])? = nil) {
         self.bridge = bridge
         self.bridgeHandler = bridgeHandler
         self.drainReportingDelay = drainReportingDelay
+        pressureRegistration = memoryPressure.register { [weak self] in self?.evictRuntimeCaches() }
+    }
+
+    private func evictRuntimeCaches() {
+        ioQueue.async { [weak self] in
+            guard let self, let run = self.invocation, run.supportsMemoryPressure,
+                  run.lease.accepts(run.lease.id) else { return }
+            self.send(["kind": "memory_pressure", "task_generation_id": run.lease.id,
+                       "level": "warning"], for: run)
+        }
     }
 
     func start(
@@ -317,6 +330,11 @@ final class AgentRuntimeProcess {
             return
         }
         switch kind {
+        case "runtime_ready":
+            // Negotiate this private control independently of older helpers.
+            if let version = message["memory_pressure_version"] as? NSNumber,
+               CFGetTypeID(version) != CFBooleanGetTypeID(), version.intValue == 1,
+               version.doubleValue == 1 { run.supportsMemoryPressure = true }
         case "model_health":
             emit(.modelHealth(message["model"] as? String ?? "", message["state"] as? String ?? "repair", message["detail"] as? String ?? ""), for: run)
         case "request_metrics":

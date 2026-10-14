@@ -18,10 +18,17 @@ class BridgeReplyLost(RuntimeError):
 
 
 class RuntimeInbox:
-    def __init__(self, stream):
+    def __init__(self, stream, control_handler=None):
         self.stream = stream
+        self.control_handler = control_handler
         self.lines = queue.Queue()
         threading.Thread(target=self._read, daemon=True).start()
+
+    def _enqueue(self, line):
+        # Control messages must not enter a bridge/secure-input reply wait.
+        # The sole reader can release disposable caches during a model wait.
+        if self.control_handler is None or not self.control_handler(line):
+            self.lines.put(line)
 
     def _read(self):
         try:
@@ -31,7 +38,7 @@ class RuntimeInbox:
                 descriptor = None
             if descriptor is None:
                 for line in self.stream:
-                    self.lines.put(line)
+                    self._enqueue(line)
             else:
                 # Reading the real pipe directly avoids holding stdin's
                 # BufferedReader lock on a daemon thread during process exit.
@@ -40,10 +47,10 @@ class RuntimeInbox:
                 while chunk := os.read(descriptor, 65536):
                     pending.extend(chunk)
                     while (newline := pending.find(b'\n')) >= 0:
-                        self.lines.put(bytes(pending[:newline + 1]).decode('utf-8'))
+                        self._enqueue(bytes(pending[:newline + 1]).decode('utf-8'))
                         del pending[:newline + 1]
                 if pending:
-                    self.lines.put(bytes(pending).decode('utf-8'))
+                    self._enqueue(bytes(pending).decode('utf-8'))
         except (OSError, ValueError):
             pass
         finally:

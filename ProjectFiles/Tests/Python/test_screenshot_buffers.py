@@ -1,10 +1,13 @@
 """Screenshot reuse through real ACP serialization with offline transport."""
 import base64
 import hashlib
+import io
 import json
+from copy import deepcopy
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -12,9 +15,102 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "AgentRuntime"))
 import openclaw_runtime as runtime
 from evidence_fixtures import proof_response, with_requirements
 from test_verification_sessions import ACPFixture
+from action_receipts import RuntimeInbox
+from test_task_evidence import requirement, write, written
 
 
 class ScreenshotBufferTests(unittest.TestCase):
+    def pressure(self, generation="task-pressure", level="warning"):
+        return json.dumps({"kind": "memory_pressure", "task_generation_id": generation, "level": level}) + "\n"
+
+    def test_pressure_evicts_representations_without_rereading_or_losing_evidence(self):
+        with mock.patch.object(runtime, "_task_generation_id", "task-pressure"), runtime.screenshot_buffer_scope() as images:
+            image = images.image(self.path, "first")
+            original, digest = image.base64, image.digest
+            state = images.observation(self.observation)
+            fingerprint, revision = state.fingerprint, state.revision
+            indexes = images.indexes(self.observation)
+            task = 'Write /fixture/a.txt with A.'
+            ledger = runtime.TaskEvidenceLedger(task, "task-pressure")
+            ledger.add_requirements([requirement(task, path='/fixture/a.txt', content='A')])
+            ledger.record_action(write(), written(write()))
+            ledger_fingerprint = ledger.fingerprint()
+            evidence, requirements = deepcopy(ledger.evidence), deepcopy(ledger.requirements)
+            self.path.write_bytes(b"changed file after acceptance")
+            self.assertTrue(runtime.handle_runtime_control(self.pressure()))
+            self.assertIsNone(image._base64)
+            self.assertEqual(image._data, self.pixels)
+            self.assertEqual(state._values, {})
+            self.assertEqual((image.digest, state.revision, state.fingerprint), (digest, revision, fingerprint))
+            self.assertIsNot(images.indexes(self.observation), indexes)
+            self.assertEqual(image.base64, original)
+            self.assertEqual(self.reads, [self.path])
+            self.assertEqual(self.encode.call_count, 2)
+            self.assertEqual((ledger.evidence, ledger.requirements, ledger.fingerprint()),
+                             (evidence, requirements, ledger_fingerprint))
+            self.assertTrue(self.path.exists())
+
+    def test_pressure_controls_do_not_enter_action_or_secure_input_reply_waits(self):
+        with mock.patch.object(runtime, "_task_generation_id", "task-pressure"), runtime.screenshot_buffer_scope() as images:
+            image = images.image(self.path, "first"); image.base64
+            bridge_reply = '{"kind":"bridge_response","request_id":"fixture","ok":true}\n'
+            secure_reply = '{"kind":"user_input_response","request_id":"fixture","value":"fixture"}\n'
+            stream = io.StringIO(self.pressure() + bridge_reply + self.pressure(level="critical") + secure_reply)
+            inbox = RuntimeInbox(stream, control_handler=runtime.handle_runtime_control)
+            self.assertEqual(inbox.read(1), bridge_reply)
+            self.assertEqual(inbox.read(1), secure_reply)
+            self.assertIsNone(image._base64)
+            self.assertEqual(image._data, self.pixels)
+
+    def test_invalid_and_cross_task_controls_are_consumed_without_eviction(self):
+        with mock.patch.object(runtime, "_task_generation_id", "task-pressure"), runtime.screenshot_buffer_scope() as images:
+            image = images.image(self.path, "first"); original = image.base64
+            for generation, level in [("old-task", "warning"), (None, "critical"), (True, "warning"),
+                                      ("task-pressure", "normal"), ("task-pressure", "invalid")]:
+                self.assertTrue(runtime.handle_runtime_control(self.pressure(generation, level)))
+                self.assertIs(image._base64, original)
+            self.assertFalse(runtime.handle_runtime_control('{"kind":"bridge_response"}'))
+            self.assertFalse(runtime.handle_runtime_control('malformed'))
+        self.assertIsNone(runtime._pressure_images)
+        self.assertTrue(runtime.handle_runtime_control(self.pressure()))
+        self.assertIsNone(image._data)
+
+    def test_eviction_keeps_identical_valid_decision_reuse_and_adds_no_model_calls(self):
+        fixture = ACPFixture(['{"status":"done"}'])
+        with mock.patch.object(runtime, "_task_generation_id", "task-pressure"), runtime.screenshot_buffer_scope():
+            self.route(fixture)
+            runtime.handle_runtime_control(self.pressure(level="critical"))
+            self.route(fixture)
+            self.assertEqual(fixture.client.prompt_calls, 1)
+            self.assertEqual(self.router.metrics["cache_hits"], 1)
+            self.assertEqual((len(self.reads), self.encode.call_count), (1, 1))
+
+    def test_eviction_waits_for_encoding_then_releases_only_its_cache_reference(self):
+        with runtime.screenshot_buffer_scope() as images:
+            image = images.image(self.path, "first")
+            entered, release = threading.Event(), threading.Event()
+            result, errors = [], []
+            def read():
+                try: result.append(image.base64)
+                except BaseException as error: errors.append(error)
+            # Patch a captured encoder, avoiding recursively calling the mock.
+            real_encode = self.encode._mock_wraps
+            def controlled(data):
+                entered.set()
+                if not release.wait(2): raise RuntimeError("Fixture was not released")
+                return real_encode(data)
+            with mock.patch.object(runtime.base64, "b64encode", side_effect=controlled):
+                worker = threading.Thread(target=read)
+                worker.start(); self.assertTrue(entered.wait(1))
+                eviction = threading.Thread(target=images.evict_disposable)
+                eviction.start(); release.set()
+                worker.join(2); eviction.join(2)
+            self.assertFalse(worker.is_alive()); self.assertFalse(eviction.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(result, [real_encode(self.pixels).decode("ascii")])
+            self.assertIsNone(image._base64)
+            self.assertEqual(image._data, self.pixels)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

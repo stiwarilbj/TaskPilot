@@ -42,8 +42,7 @@ actor ScreenCaptureService {
     static let maximumPreviewWidth = 1440.0
     static let maximumPreviewHeight = 900.0
 
-    private var cachedContent: SCShareableContent?
-    private var contentCachedAt: ContinuousClock.Instant?
+    private let contentCache = PressureSensitiveCache<(content: SCShareableContent, created: ContinuousClock.Instant)>()
     private let contentCacheLifetime: Duration = .milliseconds(750)
 
     /// Reads macOS' existing TCC decision without invoking ScreenCaptureKit.
@@ -64,8 +63,7 @@ actor ScreenCaptureService {
     /// switch is On, so verification can never create an unsolicited prompt.
     func authorizationStatus(verifyPixels: Bool = false) async -> ScreenCaptureAuthorization {
         guard Self.preflightAuthorizationStatus() == .authorized else {
-            cachedContent = nil
-            contentCachedAt = nil
+            contentCache.evict()
             return .denied
         }
         guard verifyPixels else {
@@ -94,8 +92,7 @@ actor ScreenCaptureService {
             )
             return .authorized
         } catch {
-            cachedContent = nil
-            contentCachedAt = nil
+            contentCache.evict()
             // macOS commonly updates the Settings switch before the running
             // process receives a usable ScreenCaptureKit authorization. Report
             // the switch as On while requiring an automatic relaunch before a
@@ -155,8 +152,7 @@ actor ScreenCaptureService {
                 configuration: configuration
             )
         } catch {
-            cachedContent = nil
-            contentCachedAt = nil
+            contentCache.evict()
             throw permissionError(for: error)
         }
         try await TaskOwnership.checkpoint()
@@ -221,26 +217,23 @@ actor ScreenCaptureService {
                 configuration: configuration
             )
         } catch {
-            cachedContent = nil
-            contentCachedAt = nil
+            contentCache.evict()
             throw permissionError(for: error)
         }
     }
 
     private func shareableContent(forceRefresh: Bool = false) async throws -> SCShareableContent {
         let now = ContinuousClock.now
-        if !forceRefresh,
-           let cachedContent,
-           let contentCachedAt,
-           now - contentCachedAt < contentCacheLifetime {
-            return cachedContent
+        let snapshot = contentCache.snapshot()
+        if !forceRefresh, let cached = snapshot.value,
+           now - cached.created < contentCacheLifetime {
+            return cached.content
         }
         let content = try await SCShareableContent.excludingDesktopWindows(
             false,
             onScreenWindowsOnly: false
         )
-        cachedContent = content
-        contentCachedAt = now
+        contentCache.store((content, now), epoch: snapshot.epoch)
         return content
     }
 

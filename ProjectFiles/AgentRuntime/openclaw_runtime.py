@@ -108,12 +108,33 @@ _local_change_metrics = {"local_notifications": 0, "local_targeted_checks": 0, "
 _command_capability_metrics = {"command_inspections": 0, "command_probes": 0, "command_probe_cache_hits": 0, "command_preflight_rejections": 0}
 _command_capabilities: dict[str, dict[str, Any]] = {}
 _screenshot_buffers = ContextVar("task_screenshot_buffers", default=None)
+_pressure_lock = threading.Lock()
+_pressure_images = None
+
+
+def handle_runtime_control(line: str) -> bool:
+    try:
+        message = json.loads(line)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(message, dict) or message.get("kind") != "memory_pressure":
+        return False
+    with _pressure_lock:
+        images = _pressure_images
+    generation = message.get("task_generation_id")
+    if (images is not None and isinstance(generation, str) and generation
+            and generation == _task_generation_id == images.generation
+            and message.get("level") in ("warning", "critical")):
+        images.evict_disposable()
+    # Consume invalid/stale pressure controls too; never confuse them with a
+    # native action receipt or a secure-input reply.
+    return True
 
 
 def runtime_line(timeout: float | None = None) -> str:
     global _runtime_inbox
     if _runtime_inbox is None or _runtime_inbox.stream is not sys.stdin:
-        _runtime_inbox = RuntimeInbox(sys.stdin)
+        _runtime_inbox = RuntimeInbox(sys.stdin, control_handler=handle_runtime_control)
     return _runtime_inbox.read(timeout)
 
 
@@ -897,57 +918,67 @@ def _observation_progress_signature(observation: dict[str, Any], pid: int | None
 class ScreenshotBuffer:
     """One immutable image read, with a lazy encoding for ACP requests only."""
     def __init__(self, path: Path) -> None:
+        self._lock = threading.RLock()
         self._data: bytes | None = path.read_bytes()
         self._digest = hashlib.blake2b(self._data, digest_size=16).hexdigest()
         self._base64: str | None = None
 
     @property
     def digest(self) -> str:
-        if self._data is None:
-            raise RuntimeError("The observation image has been discarded")
-        return self._digest
+        with self._lock:
+            if self._data is None:
+                raise RuntimeError("The observation image has been discarded")
+            return self._digest
 
     @property
     def base64(self) -> str:
-        if self._data is None:
-            raise RuntimeError("The observation image has been discarded")
-        if self._base64 is None:
-            self._base64 = base64.b64encode(self._data).decode("ascii")
-        return self._base64
+        with self._lock:
+            if self._data is None:
+                raise RuntimeError("The observation image has been discarded")
+            if self._base64 is None:
+                self._base64 = base64.b64encode(self._data).decode("ascii")
+            return self._base64
+
+    def evict_encoding(self) -> None:
+        with self._lock: self._base64 = None
 
     def discard(self) -> None:
-        self._data = self._base64 = None
-        self._digest = ""
+        with self._lock:
+            self._data = self._base64 = None
+            self._digest = ""
 
 
 class ScreenshotBuffers:
     def __init__(self, generation: str | None) -> None:
+        self._lock = threading.RLock()
         self.generation = generation
         self.images: dict[tuple[Path, str | None], ScreenshotBuffer] = {}
         self.current: dict[Path, tuple[Path, str | None]] = {}
         self.states: dict[tuple[Path, str | None], RevisionedJSONState] = {}
 
     def observation(self, observation: dict[str, Any]) -> RevisionedJSONState:
-        if self.generation != _task_generation_id:
-            raise ActionRejected("Observation belongs to another task", "cancelled")
-        path = Path(str(observation.get("screenshot_path") or "")).absolute()
-        key = (path, observation.get("observation_revision"))
-        if key not in self.states: self.states[key] = RevisionedJSONState()
-        state = self.states[key]
-        # Accepted observations are read-only in the loop. The content guard also
-        # detects accidental edits and reused revisions without serializing them.
-        state.update(coverage_cache_input(observation))
-        return state
+        with self._lock:
+            if self.generation != _task_generation_id:
+                raise ActionRejected("Observation belongs to another task", "cancelled")
+            path = Path(str(observation.get("screenshot_path") or "")).absolute()
+            key = (path, observation.get("observation_revision"))
+            if key not in self.states: self.states[key] = RevisionedJSONState()
+            state = self.states[key]
+            # Accepted observations are read-only in the loop. The content guard also
+            # detects accidental edits and reused revisions without serializing them.
+            state.update(coverage_cache_input(observation))
+            return state
 
     def image(self, path: Path, revision: str | None = None) -> ScreenshotBuffer:
-        if self.generation != _task_generation_id:
-            raise ActionRejected("Observation image belongs to another task", "cancelled")
-        path = path.absolute()
-        key = (path, revision) if revision is not None else self.current.get(path, (path, None))
-        if key not in self.images:
-            self.images[key] = ScreenshotBuffer(path)
-        self.current[path] = key
-        return self.images[key]
+        with self._lock:
+            if self.generation != _task_generation_id:
+                raise ActionRejected("Observation image belongs to another task", "cancelled")
+            path = path.absolute()
+            key = (path, revision) if revision is not None else self.current.get(path, (path, None))
+            if key not in self.images:
+                self.images[key] = ScreenshotBuffer(path)
+            self.current[path] = key
+            return self.images[key]
 
     def indexes(self, observation: dict[str, Any]) -> ObservationIndexes:
         if self.generation is not None and observation.get("task_generation_id") not in (None, self.generation):
@@ -956,38 +987,51 @@ class ScreenshotBuffers:
         return state.memoize(("lookup_indexes", OBSERVATION_INDEX_VERSION), lambda: ObservationIndexes(observation))
 
     def discard(self, path: Path, revision: str | None = None) -> bool:
-        path = path.absolute()
-        for key in list(self.states):
-            if key[0] == path and (revision is None or key[1] == revision):
-                self.states.pop(key).clear()
-        keys = [(path, revision)] if revision is not None else [key for key in self.images if key[0] == path]
-        for key in keys:
-            image = self.images.pop(key, None)
-            if image is not None:
-                image.discard()
-            if self.current.get(path) == key:
-                self.current.pop(path, None)
-        # Native captures have unique paths. If a path was reused, discarding
-        # an older revision must not unlink another live revision's image.
-        return not any(key[0] == path for key in self.images) and not any(key[0] == path for key in self.states)
+        with self._lock:
+            path = path.absolute()
+            for key in list(self.states):
+                if key[0] == path and (revision is None or key[1] == revision):
+                    self.states.pop(key).clear()
+            keys = [(path, revision)] if revision is not None else [key for key in self.images if key[0] == path]
+            for key in keys:
+                image = self.images.pop(key, None)
+                if image is not None:
+                    image.discard()
+                if self.current.get(path) == key:
+                    self.current.pop(path, None)
+            # Native captures have unique paths. If a path was reused, discarding
+            # an older revision must not unlink another live revision's image.
+            return not any(key[0] == path for key in self.images) and not any(key[0] == path for key in self.states)
 
     def clear(self) -> None:
-        for image in self.images.values():
-            image.discard()
-        self.images.clear()
-        self.current.clear()
-        for state in self.states.values(): state.clear()
-        self.states.clear()
+        with self._lock:
+            for image in self.images.values():
+                image.discard()
+            self.images.clear()
+            self.current.clear()
+            for state in self.states.values(): state.clear()
+            self.states.clear()
+
+    def evict_disposable(self) -> None:
+        with self._lock:
+            for image in self.images.values(): image.evict_encoding()
+            for state in self.states.values(): state.evict_memoized()
 
 
 @contextmanager
 def screenshot_buffer_scope():
+    global _pressure_images
     images = ScreenshotBuffers(_task_generation_id)
+    with _pressure_lock:
+        previous = _pressure_images
+        _pressure_images = images
     token = _screenshot_buffers.set(images)
     try:
         with observation_index_scope(images.indexes):
             yield images
     finally:
+        with _pressure_lock:
+            if _pressure_images is images: _pressure_images = previous
         images.clear()
         _screenshot_buffers.reset(token)
 
@@ -3236,6 +3280,7 @@ def main() -> int:
             return 0 if check_models(find_openclaw(args.openclaw_path), api_key, read_only=args.read_readiness) else 1
         if args.task is None or args.display_id is None:
             raise RuntimeError("TaskPilot requires a task and target display")
+        emit("runtime_ready", memory_pressure_version=1)
         run_task(args.task, args.display_id, args.openclaw_path, api_key)
         return 0
     except KeyboardInterrupt:

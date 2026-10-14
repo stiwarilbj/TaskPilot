@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import threading
 from copy import deepcopy
 from typing import Any
 
@@ -56,19 +57,26 @@ def same_json_state(first: Any, second: Any) -> bool:
 class RevisionedJSONState:
     """In-memory representations of one state revision, never a result cache."""
     def __init__(self) -> None:
+        self._lock = threading.RLock()
         self.revision = 0
         self._snapshot: Any = None
         self._values: dict[Any, Any] = {}
 
     def update(self, value: Any) -> None:
-        if not self.revision or not same_json_state(value, self._snapshot):
-            self._snapshot = deepcopy(value)
-            self.revision += 1
-            self._values.clear()
+        with self._lock:
+            if not self.revision or not same_json_state(value, self._snapshot):
+                self._snapshot = deepcopy(value)
+                self.revision += 1
+                self._values.clear()
 
     def memoize(self, key: Any, build):
-        if key not in self._values: self._values[key] = build()
-        return self._values[key]
+        with self._lock:
+            if key not in self._values: self._values[key] = build()
+            return self._values[key]
+
+    def evict_memoized(self) -> None:
+        # Retain the accepted snapshot and revision, never discard evidence.
+        with self._lock: self._values.clear()
 
     @property
     def canonical(self) -> str:
@@ -80,9 +88,10 @@ class RevisionedJSONState:
         return self.memoize("fingerprint", lambda: hashlib.sha256(self.canonical.encode()).hexdigest())
 
     def clear(self) -> None:
-        self._snapshot = None
-        self._values.clear()
-        self.revision = 0
+        with self._lock:
+            self._snapshot = None
+            self._values.clear()
+            self.revision = 0
 
 
 def path_key(path: str) -> str:

@@ -45,17 +45,26 @@ final class TaskToolExecutor {
     private let capabilityLock = NSLock()
     private var commandBindings: [String: CommandCapabilities.Binding] = [:]
     private var helpCache: [String: (created: TimeInterval, result: [String: Any])] = [:]
+    private var helpCacheEpoch: UInt64 = 0
+    private var pressureRegistration: MemoryPressureMonitor.Registration?
     private let profileProvider: (String, [String?]) -> CommandCapabilities.Profile?
     private let outputSpillRoot: URL
 
     init(profileProvider: @escaping (String, [String?]) -> CommandCapabilities.Profile? = CommandCapabilities.profile,
-         outputSpillRoot: URL = FileManager.default.temporaryDirectory) {
+         outputSpillRoot: URL = FileManager.default.temporaryDirectory,
+         memoryPressure: MemoryPressureMonitor = .shared) {
         self.profileProvider = profileProvider
         self.outputSpillRoot = outputSpillRoot
+        pressureRegistration = memoryPressure.register { [weak self] in self?.evictDisposableCaches() }
+    }
+
+    private func evictDisposableCaches() {
+        capabilityLock.withLock { helpCache.removeAll(); helpCacheEpoch &+= 1 }
+        // Inspected command bindings remain authoritative until task teardown.
     }
 
     func resetCommandCapabilities() {
-        capabilityLock.withLock { commandBindings.removeAll(); helpCache.removeAll() }
+        capabilityLock.withLock { commandBindings.removeAll(); helpCache.removeAll(); helpCacheEpoch &+= 1 }
     }
 
     static func commandEnvironment() -> [String: String] {
@@ -407,7 +416,7 @@ final class TaskToolExecutor {
                     "size": identity.size, "modified": [identity.modified.tv_sec, identity.modified.tv_nsec],
                     "changed": [identity.changed.tv_sec, identity.changed.tv_nsec], "environment": toolEnvironment,
                     "directory": policy.workingDirectory.path, "probe": profile.arguments])
-                let cached = capabilityLock.withLock { helpCache[cacheKey] }
+                let (cached, cacheEpoch) = capabilityLock.withLock { (helpCache[cacheKey], helpCacheEpoch) }
                 if let cached, ProcessInfo.processInfo.systemUptime - cached.created < 120 {
                     summary.merge(cached.result) { _, new in new }; cacheHits += 1
                 } else if deadline > ProcessInfo.processInfo.systemUptime {
@@ -431,6 +440,7 @@ final class TaskToolExecutor {
                     summary.merge(probed) { _, new in new }
                     if complete {
                         capabilityLock.withLock {
+                            guard helpCacheEpoch == cacheEpoch else { return }
                             if helpCache.count >= CommandCapabilities.maximumBindings { helpCache.removeAll() }
                             helpCache[cacheKey] = (ProcessInfo.processInfo.systemUptime, probed)
                         }

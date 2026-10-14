@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -16,6 +17,30 @@ from test_verification_sessions import ACPFixture
 
 
 class CanonicalStateTests(unittest.TestCase):
+    def test_pressure_eviction_serializes_with_rebuild_and_preserves_accepted_state(self):
+        state = evidence.RevisionedJSONState()
+        state.update({"label": "accepted fixture"})
+        fingerprint, revision = state.fingerprint, state.revision
+        entered, release = threading.Event(), threading.Event()
+        results, errors = [], []
+        def build():
+            entered.set()
+            if not release.wait(2): raise RuntimeError("Fixture was not released")
+            return state.fingerprint  # Nested memoization must not deadlock.
+        def rebuild():
+            try: results.append(state.memoize("fixture", build))
+            except BaseException as error: errors.append(error)
+        worker = threading.Thread(target=rebuild)
+        worker.start(); self.assertTrue(entered.wait(1))
+        eviction = threading.Thread(target=state.evict_memoized)
+        eviction.start(); release.set()
+        worker.join(2); eviction.join(2)
+        self.assertFalse(worker.is_alive()); self.assertFalse(eviction.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [fingerprint])
+        self.assertEqual(state._values, {})
+        self.assertEqual((state.fingerprint, state.revision), (fingerprint, revision))
+
     def test_unchanged_state_encodes_and_hashes_once(self):
         state = evidence.RevisionedJSONState()
         value = {"nested": [{"label": "Save", "enabled": True}], "unicode": "café"}

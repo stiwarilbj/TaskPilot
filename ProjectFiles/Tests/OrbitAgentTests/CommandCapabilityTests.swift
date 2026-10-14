@@ -69,6 +69,49 @@ final class CommandCapabilityTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: URL(fileURLWithPath: executable.path + ".executions")), "executed\n")
     }
 
+    func testPressureEvictsHelpButPreservesInspectedExecutionAuthority() async throws {
+        let monitor = MemoryPressureMonitor(listen: false)
+        let root = try fixture(), executable = try tool(root), input = action(executable, root)
+        let executor = TaskToolExecutor(profileProvider: { _, _ in
+            .init(arguments: ["--help"], context: "fixture", exhaustiveLongOptions: true)
+        }, memoryPressure: monitor)
+        let inspected = try await executor.inspectCommand(action: input)
+        XCTAssertEqual(inspected["probes"] as? Int, 1)
+        monitor.receive(.warning)
+        let reused = try await executor.inspectCommand(action: input)
+        XCTAssertEqual(reused["inspection_id"] as? String, inspected["inspection_id"] as? String)
+        XCTAssertEqual(reused["cache_hit"] as? Bool, true)
+        let other = try await executor.inspectCommand(action: action(executable, root, flag: "--other"))
+        XCTAssertEqual(other["probes"] as? Int, 1)
+        XCTAssertEqual(other["cache_hits"] as? Int, 0)
+        monitor.receive(.critical)
+        _ = try await executor.perform(action: input, commandBindingID: inspected["inspection_id"] as? String)
+        XCTAssertEqual(try String(contentsOf: URL(fileURLWithPath: executable.path + ".executions")), "executed\n")
+    }
+
+    func testPressureDuringHelpProbePreventsLateCacheRefill() async throws {
+        let monitor = MemoryPressureMonitor(listen: false), root = try fixture()
+        let executable = try tool(root, help: "touch \"${0}.probing\"; sleep 0.15; printf '%s\\n' 'Options: --help --safe'; exit 0")
+        let executor = TaskToolExecutor(profileProvider: { _, _ in
+            .init(arguments: ["--help"], context: "fixture", exhaustiveLongOptions: true)
+        }, memoryPressure: monitor)
+        let input = action(executable, root)
+        let pending = Task.detached { try await executor.inspectCommand(action: input) }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !FileManager.default.fileExists(atPath: executable.path + ".probing"), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: executable.path + ".probing"))
+        monitor.receive(.critical)
+        let inspected = try await pending.value
+        XCTAssertEqual(inspected["ready"] as? Bool, true)
+        let other = try await executor.inspectCommand(action: action(executable, root, flag: "--other"))
+        XCTAssertEqual(other["probes"] as? Int, 1)
+        XCTAssertEqual(other["cache_hits"] as? Int, 0)
+        _ = try await executor.perform(action: input, commandBindingID: inspected["inspection_id"] as? String)
+        XCTAssertEqual(try String(contentsOf: URL(fileURLWithPath: executable.path + ".executions")), "executed\n")
+    }
+
     func testChangedCommandAndWorkingDirectoryCannotBorrowABinding() async throws {
         let root = try fixture(), executable = try tool(root), executor = executor(), input = action(executable, root)
         let id = try await executor.inspectCommand(action: input)["inspection_id"] as! String
