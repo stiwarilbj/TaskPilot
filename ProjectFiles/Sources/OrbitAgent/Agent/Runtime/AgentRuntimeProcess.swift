@@ -76,6 +76,7 @@ final class AgentRuntimeProcess {
     private let bridgeHandler: (([String: Any]) async -> [String: Any])?
     private let drainReportingDelay: TimeInterval
     private let ioQueue = DispatchQueue(label: "com.orbitagent.runtime-io")
+    private let telemetry = BackendTelemetry.current
     private var pressureRegistration: MemoryPressureMonitor.Registration?
     private final class Invocation {
         let lease: TaskLease
@@ -86,6 +87,7 @@ final class AgentRuntimeProcess {
         var outputBuffer = RuntimeLineBuffer()
         var snapshots = RuntimeSnapshotFilter()
         var supportsMemoryPressure = false
+        var startupSpan: BackendTelemetry.Span?
         var lastErrorLine = ""
         var requestedStop = false
         var receivedTerminalEvent = false
@@ -130,6 +132,9 @@ final class AgentRuntimeProcess {
         lease: TaskLease = TaskLease()
     ) throws {
         guard ioQueue.sync(execute: { invocation == nil || invocation?.lease.state == .retired }) else { throw RuntimeProcessError.alreadyRunning }
+        let startup = telemetry.begin(.startup)
+        var startupTransferred = false
+        defer { if !startupTransferred { startup.finish(.failed) } }
         guard FileManager.default.isExecutableFile(atPath: runtimeURL.path) else {
             throw RuntimeProcessError.runtimeMissing
         }
@@ -155,6 +160,8 @@ final class AgentRuntimeProcess {
         process.standardError = error
 
         let run = Invocation(lease: lease, process: process, input: input, handler: onEvent)
+        run.startupSpan = startup
+        startupTransferred = true
         ioQueue.sync { invocation = run }
         installOutputHandler(output.fileHandleForReading, for: run)
         installErrorHandler(error.fileHandleForReading, for: run)
@@ -183,7 +190,7 @@ final class AgentRuntimeProcess {
             // Pass the secret through the already-private controller pipe,
             // never through arguments, environment variables, or logs. The
             // runtime consumes this first line before it begins bridge calls.
-            var configuration = try JSONSerialization.data(withJSONObject: [
+            var configuration = try telemetry.encodeJSON([
                 "kind": "runtime_configuration",
                 "gemini_api_key": geminiAPIKey,
                 "action_contract_hash": ActionContract.fingerprint,
@@ -195,9 +202,11 @@ final class AgentRuntimeProcess {
                 "text_recognition_version": LocalTextRecognition.version,
                 "evidence_consistency_version": ControlEvidencePolicy.version,
                 "command_capability_version": CommandCapabilities.version
-            ])
+            ], recordSize: false) // Credential-bearing frames expose timing only.
             configuration.append(0x0A)
-            try input.fileHandleForWriting.write(contentsOf: configuration)
+            try telemetry.measure(.ipcSend) { _ in
+                try input.fileHandleForWriting.write(contentsOf: configuration)
+            }
         } catch let launchError {
             if launched {
                 // A successfully spawned helper must drain like every other
@@ -214,6 +223,8 @@ final class AgentRuntimeProcess {
             process.terminationHandler = nil
             if process.isRunning { process.terminate() }
             lease.revoke()
+            run.startupSpan?.finish(.failed)
+            run.startupSpan = nil
             ioQueue.sync { run.exited = true; run.pendingTerminalEvent = nil; run.lease.retire() }
             throw launchError
         }
@@ -317,7 +328,10 @@ final class AgentRuntimeProcess {
     }
 
     private func processLine(_ data: Data, for run: Invocation) {
-        guard let object = try? JSONSerialization.jsonObject(with: data),
+        let receive = telemetry.begin(.ipcReceive, inputBytes: data.count)
+        var accepted = false
+        defer { receive.finish(accepted ? .succeeded : .failed) }
+        guard let object = try? telemetry.measure(.jsonDecoding, inputBytes: data.count, { _ -> Any in try JSONSerialization.jsonObject(with: data) }),
               let message = object as? [String: Any],
               let kind = message["kind"] as? String else { return }
 
@@ -328,6 +342,14 @@ final class AgentRuntimeProcess {
                 run.process.terminate()
             }
             return
+        }
+        accepted = true
+        // Older helpers lack runtime_ready; their first valid non-error frame
+        // is the compatibility boundary. Current helpers announce readiness.
+        if ["runtime_ready", "model_health", "request_metrics", "bridge_request", "status",
+            "output", "user_input_required", "complete", "error"].contains(kind) {
+            run.startupSpan?.finish(kind == "error" ? .failed : .succeeded)
+            run.startupSpan = nil
         }
         switch kind {
         case "runtime_ready":
@@ -340,9 +362,10 @@ final class AgentRuntimeProcess {
         case "request_metrics":
             if let metrics = try? run.metricsDecoder.decode(AgentRequestMetrics.self, from: data) { emit(.diagnostics(metrics), for: run) }
         case "bridge_request":
+            let bridgeSpan = telemetry.begin(.ipcBridge, inputBytes: data.count)
             let operationID = UUID()
             let operation = Task { [weak self] in
-                guard let self else { return }
+                guard let self else { bridgeSpan.finish(.cancelled); return }
                 let response = await TaskOwnership.$current.withValue(run.lease) {
                     if let handler = self.bridgeHandler {
                         return await TaskOwnership.withCancellationWakeup { await handler(message) }
@@ -350,7 +373,7 @@ final class AgentRuntimeProcess {
                     return await self.bridge.handle(message)
                 }
                 self.ioQueue.async {
-                    self.send(response, for: run)
+                    self.send(response, for: run, bridgeSpan: bridgeSpan)
                     run.operations.removeValue(forKey: operationID)
                 }
             }
@@ -392,13 +415,24 @@ final class AgentRuntimeProcess {
         }
     }
 
-    private func send(_ object: [String: Any], for run: Invocation) {
+    private func send(_ object: [String: Any], for run: Invocation, bridgeSpan: BackendTelemetry.Span? = nil) {
         ioQueue.async { [weak self] in
-            guard let self, self.invocation === run, run.lease.accepts(object["task_generation_id"] as? String),
-                  var data = try? JSONSerialization.data(withJSONObject: object) else { return }
+            guard let self, self.invocation === run, run.lease.accepts(object["task_generation_id"] as? String) else {
+                bridgeSpan?.finish(.cancelled); return
+            }
+            let recordSize = object["kind"] as? String != "user_input_response"
+            guard var data = try? self.telemetry.encodeJSON(object, recordSize: recordSize) else { bridgeSpan?.finish(.failed); return }
             data.append(0x0A)
-            do { try run.input.fileHandleForWriting.write(contentsOf: data) }
+            do {
+                try self.telemetry.measure(.ipcSend, inputBytes: recordSize ? data.count : nil) { span in
+                    try run.input.fileHandleForWriting.write(contentsOf: data)
+                    if recordSize { span.record(outputBytes: data.count) }
+                }
+                bridgeSpan?.record(outputBytes: data.count)
+                bridgeSpan?.finish(.succeeded)
+            }
             catch {
+                bridgeSpan?.finish(.failed)
                 run.pendingTerminalEvent = .failed("Lost contact with the native screen controller")
                 self.beginDrain(run)
                 if run.process.isRunning { run.process.terminate() }
@@ -408,6 +442,8 @@ final class AgentRuntimeProcess {
 
     private func beginDrain(_ run: Invocation) {
         guard run.drainStarted == nil else { return }
+        run.startupSpan?.finish(run.requestedStop ? .cancelled : .failed)
+        run.startupSpan = nil
         run.drainStarted = .now
         run.lease.revoke()
         for operation in run.operations.values { operation.cancel() }

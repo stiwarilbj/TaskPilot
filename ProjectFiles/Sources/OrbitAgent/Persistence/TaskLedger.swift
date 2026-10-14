@@ -162,37 +162,54 @@ struct AgentTaskLedgerStore: Sendable {
     }
 
     func load() throws -> AgentTaskLedgerSnapshot {
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            return AgentTaskLedgerSnapshot()
+        try BackendTelemetry.current.measure(.persistenceRead) { span in
+            guard FileManager.default.fileExists(atPath: fileURL.path) else {
+                span.record(inputBytes: 0)
+                return AgentTaskLedgerSnapshot()
+            }
+            let data = try Data(contentsOf: fileURL)
+            span.record(inputBytes: data.count)
+            let telemetry = BackendTelemetry.current
+            return try codingQueue.sync {
+                try telemetry.measure(.jsonDecoding, inputBytes: data.count) { _ in
+                    try decoder.decode(AgentTaskLedgerSnapshot.self, from: data)
+                }
+            }
         }
-        let data = try Data(contentsOf: fileURL)
-        return try codingQueue.sync { try decoder.decode(AgentTaskLedgerSnapshot.self, from: data) }
     }
 
     func save(
         queue: [QueuedAgentTask],
         history: [AgentTaskHistoryEntry]
     ) throws {
-        let fileManager = FileManager.default
-        let directory = fileURL.deletingLastPathComponent()
-        try fileManager.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: Self.directoryPermissions]
-        )
-        try fileManager.setAttributes(
-            [.posixPermissions: Self.directoryPermissions],
-            ofItemAtPath: directory.path
-        )
+        try BackendTelemetry.current.measure(.persistenceWrite, items: queue.count + history.count) { span in
+            let fileManager = FileManager.default
+            let directory = fileURL.deletingLastPathComponent()
+            try fileManager.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: Self.directoryPermissions]
+            )
+            try fileManager.setAttributes(
+                [.posixPermissions: Self.directoryPermissions],
+                ofItemAtPath: directory.path
+            )
 
-        let data = try codingQueue.sync {
-            try encoder.encode(AgentTaskLedgerSnapshot(queue: queue, history: history))
+            let telemetry = BackendTelemetry.current
+            let data = try codingQueue.sync {
+                try telemetry.measure(.jsonEncoding) { encoding in
+                    let data = try encoder.encode(AgentTaskLedgerSnapshot(queue: queue, history: history))
+                    encoding.record(outputBytes: data.count)
+                    return data
+                }
+            }
+            try data.write(to: fileURL, options: .atomic)
+            try fileManager.setAttributes(
+                [.posixPermissions: Self.filePermissions],
+                ofItemAtPath: fileURL.path
+            )
+            span.record(outputBytes: data.count)
         }
-        try data.write(to: fileURL, options: .atomic)
-        try fileManager.setAttributes(
-            [.posixPermissions: Self.filePermissions],
-            ofItemAtPath: fileURL.path
-        )
     }
 }
 

@@ -75,6 +75,17 @@ final class ObservationCollection<Node> {
                  equal: (Node, Node) -> Bool,
                  inspect: (Entry, String) throws -> Inspection,
                  children: (Entry, Int, Int) throws -> Page) throws {
+        let before = collected
+        try BackendTelemetry.current.measure(.axCollection) { span in
+            defer { span.record(items: collected - before) }
+            try collectNodes(roots: roots, revision: revision, expand: expand, check: check,
+                             equal: equal, inspect: inspect, children: children)
+        }
+    }
+
+    private func collectNodes(roots: [Entry], revision: String, expand: Bool, check: () throws -> Void,
+                              equal: (Node, Node) -> Bool, inspect: (Entry, String) throws -> Inspection,
+                              children: (Entry, Int, Int) throws -> Page) throws {
         func deferNode(_ entry: Entry, _ reason: String) { pending.append(Pending(entry: entry, reason: reason)) }
         func walk(_ entry: Entry) throws {
             try check()

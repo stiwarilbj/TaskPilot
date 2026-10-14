@@ -587,7 +587,7 @@ final class TaskToolExecutor {
             try TaskOwnership.commit {
                 commandLock.lock(); defer { commandLock.unlock() }
                 if commandCancelled { throw CancellationError() }
-                do { try process.run() }
+                do { try BackendTelemetry.current.measure(.commandLaunch, items: arguments.count) { _ in try process.run() } }
                 catch { throw TaskToolError.operationFailed("Could not start the command: \(error.localizedDescription)") }
                 _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
                 activeCommand = process

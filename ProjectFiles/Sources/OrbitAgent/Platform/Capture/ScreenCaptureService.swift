@@ -107,6 +107,8 @@ actor ScreenCaptureService {
 
     func capture(display: DisplayDescriptor, forceRefresh: Bool = false) async throws -> CapturedScreen {
         try await TaskOwnership.checkpoint()
+        let captureSpan = BackendTelemetry.current.begin(.capture)
+        defer { captureSpan.finish(Task.isCancelled ? .cancelled : .failed) }
         guard Self.preflightAuthorizationStatus() == .authorized else {
             throw ScreenCaptureError.permissionDenied("Screen capture is not authorized for this TaskPilot process")
         }
@@ -159,31 +161,43 @@ actor ScreenCaptureService {
         guard CGDisplayBounds(display.id) == display.frame else { throw ScreenCoordinateError.captureChanged }
         let coordinates = try ScreenCoordinateMapping(displayID: display.id, displayBounds: display.frame,
             imageSize: CGSize(width: image.width, height: image.height))
+        captureSpan.record(items: image.width * image.height)
+        captureSpan.finish(.succeeded)
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("OrbitAgent", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let url = directory.appendingPathComponent("screen-\(UUID().uuidString).png")
-        guard let destination = CGImageDestinationCreateWithURL(
-            url as CFURL,
-            UTType.png.identifier as CFString,
-            1,
-            nil
-        ) else {
-            throw ScreenCaptureError.couldNotWriteImage
-        }
-        CGImageDestinationAddImage(destination, image, nil)
-        guard CGImageDestinationFinalize(destination) else {
-            throw ScreenCaptureError.couldNotWriteImage
-        }
+        try Self.writePNG(image, to: url)
         do { try TaskOwnership.check(); try TaskOwnership.current?.ownArtifact(url) }
         catch { try? FileManager.default.removeItem(at: url); throw error }
         return CapturedScreen(url: url, coordinates: coordinates, image: image)
+    }
+
+    static func writePNG(_ image: CGImage, to url: URL) throws {
+        try BackendTelemetry.current.measure(.pngEncoding, inputBytes: image.bytesPerRow * image.height) { span in
+            guard let destination = CGImageDestinationCreateWithURL(
+                url as CFURL,
+                UTType.png.identifier as CFString,
+                1,
+                nil
+            ) else {
+                throw ScreenCaptureError.couldNotWriteImage
+            }
+            CGImageDestinationAddImage(destination, image, nil)
+            guard CGImageDestinationFinalize(destination) else {
+                throw ScreenCaptureError.couldNotWriteImage
+            }
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
+            span.record(outputBytes: size, items: image.width * image.height)
+        }
     }
 
     /// Captures a local-only viewer frame. Unlike the OpenClaw frame, this keeps
     /// TaskPilot's click-through cursor overlay so the user can watch exactly where
     /// the agent is pointing without moving their hardware cursor.
     func capturePreview(display: DisplayDescriptor) async throws -> CGImage {
+        let span = BackendTelemetry.current.begin(.previewCapture)
+        defer { span.finish(Task.isCancelled ? .cancelled : .failed) }
         let content: SCShareableContent
         do {
             content = try await shareableContent()
@@ -212,10 +226,13 @@ actor ScreenCaptureService {
         configuration.capturesAudio = false
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         do {
-            return try await SCScreenshotManager.captureImage(
+            let image = try await SCScreenshotManager.captureImage(
                 contentFilter: filter,
                 configuration: configuration
             )
+            span.record(items: image.width * image.height)
+            span.finish(.succeeded)
+            return image
         } catch {
             contentCache.evict()
             throw permissionError(for: error)
