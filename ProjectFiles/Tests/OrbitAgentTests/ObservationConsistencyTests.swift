@@ -2,6 +2,32 @@ import XCTest
 @testable import OrbitAgent
 
 final class ObservationConsistencyTests: XCTestCase {
+    func testControlSignatureRetainsFoundationLabelsAndGeometryAfterPoolsDrain() throws {
+        let signature = try autoreleasepool {
+            let rows: [[String: Any]] = (0..<360).map { index in
+                ["id": "fixture:e\(index)", "pid": 42, "role": "AXButton" as NSString,
+                 "title": NSString(format: "Control %d • Save", index),
+                 "enabled": index.isMultiple(of: 2), "actions": ["AXPress"] as NSArray,
+                 "frame": ["x": index, "y": -200, "width": 30, "height": 20] as NSDictionary]
+            }
+            return try ObservationConsistency.controlSignature(elements: rows, applications: [])
+        }
+        // Read every returned value after the producing pools have drained.
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(signature.utf8)) as? [String: Any])
+        let controls = try XCTUnwrap(object["controls"] as? [String])
+        XCTAssertEqual(controls.count, 360)
+        var labels: Set<String> = []
+        for control in controls {
+            let row = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(control.utf8)) as? [String: Any])
+            labels.insert(try XCTUnwrap(row["title"] as? String))
+            XCTAssertEqual(row["role"] as? String, "AXButton")
+            XCTAssertEqual(row["actions"] as? [String], ["AXPress"])
+            let frame = try XCTUnwrap(row["frame"] as? [String: Int])
+            XCTAssertEqual(frame["y"], -200); XCTAssertEqual(frame["width"], 30)
+        }
+        XCTAssertEqual(labels, Set((0..<360).map { "Control \($0) • Save" }))
+    }
+
     private struct Candidate { let number: Int; let signature: String }
     private final class World {
         var time: Double = 1

@@ -253,6 +253,7 @@ final class LocalTextRecognitionTests: XCTestCase {
         let map = try ScreenCoordinateMapping(displayID: 1, displayBounds: CGRect(x: -200, y: 50, width: 200, height: 60),
             imageSize: CGSize(width: 400, height: 120))
         let matches = try await LocalTextRecognition.recognize(image, map, 10)
+        await Task.yield() // The worker pool has drained before results publish.
         let text = try XCTUnwrap(matches.first { $0.text == "SAVE" })
         let second = try XCTUnwrap(matches.first { $0.text == "REPORT" })
         XCTAssertEqual(text.lineText, "SAVE REPORT")
@@ -260,5 +261,16 @@ final class LocalTextRecognitionTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(text.confidence, 0.8)
         XCTAssertTrue(map.displayBounds.contains(text.frame))
         XCTAssertGreaterThan(text.frame.minX, -200); XCTAssertGreaterThan(text.frame.minY, 50)
+    }
+
+    func testRevokedVisionWorkerReturnsItsErrorThroughThePoolOnce() async throws {
+        let lease = TaskLease()
+        lease.revoke()
+        do {
+            _ = try await TaskOwnership.$current.withValue(lease) {
+                try await LocalTextRecognition.recognize(image(width: 400, height: 120), mapping(), 10)
+            }
+            XCTFail("Revoked recognition published results")
+        } catch is CancellationError { }
     }
 }

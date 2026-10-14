@@ -122,7 +122,11 @@ enum ObservationConsistency {
             return result
         }
         func encode(_ value: Any) throws -> String {
-            String(decoding: try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), as: UTF8.self)
+            // Foundation's bridged containers/data must drain between rows,
+            // rather than accumulate across a full control tree or retry.
+            try autoreleasepool {
+                String(decoding: try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), as: UTF8.self)
+            }
         }
         let controls = try elements.map { row -> String in
             var stable = row.filter { !["id", "parent_id", "window_id", "depth", "app"].contains($0.key) }

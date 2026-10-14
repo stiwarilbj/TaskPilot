@@ -290,19 +290,24 @@ enum LocalTextRecognition {
             try await withCheckedThrowingContinuation { continuation in
                 DispatchQueue.global(qos: .userInitiated).async {
                     do {
-                        try lease?.check(); try work.check()
-                        let handler = VNImageRequestHandler(cgImage: image, orientation: .up)
-                        try handler.perform([work.request]); try work.check()
-                        let matches = try (work.request.results ?? []).flatMap { observation -> [ScreenTextMatch] in
-                            guard let candidate = observation.topCandidates(1).first else { return [] }
-                            // A line can span neighboring buttons ("Save Cancel").
-                            // Word boxes keep its midpoint out of the gap while
-                            // preserving the full line as surrounding context.
-                            return try candidate.string.split(whereSeparator: { $0.isWhitespace }).compactMap { word in
-                                guard let box = try candidate.boundingBox(for: word.startIndex..<word.endIndex) else { return nil }
-                                return ScreenTextMatch(text: String(word), confidence: Double(candidate.confidence),
-                                    frame: try globalFrame(box.boundingBox, coordinates: coordinates),
-                                    lineText: String(candidate.string.trimmingCharacters(in: .whitespacesAndNewlines).prefix(256)))
+                        // This pool contains only synchronous worker work. ARC
+                        // retains the returned Swift matches; drain temporary
+                        // Vision objects before resuming the async caller.
+                        let matches = try autoreleasepool {
+                            try lease?.check(); try work.check()
+                            let handler = VNImageRequestHandler(cgImage: image, orientation: .up)
+                            try handler.perform([work.request]); try work.check()
+                            return try (work.request.results ?? []).flatMap { observation -> [ScreenTextMatch] in
+                                guard let candidate = observation.topCandidates(1).first else { return [] }
+                                // A line can span neighboring buttons ("Save Cancel").
+                                // Word boxes keep its midpoint out of the gap while
+                                // preserving the full line as surrounding context.
+                                return try candidate.string.split(whereSeparator: { $0.isWhitespace }).compactMap { word in
+                                    guard let box = try candidate.boundingBox(for: word.startIndex..<word.endIndex) else { return nil }
+                                    return ScreenTextMatch(text: String(word), confidence: Double(candidate.confidence),
+                                        frame: try globalFrame(box.boundingBox, coordinates: coordinates),
+                                        lineText: String(candidate.string.trimmingCharacters(in: .whitespacesAndNewlines).prefix(256)))
+                                }
                             }
                         }
                         continuation.resume(returning: matches)
