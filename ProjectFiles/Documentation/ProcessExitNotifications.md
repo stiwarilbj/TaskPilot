@@ -1,11 +1,10 @@
 # Command process exit notifications
 
-Task commands, syntax/help probes and OpenClaw's local status/dashboard helpers
-install a [Foundation termination handler](https://developer.apple.com/documentation/foundation/process/terminationhandler)
-before launch. Each invocation owns a locked exit status and notification
-signals. An exit before the worker starts waiting is retained; a late callback
-can only settle that invocation. The existing ACP runtime already uses its own
-termination callback and output-drain path.
+Task commands, syntax/help probes, OpenClaw status/dashboard helpers, and the
+ACP task runtime now use the [owned subprocess supervisor](SubprocessSupervision.md).
+Kernel process-exit notifications retain the parent's status; each invocation
+owns its exit signal and separately awaits descendant and output drainage. A
+late callback can only settle its originating invocation.
 
 Workers wait on notifications with a monotonic execution deadline instead of
 polling `isRunning` every 25 or 50 milliseconds. Timeout, command cancellation,
@@ -56,7 +55,7 @@ These tests use disposable local processes and files; no fixer, live-control
 tester, Chrome, live desktop task or provider request is run. Live accuracy
 validation remains incomplete.
 
-This avoids temporary output files for short commands and periodic process-status
-wakeups; it does not add model requests or change prompts, model defaults, the
+This avoids temporary output files for short commands and parent-exit polling;
+descendant discovery still uses bounded local inventory checks; it does not add model requests or change prompts, model defaults, the
 action contract, permissions, setup, cleanup
 preferences or the interface. Task-level performance is not benchmarked here.

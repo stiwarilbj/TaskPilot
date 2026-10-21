@@ -952,6 +952,7 @@ final class TaskPilotCoordinator: ObservableObject {
 
     func setClosesTaskAppsAfterUse(_ enabled: Bool) {
         closesTaskAppsAfterUse = enabled
+        currentTaskLease?.setProcessCleanup(enabled)
         UserDefaults.standard.set(enabled, forKey: "OrbitAgent.closesTaskAppsAfterUse")
         pinStatus(enabled
             ? "Task cleanup on — apps and windows opened by \(TaskPilotIdentity.displayName) will close after each task"
@@ -1104,7 +1105,7 @@ final class TaskPilotCoordinator: ObservableObject {
         requestMetrics = nil
         userInputRequest = nil
         userInputDraft = ""
-        let lease = TaskLease()
+        let lease = TaskLease(taskRequest: request, closePersistentProcesses: closesTaskAppsAfterUse)
         currentTaskLease = lease
         accessibility.beginTaskResourceTracking(on: display, lease: lease)
         agentCursor.hide()

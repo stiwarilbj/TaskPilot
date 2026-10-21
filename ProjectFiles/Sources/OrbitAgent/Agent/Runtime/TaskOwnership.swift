@@ -15,8 +15,45 @@ final class TaskLease: @unchecked Sendable {
     private var revocationObservers: [UUID: @Sendable () -> Void] = [:]
     private var pauseWaiters: [UUID: @Sendable () -> Void] = [:]
     private var pauseRegistrations = 0
-    init(id: String = UUID().uuidString) {
+    let permitsPersistentProcesses: Bool
+    private var closePersistentProcesses: Bool
+    private var persistentProcesses: [SubprocessSupervisor] = []
+    private var processCleanupStarted = false
+    init(id: String = UUID().uuidString, taskRequest: String = "", closePersistentProcesses: Bool = true) {
         self.id = id; self.actionReceipts = ActionReceiptStore(generation: id)
+        self.closePersistentProcesses = closePersistentProcesses
+        // Conservative authorization from the original user request, never a
+        // model response or command's background operator alone.
+        let text = taskRequest.lowercased()
+        permitsPersistentProcesses = text.range(of: "do not|don't|never|^(explain|describe|how|what|show me how)\\b", options: .regularExpression) == nil &&
+            text.range(of: #"\b(start|launch|run)\b[^.!?\n]*\b(in (the )?background|background service)\b|\bkeep\b[^.!?\n]*\b(server|service|process)\b[^.!?\n]*\b(running|alive)\b|\b(start|launch|run)\b[^.!?\n]*\b(server|service)\b[^.!?\n]*\bkeep (it )?running\b"#, options: .regularExpression) != nil
+    }
+    func setProcessCleanup(_ enabled: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        if !processCleanupStarted { closePersistentProcesses = enabled }
+    }
+    func ownPersistentProcess(_ process: SubprocessSupervisor) throws {
+        try commit {
+            guard permitsPersistentProcesses, !processCleanupStarted else { throw CancellationError() }
+            persistentProcesses.append(process)
+        }
+    }
+    /// Called before task handoff; retained services are exempt only from the
+    /// cleanup the user disabled, never accidentally forgotten at shell exit.
+    func drainPersistentProcesses() -> Bool {
+        lock.lock()
+        let processes = persistentProcesses
+        let close = closePersistentProcesses
+        let start = !processCleanupStarted; processCleanupStarted = true
+        if !close { persistentProcesses.removeAll() }
+        lock.unlock()
+        if start {
+            for process in processes {
+                if close { process.beginTeardown() }
+                else { PersistentProcessResources.shared.retain(process) }
+            }
+        }
+        return !close || processes.allSatisfy { $0.snapshot.treeFinished }
     }
     var state: State { lock.lock(); defer { lock.unlock() }; return value }
     var staleWorkCount: Int { lock.lock(); defer { lock.unlock() }; return discarded }
@@ -79,6 +116,8 @@ final class TaskLease: @unchecked Sendable {
         let waiters = Array(pauseWaiters.values); pauseWaiters.removeAll(); lock.unlock()
         for waiter in waiters { waiter() }
         for observer in observers { observer() }
+        _ = drainPersistentProcesses()
+        lock.lock(); persistentProcesses.removeAll(); lock.unlock()
         actionReceipts.discard()
         for url in files { try? FileManager.default.removeItem(at: url) }
     }

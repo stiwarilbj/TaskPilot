@@ -278,7 +278,7 @@ final class OpenClawService {
         timeout: TimeInterval,
         outputSpillRoot: URL = FileManager.default.temporaryDirectory
     ) -> CommandResult {
-        let process = Process()
+        let process = SubprocessSupervisor()
         do {
             process.executableURL = executable
             process.arguments = arguments
@@ -290,10 +290,10 @@ final class OpenClawService {
             process.standardOutput = capture.stdout
             process.standardError = capture.stderr
             try process.run()
-            _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
             capture.closeWriters()
             let status = waitForCommand(process, exit: exit, timeout: timeout)
             let output = try capture.finish().stdout
+            process.markOutputDrained()
             if status == -2 { return CommandResult(status: status, output: "OpenClaw status check timed out") }
             guard !output.truncated else { return CommandResult(status: -1, output: "OpenClaw status output was incomplete") }
             return CommandResult(status: status,
@@ -310,7 +310,7 @@ final class OpenClawService {
         arguments: [String],
         timeout: TimeInterval
     ) -> Int32 {
-        let process = Process()
+        let process = SubprocessSupervisor()
         process.executableURL = executable
         process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice
@@ -319,24 +319,21 @@ final class OpenClawService {
         defer { process.terminationHandler = nil }
         do {
             try process.run()
-            _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
         } catch {
             return -1
         }
 
-        return waitForCommand(process, exit: exit, timeout: timeout)
+        let status = waitForCommand(process, exit: exit, timeout: timeout)
+        process.markOutputDrained() // Both streams were explicitly discarded.
+        return status
     }
 
-    private static func waitForCommand(_ process: Process, exit: ProcessExitNotification, timeout: TimeInterval) -> Int32 {
-        if case .exited(let status) = exit.wait(until: .now() + timeout) { return status }
-        if process.isRunning { process.terminate() }
-        _ = exit.waitForExit(until: .now() + 1)
-        // Descendants may outlive a terminated shell; clean up the owned group.
-        if Darwin.kill(-process.processIdentifier, SIGKILL) != 0, process.isRunning {
-            Darwin.kill(process.processIdentifier, SIGKILL)
-        }
-        // A timed-out process still owns its output until its actual exit.
-        // Never publish a result or release its handles while it can write.
+    private static func waitForCommand(_ process: SubprocessSupervisor, exit: ProcessExitNotification, timeout: TimeInterval) -> Int32 {
+        let deadline = DispatchTime.now() + timeout
+        if case .exited(let status) = exit.wait(until: deadline),
+           case .finished = process.waitForTree(until: deadline) { return status }
+        process.beginTeardown()
+        _ = process.waitForTree(ignoreInterrupt: true)
         _ = exit.waitForExit()
         return -2
     }

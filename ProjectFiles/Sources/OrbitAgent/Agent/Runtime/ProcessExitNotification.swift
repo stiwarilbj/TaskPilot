@@ -11,21 +11,24 @@ final class ProcessExitNotification: @unchecked Sendable {
     private var interrupted = false
 
     init(_ process: Process) {
-        process.terminationHandler = { [self] process in
-            lock.lock()
-            guard status == nil else { lock.unlock(); return }
-            status = process.terminationStatus
-            lock.unlock()
-            ended.signal()
-            changed.signal()
-        }
+        process.terminationHandler = { [self] in record($0.terminationStatus) }
+    }
+    init(_ process: SubprocessSupervisor) {
+        process.terminationHandler = { [self] in record($0.terminationStatus) }
+    }
+    private func record(_ code: Int32) {
+        lock.lock()
+        guard status == nil else { lock.unlock(); return }
+        status = code
+        lock.unlock()
+        ended.signal(); changed.signal()
     }
 
     /// Cancellation and output-limit notifications wake the owning worker.
     /// Signal delivery and cleanup stay in that worker, outside this callback.
     func interrupt() {
         lock.lock()
-        let wake = status == nil && !interrupted
+        let wake = !interrupted
         if wake { interrupted = true }
         lock.unlock()
         if wake { changed.signal() }

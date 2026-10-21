@@ -10,8 +10,10 @@ let package = Package(
         .executable(name: "OrbitAgent", targets: ["OrbitAgent"])
     ],
     targets: [
+        .target(name: "ProcessSupport", path: "Sources/ProcessSupport"),
         .executableTarget(
             name: "OrbitAgent",
+            dependencies: ["ProcessSupport"],
             path: "Sources/OrbitAgent",
             linkerSettings: [
                 .linkedFramework("ApplicationServices"),

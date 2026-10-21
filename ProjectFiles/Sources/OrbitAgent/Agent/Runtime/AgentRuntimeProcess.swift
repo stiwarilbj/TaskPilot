@@ -80,7 +80,7 @@ final class AgentRuntimeProcess {
     private var pressureRegistration: MemoryPressureMonitor.Registration?
     private final class Invocation {
         let lease: TaskLease
-        let process: Process
+        let process: SubprocessSupervisor
         let input: Pipe
         let handler: (@MainActor (RuntimeEvent) -> Void)?
         let metricsDecoder: JSONDecoder
@@ -104,7 +104,7 @@ final class AgentRuntimeProcess {
         var terminalDelivered = false
         var drainStarted: ContinuousClock.Instant?
         var drainReported = false
-        init(lease: TaskLease, process: Process, input: Pipe, handler: (@MainActor (RuntimeEvent) -> Void)?) {
+        init(lease: TaskLease, process: SubprocessSupervisor, input: Pipe, handler: (@MainActor (RuntimeEvent) -> Void)?) {
             self.lease = lease; self.process = process; self.input = input; self.handler = handler
             // Decode only on the owning runtime's serialized I/O queue.
             metricsDecoder = JSONDecoder()
@@ -146,7 +146,7 @@ final class AgentRuntimeProcess {
         }
 
         try bridge.bind(lease)
-        let process = Process()
+        let process = SubprocessSupervisor()
         let input = Pipe()
         let output = Pipe()
         let error = Pipe()
@@ -183,19 +183,29 @@ final class AgentRuntimeProcess {
             self.ioQueue.async {
                 terminated.terminationHandler = nil
                 guard self.invocation === run, run.process === terminated else { return }
-                output.fileHandleForReading.readabilityHandler = nil
-                error.fileHandleForReading.readabilityHandler = nil
-                // A descendant may keep a pipe open after helper exit. Drain
-                // available bytes without an unbounded read-to-EOF allocation
-                // or a blocking wait that could prevent Stop.
-                self.drainAvailable(output.fileHandleForReading) { self.appendOutput($0, for: run) }
-                self.appendOutput(Data(), for: run, flush: true)
-                self.drainAvailable(error.fileHandleForReading) { self.appendError($0, for: run) }
-                run.exited = true
+                // Parent exit is not tree exit. Keep readers installed while
+                // remaining runtime children are terminated and drained.
                 if !run.requestedStop && run.pendingTerminalEvent == nil {
-                    run.pendingTerminalEvent = .failed(run.lastErrorLine.isEmpty ? "The OpenClaw bridge exited unexpectedly" : run.lastErrorLine)
+                    self.drainAvailable(output.fileHandleForReading) { self.appendOutput($0, for: run) }
+                    self.drainAvailable(error.fileHandleForReading) { self.appendError($0, for: run) }
                 }
                 self.beginDrain(run)
+                run.process.beginTeardown()
+                run.process.whenTreeExits {
+                    self.ioQueue.async {
+                        guard self.invocation === run else { return }
+                        output.fileHandleForReading.readabilityHandler = nil
+                        error.fileHandleForReading.readabilityHandler = nil
+                        self.drainAvailable(output.fileHandleForReading) { self.appendOutput($0, for: run) }
+                        self.appendOutput(Data(), for: run, flush: true)
+                        self.drainAvailable(error.fileHandleForReading) { self.appendError($0, for: run) }
+                        run.process.markOutputDrained()
+                        run.exited = true
+                        if !run.requestedStop && run.pendingTerminalEvent == nil {
+                            run.pendingTerminalEvent = .failed(run.lastErrorLine.isEmpty ? "The OpenClaw bridge exited unexpectedly" : run.lastErrorLine)
+                        }
+                    }
+                }
             }
         }
 
@@ -233,7 +243,7 @@ final class AgentRuntimeProcess {
                 ioQueue.async {
                     run.pendingTerminalEvent = .failed("Could not start the agent: \(launchError.localizedDescription)")
                     self.beginDrain(run)
-                    if process.isRunning { process.terminate() }
+                    process.beginTeardown()
                 }
                 return
             }
@@ -278,7 +288,7 @@ final class AgentRuntimeProcess {
         bridge.cancelActiveTool()
         signalRuntime(SIGCONT)
         signalRuntime(SIGTERM)
-        if run.process.isRunning { run.process.terminate() }
+        run.process.beginTeardown()
         enforceTermination(run)
     }
 
@@ -302,13 +312,8 @@ final class AgentRuntimeProcess {
     }
 
     private func signalRuntime(_ signal: Int32) {
-        guard let pid = ioQueue.sync(execute: { invocation?.process.processIdentifier }) else { return }
-        // The packaged Python helper makes itself a process-group leader, so
-        // pause/stop applies to its OpenClaw ACP child as well. Fall back to the
-        // helper pid during the brief startup window before setpgrp completes.
-        if kill(-pid, signal) != 0 {
-            kill(pid, signal)
-        }
+        let process = ioQueue.sync { invocation?.process }
+        process?.signal(signal)
     }
 
     private func installOutputHandler(_ handle: FileHandle, for run: Invocation) {
@@ -319,8 +324,8 @@ final class AgentRuntimeProcess {
             handle.readabilityHandler = nil
             self?.ioQueue.async { [weak self] in
                 guard let self, self.invocation === run else { return }
-                self.appendOutput(handle.availableData, for: run)
-                if run.process.isRunning { self.installOutputHandler(handle, for: run) }
+                let eof = self.drainAvailable(handle) { self.appendOutput($0, for: run) }
+                if !eof && !run.exited { self.installOutputHandler(handle, for: run) }
             }
         }
     }
@@ -330,8 +335,8 @@ final class AgentRuntimeProcess {
             handle.readabilityHandler = nil
             self?.ioQueue.async { [weak self] in
                 guard let self, self.invocation === run else { return }
-                self.appendError(handle.availableData, for: run)
-                if run.process.isRunning { self.installErrorHandler(handle, for: run) }
+                let eof = self.drainAvailable(handle) { self.appendError($0, for: run) }
+                if !eof && !run.exited { self.installErrorHandler(handle, for: run) }
             }
         }
     }
@@ -341,7 +346,8 @@ final class AgentRuntimeProcess {
         run.lastErrorLine = String(last)
     }
 
-    private func drainAvailable(_ handle: FileHandle, consume: (Data) -> Void) {
+    @discardableResult
+    private func drainAvailable(_ handle: FileHandle, consume: (Data) -> Void) -> Bool {
         let fd = handle.fileDescriptor
         _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
         var buffer = [UInt8](repeating: 0, count: 65536)
@@ -350,9 +356,14 @@ final class AgentRuntimeProcess {
         var remaining = RuntimeLineBuffer.maximumBatchBytes
         while remaining > 0 {
             let count = Darwin.read(fd, &buffer, min(buffer.count, remaining))
-            if count <= 0 { break }
+            if count == 0 { return true }
+            if count < 0 {
+                if errno == EINTR { continue }
+                return false
+            }
             consume(Data(buffer.prefix(count))); remaining -= count
         }
+        return false
     }
 
     // Also used after process exit; the final event need not end with a newline.
@@ -375,7 +386,9 @@ final class AgentRuntimeProcess {
             failTransport("transport_malformed_frame", for: run); return
         }
 
-        guard invocation === run, run.lease.accepts(message["task_generation_id"] as? String) else {
+        let finalDrain = run.process.snapshot.parentExited && !run.requestedStop && !run.receivedTerminalEvent && run.pendingTerminalEvent == nil &&
+            ["complete", "error"].contains(kind) && message["task_generation_id"] as? String == run.lease.id
+        guard invocation === run, finalDrain || run.lease.accepts(message["task_generation_id"] as? String) else {
             if !run.requestedStop && run.lease.state != .draining && run.lease.state != .retired {
                 run.pendingTerminalEvent = .failed("TaskPilot runtime task ownership does not match; rebuild the bundled components together")
                 beginDrain(run)
@@ -496,18 +509,15 @@ final class AgentRuntimeProcess {
         run.transportFailure = code
         run.pendingTerminalEvent = .failed("TaskPilot transport failure (\(code)). Pending actions are being reconciled and will not be repeated.")
         beginDrain(run)
-        if run.process.isRunning {
-            kill(run.process.processIdentifier, SIGCONT)
-            run.process.terminate()
-        }
+        run.process.beginTeardown()
         enforceTermination(run)
     }
 
     private func enforceTermination(_ run: Invocation, after delay: TimeInterval = 2) {
         ioQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self, self.invocation === run, !run.exited, run.process.isRunning else { return }
-            let pid = run.process.processIdentifier
-            if kill(-pid, SIGKILL) != 0 { kill(pid, SIGKILL) }
+            guard let self, self.invocation === run, !run.process.snapshot.treeFinished else { return }
+            run.process.beginTeardown()
+            run.process.signal(SIGKILL)
         }
     }
 
@@ -520,12 +530,14 @@ final class AgentRuntimeProcess {
         run.writer?.cancel()
         for operation in run.operations.values { operation.cancel() }
         bridge.cancelActiveTool()
+        enforceTermination(run, after: run.receivedTerminalEvent ? 5 : 2)
         pollDrain(run)
     }
 
     private func pollDrain(_ run: Invocation) {
         guard invocation === run, !run.terminalDelivered else { return }
-        if run.exited && run.operations.isEmpty {
+        let servicesDrained = run.lease.drainPersistentProcesses()
+        if run.exited && run.operations.isEmpty && servicesDrained {
             if let code = run.transportFailure {
                 // Receipt inspection happens after owned execution has drained.
                 // A dispatched/uncertain GUI effect never authorizes a replay

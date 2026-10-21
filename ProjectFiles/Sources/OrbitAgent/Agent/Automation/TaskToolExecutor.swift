@@ -38,7 +38,7 @@ final class TaskToolExecutor {
     static let maximumCommandLength = ActionContract.limit("command_bytes")
     static let maximumCommandTimeout = TimeInterval(ActionContract.limit("command_timeout"))
     private let commandLock = NSLock()
-    private var activeCommand: Process?
+    private var activeCommand: SubprocessSupervisor?
     private var activeCommandExit: ProcessExitNotification?
     private var commandCancelled = false
     private var commandPaused = false
@@ -186,6 +186,7 @@ final class TaskToolExecutor {
         let process = activeCommand, exit = activeCommandExit
         commandLock.unlock()
         exit?.interrupt()
+        process?.interrupt()
         Self.signal(process, SIGCONT)
         Self.signal(process, SIGTERM)
     }
@@ -530,6 +531,7 @@ final class TaskToolExecutor {
             "action_type": "run_command",
             "message": execution.timedOut
                 ? "Command timed out; inspect its effects before retrying"
+                : execution.persistent ? "Command launcher finished; explicitly requested background work remains supervised. Parent exit does not establish service readiness."
                 : verified ? "Command finished and its requested outcome checks passed"
                 : "Command finished with exit code \(execution.status); its requested outcome is not verified",
             "command": policy.displayCommand,
@@ -562,8 +564,8 @@ final class TaskToolExecutor {
     private func executeProcess(executable: URL, arguments: [String], policy: CommandExecutionPolicy,
                                 environment: [String: String], prefix: String, timeout: TimeInterval,
                                 probe: Bool = false, validate: () throws -> Void = {})
-        throws -> (status: Int32, timedOut: Bool, stdout: (text: String, truncated: Bool), stderr: (text: String, truncated: Bool)) {
-        let process = Process()
+        throws -> (status: Int32, timedOut: Bool, persistent: Bool, stdout: (text: String, truncated: Bool), stderr: (text: String, truncated: Bool)) {
+        let process = SubprocessSupervisor()
         process.executableURL = executable
         process.arguments = arguments
         process.currentDirectoryURL = policy.workingDirectory
@@ -575,15 +577,16 @@ final class TaskToolExecutor {
         do {
             capture = try BufferedProcessOutput(maximumBytes: Self.maximumCommandOutputBytes,
                 combinedLimit: probe ? CommandCapabilities.outputLimit : nil,
-                spillRoot: outputSpillRoot, onInterruption: { exit.interrupt() })
+                spillRoot: outputSpillRoot, onInterruption: { exit.interrupt(); process.interrupt() })
         } catch {
             throw TaskToolError.operationFailed("Could not prepare command output; the command was not executed")
         }
-        defer { capture.close() }
+        var retainedCapture = false
+        defer { if !retainedCapture { capture.close() } }
         process.standardOutput = capture.stdout
         process.standardError = capture.stderr
         let lease = TaskOwnership.current
-        let revocation = lease?.observeRevocation { exit.interrupt() }
+        let revocation = lease?.observeRevocation { exit.interrupt(); process.interrupt() }
         defer { if let revocation { lease?.removeRevocationObserver(revocation) } }
 
         // Always acquire the ownership gate before the command lock. Pause
@@ -595,12 +598,9 @@ final class TaskToolExecutor {
                 if commandCancelled { throw CancellationError() }
                 do { try BackendTelemetry.current.measure(.commandLaunch, items: arguments.count) { _ in try process.run() } }
                 catch { throw TaskToolError.operationFailed("Could not start the command: \(error.localizedDescription)") }
-                _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
                 activeCommand = process
                 activeCommandExit = exit
-                if commandPaused, Darwin.kill(-process.processIdentifier, SIGSTOP) != 0 {
-                    Darwin.kill(process.processIdentifier, SIGSTOP)
-                }
+                if commandPaused { process.signal(SIGSTOP) }
             }
         }
         // Resolve identity inside the lease boundary, before receipt dispatch.
@@ -614,34 +614,42 @@ final class TaskToolExecutor {
             if activeCommand === process { activeCommand = nil; activeCommandExit = nil }
             commandLock.unlock()
         }
-        let interrupted: Bool
-        switch exit.wait(until: .now() + timeout) {
-        case .exited: interrupted = false
-        case .interrupted, .timedOut: interrupted = true
+        let deadline = DispatchTime.now() + timeout
+        let parentEnded: Bool
+        switch exit.wait(until: deadline) {
+        case .exited: parentEnded = true
+        case .interrupted, .timedOut: parentEnded = false
         }
-        var timedOut = interrupted || capture.statistics.limitExceeded
-        if timedOut {
-            Self.signal(process, SIGCONT)
-            Self.signal(process, SIGTERM)
-            _ = exit.waitForExit(until: .now() + 1)
-            // Also kill children that outlive their shell.
-            if Darwin.kill(-process.processIdentifier, SIGKILL) != 0, process.isRunning {
-                Darwin.kill(process.processIdentifier, SIGKILL)
-            }
+        commandLock.lock(); let cancelled = commandCancelled; commandLock.unlock()
+        let persistent = parentEnded && process.terminationStatus == 0 && prefix == "command" && !probe &&
+            lease?.permitsPersistentProcesses == true && process.snapshot.descendants > 0 && !cancelled && !Task.isCancelled
+        var timedOut = !parentEnded || capture.statistics.limitExceeded
+        if persistent {
+            do { try lease?.ownPersistentProcess(process) }
+            catch { process.beginTeardown(); _ = process.waitForTree(ignoreInterrupt: true); throw error }
+        } else {
+            if !timedOut, case .finished = process.waitForTree(until: deadline) { }
+            else { timedOut = true }
+            if timedOut { process.beginTeardown() }
+            // No handoff until descendants (including inherited writers) end.
+            _ = process.waitForTree(ignoreInterrupt: true)
         }
         let status = exit.waitForExit()!
-        if probe { _ = Darwin.kill(-process.processIdentifier, SIGKILL) }
-        commandLock.lock(); let cancelled = commandCancelled; commandLock.unlock()
-        if cancelled || Task.isCancelled || lease?.state == .draining || lease?.state == .retired {
-            Darwin.kill(-process.processIdentifier, SIGKILL)
+        let cancelledAfterWait = commandLock.withLock { commandCancelled }
+        if cancelledAfterWait || Task.isCancelled || lease?.state == .draining || lease?.state == .retired {
+            if !persistent { process.beginTeardown(); _ = process.waitForTree(ignoreInterrupt: true) }
             throw CancellationError()
         }
         do {
-            let output = try capture.finish()
+            let output = try capture.finish(keepDraining: persistent)
+            if persistent {
+                retainedCapture = true
+                process.whenTreeExits { capture.close(); process.markOutputDrained() }
+            } else { process.markOutputDrained() }
             // A fast exit can precede its last read notification. The final
             // drain still enforces the aggregate help-probe budget.
             timedOut = timedOut || capture.statistics.limitExceeded
-            return (status, timedOut, (output.stdout.text, output.stdout.truncated), (output.stderr.text, output.stderr.truncated))
+            return (status, timedOut, persistent, (output.stdout.text, output.stdout.truncated), (output.stderr.text, output.stderr.truncated))
         } catch {
             if probe || prefix == "syntax" { throw TaskToolError.operationFailed("Preflight output could not be read; the command was not executed") }
             throw TaskToolError.uncertainDelivery("The command ended, but its output could not be read; inspect its effects before running it again")
@@ -675,10 +683,7 @@ final class TaskToolExecutor {
         return type == .typeSymbolicLink
     }
 
-    private static func signal(_ process: Process?, _ signal: Int32) {
-        guard let process, process.isRunning else { return }
-        if Darwin.kill(-process.processIdentifier, signal) != 0 {
-            Darwin.kill(process.processIdentifier, signal)
-        }
+    private static func signal(_ process: SubprocessSupervisor?, _ signal: Int32) {
+        process?.signal(signal)
     }
 }

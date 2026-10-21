@@ -317,6 +317,36 @@ final class TaskOwnershipTests: XCTestCase {
         XCTAssertEqual(bridgeCalls, 0)
     }
 
+    @MainActor func testRuntimeCompletionWaitsForDescendantTeardownAndDrainsExitTail() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let started = root.appendingPathComponent("started"), late = root.appendingPathComponent("late")
+        let helper = try helper("""
+        import subprocess
+        subprocess.Popen(['/bin/zsh', '-f', '-c', 'trap "" TERM; touch "$1"; /bin/sleep 0.7; touch "$2"', 'fixture', \(String(reflecting: started.path)), \(String(reflecting: late.path))])
+        while not __import__('os').path.exists(\(String(reflecting: started.path))): time.sleep(0.005)
+        sys.stdout.write(json.dumps(dict(kind='complete', task_generation_id=config['task_generation_id'], message='exit tail')))
+        sys.stdout.flush()
+        """)
+        let completed = expectation(description: "Tree drained before completion")
+        let lease = TaskLease(), runtime = AgentRuntimeProcess(bridge: bridge())
+        var terminals = 0
+        runtime.onEvent = { event in
+            if case .completed(let message) = event {
+                XCTAssertEqual(message, "exit tail"); terminals += 1; completed.fulfill()
+            }
+            if case .failed(let message) = event { XCTFail(message); completed.fulfill() }
+        }
+        try runtime.start(task: "fixture", display: display, runtimeURL: helper, openClawURL: helper, geminiAPIKey: "", lease: lease)
+        await fulfillment(of: [completed], timeout: 3)
+        XCTAssertEqual(lease.state, .retired)
+        try await Task.sleep(for: .milliseconds(800))
+        XCTAssertEqual(terminals, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: started.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: late.path))
+    }
+
     @MainActor func testPressureControlIsPrivateAndRequiresRuntimeNegotiation() async throws {
         for version in ["None", "True", "0", "1"] {
             let supported = version == "1", monitor = MemoryPressureMonitor(listen: false)

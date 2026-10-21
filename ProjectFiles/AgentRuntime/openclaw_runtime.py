@@ -3297,9 +3297,15 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
 
 def main() -> int:
     try:
-        os.setpgrp()
-    except OSError:
-        pass
+        # Native task launches establish this before exec. Standalone/readiness
+        # launches must establish it explicitly, never silently lose ownership.
+        if os.getpgrp() != os.getpid():
+            os.setpgrp()
+        if os.getpgrp() != os.getpid():
+            raise OSError("process group was not established")
+    except OSError as error:
+        sys.stderr.write(f"TaskPilot process-group setup failed ({error.errno})\n")
+        return 1
     signal.signal(signal.SIGTERM, _stop_handler)
     signal.signal(signal.SIGINT, _stop_handler)
     args = parse_args()

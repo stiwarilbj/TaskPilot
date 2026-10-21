@@ -285,8 +285,8 @@ final class BufferedProcessOutputTests: XCTestCase {
         let executable = try helper(root, "(/bin/sleep 20) & printf '%s' $! > \"$1\"; printf ready; exit 0")
         defer { if let contents = try? String(contentsOf: pid), let child = Int32(contents) { _ = Darwin.kill(child, SIGKILL) } }
         let output = OpenClawService.run(executable: executable, arguments: [pid.path], timeout: 1, outputSpillRoot: spills)
-        XCTAssertEqual(output.status, -1)
-        XCTAssertEqual(output.output, "OpenClaw status output was incomplete")
+        XCTAssertEqual(output.status, -2)
+        XCTAssertEqual(output.output, "OpenClaw status check timed out")
         let missing = OpenClawService.run(executable: root.appendingPathComponent("missing"), arguments: [], timeout: 1,
                                           outputSpillRoot: spills)
         XCTAssertEqual(missing.status, -1)

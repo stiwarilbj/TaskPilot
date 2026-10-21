@@ -55,6 +55,7 @@ final class BufferedProcessOutput: @unchecked Sendable {
     private var writersClosed = false
     private var stopped = false
     private var closed = false
+    private var discardFurtherOutput = false
 
     init(maximumBytes: Int? = nil, combinedLimit: Int? = nil, merged: Bool = false,
          memoryThreshold: Int = BufferedProcessOutput.memoryLimit,
@@ -143,7 +144,7 @@ final class BufferedProcessOutput: @unchecked Sendable {
             if let combinedLimit, drainedBytes > combinedLimit {
                 exceeded = true; interrupt()
             }
-            guard failure == nil else { continue }
+            guard failure == nil, !discardFurtherOutput else { continue }
             let keep = maximumBytes.map { min(count, max(0, $0 - stream.retained)) } ?? count
             guard keep > 0 else { continue }
             let data = scratch.withUnsafeBytes { Data(bytes: $0.baseAddress!, count: keep) }
@@ -177,15 +178,18 @@ final class BufferedProcessOutput: @unchecked Sendable {
     /// Called only after the process has exited. Drain remaining readable
     /// bytes before retiring readers. Inherited writers cannot strand teardown;
     /// an unclosed stream is marked incomplete, never exact-output proof.
-    func finish() throws -> Result {
+    func finish(keepDraining: Bool = false) throws -> Result {
         closeWriters()
         queue.sync {
             guard !stopped else { return }
             for stream in streams { drain(stream) }
-            stopped = true
-            for stream in streams { stream.source?.cancel() }
+            if keepDraining { discardFurtherOutput = true }
+            else {
+                stopped = true
+                for stream in streams { stream.source?.cancel() }
+            }
         }
-        cancellations.wait()
+        if !keepDraining { cancellations.wait() }
         return try queue.sync {
             guard !closed else { throw CaptureError.closed }
             if let failure { throw failure }
