@@ -1,8 +1,8 @@
 import CryptoKit
 import Foundation
 
-/// Task-local receipts retain terminal replies, never persisted payloads. IDs
-/// describe caller intent: identical parameters with a new ID are new work.
+/// Task-local replies stay in memory. Only opaque crash barriers reach the
+/// recovery journal. A restored record can never supply a delivery token.
 final class ActionReceiptStore: @unchecked Sendable {
     struct ReceiptError: LocalizedError {
         let code: String
@@ -34,8 +34,12 @@ final class ActionReceiptStore: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [String: Entry] = [:]
     private var duplicates = 0
+    private let journal: ActionRecoveryJournal?
+    private let recoveryTask: UUID?
     var duplicateCount: Int { lock.lock(); defer { lock.unlock() }; return duplicates }
-    init(generation: String) { self.generation = generation }
+    init(generation: String, journal: ActionRecoveryJournal? = nil, recoveryTask: UUID? = nil) {
+        self.generation = generation; self.journal = journal; self.recoveryTask = recoveryTask
+    }
 
     static func validateID(_ id: String?) throws -> String {
         guard let id, let uuid = UUID(uuidString: id), uuid.uuidString.lowercased() == id.lowercased() else {
@@ -56,6 +60,10 @@ final class ActionReceiptStore: @unchecked Sendable {
             duplicates += 1
             return .existing(snapshot(id, previous))
         }
+        if let journal {
+            guard let recoveryTask else { throw ActionRecoveryJournal.unavailable }
+            try journal.prepare(task: recoveryTask, action: id, payload: bytes)
+        }
         entries[id] = Entry(fingerprint: fingerprint, action: payload["action"] as? [String: Any] ?? (payload["type"] != nil ? payload : nil))
         return .new(Token(id: id, store: self))
     }
@@ -70,6 +78,7 @@ final class ActionReceiptStore: @unchecked Sendable {
     func discard() {
         lock.lock(); defer { lock.unlock() }
         entries.removeAll()
+        if let recoveryTask { try? journal?.close(task: recoveryTask) }
     }
     private func snapshot(_ id: String, _ entry: Entry) -> [String: Any] {
         var value: [String: Any] = ["action_id": id, "state": entry.state, "terminal": entry.terminal]
@@ -80,6 +89,9 @@ final class ActionReceiptStore: @unchecked Sendable {
     private func dispatched(_ id: String) throws {
         lock.lock(); defer { lock.unlock() }
         guard var entry = entries[id], !entry.terminal else { throw CancellationError() }
+        if let recoveryTask {
+            try journal?.transition(task: recoveryTask, action: id, phase: .dispatched)
+        }
         entry.state = "dispatched"; entries[id] = entry
     }
     private func complete(_ id: String, result: [String: Any]) throws {
@@ -91,6 +103,10 @@ final class ActionReceiptStore: @unchecked Sendable {
         entry.terminal = true; entry.result = result
         entry.state = result["outcome"] as? String == "delivered_unconfirmed" ? "unconfirmed" : "confirmed"
         try ActionContract.validateNativeReceipt(snapshot(id, entry), actionID: id, action: entry.action)
+        if let recoveryTask {
+            try journal?.transition(task: recoveryTask, action: id, phase: .terminal,
+                terminal: entry.state == "confirmed" ? .confirmed : .unconfirmed)
+        }
         entries[id] = entry
     }
     private func fail(_ id: String, error: Error, code: String) {
@@ -104,6 +120,17 @@ final class ActionReceiptStore: @unchecked Sendable {
         catch {
             entry.failure = ActionContract.nativeFailure(ActionContract.NativeProtocolError(message: "Native failure fields did not satisfy the protocol contract"), code: "protocol_error",
                 outcome: uncertain ? "delivered_unconfirmed" : "rejected")
+        }
+        if let recoveryTask {
+            do {
+                try journal?.transition(task: recoveryTask, action: id, phase: .terminal,
+                    terminal: uncertain ? .unconfirmed : .rejected)
+            } catch {
+                // A durability failure cannot expose a successful result or
+                // invite model recovery. Existing protocol errors stop runtime.
+                entry.failure = ActionContract.nativeFailure(ActionRecoveryJournal.unavailable, code: "protocol_error",
+                    outcome: uncertain ? "delivered_unconfirmed" : "rejected")
+            }
         }
         entries[id] = entry
     }

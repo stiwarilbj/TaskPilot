@@ -106,9 +106,41 @@ struct AgentTaskHistoryEntry: Codable, Equatable, Identifiable {
     }
 }
 
+/// The original authorization is saved with the existing private task ledger,
+/// never copied into the content-free receipt journal or model-generated data.
+struct AgentTaskAuthorization: Codable, Equatable {
+    var id = UUID()
+    let request: String
+    var startedAt = Date()
+    let wasQueued: Bool
+    var queuedTaskID: UUID? = nil
+}
+
 struct AgentTaskLedgerSnapshot: Codable, Equatable {
     var queue: [QueuedAgentTask] = []
     var history: [AgentTaskHistoryEntry] = []
+    var activeTask: AgentTaskAuthorization? = nil
+
+    /// Recovery records interruption exactly once; it never queues a retry,
+    /// restores a lease, replays actions, or translates receipts into evidence.
+    mutating func recoverInterruptedTask(journal: ActionRecoveryJournal) throws -> String? {
+        guard let activeTask else { return nil }
+        guard journal.matches(activeTask) else { throw ActionRecoveryJournal.unavailable }
+        let summary = journal.summary(task: activeTask.id)
+        let message = summary.uncertain > 0
+            ? "TaskPilot restarted during an action. Its effects remain uncertain and must be inspected before considering another execution. Nothing was automatically replayed or marked complete."
+            : "TaskPilot restarted before this task finished. Saved receipt states do not prove task completion. Nothing was automatically replayed."
+        if !history.contains(where: { $0.id == activeTask.id }) {
+            history.append(AgentTaskHistoryEntry(id: activeTask.id, request: activeTask.request,
+                responseTitle: "Task interrupted", response: message, outcome: .stopped,
+                startedAt: activeTask.startedAt, wasQueued: activeTask.wasQueued))
+        }
+        // Queue removal and active authorization were committed together before
+        // launch; this also handles a recovered older duplicate queue record.
+        if let id = activeTask.queuedTaskID { queue.removeAll { $0.id == id } }
+        self.activeTask = nil
+        return message
+    }
 }
 
 enum AgentTaskQueueOrdering {
@@ -180,7 +212,8 @@ struct AgentTaskLedgerStore: Sendable {
 
     func save(
         queue: [QueuedAgentTask],
-        history: [AgentTaskHistoryEntry]
+        history: [AgentTaskHistoryEntry],
+        activeTask: AgentTaskAuthorization? = nil
     ) throws {
         try BackendTelemetry.current.measure(.persistenceWrite, items: queue.count + history.count) { span in
             let fileManager = FileManager.default
@@ -198,12 +231,12 @@ struct AgentTaskLedgerStore: Sendable {
             let telemetry = BackendTelemetry.current
             let data = try codingQueue.sync {
                 try telemetry.measure(.jsonEncoding) { encoding in
-                    let data = try encoder.encode(AgentTaskLedgerSnapshot(queue: queue, history: history))
+                    let data = try encoder.encode(AgentTaskLedgerSnapshot(queue: queue, history: history, activeTask: activeTask))
                     encoding.record(outputBytes: data.count)
                     return data
                 }
             }
-            try data.write(to: fileURL, options: .atomic)
+            try PrivateDurableFile.replace(data, at: fileURL)
             try fileManager.setAttributes(
                 [.posixPermissions: Self.filePermissions],
                 ofItemAtPath: fileURL.path

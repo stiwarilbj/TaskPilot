@@ -136,6 +136,9 @@ final class TaskPilotCoordinator: ObservableObject {
     private let geminiAPIKeyStore = GeminiAPIKeyStore()
     private let geminiModelVerifier = GeminiModelVerifier()
     private let taskLedgerStore = AgentTaskLedgerStore()
+    private var recoveryJournal: ActionRecoveryJournal?
+    private var recoveryFailure: String?
+    private var currentTaskAuthorization: AgentTaskAuthorization?
     private var savedGeminiAPIKey = ""
     private let betterDisplay = BetterDisplayService()
     private let completionNotifications = CompletionNotificationService()
@@ -266,11 +269,25 @@ final class TaskPilotCoordinator: ObservableObject {
 
     init() {
         do {
-            let ledger = try taskLedgerStore.load()
+            let journal = try ActionRecoveryJournal()
+            recoveryJournal = journal
+            var ledger = try taskLedgerStore.load()
+            let interruptedID = ledger.activeTask?.id
+            if let message = try ledger.recoverInterruptedTask(journal: journal) {
+                // Persist the interruption before normal queue processing can
+                // run. A second crash cannot enqueue or record it twice.
+                try taskLedgerStore.save(queue: ledger.queue, history: ledger.history)
+                if let interruptedID { try journal.close(task: interruptedID) }
+                runState = .failed
+                status = message
+            }
+            try journal.sealAfterRestart()
             queuedTasks = ledger.queue
             taskHistory = ledger.history.sorted { $0.finishedAt > $1.finishedAt }
         } catch {
-            status = "\(TaskPilotIdentity.displayName) could not load Queue & History: \(error.localizedDescription)"
+            recoveryFailure = "\(TaskPilotIdentity.displayName) could not safely restore private task recovery data: \(error.localizedDescription)"
+            runState = .failed
+            status = recoveryFailure!
         }
         do {
             if let loadedKey = try geminiAPIKeyStore.load(),
@@ -1073,10 +1090,10 @@ final class TaskPilotCoordinator: ObservableObject {
     }
 
     private func startNextQueuedTaskIfPossible() {
-        guard !isActive, isReady, !windowsPresentedOnMain,
+        guard recoveryFailure == nil, !isActive, isReady, !windowsPresentedOnMain,
               !queuedTasks.isEmpty else { return }
         let next = queuedTasks.removeFirst()
-        persistTaskLedger()
+        // Removal is saved atomically with the task authorization below.
         startTask(request: next.request, queuedTask: next)
     }
 
@@ -1084,6 +1101,11 @@ final class TaskPilotCoordinator: ObservableObject {
         request: String,
         queuedTask: QueuedAgentTask?
     ) {
+        guard recoveryFailure == nil, let recoveryJournal else {
+            if let queuedTask { queuedTasks.insert(queuedTask, at: 0) }
+            status = recoveryFailure ?? ActionRecoveryJournal.unavailable.localizedDescription
+            return
+        }
         guard !isActive,
               isReady,
               !windowsPresentedOnMain,
@@ -1096,8 +1118,21 @@ final class TaskPilotCoordinator: ObservableObject {
             showingSetup = true
             return
         }
+        let authorization = AgentTaskAuthorization(request: request, wasQueued: queuedTask != nil,
+            queuedTaskID: queuedTask?.id)
+        do {
+            try recoveryJournal.register(authorization)
+            try taskLedgerStore.save(queue: queuedTasks, history: taskHistory, activeTask: authorization)
+        } catch {
+            if let queuedTask { queuedTasks.insert(queuedTask, at: 0) }
+            recoveryFailure = "Could not durably prepare the task. No actions were started: \(error.localizedDescription)"
+            runState = .failed
+            status = recoveryFailure!
+            return
+        }
+        currentTaskAuthorization = authorization
         currentTaskRequest = request
-        currentTaskStartedAt = Date()
+        currentTaskStartedAt = authorization.startedAt
         currentTaskWasQueued = queuedTask != nil
         runState = .running
         status = "Looking at the agent screen…"
@@ -1105,7 +1140,8 @@ final class TaskPilotCoordinator: ObservableObject {
         requestMetrics = nil
         userInputRequest = nil
         userInputDraft = ""
-        let lease = TaskLease(taskRequest: request, closePersistentProcesses: closesTaskAppsAfterUse)
+        let lease = TaskLease(taskRequest: request, closePersistentProcesses: closesTaskAppsAfterUse,
+            recoveryJournal: recoveryJournal, recoveryTask: authorization.id)
         currentTaskLease = lease
         accessibility.beginTaskResourceTracking(on: display, lease: lease)
         agentCursor.hide()
@@ -1130,7 +1166,6 @@ final class TaskPilotCoordinator: ObservableObject {
             _ = accessibility.finishTaskResourceTracking(
                 closeOpenedResources: closesTaskAppsAfterUse
             )
-            lease.retire()
             let wasQueued = currentTaskWasQueued
             runState = .failed
             let message = "Could not start the agent: \(error.localizedDescription)"
@@ -1140,6 +1175,7 @@ final class TaskPilotCoordinator: ObservableObject {
                 responseTitle: "Could not start",
                 response: message
             )
+            lease.retire()
             if wasQueued {
                 completionNotifications.deliverQueuedTaskFinished(
                     enabled: completionNotificationsEnabled,
@@ -1411,6 +1447,7 @@ final class TaskPilotCoordinator: ObservableObject {
               let startedAt = currentTaskStartedAt else { return }
         let wasQueued = currentTaskWasQueued
         let entry = AgentTaskHistoryEntry(
+            id: currentTaskAuthorization?.id ?? UUID(),
             request: request,
             responseTitle: responseTitle,
             response: response,
@@ -1427,6 +1464,7 @@ final class TaskPilotCoordinator: ObservableObject {
         currentTaskRequest = nil
         currentTaskStartedAt = nil
         currentTaskWasQueued = false
+        currentTaskAuthorization = nil
         persistTaskLedger()
     }
 
@@ -1450,11 +1488,14 @@ final class TaskPilotCoordinator: ObservableObject {
     }
 
     private func persistTaskLedger() {
+        guard recoveryFailure == nil else { return }
         do {
-            try taskLedgerStore.save(queue: queuedTasks, history: taskHistory)
+            try taskLedgerStore.save(queue: queuedTasks, history: taskHistory, activeTask: currentTaskAuthorization)
         } catch {
+            // Do not advance queued work after losing the durable handoff.
+            recoveryFailure = "\(TaskPilotIdentity.displayName) could not save Queue & History: \(error.localizedDescription)"
             if !isActive {
-                status = "\(TaskPilotIdentity.displayName) could not save Queue & History: \(error.localizedDescription)"
+                status = recoveryFailure!
             }
         }
     }

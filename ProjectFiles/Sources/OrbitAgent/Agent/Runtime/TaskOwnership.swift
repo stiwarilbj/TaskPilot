@@ -19,8 +19,9 @@ final class TaskLease: @unchecked Sendable {
     private var closePersistentProcesses: Bool
     private var persistentProcesses: [SubprocessSupervisor] = []
     private var processCleanupStarted = false
-    init(id: String = UUID().uuidString, taskRequest: String = "", closePersistentProcesses: Bool = true) {
-        self.id = id; self.actionReceipts = ActionReceiptStore(generation: id)
+    init(id: String = UUID().uuidString, taskRequest: String = "", closePersistentProcesses: Bool = true,
+         recoveryJournal: ActionRecoveryJournal? = nil, recoveryTask: UUID? = nil) {
+        self.id = id; self.actionReceipts = ActionReceiptStore(generation: id, journal: recoveryJournal, recoveryTask: recoveryTask)
         self.closePersistentProcesses = closePersistentProcesses
         // Conservative authorization from the original user request, never a
         // model response or command's background operator alone.
