@@ -50,6 +50,7 @@ from request_policy import (
 )
 from provider_errors import ProviderRequestError, facts as provider_error_facts, message_text, response_error
 from action_receipts import BridgeReplyLost, RuntimeInbox, reconcile_receipt
+from task_execution import TaskContext, Phase, ExecutionStateError, current_task
 from bounded_transport import ACPTransport, TransportFailure, FRAME_BYTES, read_frames, write_frame
 from prompt_compiler import (
     PROMPT_COMPILER_VERSION, COMPLETION_RULES, json_data, recovery_condition,
@@ -112,6 +113,21 @@ _pressure_lock = threading.Lock()
 _pressure_images = None
 
 
+def _task_value(name: str) -> Any:
+    context = current_task.get()
+    if context is not None:
+        return getattr(context, name)
+    return globals()["_task_generation_id" if name == "generation" else "_" + name]
+
+
+def _set_task_value(name: str, value: Any) -> None:
+    context = current_task.get()
+    if context is not None:
+        setattr(context, name, value)
+    else:
+        globals()["_" + name] = value
+
+
 def handle_runtime_control(line: str) -> bool:
     try:
         message = json.loads(line)
@@ -123,7 +139,7 @@ def handle_runtime_control(line: str) -> bool:
         images = _pressure_images
     generation = message.get("task_generation_id")
     if (images is not None and isinstance(generation, str) and generation
-            and generation == _task_generation_id == images.generation
+            and generation == images.generation
             and message.get("level") in ("warning", "critical")):
         images.evict_disposable()
     # Consume invalid/stale pressure controls too; never confuse them with a
@@ -133,6 +149,12 @@ def handle_runtime_control(line: str) -> bool:
 
 def runtime_inbox() -> RuntimeInbox:
     global _runtime_inbox
+    context = current_task.get()
+    if context is not None:
+        if context.inbox is None:
+            context.inbox = (_runtime_inbox if _runtime_inbox is not None and _runtime_inbox.stream is sys.stdin
+                             else RuntimeInbox(sys.stdin, control_handler=handle_runtime_control))
+        return context.inbox
     if _runtime_inbox is None or _runtime_inbox.stream is not sys.stdin:
         _runtime_inbox = RuntimeInbox(sys.stdin, control_handler=handle_runtime_control)
     return _runtime_inbox
@@ -174,7 +196,7 @@ class TaskModelRouter(AdaptiveModelRouter):
 
 def emit(kind: str, **payload: Any) -> None:
     envelope = {"kind": kind, **payload}
-    if _task_generation_id is not None: envelope["task_generation_id"] = _task_generation_id
+    if _task_value('generation') is not None: envelope["task_generation_id"] = _task_value('generation')
     print(json.dumps(envelope, separators=(",", ":")), flush=True)
 
 
@@ -346,7 +368,7 @@ def _check_models(path: str, key: str, read_only: bool = False) -> bool:
 def bridge_exchange(method: str, display_id: int, params: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
     request_id = str(uuid.uuid4())
     inbox = runtime_inbox()
-    key = inbox.register('bridge_response', request_id, _task_generation_id)
+    key = inbox.register('bridge_response', request_id, _task_value('generation'))
     try:
         emit("bridge_request", request_id=request_id, method=method,
              params={"display_id": display_id, **params})
@@ -356,13 +378,19 @@ def bridge_exchange(method: str, display_id: int, params: dict[str, Any], timeou
 
 
 def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
-    global _bridge_observation_revision
+    context = current_task.get()
+    if context is not None:
+        effect = {"act": "execute", "observe": "observe", "action_receipt": "receipt",
+                  "check_effect": "read", "wait_file_effect": "read", "recheck": "read",
+                  "inspect_command": "read", "wait_for_change": "read"}.get(method)
+        if effect is None: raise ExecutionStateError("Unknown task bridge operation")
+        context.machine.require(effect)
     timeout = params.pop("_reply_timeout", None)
     if method == "observe":
-        params.setdefault("observation_keywords", _observation_keywords)
+        params.setdefault("observation_keywords", _task_value('observation_keywords'))
     if method == "act":
-        if _bridge_observation_revision:
-            params.setdefault("observation_revision", _bridge_observation_revision)
+        if _task_value("bridge_observation_revision"):
+            params.setdefault("observation_revision", _task_value("bridge_observation_revision"))
         # A UUID represents this logical execution, not a hash of its payload.
         # Repairs and model selection happen before it can be allocated.
         if "action_id" not in params:
@@ -372,6 +400,7 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
         timeout = 30.0
         if params.get("action", {}).get("type") == "run_command":
             timeout += float(params["action"].get("timeout_seconds", action_default("run_command", "timeout_seconds")))
+        if context is not None: context.machine.dispatch(params["action_id"])
     try:
         response = bridge_exchange(method, display_id, params, timeout)
         if not isinstance(response, dict) or type(response.get('ok')) is not bool:
@@ -401,42 +430,48 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
                 validate_native_receipt(receipt, params['action_id'], params['action'])
             elif response['ok']:
                 raise NativeProtocolError('bridge_response.action_receipt is required for native actions')
+            elif response['terminal'] is False:
+                raise BridgeReplyLost('The native action is still dispatched')
     except BridgeReplyLost as error:
         if method != "act": raise
+        if context is not None: context.machine.reconcile()
         if not error.connected:
-            _receipt_metrics["receipt_unresolved"] += 1
+            _task_value('receipt_metrics')["receipt_unresolved"] += 1
             raise
         if error.code:
             emit('status', message=f'Native transport failure ({error.code}); checking the action receipt without repeating it…')
         response = reconcile_receipt(params["action_id"],
             lambda action_id, remaining: bridge_call("action_receipt", display_id,
-                action_id=action_id, _reply_timeout=remaining), _receipt_metrics,
+                action_id=action_id, _reply_timeout=remaining), _task_value('receipt_metrics'),
             clock=time.monotonic, sleep=time.sleep, action=params['action'])
     if not response['ok']:
         if response['error_code'] == 'protocol_error': raise NativeProtocolError(response['error'])
+        if context is not None and method == 'act': context.machine.resolve(params['action_id'])
         raise ActionRejected(response['error'], response['error_code'],
                              {'outcome': response['outcome'], 'verification_scope': response['verification_scope']})
     result = response.get("result")
     if isinstance(result, dict):
-        if method == 'act': validate_native_result(result, params['action'])
+        if method == 'act':
+            validate_native_result(result, params['action'])
+            if context is not None: context.machine.resolve(params['action_id'])
         elif method == 'action_receipt': validate_native_receipt(result, params['action_id'])
         elif method in {'check_effect', 'wait_file_effect'}:
             validate_check_batch(result, requested_checks=[params['check']])
         elif method == 'recheck': validate_native_readback(result, params['action'])
         if method == "observe" and isinstance(result, dict):
-            if _task_generation_id is not None and result.get("task_generation_id") != _task_generation_id:
+            if _task_value('generation') is not None and result.get("task_generation_id") != _task_value('generation'):
                 raise ActionRejected("Observation belongs to another task", "cancelled")
             result = dict(result)
             result.pop("task_generation_id", None)
             try:
-                validate_observation_mapping(result, required=_task_generation_id is not None)
-                validate_completeness(result, required=_task_generation_id is not None)
-                validate_text_recognition(result, required=_task_generation_id is not None)
+                validate_observation_mapping(result, required=_task_value('generation') is not None)
+                validate_completeness(result, required=_task_value('generation') is not None)
+                validate_text_recognition(result, required=_task_value('generation') is not None)
             except (CoordinateMappingError, ObservationCompletenessError, TextRecognitionError) as error:
-                _bridge_observation_revision = None
+                _set_task_value("bridge_observation_revision", None)
                 discard_observation_image(result)
                 raise ActionRejected(str(error), "observation_unstable") from error
-            _bridge_observation_revision = result.get("observation_revision")
+            _set_task_value("bridge_observation_revision", result.get("observation_revision"))
         return result
     raise NativeProtocolError('bridge_response.result must be an object')
 
@@ -963,7 +998,7 @@ class ScreenshotBuffers:
 
     def observation(self, observation: dict[str, Any]) -> RevisionedJSONState:
         with self._lock:
-            if self.generation != _task_generation_id:
+            if self.generation != _task_value('generation'):
                 raise ActionRejected("Observation belongs to another task", "cancelled")
             path = Path(str(observation.get("screenshot_path") or "")).absolute()
             key = (path, observation.get("observation_revision"))
@@ -976,7 +1011,7 @@ class ScreenshotBuffers:
 
     def image(self, path: Path, revision: str | None = None) -> ScreenshotBuffer:
         with self._lock:
-            if self.generation != _task_generation_id:
+            if self.generation != _task_value('generation'):
                 raise ActionRejected("Observation image belongs to another task", "cancelled")
             path = path.absolute()
             key = (path, revision) if revision is not None else self.current.get(path, (path, None))
@@ -1026,7 +1061,10 @@ class ScreenshotBuffers:
 @contextmanager
 def screenshot_buffer_scope():
     global _pressure_images
-    images = ScreenshotBuffers(_task_generation_id)
+    images = ScreenshotBuffers(_task_value('generation'))
+    context = current_task.get()
+    previous_owned_images = context.images if context is not None else None
+    if context is not None: context.images = images
     with _pressure_lock:
         previous = _pressure_images
         _pressure_images = images
@@ -1039,6 +1077,7 @@ def screenshot_buffer_scope():
             if _pressure_images is images: _pressure_images = previous
         images.clear()
         _screenshot_buffers.reset(token)
+        if context is not None: context.images = previous_owned_images
 
 
 def screenshot_buffer(path: Path, revision: str | None = None) -> ScreenshotBuffer:
@@ -1205,12 +1244,12 @@ def record_local_wake(wake: dict[str, Any]) -> None:
     for field, metric in [('notifications', 'local_notifications'), ('targeted_checks', 'local_targeted_checks')]:
         count = wake.get(field)
         if type(count) is int and 0 <= count <= 10000:
-            _local_change_metrics[metric] += count
+            _task_value('local_change_metrics')[metric] += count
     polls = wake.get('poll_wakeups')
     if type(polls) is int and 0 <= polls <= 10000:
-        _local_change_metrics['local_poll_wakeups'] += polls
+        _task_value('local_change_metrics')['local_poll_wakeups'] += polls
     elif polls is None and wake.get('reason') == 'poll_timeout':
-        _local_change_metrics['local_poll_wakeups'] += 1
+        _task_value('local_change_metrics')['local_poll_wakeups'] += 1
 
 
 def command_outcome_verified(action: dict[str, Any], result: dict[str, Any]) -> bool:
@@ -1385,7 +1424,7 @@ def decision_user_input_target(decision: dict[str, Any]) -> dict[str, Any]:
 def wait_for_user_input(request_id: str, *, key=None) -> str:
     inbox = runtime_inbox()
     owns_key = key is None
-    key = key or inbox.register('user_input_response', request_id, _task_generation_id)
+    key = key or inbox.register('user_input_response', request_id, _task_value('generation'))
     try:
         response = json.loads(runtime_line(key=key))
         value = response.get("value")
@@ -1403,9 +1442,11 @@ def request_and_enter_user_input(
     target: dict[str, Any],
     display_id: int,
 ) -> dict[str, Any]:
+    context = current_task.get()
+    if context is not None: context.machine.require("secure_input")
     request_id = str(uuid.uuid4())
     inbox = runtime_inbox()
-    key = inbox.register('user_input_response', request_id, _task_generation_id)
+    key = inbox.register('user_input_response', request_id, _task_value('generation'))
     try:
         emit("user_input_required", request_id=request_id, title=target["title"],
              message=target["message"], input_kind=target["input_kind"])
@@ -1433,6 +1474,8 @@ def complete_from_decision(decision: dict[str, Any], fallback: str, ledger: Task
     message = decision["output"] if isinstance(decision.get("output"), str) else str(fallback or "Task completed")
     if not ledger.can_complete(message):
         raise RuntimeError("TaskPilot cannot complete without evidence for every requested requirement")
+    context = current_task.get()
+    if context is not None: context.machine.complete()
     title = str(decision.get("output_title") or "OpenClaw result").strip()
     kind = str(decision.get("output_kind") or "result")
     if kind not in {"answer", "result", "completion"}:
@@ -1853,7 +1896,6 @@ def largest_downloads_next_action(
 
 class ACPClient:
     def __init__(self, openclaw_path: str) -> None:
-        global _active_acp_process
         environment = dict(os.environ)
         environment["OPENCLAW_HIDE_BANNER"] = "1"
         environment["OPENCLAW_SUPPRESS_NOTES"] = "1"
@@ -1868,7 +1910,7 @@ class ACPClient:
             bufsize=1,
             env=environment,
         )
-        _active_acp_process = self.process
+        _set_task_value("active_acp_process", self.process)
         self.transport = ACPTransport()
         self.stderr_tail: deque[str] = deque(maxlen=12)
         self.next_request_id = 1
@@ -2246,7 +2288,6 @@ class ACPClient:
         return response
 
     def close(self) -> None:
-        global _active_acp_process
         if self.process.poll() is None:
             try:
                 self._send({
@@ -2265,8 +2306,8 @@ class ACPClient:
         for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
             if stream is not None and not stream.closed:
                 stream.close()
-        if _active_acp_process is self.process:
-            _active_acp_process = None
+        if _task_value("active_acp_process") is self.process:
+            _set_task_value("active_acp_process", None)
 
 
 def prompt_capability_context(context: dict[str, Any]) -> dict[str, Any]:
@@ -2299,9 +2340,10 @@ def command_capability_summary(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def remember_command_capability(key: str, value: dict[str, Any]) -> None:
-    if len(_command_capabilities) >= 8 and key not in _command_capabilities:
-        _command_capabilities.pop(next(iter(_command_capabilities)))
-    _command_capabilities[key] = value
+    capabilities = _task_value('command_capabilities')
+    if len(capabilities) >= 8 and key not in capabilities:
+        capabilities.pop(next(iter(capabilities)))
+    capabilities[key] = value
 
 
 def inspect_general_command(action: dict[str, Any], display_id: int, observation: dict[str, Any]) -> dict[str, Any]:
@@ -2316,11 +2358,11 @@ def inspect_general_command(action: dict[str, Any], display_id: int, observation
     if (type(result.get('ready')) is not bool or type(result.get('capability_version')) is not int or
             result['capability_version'] != COMMAND_CAPABILITY_VERSION or not isinstance(result.get('tools', []), list)):
         raise RuntimeError('TaskPilot returned incompatible command inspection data; no command was executed')
-    _command_capability_metrics['command_inspections'] += 1
+    _task_value('command_capability_metrics')['command_inspections'] += 1
     for field, metric in [('probes', 'command_probes'), ('cache_hits', 'command_probe_cache_hits')]:
         count = result.get(field, 0)
-        if type(count) is int and 0 <= count <= 64: _command_capability_metrics[metric] += count
-    if result.get('cache_hit') is True: _command_capability_metrics['command_probe_cache_hits'] += 1
+        if type(count) is int and 0 <= count <= 64: _task_value('command_capability_metrics')[metric] += count
+    if result.get('cache_hit') is True: _task_value('command_capability_metrics')['command_probe_cache_hits'] += 1
     summary = command_capability_summary(result)
     for tool in summary['tools']:
         key = tool.get('executable', '') + ':' + tool.get('context', '')
@@ -2329,7 +2371,7 @@ def inspect_general_command(action: dict[str, Any], display_id: int, observation
         remember_command_capability('shell:limits', {'name': '/bin/zsh', 'option_status': 'partial',
                                                     'reason': ' '.join(summary['limitations'])})
     if result['ready'] is not True:
-        _command_capability_metrics['command_preflight_rejections'] += 1
+        _task_value('command_capability_metrics')['command_preflight_rejections'] += 1
         raise ActionRejected(str(result.get('message') or 'Inspect the command capabilities before execution'),
             str(result.get('error_code') or 'command_options_unverified'), {'command_capabilities': summary})
     identifier = result.get('inspection_id')
@@ -2411,8 +2453,8 @@ def desktop_instruction(
     ledger: TaskEvidenceLedger | None = None,
 ) -> str:
     context = task_capability_context(task, observation)
-    if _command_capabilities:
-        context['command_capabilities'] = [_command_capabilities[key] for key in sorted(_command_capabilities)]
+    if _task_value('command_capabilities'):
+        context['command_capabilities'] = [_task_value('command_capabilities')[key] for key in sorted(_task_value('command_capabilities'))]
     examples = relevant_action_examples(context, observation, history)
     operation_kind = next((kind for kind, recipe in CONTRACT['command_operations'].items()
                            if re.search(recipe['intent_pattern'], task, re.I)), None)
@@ -2730,7 +2772,7 @@ def publish_task_metrics(router: TaskModelRouter, client: ACPClient, ledger: Tas
     # before completion so the originating invocation can still accept them.
     router.metrics.update(evidence_checks=ledger.checks, coverage_rejections=ledger.rejections,
         requirements_proven=sum(r["state"] == "proven" for r in ledger.requirements.values()),
-        dependency_rejections=ledger.dependency_rejections, **_receipt_metrics, **_local_change_metrics, **_command_capability_metrics)
+        dependency_rejections=ledger.dependency_rejections, **_task_value('receipt_metrics'), **_task_value('local_change_metrics'), **_task_value('command_capability_metrics'))
     router.metrics.update(prompt_calls=client.prompt_calls, model_switches=client.model_switches)
     emit("request_metrics", **router.metrics)
 
@@ -2817,8 +2859,10 @@ def routed_json_prompt(
     observation: dict[str, Any] | None = None,
     ledger: TaskEvidenceLedger | None = None,
 ) -> dict[str, Any]:
+    context = current_task.get()
+    if context is not None: context.machine.require("verify" if purpose == "verification" else "plan")
     image = screenshot_buffer(screenshot_path, (observation or {}).get("observation_revision"))
-    identity = (STATE_FINGERPRINT_VERSION, _task_generation_id, VALIDATION_VERSION, CONTRACT_HASH,
+    identity = (STATE_FINGERPRINT_VERSION, _task_value('generation'), VALIDATION_VERSION, CONTRACT_HASH,
         CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, LOCAL_CHANGE_VERSION, COMMAND_CAPABILITY_VERSION,
         PROMPT_COMPILER_VERSION, VERIFICATION_SESSION_VERSION, COORDINATE_MAPPING_VERSION,
         OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION,
@@ -2854,390 +2898,437 @@ def routed_json_prompt(
 
 
 def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str) -> None:
-    with screenshot_buffer_scope():
-        _run_task(task, display_id, openclaw_path, api_key)
+    if current_task.get() is not None:
+        raise ExecutionStateError("A task already owns this execution context")
+    context = TaskContext(task, display_id, _task_value('generation'))
+    token = current_task.set(context)
+    try:
+        with screenshot_buffer_scope():
+            _run_task(task, display_id, openclaw_path, api_key)
+    finally:
+        current_task.reset(token)
 
 
 def _run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str) -> None:
-    global _observation_keywords
-    _observation_keywords = []
-    _receipt_metrics.update(receipt_queries=0, receipt_recoveries=0, receipt_unresolved=0)
-    _local_change_metrics.update(local_notifications=0, local_targeted_checks=0, local_poll_wakeups=0)
-    _command_capability_metrics.update(command_inspections=0, command_probes=0, command_probe_cache_hits=0, command_preflight_rejections=0)
-    _command_capabilities.clear()
-    ledger = TaskEvidenceLedger(task, _task_generation_id)
-    resolved_openclaw = find_openclaw(openclaw_path)
-    state = prepare_runtime(resolved_openclaw, api_key)
-    api_key = ""
-    if is_largest_downloads_file_task(task):
-        # This is an objective local filesystem fact, not a visual judgment.
-        # Answer it from exact metadata after the user explicitly names
-        # Downloads, avoiding Gemini quota use and Finder sort/group ambiguity.
-        emit("status", message=f"{PRODUCT_NAME} is checking exact file sizes in Downloads…")
-        largest = largest_top_level_file(Path.home() / "Downloads")
-        readable_size = formatted_file_size(int(largest["bytes"]))
-        message = (
-            f"The largest file in your Downloads folder is '{largest['name']}', "
-            f"which is {readable_size} ({int(largest['bytes']):,} bytes)."
-        )
-        ledger.local_answer(message)
-        emit("request_metrics", planning=0, verification=0, retries=0, model_switches=0, cache_hits=0, reconnects=0, provider_retries=None, **_receipt_metrics)
-        complete_from_decision({"output": message, "output_title": "Largest File in Downloads", "output_kind": "answer"}, message, ledger)
-        return
-    if ledger.local_complete_grammar:
-        check = next(iter(ledger.requirements.values()))["check"]
+    context = current_task.get()
+    if context is None:
+        raise ExecutionStateError("Task execution requires an owned context")
+    TaskExecution(context).run(openclaw_path, api_key)
+
+
+class TaskExecution:
+    """Phase handlers share one owned context; only the dispatcher advances work.
+
+    Native delivery/receipt and model boundaries independently enforce the phase
+    permissions, so a helper cannot accidentally execute during verification.
+    SIGSTOP freezes this process (including recovery waits); SIGCONT continues
+    the same phase and pending receipt. Native leases still gate real delivery.
+    """
+    def __init__(self, context: TaskContext):
+        self.c = context
+
+    def run(self, openclaw_path: str | None, api_key: str) -> None:
+        c = self.c
+        try:
+            c.ledger = TaskEvidenceLedger(c.task, c.generation)
+            c.recovery = ActionRecovery()
+            c.recovery_cycles = RecoveryCycles(rejection_limit=MAX_IDENTICAL_ACTIONS)
+            c.evidence_guard = EvidenceConsistency()
+            c.machine.require("configure")
+            resolved = find_openclaw(openclaw_path)
+            c.runtime_state = prepare_runtime(resolved, api_key)
+            api_key = ""
+            if self.local_task():
+                return
+            c.observation_keywords = sorted(w for w in words(c.task) if len(w) <= 64 and w.isalnum())[:48]
+            c.machine.require("connect")
+            try:
+                c.client = ACPClient(resolved)
+            except Exception as error:
+                c.runtime_state.record_failure(PRIMARY_MODELS[0], classify_failure(error, time.time()))
+                emit("model_health", model=PRIMARY_MODELS[0], state="repair", detail=str(error))
+                raise
+            c.router = TaskModelRouter(state=c.runtime_state)
+            c.machine.transition(Phase.OBSERVING)
+            emit("status", message=f"OpenClaw is connecting to the {PRODUCT_NAME} screen…")
+            handlers = {
+                Phase.OBSERVING: self.observe, Phase.PLANNING: self.plan,
+                Phase.RECONCILING: self.reconcile, Phase.EXECUTING: self.execute,
+                Phase.WAITING_INPUT: self.secure_input, Phase.VERIFYING: self.verify,
+            }
+            while c.machine.phase != Phase.DRAINING:
+                handlers[c.machine.phase]()
+        except BaseException:
+            c.machine.drain()  # Includes Stop/SystemExit, not just provider errors.
+            if c.runtime_state is not None:
+                c.runtime_state.invalidate()
+            raise
+        finally:
+            c.machine.drain()
+            try:
+                discard_observation_image(c.pending_observation)
+                discard_observation_image(c.observation)
+                c.pending_observation = c.observation = None
+                c.observation_keywords.clear()
+                c.command_capabilities.clear()
+                if c.router is not None:
+                    c.router.metrics.update(recovery_cycles=c.recovery_cycles.detections,
+                                            cycle_suppressions=c.recovery_cycles.suppressions)
+                    publish_task_metrics(c.router, c.client, c.ledger)
+            finally:
+                if c.client is not None: c.client.close()
+            c.machine.transition(Phase.FINISHED, cleanup=True)
+
+    def local_task(self) -> bool:
+        c = self.c
+        if is_largest_downloads_file_task(c.task):
+            c.machine.transition(Phase.OBSERVING)
+            emit("status", message=f"{PRODUCT_NAME} is checking exact file sizes in Downloads…")
+            largest = largest_top_level_file(Path.home() / "Downloads")
+            message = (f"The largest file in your Downloads folder is '{largest['name']}', "
+                       f"which is {formatted_file_size(int(largest['bytes']))} ({int(largest['bytes']):,} bytes).")
+            c.ledger.local_answer(message)
+            c.machine.transition(Phase.VERIFYING, local_request=True)
+            self.local_metrics()
+            complete_from_decision({"output": message, "output_title": "Largest File in Downloads", "output_kind": "answer"}, message, c.ledger)
+            return True
+        if not c.ledger.local_complete_grammar:
+            return False
+        c.machine.transition(Phase.OBSERVING)
+        c.machine.transition(Phase.EXECUTING, local_request=True)
+        check = next(iter(c.ledger.requirements.values()))["check"]
         action = {"type": "read_file", "path": check["path"], "max_bytes": action_default("read_file", "max_bytes")}
-        result = bridge_call("act", display_id, action=action)
-        ledger.record_action(action, result)
+        result = bridge_call("act", c.display_id, action=action)
+        c.ledger.record_action(action, result)
         if result.get("truncated") is not False:
             raise RuntimeError("The requested full file contents exceed the bounded 128 KiB read limit; the task is incomplete")
-        output = ledger.exact_output(check, next(iter(ledger.requirements.values()))["evidence_ids"])
+        output = c.ledger.exact_output(check, next(iter(c.ledger.requirements.values()))["evidence_ids"])
         if output is None:
             raise RuntimeError("TaskPilot could not verify the requested file contents; the task is incomplete")
-        emit("request_metrics", planning=0, verification=0, retries=0, model_switches=0, cache_hits=0, reconnects=0, provider_retries=None, **_receipt_metrics)
-        complete_from_decision({"output": output, "output_title": "File contents", "output_kind": "result"}, str(result.get("message") or "Read file"), ledger)
-        return
+        c.machine.reconcile()
+        # The entire local grammar and deterministic evidence replace planning.
+        c.machine.transition(Phase.OBSERVING)
+        c.machine.transition(Phase.VERIFYING, local_request=True)
+        self.local_metrics()
+        complete_from_decision({"output": output, "output_title": "File contents", "output_kind": "result"}, str(result.get("message") or "Read file"), c.ledger)
+        return True
 
-    _observation_keywords = sorted(w for w in words(task) if len(w) <= 64 and w.isalnum())[:48]
-    try:
-        client = ACPClient(resolved_openclaw)
-    except Exception as error:
-        _observation_keywords = []
-        state.record_failure(PRIMARY_MODELS[0], classify_failure(error, time.time()))
-        emit("model_health", model=PRIMARY_MODELS[0], state="repair", detail=str(error))
-        raise
-    model_router = TaskModelRouter(state=state)
-    history: list[dict[str, Any]] = []
-    last_action_signature = ""
-    last_screen_digest = ""
-    identical_action_count = 0
-    consecutive_action_failures = 0
-    blocked_recoveries = 0
-    pending_observation: dict[str, Any] | None = None
-    recovery = ActionRecovery()
-    recovery_cycles = RecoveryCycles(rejection_limit=MAX_IDENTICAL_ACTIONS)
-    loading_pid: int | None = None
-    loading_waits = 0
-    consecutive_dependency_blocks = 0
-    evidence_guard = EvidenceConsistency()
-    consecutive_evidence_conflicts = 0
-    command_hints_inspected = False
-    def defer_for_evidence(decision: dict, observation: dict, step: int) -> bool:
-        nonlocal pending_observation, consecutive_evidence_conflicts
-        conflicts = evidence_guard.conflicts(decision, observation, ledger)
+    def local_metrics(self) -> None:
+        emit("request_metrics", planning=0, verification=0, retries=0, model_switches=0,
+             cache_hits=0, reconnects=0, provider_retries=None, **self.c.receipt_metrics)
+
+    def observe(self) -> None:
+        c = self.c
+        c.step += 1
+        if c.step > MAX_STEPS:
+            raise RuntimeError(f"{PRODUCT_NAME} reached its {MAX_STEPS}-step safety limit")
+        c.decision = c.action = c.result = c.recovered_result = c.input_target = c.failure = None
+        discard_observation_image(c.observation)
+        c.observation = c.pending_observation if c.pending_observation is not None else bridge_call("observe", c.display_id)
+        c.pending_observation = None
+        c.screenshot_path = Path(str(c.observation.get("screenshot_path") or ""))
+        if not c.screenshot_path.is_file():
+            raise RuntimeError(f"{PRODUCT_NAME} did not provide a readable screen image")
+        c.ledger.observe(c.observation)
+        cycle_report = c.recovery_cycles.observe(c.observation, c.ledger)
+        c.router.metrics.update(recovery_cycles=c.recovery_cycles.detections, cycle_suppressions=c.recovery_cycles.suppressions)
+        if cycle_report:
+            c.history.append({"step": c.step, "action": "recovery_cycle", "result": cycle_report})
+        c.input_target = secure_input_target(c.observation, c.history)
+        if c.input_target is not None:
+            discard_observation_image(c.observation)
+            c.machine.transition(Phase.WAITING_INPUT, secure_target=True)
+            return
+        if c.loading_pid is not None:
+            if observation_is_loading(c.observation, c.loading_pid):
+                c.reconcile_reason = "loading"
+                c.machine.transition(Phase.RECONCILING, observation=True)
+                return
+            c.loading_pid, c.loading_waits = None, 0
+        c.machine.transition(Phase.PLANNING, observation=True)
+
+    def plan(self) -> None:
+        c = self.c
+        try:
+            c.screenshot_digest = observation_image_digest(c.observation)
+            if not c.command_hints_inspected:
+                inspect_task_command_hints(c.task, c.display_id, c.observation)
+                c.command_hints_inspected = True
+            emit("status", message=f"OpenClaw is planning visible step {c.step}…")
+            c.decision = routed_json_prompt(c.router, c.client,
+                desktop_instruction(c.task, c.observation, c.history, c.ledger), c.screenshot_path,
+                observation=c.observation, ledger=c.ledger)
+        finally:
+            discard_observation_image(c.observation)
+        c.ledger.accept_plan(c.decision, c.observation)
+        emit("status", message=str(c.decision.get("summary") or "OpenClaw inspected the screen"))
+        c.reconcile_reason = "decision"
+        c.machine.transition(Phase.RECONCILING, decision=True)
+
+    def defer_for_evidence(self) -> bool:
+        c = self.c
+        conflicts = c.evidence_guard.conflicts(c.decision, c.observation, c.ledger)
         if not conflicts: return False
-        pending_observation, report = inspect_evidence(evidence_guard, conflicts, observation, display_id, ledger, model_router.metrics)
-        history.append({"step": step, "action": "evidence_inspection", "result": report})
-        consecutive_evidence_conflicts += 1
-        if consecutive_evidence_conflicts >= 3:
+        c.pending_observation, report = inspect_evidence(c.evidence_guard, conflicts, c.observation,
+                                                       c.display_id, c.ledger, c.router.metrics)
+        c.history.append({"step": c.step, "action": "evidence_inspection", "result": report})
+        c.consecutive_evidence_conflicts += 1
+        if c.consecutive_evidence_conflicts >= 3:
             raise RuntimeError("TaskPilot could not reconcile the target's conflicting evidence after three fresh decisions; no dependent action was dispatched")
         emit("status", message="Inspecting conflicting evidence before continuing…")
         return True
-    def completion_rejected() -> None:
-        nonlocal consecutive_evidence_conflicts
-        if history and isinstance(history[-1].get("result"), dict) and history[-1]["result"].get("error_code") == "evidence_conflict":
-            consecutive_evidence_conflicts += 1
-            if consecutive_evidence_conflicts >= 3:
-                raise RuntimeError("TaskPilot could not reconcile completion evidence after three fresh decisions; completion remains unconfirmed")
-    def defer_for_dependencies(decision: dict, observation: dict, step: int) -> bool:
-        nonlocal consecutive_dependency_blocks
-        blocked = prepare_dependency_action(decision, display_id, ledger, model_router.metrics, evidence_guard)
-        if defer_for_evidence(decision, observation, step): return True
+
+    def defer_for_dependencies(self) -> bool:
+        c = self.c
+        blocked = prepare_dependency_action(c.decision, c.display_id, c.ledger, c.router.metrics, c.evidence_guard)
+        if self.defer_for_evidence(): return True
         if blocked is None:
-            consecutive_dependency_blocks = 0
+            c.consecutive_dependency_blocks = 0
             return False
-        consecutive_dependency_blocks += 1
-        ledger.dependency_rejections += 1
-        history.append({"step": step, "action": decision.get("action"),
-                        "result": {"outcome": "rejected", "error_code": "prerequisite_unproven",
-                                   "message": "No action delivered; prove the prerequisite before advancing", **blocked},
-                        "requirement_ids": ledger.action_requirements(decision)})
-        if consecutive_dependency_blocks >= 3:
+        c.consecutive_dependency_blocks += 1
+        c.ledger.dependency_rejections += 1
+        c.history.append({"step": c.step, "action": c.decision.get("action"),
+            "result": {"outcome": "rejected", "error_code": "prerequisite_unproven",
+                       "message": "No action delivered; prove the prerequisite before advancing", **blocked},
+            "requirement_ids": c.ledger.action_requirements(c.decision)})
+        if c.consecutive_dependency_blocks >= 3:
             raise RuntimeError("TaskPilot could not prove the required prerequisites after three fresh decisions; no dependent action was delivered")
         emit("status", message="Checking the required prerequisites before continuing…")
         return True
-    try:
-        emit("status", message=f"OpenClaw is connecting to the {PRODUCT_NAME} screen…")
-        for step in range(1, MAX_STEPS + 1):
-            observation = pending_observation if pending_observation is not None else bridge_call("observe", display_id)
-            pending_observation = None
-            screenshot_path = Path(str(observation.get("screenshot_path") or ""))
-            if not screenshot_path.is_file():
-                raise RuntimeError(f"{PRODUCT_NAME} did not provide a readable screen image")
-            ledger.observe(observation)
-            cycle_report = recovery_cycles.observe(observation, ledger)
-            model_router.metrics.update(recovery_cycles=recovery_cycles.detections,
-                                        cycle_suppressions=recovery_cycles.suppressions)
-            if cycle_report:
-                history.append({"step": step, "action": "recovery_cycle", "result": cycle_report})
 
-            # Passwords and verification codes stay entirely on the private
-            # TaskPilot runtime pipe. Detect a visible secure field before the
-            # screenshot or observation reaches OpenClaw, pause, and let the
-            # native app collect the value locally.
-            automatic_input_target = secure_input_target(observation, history)
-            if automatic_input_target is not None:
-                discard_observation_image(observation)
-                emit("status", message=f"{PRODUCT_NAME} paused because the waiting app needs secure input…")
-                ledger.before_action({"type": "type_text"})
-                secure_result = request_and_enter_user_input(
-                    automatic_input_target, display_id
-                )
-                history.append({
-                    "step": step,
-                    "action": "user_input_entered",
-                    "result": secure_result,
-                    "completed_requirements": [],
-                    "remaining_requirements": [],
-                })
-                pending_observation, _ = wait_for_screen_change(
-                    display_id, observation, {"type": "type_text", "pid": automatic_input_target["pid"]})
-                loading_pid, loading_waits = None, 0
-                continue
-
-            if loading_pid is not None:
-                if observation_is_loading(observation, loading_pid):
-                    if loading_waits >= 2:
-                        discard_observation_image(observation)
-                        raise RuntimeError("The target app is still loading after bounded local recovery; no action was repeated while it was busy.")
-                    loading_waits += 1
-                    try:
-                        pending_observation, settling = wait_for_screen_change(
-                            display_id, observation, {"type": "wait", "pid": loading_pid}, timeout=5.0)
-                    finally:
-                        discard_observation_image(observation)
-                    history.append({"step": step, "action": {"type": "wait", "seconds": 5},
-                                    "result": {"message": "Waited locally for the loading app", "recovery": "wait_for_loading", "settling": settling}})
-                    continue
-                loading_pid, loading_waits = None, 0
-
+    def reconcile(self) -> None:
+        c = self.c
+        if c.reconcile_reason == "loading":
+            if c.loading_waits >= 2:
+                raise RuntimeError("The target app is still loading after bounded local recovery; no action was repeated while it was busy.")
+            c.loading_waits += 1
             try:
-                screenshot_digest = observation_image_digest(observation)
-                if not command_hints_inspected:
-                    inspect_task_command_hints(task, display_id, observation)
-                    command_hints_inspected = True
-                emit("status", message=f"OpenClaw is planning visible step {step}…")
-                decision = routed_json_prompt(
-                    model_router,
-                    client,
-                    desktop_instruction(task, observation, history, ledger),
-                    screenshot_path,
-                    observation=observation, ledger=ledger,
-                )
+                c.pending_observation, settling = wait_for_screen_change(c.display_id, c.observation,
+                    {"type": "wait", "pid": c.loading_pid}, timeout=5.0)
             finally:
-                discard_observation_image(observation)
+                discard_observation_image(c.observation)
+            c.history.append({"step": c.step, "action": {"type": "wait", "seconds": 5},
+                "result": {"message": "Waited locally for the loading app", "recovery": "wait_for_loading", "settling": settling}})
+        elif c.reconcile_reason == "secure_settle":
+            c.pending_observation, _ = wait_for_screen_change(c.display_id, c.observation,
+                {"type": "type_text", "pid": c.input_target["pid"]})
+            c.loading_pid, c.loading_waits = None, 0
+        elif c.reconcile_reason == "failure":
+            self.reconcile_failure()
+        elif c.reconcile_reason == "effect":
+            c.pending_observation, c.result = verify_expected_effect(c.display_id, c.observation, c.action,
+                c.result, c.decision.get("expected_result"), c.screenshot_digest, c.router.metrics)
+            if c.result.get("outcome") == "verified": c.recovery.succeeded(c.action, c.observation)
+            if c.result.get("outcome") == "delivered_unconfirmed":
+                c.router.metrics["unconfirmed_actions"] += 1
+                c.recovery.unconfirmed(c.action, c.observation)
+                c.result = {**c.result, "recovery": "inspect_effect"}
+            record_action_diagnostic(c.action, c.result)
+            self.record_result()
+            return
+        elif c.reconcile_reason == "decision":
+            self.prepare_decision()
+            return
+        else:
+            raise ExecutionStateError("Unknown task reconciliation reason")
+        c.machine.transition(Phase.OBSERVING)
 
-            ledger.accept_plan(decision, observation)
-            status = effective_decision_status(decision)
-            summary = str(decision.get("summary") or "OpenClaw inspected the screen")
-            emit("status", message=summary)
+    def prepare_decision(self) -> None:
+        c = self.c
+        if self.defer_for_evidence():
+            c.machine.transition(Phase.OBSERVING)
+            return
+        status = effective_decision_status(c.decision)
+        if status == "needs_user":
+            if self.defer_for_dependencies():
+                c.machine.transition(Phase.OBSERVING)
+                return
+            c.input_target = decision_user_input_target(c.decision)
+            c.machine.transition(Phase.WAITING_INPUT, secure_target=True, preflight=True)
+            return
+        if status == "blocked":
+            reason = str(c.decision.get("reason") or c.decision.get("summary") or "OpenClaw is blocked")
+            if re.search(r"credential|password|verification code|permission denied|not authorized|cancelled|destructive|irreversible", reason, re.I):
+                raise RuntimeError(reason)
+            launch = blocked_recovery_action(c.task, c.observation, c.history)
+            if launch:
+                c.decision = {"status": "act", "action": launch, "summary": "Opening the requested installed app"}
+                status = "act"
+            elif c.blocked_recoveries < 1:
+                c.blocked_recoveries += 1
+                c.history.append({"step": c.step, "action": "blocked_recovery", "result": {
+                    "message": "Reconsider on a fresh screen: check app launch, visible coordinate targets, menus, and prior rejection codes before declaring this task blocked.",
+                    "previous_reason": reason}})
+                c.machine.transition(Phase.OBSERVING)
+                return
+            else: raise RuntimeError(reason)
+        if status == "done":
+            c.machine.transition(Phase.VERIFYING, decision=True)
+            return
+        if status != "act":
+            raise RuntimeError("OpenClaw returned neither an action, completion, nor a blocker")
+        c.action = normalized_action(c.decision.get("action"))
+        action_type = str(c.action["type"])
+        signature = action_identity(c.action, c.observation)
+        c.recovered_result = c.recovery.check(c.action, c.observation)
+        if c.recovered_result and c.recovered_result["outcome"] == "suppressed":
+            c.history.append({"step": c.step, "action": "repeat_suppressed", "result": c.recovered_result})
+            c.machine.transition(Phase.OBSERVING)
+            return
+        target_pid = action_target_pid(c.action, c.observation)
+        if action_type in {"press", "focus", "set_value", "type_text", "click", "double_click", "key", "scroll"} and target_pid is not None and observation_is_loading(c.observation, target_pid):
+            c.loading_pid, c.loading_waits = target_pid, 1
+            c.pending_observation, settling = wait_for_screen_change(c.display_id, c.observation,
+                c.action, c.screenshot_digest, timeout=5.0, target_pid=target_pid)
+            c.history.append({"step": c.step, "action": {"type": "wait", "seconds": 5},
+                "result": {"message": "Discarded the busy-target action and waited locally; select a fresh target",
+                           "recovery": "wait_for_loading", "settling": settling}})
+            c.machine.transition(Phase.OBSERVING)
+            return
+        if action_type == "wait": c.identical_action_count = 0
+        elif signature == c.last_action_signature and c.screenshot_digest == c.last_screen_digest:
+            c.identical_action_count += 1
+        else: c.identical_action_count = 1
+        c.last_action_signature, c.last_screen_digest = signature, c.screenshot_digest
+        if c.identical_action_count > MAX_IDENTICAL_ACTIONS:
+            raise RuntimeError(f"OpenClaw repeated the same desktop action on an unchanged screen; {PRODUCT_NAME} stopped the loop safely")
+        if not c.recovered_result and action_type not in {"wait", "none"}:
+            if self.defer_for_dependencies():
+                c.machine.transition(Phase.OBSERVING)
+                return
+            rejection = c.recovery_cycles.check(c.action, c.observation, c.ledger, c.screenshot_digest)
+            c.router.metrics.update(recovery_cycles=c.recovery_cycles.detections, cycle_suppressions=c.recovery_cycles.suppressions)
+            if rejection:
+                c.history.append({"step": c.step, "action": c.action, "result": rejection})
+                record_action_diagnostic(c.action, rejection)
+                emit("status", message="Reconsidering the recovery strategy after repeated states…")
+                c.machine.transition(Phase.OBSERVING)
+                return
+        c.machine.transition(Phase.EXECUTING, decision=True, preflight=True)
 
-            if defer_for_evidence(decision, observation, step): continue
+    def secure_input(self) -> None:
+        c = self.c
+        emit("status", message=f"{PRODUCT_NAME} paused because the waiting app needs secure input…")
+        c.ledger.before_action({"type": "type_text"})
+        result = request_and_enter_user_input(c.input_target, c.display_id)
+        decision = c.decision or {}
+        c.history.append({"step": c.step, "action": "user_input_entered", "result": result,
+            "completed_requirements": decision.get("completed_requirements") or [],
+            "remaining_requirements": decision.get("remaining_requirements") or []})
+        c.reconcile_reason = "secure_settle"
+        c.machine.reconcile()
 
-            if status == "needs_user":
-                if defer_for_dependencies(decision, observation, step): continue
-                input_target = decision_user_input_target(decision)
-                emit("status", message=f"{PRODUCT_NAME} paused because the waiting app needs secure input…")
-                ledger.before_action({"type": "type_text"})
-                secure_result = request_and_enter_user_input(input_target, display_id)
-                history.append({
-                    "step": step,
-                    "action": "user_input_entered",
-                    "result": secure_result,
-                    "completed_requirements": decision.get("completed_requirements") or [],
-                    "remaining_requirements": decision.get("remaining_requirements") or [],
-                })
-                pending_observation, _ = wait_for_screen_change(
-                    display_id, observation, {"type": "type_text", "pid": input_target["pid"]})
-                continue
+    def execute(self) -> None:
+        c = self.c
+        action_type = str(c.action["type"])
+        if c.recovered_result:
+            c.result = c.recovered_result
+            c.consecutive_action_failures = c.consecutive_evidence_conflicts = 0
+        elif action_type == "wait":
+            c.machine.reconcile()
+            seconds = float(c.action.get("seconds", action_default("wait", "seconds")))
+            c.pending_observation, settling = wait_for_screen_change(c.display_id, c.observation, c.action,
+                                                                     c.screenshot_digest, timeout=seconds)
+            c.result = {"message": "Observed locally while waiting", "settling": settling}
+        elif action_type == "none":
+            c.result = "No action was performed"
+        else:
+            try:
+                command_params = inspect_general_command(c.action, c.display_id, c.observation)
+                c.ledger.before_action(c.action)
+                result = bridge_call("act", c.display_id, action=c.action, **command_params)
+            except RuntimeError as error:
+                if not isinstance(error, ActionRejected) or error.code in {"cancelled", "permission_denied", "protected_target", "secure_input"}:
+                    raise
+                self.action_rejected(error)
+                return
+            c.consecutive_action_failures = c.consecutive_evidence_conflicts = 0
+            c.action = bind_command_outcomes(c.action, result)
+            c.evidence_guard.remember_native(c.action, c.observation, result)
+            c.ledger.record_action(c.action, result)
+            c.result = result
+            c.router.metrics["action_deliveries"] += 1
+            c.reconcile_reason = "effect"
+            c.machine.reconcile()
+            return
+        c.machine.reconcile()
+        self.record_result()
 
-            if status == "blocked":
-                reason = str(decision.get("reason") or summary or "OpenClaw is blocked")
-                if re.search(r"credential|password|verification code|permission denied|not authorized|cancelled|destructive|irreversible", reason, re.I):
-                    raise RuntimeError(reason)
-                launch_recovery = blocked_recovery_action(task, observation, history)
-                if launch_recovery:
-                    decision = {"status": "act", "action": launch_recovery, "summary": "Opening the requested installed app"}
-                    status = "act"
-                elif blocked_recoveries < 1:
-                    blocked_recoveries += 1
-                    history.append({"step": step, "action": "blocked_recovery", "result": {
-                        "message": "Reconsider on a fresh screen: check app launch, visible coordinate targets, menus, and prior rejection codes before declaring this task blocked.",
-                        "previous_reason": reason}})
-                    continue
-                else:
-                    raise RuntimeError(reason)
+    def action_rejected(self, error: ActionRejected) -> None:
+        c = self.c
+        c.machine.reconcile()
+        c.consecutive_action_failures += 1
+        uncertain = error.code == "delivery_uncertain" or error.details.get("outcome") == "delivered_unconfirmed"
+        code = "delivery_uncertain" if uncertain else error.code
+        c.router.metrics["action_rejections"] += 1
+        c.failure = {"message": str(error), "outcome": "delivered_unconfirmed" if uncertain else "rejected",
+                     "error_code": error.code, "recovery": action_failure_recovery(code), **error.details}
+        c.recovery.rejected(c.action, c.observation, code)
+        c.recovery_cycles.record(c.action, c.observation, c.failure, c.ledger, c.screenshot_digest)
+        record_action_diagnostic(c.action, c.failure)
+        if uncertain: c.router.metrics["unconfirmed_actions"] += 1
+        c.history.append({"step": c.step, "visual_evidence": str(c.decision.get("visual_evidence") or ""),
+            "action": c.action, "result": c.failure, **action_history_context(c.decision, c.action, c.observation),
+            "completed_requirements": c.decision.get("completed_requirements") or [],
+            "remaining_requirements": c.decision.get("remaining_requirements") or []})
+        if c.consecutive_action_failures >= 3:
+            raise RuntimeError("OpenClaw could not produce a valid action after three fresh screen checks") from error
+        c.reconcile_reason = "failure"
 
-            if status == "done":
-                if verify_task_completion(task, decision, display_id, history, model_router, client, ledger, evidence_guard):
-                    return
-                completion_rejected()
-                continue
+    def reconcile_failure(self) -> None:
+        c = self.c
+        c.pending_observation = bridge_call("observe", c.display_id)
+        target_pid = action_target_pid(c.action, c.observation)
+        uncertain = c.failure["outcome"] == "delivered_unconfirmed"
+        if target_pid is not None and (uncertain or observation_is_loading(c.pending_observation, target_pid)):
+            fresh, c.pending_observation = c.pending_observation, None
+            try:
+                c.pending_observation, settling = wait_for_screen_change(c.display_id, fresh, c.action,
+                    timeout=5.0 if observation_is_loading(fresh, target_pid) else 2.0, target_pid=target_pid)
+                c.failure["settling"] = settling
+            finally:
+                discard_observation_image(fresh)
+            if observation_is_loading(c.pending_observation, target_pid):
+                c.loading_pid, c.loading_waits = target_pid, 1
+        emit("status", message="Checking fresh evidence and the action failure before continuing…")
 
-            if status != "act":
-                raise RuntimeError("OpenClaw returned neither an action, completion, nor a blocker")
+    def record_result(self) -> None:
+        c = self.c
+        c.history.append({"step": c.step, "visual_evidence": str(c.decision.get("visual_evidence") or ""),
+            "action": c.action, "result": c.result, **action_history_context(c.decision, c.action, c.observation),
+            "completed_requirements": c.decision.get("completed_requirements") or [],
+            "remaining_requirements": c.decision.get("remaining_requirements") or []})
+        if isinstance(c.result, dict):
+            effect = c.result.get("expected_effect", {})
+            if effect.get("outcome") == "verified" and effect.get("check") in FILE_EFFECTS:
+                c.ledger.record_effect(c.decision["expected_result"], effect["evidence"], c.action)
+            if not c.recovered_result:
+                c.recovery_cycles.record(c.action, c.observation, c.result, c.ledger, c.screenshot_digest)
+        if (c.decision.get("finish_after_action") is True and c.action["type"] in {"write_file", "run_command"}
+                and isinstance(c.result, dict) and c.result.get("verification_scope") != "expected_effect_unconfirmed"):
+            discard_observation_image(c.pending_observation)
+            c.pending_observation = None
+            c.machine.transition(Phase.VERIFYING, decision=True)
+        else:
+            c.machine.transition(Phase.OBSERVING)
 
-            action = normalized_action(decision.get("action"))
-            action_type = str(action["type"])
-            action_signature = action_identity(action, observation)
-            recovered_result = recovery.check(action, observation)
-            if recovered_result and recovered_result["outcome"] == "suppressed":
-                history.append({"step": step, "action": "repeat_suppressed", "result": recovered_result})
-                continue
-            target_pid = action_target_pid(action, observation)
-            if action_type in {"press", "focus", "set_value", "type_text", "click", "double_click", "key", "scroll"} \
-                    and target_pid is not None and observation_is_loading(observation, target_pid):
-                # The decision was made while its target was busy. Discard it;
-                # never deliver its old target after local polling changes IDs.
-                loading_pid, loading_waits = target_pid, 1
-                pending_observation, settling = wait_for_screen_change(
-                    display_id, observation, action, screenshot_digest, timeout=5.0, target_pid=target_pid)
-                history.append({"step": step, "action": {"type": "wait", "seconds": 5},
-                                "result": {"message": "Discarded the busy-target action and waited locally; select a fresh target",
-                                           "recovery": "wait_for_loading", "settling": settling}})
-                continue
-            if action_type == "wait":
-                identical_action_count = 0
-            elif action_signature == last_action_signature and screenshot_digest == last_screen_digest:
-                identical_action_count += 1
-            else:
-                identical_action_count = 1
-            last_action_signature = action_signature
-            last_screen_digest = screenshot_digest
-            if identical_action_count > MAX_IDENTICAL_ACTIONS:
-                    raise RuntimeError(
-                        f"OpenClaw repeated the same desktop action on an unchanged screen; {PRODUCT_NAME} stopped the loop safely"
-                    )
-
-            if recovered_result:
-                result_message = recovered_result
-                consecutive_action_failures = 0
-                consecutive_evidence_conflicts = 0
-            elif action_type == "wait":
-                seconds = float(action.get("seconds", action_default("wait", "seconds")))
-                pending_observation, settling = wait_for_screen_change(
-                    display_id, observation, action, screenshot_digest, timeout=seconds)
-                result_message = {"message": "Observed locally while waiting", "settling": settling}
-            elif action_type == "none":
-                result_message = "No action was performed"
-            else:
-                if defer_for_dependencies(decision, observation, step): continue
-                cycle_rejection = recovery_cycles.check(action, observation, ledger, screenshot_digest)
-                model_router.metrics.update(recovery_cycles=recovery_cycles.detections,
-                                            cycle_suppressions=recovery_cycles.suppressions)
-                if cycle_rejection:
-                    history.append({"step": step, "action": action, "result": cycle_rejection})
-                    record_action_diagnostic(action, cycle_rejection)
-                    emit("status", message="Reconsidering the recovery strategy after repeated states…")
-                    continue
-                try:
-                    command_params = inspect_general_command(action, display_id, observation)
-                    ledger.before_action(action)
-                    result = bridge_call("act", display_id, action=action, **command_params)
-                except RuntimeError as action_error:
-                    # Receipt lookup has already tried to recover a lost reply.
-                    # An unresolved operation must stop, without another action.
-                    if not isinstance(action_error, ActionRejected):
-                        raise
-                    code = getattr(action_error, "code", "action_rejected")
-                    if code in {"cancelled", "permission_denied", "protected_target", "secure_input"}:
-                        raise
-                    consecutive_action_failures += 1
-                    uncertain = code == 'delivery_uncertain' or action_error.details.get('outcome') == 'delivered_unconfirmed'
-                    recovery_code = 'delivery_uncertain' if uncertain else code
-                    model_router.metrics["action_rejections"] += 1
-                    failure_result = {"message": str(action_error),
-                                      "outcome": "delivered_unconfirmed" if uncertain else "rejected",
-                                      "error_code": code, "recovery": action_failure_recovery(recovery_code), **action_error.details}
-                    recovery.rejected(action, observation, recovery_code)
-                    recovery_cycles.record(action, observation, failure_result, ledger, screenshot_digest)
-                    record_action_diagnostic(action, failure_result)
-                    if uncertain:
-                        model_router.metrics["unconfirmed_actions"] += 1
-                    history.append({
-                        "step": step,
-                        "visual_evidence": str(decision.get("visual_evidence") or ""),
-                        "action": action,
-                        "result": failure_result,
-                        **action_history_context(decision, action, observation),
-                        "completed_requirements": decision.get("completed_requirements") or [],
-                        "remaining_requirements": decision.get("remaining_requirements") or [],
-                    })
-                    if consecutive_action_failures >= 3:
-                        raise RuntimeError(
-                            "OpenClaw could not produce a valid action after three fresh screen checks"
-                        ) from action_error
-                    pending_observation = bridge_call("observe", display_id)
-                    if target_pid is not None and (uncertain or observation_is_loading(pending_observation, target_pid)):
-                        fresh = pending_observation
-                        pending_observation = None
-                        try:
-                            pending_observation, settling = wait_for_screen_change(
-                                display_id, fresh, action, timeout=5.0 if observation_is_loading(fresh, target_pid) else 2.0,
-                                target_pid=target_pid)
-                            failure_result["settling"] = settling
-                        finally:
-                            discard_observation_image(fresh)
-                        if observation_is_loading(pending_observation, target_pid):
-                            loading_pid, loading_waits = target_pid, 1
-                    emit("status", message="Checking fresh evidence and the action failure before continuing…")
-                    continue
-                consecutive_action_failures = 0
-                action = bind_command_outcomes(action, result)
-                consecutive_evidence_conflicts = 0
-                evidence_guard.remember_native(action, observation, result)
-                ledger.record_action(action, result)
-                result_message = result
-                model_router.metrics["action_deliveries"] += 1
-                pending_observation, result_message = verify_expected_effect(
-                    display_id, observation, action, result, decision.get('expected_result'), screenshot_digest, model_router.metrics)
-                if result_message.get("outcome") == "verified":
-                    recovery.succeeded(action, observation)
-                if result_message.get("outcome") == "delivered_unconfirmed":
-                    model_router.metrics["unconfirmed_actions"] += 1
-                    recovery.unconfirmed(action, observation)
-                    result_message = {**result_message, "recovery": "inspect_effect"}
-                record_action_diagnostic(action, result_message)
-
-            history.append({
-                "step": step,
-                "visual_evidence": str(decision.get("visual_evidence") or ""),
-                "action": action,
-                "result": result_message,
-                **action_history_context(decision, action, observation),
-                "completed_requirements": decision.get("completed_requirements") or [],
-                "remaining_requirements": decision.get("remaining_requirements") or [],
-            })
-            if isinstance(result_message, dict):
-                effect_proof = result_message.get('expected_effect', {})
-                if effect_proof.get('outcome') == 'verified' and effect_proof.get('check') in FILE_EFFECTS:
-                    ledger.record_effect(decision['expected_result'], effect_proof['evidence'], action)
-                if not recovered_result:
-                    recovery_cycles.record(action, observation, result_message, ledger, screenshot_digest)
-            if (decision.get("finish_after_action") is True and action_type in {"write_file", "run_command"}
-                    and isinstance(result_message, dict) and result_message.get('verification_scope') != 'expected_effect_unconfirmed'):
-                discard_observation_image(pending_observation)
-                pending_observation = None
-                if verify_task_completion(task, decision, display_id, history, model_router, client, ledger, evidence_guard):
-                    return
-                completion_rejected()
-        raise RuntimeError(f"{PRODUCT_NAME} reached its {MAX_STEPS}-step safety limit")
-    except Exception:
-        state.invalidate()
-        raise
-    finally:
-        discard_observation_image(pending_observation)
-        _observation_keywords = []
-        _command_capabilities.clear()
-        model_router.metrics.update(recovery_cycles=recovery_cycles.detections,
-                                    cycle_suppressions=recovery_cycles.suppressions)
-        publish_task_metrics(model_router, client, ledger)
-        client.close()
+    def verify(self) -> None:
+        c = self.c
+        if verify_task_completion(c.task, c.decision, c.display_id, c.history, c.router, c.client, c.ledger, c.evidence_guard):
+            c.machine.drain()
+            return
+        if c.history and isinstance(c.history[-1].get("result"), dict) and c.history[-1]["result"].get("error_code") == "evidence_conflict":
+            c.consecutive_evidence_conflicts += 1
+            if c.consecutive_evidence_conflicts >= 3:
+                raise RuntimeError("TaskPilot could not reconcile completion evidence after three fresh decisions; completion remains unconfirmed")
+        c.machine.transition(Phase.OBSERVING)
 
 
 def _stop_handler(_signal_number: int, _frame: Any) -> None:
-    if _active_acp_process is not None and _active_acp_process.poll() is None:
-        _active_acp_process.terminate()
+    context = current_task.get()
+    if context is not None: context.machine.drain()
+    if _task_value("active_acp_process") is not None and _task_value("active_acp_process").poll() is None:
+        _task_value("active_acp_process").terminate()
     raise SystemExit(143)
 
 

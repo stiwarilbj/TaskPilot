@@ -1,5 +1,10 @@
 # TaskPilot architecture
 
+The private Python execution graph and its task-owned state are described in
+[TaskExecution.md](TaskExecution.md). It declares prerequisites and permitted
+effects for observation, planning, execution, reconciliation, secure input,
+verification and drainage.
+
 TaskPilot is split by responsibility, so the folder name tells you why the code exists before you even open a file.
 
 Background prompt changes can be evaluated against private sanitized cases
