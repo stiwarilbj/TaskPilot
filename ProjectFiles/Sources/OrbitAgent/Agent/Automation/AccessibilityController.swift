@@ -1066,7 +1066,9 @@ final class AccessibilityController {
         let type = action["type"] as? String ?? ""
         if ["launch_app", "open_route", "navigate_browser"].contains(type) {
             let message = try await perform(action: action, on: display)
-            return ["message": message, "delivery_method": "workspace", "outcome": type == "launch_app" ? "verified" : "delivered_unconfirmed", "verification_scope": "window_visible"]
+            return ["action_type": type, "message": message, "delivery_method": "workspace",
+                    "outcome": type == "launch_app" ? "verified" : "delivered_unconfirmed", "verified": type == "launch_app",
+                    "verification_scope": type == "launch_app" ? "window_visible" : "delivery_only"]
         }
         guard AXIsProcessTrusted() else { throw AccessibilityActionError.permissionDenied }
         let record = action["element_id"] == nil ? nil : try self.record(for: action)
@@ -1093,6 +1095,7 @@ final class AccessibilityController {
         if ["set_value", "type_text"].contains(type) {
             let target = try record ?? observedFocusedInput(pid: pid)
             return try await performTextEntry(action: action, record: target, on: display, privateInput: privateInput).dictionary(pid: pid)
+                .merging(["action_type": type]) { _, new in new }
         }
         let profileKey = try record.flatMap { try compatibilityKey($0, action: action, on: display) }
         if let profileKey { _ = try ControlCompatibilityProfiles.owned { compatibilityProfiles.preferred(for: profileKey, permitted: []) } }
@@ -1121,7 +1124,8 @@ final class AccessibilityController {
             try recordCompatibility(proven ? .verified : .supported, method: deliveryMethod,
                                     key: profileKey, record: record, action: action, on: display)
         }
-        return ["message": verified ? "\(message); confirmed focus" : "\(message); delivery acknowledged, intended effect not confirmed",
+        return ["action_type": type, "verified": verified,
+                "message": verified ? "\(message); confirmed focus" : "\(message); delivery acknowledged, intended effect not confirmed",
                 "delivery_method": method, "outcome": verified ? "verified" : "delivered_unconfirmed",
                 "verification_scope": verified ? "focus" : "delivery_only", "pid": Int(pid)]
     }

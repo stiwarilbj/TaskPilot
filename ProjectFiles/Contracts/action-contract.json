@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "fields": {
     "element_id": {
       "type": "string",
@@ -1084,76 +1084,3920 @@
     "option": 524288,
     "control": 262144
   },
-  "task_protocol_version": 5,
+  "task_protocol_version": 6,
   "command_operations": {
     "create_directory": {
-      "fields": {"path": {"field": "path"}},
-      "required": ["path"], "rules": [], "reject_unknown": true,
-      "argv": ["/bin/mkdir", "-p", {"parameter": "path"}],
-      "checks": [{"type": "directory_exists", "path": {"parameter": "path"}}],
+      "fields": {
+        "path": {
+          "field": "path"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "rules": [],
+      "reject_unknown": true,
+      "argv": [
+        "/bin/mkdir",
+        "-p",
+        {
+          "parameter": "path"
+        }
+      ],
+      "checks": [
+        {
+          "type": "directory_exists",
+          "path": {
+            "parameter": "path"
+          }
+        }
+      ],
       "reference": "create_directory(path)",
       "intent_pattern": "\\b(?:mkdir|(?:create|make)\\s+(?:(?:the|a|an)\\s+)?(?:directory|folder))\\b",
       "request_pattern": "(?:create|make)\\s+(?:(?:a|the)\\s+)?(?:directory|folder)\\s+(?:at\\s+)?(?P<path>@path@)",
-      "example": {"type": "create_directory", "path": "/example/new folder"}
+      "example": {
+        "type": "create_directory",
+        "path": "/example/new folder"
+      }
     },
     "copy_file": {
-      "fields": {"source": {"field": "path"}, "destination": {"field": "path"}},
-      "required": ["source", "destination"], "rules": [], "reject_unknown": true,
-      "argv": ["/bin/cp", "-n", {"parameter": "source"}, {"parameter": "destination"}],
-      "checks": [{"type": "file_exists", "path": {"parameter": "destination"}}],
-      "snapshot": {"source": "source", "destination": "destination", "max_bytes": {"limit": "read_bytes"}},
-      "absent": "destination", "regular_file": "source", "parent_directory": "destination",
+      "fields": {
+        "source": {
+          "field": "path"
+        },
+        "destination": {
+          "field": "path"
+        }
+      },
+      "required": [
+        "source",
+        "destination"
+      ],
+      "rules": [],
+      "reject_unknown": true,
+      "argv": [
+        "/bin/cp",
+        "-n",
+        {
+          "parameter": "source"
+        },
+        {
+          "parameter": "destination"
+        }
+      ],
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": {
+            "parameter": "destination"
+          }
+        }
+      ],
+      "snapshot": {
+        "source": "source",
+        "destination": "destination",
+        "max_bytes": {
+          "limit": "read_bytes"
+        }
+      },
+      "absent": "destination",
+      "regular_file": "source",
+      "parent_directory": "destination",
       "reference": "copy_file(source,destination)",
       "intent_pattern": "\\b(?:copy|duplicate)\\b",
       "request_pattern": "(?:copy|duplicate)\\s+(?:(?:the\\s+)?file\\s+)?(?P<source>@path@)\\s+to\\s+(?P<destination>@path@)",
-      "prerequisite": {"type": "create_directory", "operand": "path", "parent_of": "destination"},
-      "example": {"type": "copy_file", "source": "/example/a", "destination": "/example/b"}
+      "prerequisite": {
+        "type": "create_directory",
+        "operand": "path",
+        "parent_of": "destination"
+      },
+      "example": {
+        "type": "copy_file",
+        "source": "/example/a",
+        "destination": "/example/b"
+      }
     },
     "move_file": {
-      "fields": {"source": {"field": "path"}, "destination": {"field": "path"}},
-      "required": ["source", "destination"], "rules": [], "reject_unknown": true,
-      "argv": ["/bin/mv", "-n", {"parameter": "source"}, {"parameter": "destination"}],
-      "checks": [{"type": "file_exists", "path": {"parameter": "destination"}},
-                 {"type": "path_absent", "path": {"parameter": "source"}}],
-      "snapshot": {"source": "source", "destination": "destination", "max_bytes": {"limit": "read_bytes"}},
-      "absent": "destination", "regular_file": "source", "parent_directory": "destination",
+      "fields": {
+        "source": {
+          "field": "path"
+        },
+        "destination": {
+          "field": "path"
+        }
+      },
+      "required": [
+        "source",
+        "destination"
+      ],
+      "rules": [],
+      "reject_unknown": true,
+      "argv": [
+        "/bin/mv",
+        "-n",
+        {
+          "parameter": "source"
+        },
+        {
+          "parameter": "destination"
+        }
+      ],
+      "checks": [
+        {
+          "type": "file_exists",
+          "path": {
+            "parameter": "destination"
+          }
+        },
+        {
+          "type": "path_absent",
+          "path": {
+            "parameter": "source"
+          }
+        }
+      ],
+      "snapshot": {
+        "source": "source",
+        "destination": "destination",
+        "max_bytes": {
+          "limit": "read_bytes"
+        }
+      },
+      "absent": "destination",
+      "regular_file": "source",
+      "parent_directory": "destination",
       "reference": "move_file(source,destination)",
       "intent_pattern": "\\b(?:move|rename)\\b",
       "request_pattern": "(?:move|rename)\\s+(?:(?:the\\s+)?file\\s+)?(?P<source>@path@)\\s+to\\s+(?P<destination>@path@)",
-      "prerequisite": {"type": "create_directory", "operand": "path", "parent_of": "destination"},
-      "example": {"type": "move_file", "source": "/example/a", "destination": "/example/b"}
+      "prerequisite": {
+        "type": "create_directory",
+        "operand": "path",
+        "parent_of": "destination"
+      },
+      "example": {
+        "type": "move_file",
+        "source": "/example/a",
+        "destination": "/example/b"
+      }
     },
     "remove_file": {
-      "fields": {"path": {"field": "path"}},
-      "required": ["path"], "rules": [], "reject_unknown": true,
-      "argv": ["/bin/rm", "-f", {"parameter": "path"}],
-      "checks": [{"type": "path_absent", "path": {"parameter": "path"}}],
+      "fields": {
+        "path": {
+          "field": "path"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "rules": [],
+      "reject_unknown": true,
+      "argv": [
+        "/bin/rm",
+        "-f",
+        {
+          "parameter": "path"
+        }
+      ],
+      "checks": [
+        {
+          "type": "path_absent",
+          "path": {
+            "parameter": "path"
+          }
+        }
+      ],
       "regular_file_if_present": "path",
       "reference": "remove_file(path)",
       "intent_pattern": "\\b(?:remove|delete)\\s+(?:(?:the|a)\\s+)?file\\b",
       "request_pattern": "(?:remove|delete)\\s+(?:(?:the|a)\\s+)?file\\s+(?P<path>@path@)",
-      "example": {"type": "remove_file", "path": "/example/unneeded.txt"}
+      "example": {
+        "type": "remove_file",
+        "path": "/example/unneeded.txt"
+      }
     },
     "remove_empty_directory": {
-      "fields": {"path": {"field": "path"}},
-      "required": ["path"], "rules": [], "reject_unknown": true,
-      "argv": ["/bin/rmdir", {"parameter": "path"}],
-      "checks": [{"type": "path_absent", "path": {"parameter": "path"}}],
+      "fields": {
+        "path": {
+          "field": "path"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "rules": [],
+      "reject_unknown": true,
+      "argv": [
+        "/bin/rmdir",
+        {
+          "parameter": "path"
+        }
+      ],
+      "checks": [
+        {
+          "type": "path_absent",
+          "path": {
+            "parameter": "path"
+          }
+        }
+      ],
       "directory": "path",
       "reference": "remove_empty_directory(path)",
       "intent_pattern": "\\b(?:remove|delete)\\s+(?:(?:the|a|an)\\s+)?empty\\s+(?:directory|folder)\\b",
       "request_pattern": "(?:remove|delete)\\s+(?:(?:the|an?)\\s+)?empty\\s+(?:directory|folder)\\s+(?P<path>@path@)",
-      "example": {"type": "remove_empty_directory", "path": "/example/empty folder"}
+      "example": {
+        "type": "remove_empty_directory",
+        "path": "/example/empty folder"
+      }
     },
     "print_text": {
-      "fields": {"text": {"field": "text"}},
-      "required": ["text"], "rules": [], "reject_unknown": true,
-      "argv": ["/usr/bin/printf", "%s", {"parameter": "text"}],
-      "checks": [{"type": "stdout_equals", "text": {"parameter": "text"}}],
+      "fields": {
+        "text": {
+          "field": "text"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "rules": [],
+      "reject_unknown": true,
+      "argv": [
+        "/usr/bin/printf",
+        "%s",
+        {
+          "parameter": "text"
+        }
+      ],
+      "checks": [
+        {
+          "type": "stdout_equals",
+          "text": {
+            "parameter": "text"
+          }
+        }
+      ],
       "reference": "print_text(text)",
       "intent_pattern": "\\b(?:print|output)\\s+(?:literal\\s+)?text\\b",
       "request_pattern": "(?:print|output)\\s+literal\\s+text\\s+(?P<text>@quoted_text@)",
-      "example": {"type": "print_text", "text": "Example output"}
+      "example": {
+        "type": "print_text",
+        "text": "Example output"
+      }
     }
+  },
+  "native_outcomes": {
+    "rejected": "Rejected before delivery; no effect was dispatched.",
+    "dispatched": "Delivery began; work has not reached a terminal response.",
+    "delivered_unconfirmed": "Work finished, but the intended effect is unknown.",
+    "verified": "A terminal result verifies only its named scope."
+  },
+  "native_schemas": {
+    "check_result": {
+      "type": "variant",
+      "tag": "type",
+      "variants": {
+        "file_exists": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "reason": {
+              "type": "string"
+            },
+            "path": {
+              "field": "path"
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope",
+            "path"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal check outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must name this check",
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "file_exists"
+                ]
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "directory_exists": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "reason": {
+              "type": "string"
+            },
+            "path": {
+              "field": "path"
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope",
+            "path"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal check outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must name this check",
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "directory_exists"
+                ]
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "path_absent": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "reason": {
+              "type": "string"
+            },
+            "path": {
+              "field": "path"
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope",
+            "path"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal check outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must name this check",
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "path_absent"
+                ]
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "file_contents": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "reason": {
+              "type": "string"
+            },
+            "path": {
+              "field": "path"
+            },
+            "content_sha256": {
+              "type": "string",
+              "format": "sha256"
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope",
+            "path"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal check outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must name this check",
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "file_contents"
+                ]
+              }
+            },
+            {
+              "path": "content_sha256",
+              "error": "is required for verified content",
+              "when": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              },
+              "assert": {
+                "has": "content_sha256"
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "stdout_equals": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "reason": {
+              "type": "string"
+            },
+            "text_sha256": {
+              "type": "string",
+              "format": "sha256"
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal check outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must name this check",
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "stdout_equals"
+                ]
+              }
+            },
+            {
+              "path": "text_sha256",
+              "error": "is required for verified content",
+              "when": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              },
+              "assert": {
+                "has": "text_sha256"
+              }
+            }
+          ],
+          "reject_unknown": true
+        }
+      }
+    },
+    "check_batch": {
+      "type": "object",
+      "fields": {
+        "outcome": {
+          "type": "string",
+          "choices": [
+            "rejected",
+            "dispatched",
+            "delivered_unconfirmed",
+            "verified"
+          ]
+        },
+        "verified": {
+          "type": "boolean"
+        },
+        "verification_scope": {
+          "type": "string",
+          "nonempty": true
+        },
+        "requested_checks": {
+          "field": "checks"
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "reference",
+            "schema": "check_result"
+          },
+          "max_items": 10000
+        },
+        "local_wait": {
+          "type": "object",
+          "fields": {
+            "reason": {
+              "type": "string"
+            },
+            "changed": {
+              "type": "boolean"
+            },
+            "notifications": {
+              "type": "integer",
+              "min": 0,
+              "max": 9007199254740991
+            },
+            "targeted_checks": {
+              "type": "integer",
+              "min": 0,
+              "max": 9007199254740991
+            },
+            "poll_wakeups": {
+              "type": "integer",
+              "min": 0,
+              "max": 9007199254740991
+            },
+            "elapsed_ms": {
+              "type": "integer",
+              "min": 0,
+              "max": 9007199254740991
+            },
+            "elapsed_seconds": {
+              "type": "number",
+              "min": 0,
+              "max": 10
+            },
+            "effect_ready": {
+              "type": "boolean",
+              "nullable": true
+            },
+            "notification_supported": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "reason"
+          ],
+          "rules": [],
+          "reject_unknown": true
+        }
+      },
+      "required": [
+        "outcome",
+        "verified",
+        "verification_scope",
+        "requested_checks",
+        "checks"
+      ],
+      "rules": [
+        {
+          "path": "verified",
+          "error": "must agree with outcome",
+          "when": {
+            "equals": [
+              "outcome",
+              "verified"
+            ]
+          },
+          "assert": {
+            "equals": [
+              "verified",
+              true
+            ]
+          }
+        },
+        {
+          "path": "verified",
+          "error": "must agree with outcome",
+          "when": {
+            "not": {
+              "equals": [
+                "outcome",
+                "verified"
+              ]
+            }
+          },
+          "assert": {
+            "equals": [
+              "verified",
+              false
+            ]
+          }
+        },
+        {
+          "path": "outcome",
+          "error": "must be a terminal check outcome",
+          "assert": {
+            "any": [
+              {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              {
+                "equals": [
+                  "outcome",
+                  "delivered_unconfirmed"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "path": "verification_scope",
+          "error": "must be requested_outcomes",
+          "assert": {
+            "equals": [
+              "verification_scope",
+              "requested_outcomes"
+            ]
+          }
+        },
+        {
+          "path": "checks",
+          "error": "must all verify the requested outcomes",
+          "when": {
+            "equals": [
+              "verified",
+              true
+            ]
+          },
+          "assert": {
+            "all_verified": "checks"
+          }
+        },
+        {
+          "path": "verified",
+          "error": "must agree with all check results",
+          "when": {
+            "equals": [
+              "verified",
+              false
+            ]
+          },
+          "assert": {
+            "not": {
+              "all_verified": "checks"
+            }
+          }
+        }
+      ],
+      "reject_unknown": true
+    },
+    "action_result": {
+      "type": "variant",
+      "tag": "action_type",
+      "variants": {
+        "press": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "message": {
+              "type": "string"
+            },
+            "delivery_method": {
+              "type": "string",
+              "nonempty": true
+            },
+            "pid": {
+              "field": "pid"
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal action outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "cannot verify task effects from event delivery",
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must be delivery_only",
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "delivery_only"
+                ]
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "focus": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "message": {
+              "type": "string"
+            },
+            "delivery_method": {
+              "type": "string",
+              "nonempty": true
+            },
+            "pid": {
+              "field": "pid"
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal action outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must name the verified effect",
+              "when": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "focus"
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must be delivery_only when unconfirmed",
+              "when": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "delivery_only"
+                ]
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "set_value": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "message": {
+              "type": "string"
+            },
+            "delivery_method": {
+              "type": "string",
+              "nonempty": true
+            },
+            "pid": {
+              "field": "pid"
+            },
+            "text_verification": {
+              "type": "string",
+              "choices": [
+                "matched",
+                "already_matched",
+                "mismatch",
+                "unavailable",
+                "secure"
+              ]
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope",
+            "text_verification",
+            "pid",
+            "delivery_method"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal action outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must be text_value",
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "text_value"
+                ]
+              }
+            },
+            {
+              "path": "text_verification",
+              "error": "must agree with verified",
+              "when": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              },
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "text_verification",
+                      "matched"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "text_verification",
+                      "already_matched"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "text_verification",
+              "error": "must agree with verified",
+              "when": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              },
+              "assert": {
+                "not": {
+                  "any": [
+                    {
+                      "equals": [
+                        "text_verification",
+                        "matched"
+                      ]
+                    },
+                    {
+                      "equals": [
+                        "text_verification",
+                        "already_matched"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "click": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "message": {
+              "type": "string"
+            },
+            "delivery_method": {
+              "type": "string",
+              "nonempty": true
+            },
+            "pid": {
+              "field": "pid"
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal action outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "cannot verify task effects from event delivery",
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must be delivery_only",
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "delivery_only"
+                ]
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "double_click": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "message": {
+              "type": "string"
+            },
+            "delivery_method": {
+              "type": "string",
+              "nonempty": true
+            },
+            "pid": {
+              "field": "pid"
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal action outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "cannot verify task effects from event delivery",
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must be delivery_only",
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "delivery_only"
+                ]
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "type_text": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "message": {
+              "type": "string"
+            },
+            "delivery_method": {
+              "type": "string",
+              "nonempty": true
+            },
+            "pid": {
+              "field": "pid"
+            },
+            "text_verification": {
+              "type": "string",
+              "choices": [
+                "matched",
+                "already_matched",
+                "mismatch",
+                "unavailable",
+                "secure"
+              ]
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope",
+            "text_verification",
+            "pid",
+            "delivery_method"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal action outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must be text_value",
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "text_value"
+                ]
+              }
+            },
+            {
+              "path": "text_verification",
+              "error": "must agree with verified",
+              "when": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              },
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "text_verification",
+                      "matched"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "text_verification",
+                      "already_matched"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "text_verification",
+              "error": "must agree with verified",
+              "when": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              },
+              "assert": {
+                "not": {
+                  "any": [
+                    {
+                      "equals": [
+                        "text_verification",
+                        "matched"
+                      ]
+                    },
+                    {
+                      "equals": [
+                        "text_verification",
+                        "already_matched"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "key": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "message": {
+              "type": "string"
+            },
+            "delivery_method": {
+              "type": "string",
+              "nonempty": true
+            },
+            "pid": {
+              "field": "pid"
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal action outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "cannot verify task effects from event delivery",
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must be delivery_only",
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "delivery_only"
+                ]
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "scroll": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "message": {
+              "type": "string"
+            },
+            "delivery_method": {
+              "type": "string",
+              "nonempty": true
+            },
+            "pid": {
+              "field": "pid"
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal action outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "cannot verify task effects from event delivery",
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must be delivery_only",
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "delivery_only"
+                ]
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "launch_app": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "message": {
+              "type": "string"
+            },
+            "delivery_method": {
+              "type": "string",
+              "nonempty": true
+            },
+            "pid": {
+              "field": "pid"
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal action outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must name the verified effect",
+              "when": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "window_visible"
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must be delivery_only when unconfirmed",
+              "when": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "delivery_only"
+                ]
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "open_route": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "message": {
+              "type": "string"
+            },
+            "delivery_method": {
+              "type": "string",
+              "nonempty": true
+            },
+            "pid": {
+              "field": "pid"
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal action outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "cannot verify task effects from event delivery",
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must be delivery_only",
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "delivery_only"
+                ]
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "read_file": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "message": {
+              "type": "string"
+            },
+            "delivery_method": {
+              "type": "string",
+              "nonempty": true
+            },
+            "pid": {
+              "field": "pid"
+            },
+            "path": {
+              "field": "path"
+            },
+            "content": {
+              "type": "string"
+            },
+            "encoding": {
+              "type": "string",
+              "choices": [
+                "utf-8",
+                "base64"
+              ]
+            },
+            "bytes_returned": {
+              "type": "integer",
+              "min": 0,
+              "max": 131072
+            },
+            "content_sha256": {
+              "type": "string",
+              "format": "sha256"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope",
+            "path",
+            "content",
+            "encoding",
+            "bytes_returned",
+            "content_sha256",
+            "truncated"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal action outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must verify the returned bytes",
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must be file_read",
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "file_read"
+                ]
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "write_file": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "message": {
+              "type": "string"
+            },
+            "delivery_method": {
+              "type": "string",
+              "nonempty": true
+            },
+            "pid": {
+              "field": "pid"
+            },
+            "path": {
+              "field": "path"
+            },
+            "bytes_written": {
+              "type": "integer",
+              "min": 0,
+              "max": 2097152
+            },
+            "file_size": {
+              "type": "integer",
+              "min": 0,
+              "max": 9007199254740991
+            },
+            "content_sha256": {
+              "type": "string",
+              "format": "sha256"
+            },
+            "mode": {
+              "type": "string",
+              "choices": [
+                "overwrite",
+                "append"
+              ]
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope",
+            "path",
+            "bytes_written",
+            "file_size",
+            "content_sha256",
+            "mode"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal action outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must verify the written bytes",
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must be file_write",
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "file_write"
+                ]
+              }
+            },
+            {
+              "path": "file_size",
+              "error": "must match bytes_written for overwrite",
+              "when": {
+                "equals": [
+                  "mode",
+                  "overwrite"
+                ]
+              },
+              "assert": {
+                "same_value": [
+                  "file_size",
+                  "bytes_written"
+                ]
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "run_command": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "message": {
+              "type": "string"
+            },
+            "delivery_method": {
+              "type": "string",
+              "nonempty": true
+            },
+            "pid": {
+              "field": "pid"
+            },
+            "command": {
+              "type": "string"
+            },
+            "working_directory": {
+              "field": "path"
+            },
+            "execution_method": {
+              "type": "string",
+              "choices": [
+                "argument_array",
+                "shell"
+              ]
+            },
+            "syntax_checked": {
+              "type": "boolean"
+            },
+            "exit_code": {
+              "type": "integer",
+              "min": -2147483648,
+              "max": 2147483647
+            },
+            "timed_out": {
+              "type": "boolean"
+            },
+            "executed": {
+              "type": "boolean"
+            },
+            "checks": {
+              "type": "array",
+              "items": {
+                "type": "reference",
+                "schema": "check_result"
+              },
+              "max_items": 10000
+            },
+            "stdout": {
+              "type": "string"
+            },
+            "stderr": {
+              "type": "string"
+            },
+            "stdout_truncated": {
+              "type": "boolean"
+            },
+            "stderr_truncated": {
+              "type": "boolean"
+            },
+            "command_operation": {
+              "field": "operation"
+            },
+            "outcome_checks": {
+              "field": "checks"
+            },
+            "command_capabilities": {
+              "type": "object",
+              "fields": {},
+              "required": [],
+              "rules": [],
+              "reject_unknown": false
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope",
+            "working_directory",
+            "exit_code",
+            "timed_out",
+            "executed",
+            "checks",
+            "stdout",
+            "stderr",
+            "stdout_truncated",
+            "stderr_truncated"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal action outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must describe command verification",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "verification_scope",
+                      "execution_only"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "verification_scope",
+                      "requested_outcomes"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "executed",
+              "error": "must agree with command termination",
+              "when": {
+                "equals": [
+                  "executed",
+                  true
+                ]
+              },
+              "assert": {
+                "all": [
+                  {
+                    "equals": [
+                      "exit_code",
+                      0
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "timed_out",
+                      false
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "executed",
+              "error": "must agree with command termination",
+              "when": {
+                "equals": [
+                  "executed",
+                  false
+                ]
+              },
+              "assert": {
+                "not": {
+                  "all": [
+                    {
+                      "equals": [
+                        "exit_code",
+                        0
+                      ]
+                    },
+                    {
+                      "equals": [
+                        "timed_out",
+                        false
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "path": "verified",
+              "error": "requires successful execution and verified requested outcomes",
+              "when": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              },
+              "assert": {
+                "all": [
+                  {
+                    "equals": [
+                      "executed",
+                      true
+                    ]
+                  },
+                  {
+                    "all_verified": "checks"
+                  },
+                  {
+                    "equals": [
+                      "verification_scope",
+                      "requested_outcomes"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with command checks",
+              "when": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              },
+              "assert": {
+                "not": {
+                  "all": [
+                    {
+                      "equals": [
+                        "executed",
+                        true
+                      ]
+                    },
+                    {
+                      "all_verified": "checks"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "path": "command_operation",
+              "error": "must accompany outcome_checks",
+              "assert": {
+                "same_presence": [
+                  "command_operation",
+                  "outcome_checks"
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must be requested_outcomes when checks are present",
+              "when": {
+                "truthy": "checks"
+              },
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "requested_outcomes"
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must be execution_only without checks",
+              "when": {
+                "not": {
+                  "truthy": "checks"
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "execution_only"
+                ]
+              }
+            }
+          ],
+          "reject_unknown": true
+        },
+        "navigate_browser": {
+          "fields": {
+            "outcome": {
+              "type": "string",
+              "choices": [
+                "rejected",
+                "dispatched",
+                "delivered_unconfirmed",
+                "verified"
+              ]
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "verification_scope": {
+              "type": "string",
+              "nonempty": true
+            },
+            "message": {
+              "type": "string"
+            },
+            "delivery_method": {
+              "type": "string",
+              "nonempty": true
+            },
+            "pid": {
+              "field": "pid"
+            }
+          },
+          "required": [
+            "outcome",
+            "verified",
+            "verification_scope"
+          ],
+          "rules": [
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "equals": [
+                  "outcome",
+                  "verified"
+                ]
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  true
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "must agree with outcome",
+              "when": {
+                "not": {
+                  "equals": [
+                    "outcome",
+                    "verified"
+                  ]
+                }
+              },
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "outcome",
+              "error": "must be a terminal action outcome",
+              "assert": {
+                "any": [
+                  {
+                    "equals": [
+                      "outcome",
+                      "verified"
+                    ]
+                  },
+                  {
+                    "equals": [
+                      "outcome",
+                      "delivered_unconfirmed"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "path": "verified",
+              "error": "cannot verify task effects from event delivery",
+              "assert": {
+                "equals": [
+                  "verified",
+                  false
+                ]
+              }
+            },
+            {
+              "path": "verification_scope",
+              "error": "must be delivery_only",
+              "assert": {
+                "equals": [
+                  "verification_scope",
+                  "delivery_only"
+                ]
+              }
+            }
+          ],
+          "reject_unknown": true
+        }
+      },
+      "choices_error": "must be a supported action result"
+    },
+    "error": {
+      "type": "object",
+      "fields": {
+        "outcome": {
+          "type": "string",
+          "choices": [
+            "rejected",
+            "dispatched",
+            "delivered_unconfirmed",
+            "verified"
+          ]
+        },
+        "verified": {
+          "type": "boolean"
+        },
+        "verification_scope": {
+          "type": "string",
+          "nonempty": true
+        },
+        "error": {
+          "type": "string",
+          "nonempty": true
+        },
+        "error_code": {
+          "type": "string",
+          "nonempty": true,
+          "max_bytes": 128
+        },
+        "terminal": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "outcome",
+        "verified",
+        "verification_scope",
+        "error",
+        "error_code",
+        "terminal"
+      ],
+      "rules": [
+        {
+          "path": "verified",
+          "error": "must be false for errors",
+          "assert": {
+            "equals": [
+              "verified",
+              false
+            ]
+          }
+        },
+        {
+          "path": "verification_scope",
+          "error": "must be none for errors",
+          "assert": {
+            "equals": [
+              "verification_scope",
+              "none"
+            ]
+          }
+        },
+        {
+          "path": "outcome",
+          "error": "must describe delivery certainty",
+          "assert": {
+            "any": [
+              {
+                "equals": [
+                  "outcome",
+                  "rejected"
+                ]
+              },
+              {
+                "equals": [
+                  "outcome",
+                  "delivered_unconfirmed"
+                ]
+              },
+              {
+                "equals": [
+                  "outcome",
+                  "dispatched"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "path": "terminal",
+          "error": "must be false for dispatched work",
+          "when": {
+            "equals": [
+              "outcome",
+              "dispatched"
+            ]
+          },
+          "assert": {
+            "equals": [
+              "terminal",
+              false
+            ]
+          }
+        },
+        {
+          "path": "terminal",
+          "error": "must be true for terminal errors",
+          "when": {
+            "not": {
+              "equals": [
+                "outcome",
+                "dispatched"
+              ]
+            }
+          },
+          "assert": {
+            "equals": [
+              "terminal",
+              true
+            ]
+          }
+        }
+      ],
+      "reject_unknown": true
+    },
+    "receipt": {
+      "type": "object",
+      "fields": {
+        "action_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "state": {
+          "type": "string",
+          "choices": [
+            "unknown",
+            "pending",
+            "dispatched",
+            "rejected",
+            "unconfirmed",
+            "confirmed"
+          ]
+        },
+        "terminal": {
+          "type": "boolean"
+        },
+        "result": {
+          "type": "reference",
+          "schema": "action_result"
+        },
+        "outcome": {
+          "type": "string",
+          "choices": [
+            "rejected",
+            "dispatched",
+            "delivered_unconfirmed",
+            "verified"
+          ]
+        },
+        "verified": {
+          "type": "boolean"
+        },
+        "verification_scope": {
+          "type": "string",
+          "nonempty": true
+        },
+        "error": {
+          "type": "string",
+          "nonempty": true
+        },
+        "error_code": {
+          "type": "string",
+          "nonempty": true,
+          "max_bytes": 128
+        }
+      },
+      "required": [
+        "action_id",
+        "state",
+        "terminal"
+      ],
+      "rules": [
+        {
+          "path": "state",
+          "error": "must have no terminal payload",
+          "when": {
+            "equals": [
+              "state",
+              "unknown"
+            ]
+          },
+          "assert": {
+            "all": [
+              {
+                "equals": [
+                  "terminal",
+                  false
+                ]
+              },
+              {
+                "not": {
+                  "has": "result"
+                }
+              },
+              {
+                "not": {
+                  "has": "outcome"
+                }
+              },
+              {
+                "not": {
+                  "has": "verified"
+                }
+              },
+              {
+                "not": {
+                  "has": "verification_scope"
+                }
+              },
+              {
+                "not": {
+                  "has": "error"
+                }
+              },
+              {
+                "not": {
+                  "has": "error_code"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "path": "state",
+          "error": "must have no terminal payload",
+          "when": {
+            "equals": [
+              "state",
+              "pending"
+            ]
+          },
+          "assert": {
+            "all": [
+              {
+                "equals": [
+                  "terminal",
+                  false
+                ]
+              },
+              {
+                "not": {
+                  "has": "result"
+                }
+              },
+              {
+                "not": {
+                  "has": "outcome"
+                }
+              },
+              {
+                "not": {
+                  "has": "verified"
+                }
+              },
+              {
+                "not": {
+                  "has": "verification_scope"
+                }
+              },
+              {
+                "not": {
+                  "has": "error"
+                }
+              },
+              {
+                "not": {
+                  "has": "error_code"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "path": "state",
+          "error": "must have no terminal payload",
+          "when": {
+            "equals": [
+              "state",
+              "dispatched"
+            ]
+          },
+          "assert": {
+            "all": [
+              {
+                "equals": [
+                  "terminal",
+                  false
+                ]
+              },
+              {
+                "not": {
+                  "has": "result"
+                }
+              },
+              {
+                "not": {
+                  "has": "outcome"
+                }
+              },
+              {
+                "not": {
+                  "has": "verified"
+                }
+              },
+              {
+                "not": {
+                  "has": "verification_scope"
+                }
+              },
+              {
+                "not": {
+                  "has": "error"
+                }
+              },
+              {
+                "not": {
+                  "has": "error_code"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "path": "terminal",
+          "error": "must be true for terminal receipts",
+          "when": {
+            "equals": [
+              "state",
+              "rejected"
+            ]
+          },
+          "assert": {
+            "equals": [
+              "terminal",
+              true
+            ]
+          }
+        },
+        {
+          "path": "terminal",
+          "error": "must be true for terminal receipts",
+          "when": {
+            "equals": [
+              "state",
+              "unconfirmed"
+            ]
+          },
+          "assert": {
+            "equals": [
+              "terminal",
+              true
+            ]
+          }
+        },
+        {
+          "path": "terminal",
+          "error": "must be true for terminal receipts",
+          "when": {
+            "equals": [
+              "state",
+              "confirmed"
+            ]
+          },
+          "assert": {
+            "equals": [
+              "terminal",
+              true
+            ]
+          }
+        },
+        {
+          "path": "result",
+          "error": "is required for confirmed receipts",
+          "when": {
+            "equals": [
+              "state",
+              "confirmed"
+            ]
+          },
+          "assert": {
+            "has": "result"
+          }
+        },
+        {
+          "path": "result",
+          "error": "cannot accompany a rejection",
+          "when": {
+            "equals": [
+              "state",
+              "rejected"
+            ]
+          },
+          "assert": {
+            "not": {
+              "has": "result"
+            }
+          }
+        },
+        {
+          "path": "state",
+          "error": "requires a terminal result or error",
+          "when": {
+            "equals": [
+              "terminal",
+              true
+            ]
+          },
+          "assert": {
+            "any": [
+              {
+                "has": "result"
+              },
+              {
+                "has": "error"
+              }
+            ]
+          }
+        },
+        {
+          "path": "error",
+          "error": "cannot accompany a result",
+          "when": {
+            "has": "result"
+          },
+          "assert": {
+            "not": {
+              "has": "error"
+            }
+          }
+        }
+      ],
+      "reject_unknown": true
+    },
+    "evidence_fact": {
+      "type": "variant",
+      "tag": "type",
+      "variants": {
+        "file_exists": {
+          "fields": {
+            "path": {
+              "field": "path"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "rules": [],
+          "reject_unknown": true
+        },
+        "directory_exists": {
+          "fields": {
+            "path": {
+              "field": "path"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "rules": [],
+          "reject_unknown": true
+        },
+        "path_absent": {
+          "fields": {
+            "path": {
+              "field": "path"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "rules": [],
+          "reject_unknown": true
+        },
+        "file_contents": {
+          "fields": {
+            "path": {
+              "field": "path"
+            },
+            "content_sha256": {
+              "type": "string",
+              "format": "sha256"
+            }
+          },
+          "required": [
+            "path",
+            "content_sha256"
+          ],
+          "rules": [],
+          "reject_unknown": true
+        },
+        "file_append": {
+          "fields": {
+            "path": {
+              "field": "path"
+            },
+            "content_sha256": {
+              "type": "string",
+              "format": "sha256"
+            }
+          },
+          "required": [
+            "path",
+            "content_sha256"
+          ],
+          "rules": [],
+          "reject_unknown": true
+        },
+        "file_written": {
+          "fields": {
+            "path": {
+              "field": "path"
+            },
+            "content_sha256": {
+              "type": "string",
+              "format": "sha256"
+            },
+            "mode": {
+              "type": "string",
+              "choices": [
+                "append",
+                "overwrite"
+              ]
+            }
+          },
+          "required": [
+            "path",
+            "content_sha256",
+            "mode"
+          ],
+          "rules": [],
+          "reject_unknown": true
+        },
+        "file_read": {
+          "fields": {
+            "path": {
+              "field": "path"
+            },
+            "content": {
+              "type": "string"
+            },
+            "encoding": {
+              "type": "string",
+              "choices": [
+                "utf-8",
+                "base64"
+              ]
+            },
+            "content_sha256": {
+              "type": "string",
+              "format": "sha256"
+            }
+          },
+          "required": [
+            "path",
+            "content",
+            "encoding",
+            "content_sha256"
+          ],
+          "rules": [],
+          "reject_unknown": true
+        },
+        "stdout_equals": {
+          "fields": {
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "rules": [],
+          "reject_unknown": true
+        },
+        "local_answer": {
+          "fields": {
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "rules": [],
+          "reject_unknown": true
+        },
+        "observation": {
+          "fields": {
+            "revision": {
+              "type": "string",
+              "nonempty": true
+            }
+          },
+          "required": [
+            "revision"
+          ],
+          "rules": [],
+          "reject_unknown": true
+        },
+        "requirement_observed": {
+          "fields": {
+            "requirement_id": {
+              "type": "string",
+              "format": "requirement_id"
+            },
+            "check_fingerprint": {
+              "type": "string",
+              "format": "sha256"
+            },
+            "revision": {
+              "type": "string",
+              "nonempty": true
+            }
+          },
+          "required": [
+            "requirement_id",
+            "check_fingerprint",
+            "revision"
+          ],
+          "rules": [],
+          "reject_unknown": true
+        },
+        "prerequisite_checked": {
+          "fields": {
+            "requirement_id": {
+              "type": "string",
+              "format": "requirement_id"
+            },
+            "check_fingerprint": {
+              "type": "string",
+              "format": "sha256"
+            },
+            "before_action": {
+              "type": "integer",
+              "min": 1,
+              "max": 9007199254740991
+            },
+            "witnesses": {
+              "type": "array",
+              "items": {
+                "type": "reference",
+                "schema": "evidence_fact"
+              },
+              "max_items": 10000
+            }
+          },
+          "required": [
+            "requirement_id",
+            "check_fingerprint",
+            "before_action",
+            "witnesses"
+          ],
+          "rules": [],
+          "reject_unknown": true
+        },
+        "command_operation": {
+          "fields": {
+            "operation": {
+              "field": "operation"
+            }
+          },
+          "required": [
+            "operation"
+          ],
+          "rules": [],
+          "reject_unknown": true
+        },
+        "command_executed": {
+          "fields": {
+            "argv": {
+              "field": "argv"
+            },
+            "command": {
+              "field": "command"
+            },
+            "working_directory": {
+              "field": "path"
+            }
+          },
+          "required": [
+            "working_directory"
+          ],
+          "rules": [
+            {
+              "path": "argv",
+              "error": "requires exactly one command representation",
+              "assert": {
+                "any": [
+                  {
+                    "all": [
+                      {
+                        "has": "argv"
+                      },
+                      {
+                        "not": {
+                          "has": "command"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "all": [
+                      {
+                        "has": "command"
+                      },
+                      {
+                        "not": {
+                          "has": "argv"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ],
+          "reject_unknown": true
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "fields": {
+        "fact": {
+          "type": "reference",
+          "schema": "evidence_fact"
+        },
+        "verified": {
+          "type": "boolean"
+        },
+        "verification_scope": {
+          "type": "string",
+          "choices": [
+            "file_exists",
+            "directory_exists",
+            "path_absent",
+            "file_contents",
+            "file_append",
+            "file_written",
+            "file_read",
+            "stdout_equals",
+            "local_answer",
+            "observation",
+            "requirement_observed",
+            "prerequisite_checked",
+            "command_operation",
+            "command_executed"
+          ]
+        },
+        "mutable": {
+          "type": "boolean"
+        },
+        "valid": {
+          "type": "boolean"
+        },
+        "generation": {
+          "type": "string",
+          "nullable": true
+        },
+        "origin": {
+          "type": "object",
+          "fields": {
+            "action_id": {
+              "type": "string",
+              "nonempty": true
+            },
+            "method": {
+              "type": "string",
+              "choices": [
+                "execution",
+                "readback"
+              ]
+            }
+          },
+          "required": [
+            "action_id",
+            "method"
+          ],
+          "rules": [],
+          "reject_unknown": true,
+          "nullable": true
+        },
+        "action": {
+          "type": "object",
+          "fields": {},
+          "required": [],
+          "rules": [],
+          "reject_unknown": false,
+          "nullable": true
+        },
+        "fact_fingerprint": {
+          "type": "string",
+          "format": "sha256"
+        },
+        "action_fingerprint": {
+          "type": "string",
+          "format": "sha256"
+        },
+        "effect_check": {
+          "type": "variant",
+          "tag": "type",
+          "variants": {
+            "file_exists": {
+              "fields": {
+                "path": {
+                  "field": "path"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "reject_unknown": true,
+              "rules": []
+            },
+            "directory_exists": {
+              "fields": {
+                "path": {
+                  "field": "path"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "reject_unknown": true,
+              "rules": []
+            },
+            "path_absent": {
+              "fields": {
+                "path": {
+                  "field": "path"
+                }
+              },
+              "required": [
+                "path"
+              ],
+              "reject_unknown": true,
+              "rules": []
+            },
+            "file_contents": {
+              "fields": {
+                "path": {
+                  "field": "path"
+                },
+                "content": {
+                  "field": "content"
+                },
+                "encoding": {
+                  "field": "encoding"
+                }
+              },
+              "required": [
+                "path",
+                "content"
+              ],
+              "reject_unknown": true,
+              "rules": [
+                {
+                  "payload": "content",
+                  "encoding": "encoding",
+                  "max_bytes": {
+                    "limit": "write_bytes"
+                  },
+                  "size_error": "must contain at most 2 MiB",
+                  "default_encoding": {
+                    "default": [
+                      "write_file",
+                      "encoding"
+                    ]
+                  }
+                }
+              ]
+            },
+            "stdout_equals": {
+              "fields": {
+                "text": {
+                  "type": "string",
+                  "no_nul": true,
+                  "max_bytes": {
+                    "limit": "command_output_bytes"
+                  },
+                  "bytes_error": "must contain no NUL bytes and at most 65536 bytes"
+                }
+              },
+              "required": [
+                "text"
+              ],
+              "reject_unknown": true,
+              "rules": []
+            }
+          }
+        }
+      },
+      "required": [
+        "fact",
+        "verified",
+        "verification_scope",
+        "mutable",
+        "valid",
+        "generation",
+        "origin",
+        "action",
+        "fact_fingerprint",
+        "action_fingerprint"
+      ],
+      "rules": [
+        {
+          "path": "verified",
+          "error": "must be true for evidence",
+          "assert": {
+            "equals": [
+              "verified",
+              true
+            ]
+          }
+        }
+      ],
+      "reject_unknown": true
+    }
+  },
+  "receipt_outcomes": {
+    "confirmed": "verified",
+    "unconfirmed": "delivered_unconfirmed",
+    "rejected": "rejected"
   }
 }

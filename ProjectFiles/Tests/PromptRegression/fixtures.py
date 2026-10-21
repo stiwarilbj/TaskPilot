@@ -5,6 +5,7 @@ Private corpus files are materialized by the evaluator, outside the checkout.
 """
 from copy import deepcopy
 import hashlib
+from evidence_fixtures import native_result, native_batch, native_delivery
 
 
 def control(key, title, role="AXButton", window="Draft", x=100, **fields):
@@ -34,9 +35,11 @@ VERIFIED = {"outcome": "verified", "delivery_method": "fixture", "pid": 42,
 
 
 def transition(source, action, destination, effect=None, correct=True, result=None, **fields):
+    if result is None: result = native_result(action, delivery_method='fixture', pid=42, message='Fixture event delivered')
+    else: result = native_delivery(action, result)
     return {"from": source, "action": action, "to": destination,
             "effects": effect or {}, "correct": correct,
-            "result": VERIFIED if result is None else result, **fields}
+            "result": result, **fields}
 
 
 def case(identifier, category, states, transitions, baseline, candidate, source):
@@ -120,7 +123,7 @@ def seed_cases():
     submit = control("save", "Submit Draft")
     uncertain = case("uncertain-submission", "wrong_clicks",
                      {"initial": state(submit), "saved": state(submit, control("receipt", "Draft submitted", "AXStaticText"))},
-                     [transition("initial", press, "saved", {"saved": 1}, result={**VERIFIED, "outcome": "delivered_unconfirmed"}),
+                     [transition("initial", press, "saved", {"saved": 1}, result=native_result(press, message='Fixture event delivered', delivery_method='fixture', pid=42)),
                       transition("saved", press, "saved", {"saved": 1}, correct=False)],
                      [act(), act(), act()], normal,
                      "test_action_recovery / do not replay an uncertain mutation")
@@ -149,10 +152,12 @@ def seed_cases():
 def cycle_cases():
     opened = act(target="$open")
     closed = act(target="$close")
+    opened['expected_result'] = {'type':'field_value','element_id':'$state','value':'open'}
+    closed['expected_result'] = {'type':'field_value','element_id':'$state','value':'closed'}
     saved = state(control("saved", "Draft saved", "AXStaticText"))
     dialog = case("repeated-dialog", "recovery_cycles",
-        {"initial": state(control("open", "Open save dialog"), control("save", "Save using menu")),
-         "dialog": state(control("dialog", "Save Draft", "AXSheet"), control("close", "Cancel")), "saved": saved},
+        {"initial": state(control("open", "Open save dialog"), control("save", "Save using menu"), control("state", "Dialog status", "AXTextField", value="closed", value_complete=True)),
+         "dialog": state(control("dialog", "Save Draft", "AXSheet"), control("close", "Cancel"), control("state", "Dialog status", "AXTextField", value="open", value_complete=True)), "saved": saved},
         [transition("initial", opened["action"], "dialog"), transition("dialog", closed["action"], "initial"),
          transition("initial", {"type": "press", "element_id": "$save"}, "saved", {"saved": 1})],
         [opened, closed, opened, closed, opened, opened, opened],

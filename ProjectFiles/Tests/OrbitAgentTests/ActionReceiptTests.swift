@@ -3,7 +3,9 @@ import XCTest
 @testable import OrbitAgent
 
 final class ActionReceiptTests: XCTestCase {
-    private let payload: [String: Any] = ["action": ["type": "press", "element_id": "fixture:send"]]
+    private static let focused: [String: Any] = ["action_type": "focus", "outcome": "verified", "verified": true, "verification_scope": "focus"]
+    private static let unconfirmed: [String: Any] = ["action_type": "press", "outcome": "delivered_unconfirmed", "verified": false, "verification_scope": "delivery_only"]
+    private let payload: [String: Any] = ["action": ["type": "focus", "element_id": "fixture:send"]]
     private func token(_ lease: TaskLease, id: String, payload: [String: Any]) throws -> ActionReceiptStore.Token {
         switch try lease.commit({ try lease.actionReceipts.begin(id: id, payload: payload) }) {
         case .new(let token): return token
@@ -28,7 +30,7 @@ final class ActionReceiptTests: XCTestCase {
                                 try TaskOwnership.commit { 1 }
                             }
                         }
-                        token.complete(["outcome": "verified"])
+                        try token.complete(Self.focused)
                         return count
                     case .existing: return 0
                     }
@@ -55,7 +57,7 @@ final class ActionReceiptTests: XCTestCase {
                 }
             }
         }
-        receipt.complete(["message": "acknowledged", "outcome": "verified"])
+        try receipt.complete(Self.focused)
         receipt.fail(CancellationError(), code: "cancelled")
         XCTAssertEqual(receipt.receipt["state"] as? String, "confirmed") // terminal state settles once
     }
@@ -63,7 +65,7 @@ final class ActionReceiptTests: XCTestCase {
     func testReuseWithDifferentIntentRejectsWithoutChangingOriginalReceipt() throws {
         let lease = TaskLease(), id = UUID().uuidString
         let receipt = try token(lease, id: id, payload: payload)
-        receipt.complete(["outcome": "verified"])
+        try receipt.complete(Self.focused)
         XCTAssertThrowsError(try lease.actionReceipts.begin(id: id, payload: ["action": ["type": "key", "key": "return"]])) {
             XCTAssertEqual(($0 as? ActionReceiptStore.ReceiptError)?.code, "receipt_conflict")
         }
@@ -72,7 +74,7 @@ final class ActionReceiptTests: XCTestCase {
 
     func testEndedActionContextCannotDeliverALateEffect() throws {
         let lease = TaskLease(), receipt = try token(lease, id: UUID().uuidString, payload: payload)
-        receipt.complete(["outcome": "verified"])
+        try receipt.complete(Self.focused)
         var effects = 0
         XCTAssertThrowsError(try TaskOwnership.$current.withValue(lease) {
             try TaskOwnership.$actionReceipt.withValue(receipt) { try TaskOwnership.commit { effects += 1 } }
@@ -84,7 +86,7 @@ final class ActionReceiptTests: XCTestCase {
     func testCanonicalPayloadOrderAndIDCaseDoNotChangeIntent() throws {
         let lease = TaskLease(), id = UUID().uuidString
         let receipt = try token(lease, id: id, payload: ["b": 2, "a": 1])
-        receipt.complete(["verified": true])
+        try receipt.complete(Self.focused)
         guard case .existing(let replay) = try lease.actionReceipts.begin(id: id.lowercased(), payload: ["a": 1, "b": 2]) else { return XCTFail("Duplicate admitted") }
         XCTAssertEqual(replay["action_id"] as? String, id.lowercased())
         XCTAssertEqual(replay["state"] as? String, "confirmed")
@@ -102,9 +104,9 @@ final class ActionReceiptTests: XCTestCase {
         }
         uncertain.fail(ActionReceiptStore.ReceiptError(code: "fixture", message: "Lost result"), code: "action_rejected")
         XCTAssertEqual(uncertain.receipt["state"] as? String, "unconfirmed")
-        XCTAssertEqual(uncertain.receipt["error_code"] as? String, "delivery_uncertain")
+        XCTAssertEqual(uncertain.receipt["error_code"] as? String, "action_rejected")
         let delivered = try token(lease, id: UUID().uuidString, payload: payload)
-        delivered.complete(["outcome": "delivered_unconfirmed", "verification_scope": "action_effect"])
+        try delivered.complete(Self.focused.merging(["outcome": "delivered_unconfirmed", "verified": false, "verification_scope": "delivery_only"]) { _, new in new })
         XCTAssertEqual(delivered.receipt["state"] as? String, "unconfirmed")
     }
 
@@ -136,7 +138,7 @@ final class ActionReceiptTests: XCTestCase {
                 try await TaskOwnership.$actionReceipt.withValue(receipt) {
                     started.fulfill()
                     try await TaskOwnership.checkpoint()
-                    try TaskOwnership.commit { receipt.complete(["outcome": "verified"]) }
+                    try TaskOwnership.commit { try receipt.complete(Self.focused) }
                 }
             }
         }
@@ -158,13 +160,13 @@ final class ActionReceiptTests: XCTestCase {
         let result = try await TaskOwnership.$current.withValue(lease) {
             try await TaskOwnership.$actionReceipt.withValue(receipt) { try await tool.perform(action: action) }
         }
-        receipt.complete(result)
+        try receipt.complete(result)
         guard case .existing(let replay) = try lease.actionReceipts.begin(id: id, payload: action) else { return XCTFail("Write admitted again") }
         XCTAssertEqual((replay["result"] as? [String: Any])?["bytes_written"] as? Int, 1)
         XCTAssertEqual(try String(contentsOf: path, encoding: .utf8), "X")
         // A new caller intent must remain possible even with identical data.
         let next = try token(lease, id: UUID().uuidString, payload: action)
-        next.complete(try await TaskOwnership.$current.withValue(lease) {
+        try next.complete(try await TaskOwnership.$current.withValue(lease) {
             try await TaskOwnership.$actionReceipt.withValue(next) { try await tool.perform(action: action) }
         })
         XCTAssertEqual(try String(contentsOf: path, encoding: .utf8), "XX")
@@ -175,15 +177,15 @@ final class ActionReceiptTests: XCTestCase {
         let action: [String: Any] = ["type": "press", "element_id": "old:send"]
         let identity: [String: Any] = ["display_id": 999_999, "observation_revision": "old", "action": try ActionContract.validate(action)]
         let receipt = try token(lease, id: id, payload: identity)
-        receipt.complete(["outcome": "verified", "verification_scope": "action_effect"])
+        try receipt.complete(Self.unconfirmed)
         var params = identity
         params["action_id"] = id
         params["action"] = ["type": "click", "element_id": "old:send", "x": 0, "y": 0] // canonical press
         let reply = await bridge.handleOwned(["task_generation_id": lease.id, "request_id": "replay", "method": "act", "params": params], lease: lease)
         XCTAssertEqual(reply["ok"] as? Bool, true)
-        XCTAssertEqual((reply["action_receipt"] as? [String: Any])?["state"] as? String, "confirmed")
+        XCTAssertEqual((reply["action_receipt"] as? [String: Any])?["state"] as? String, "unconfirmed")
         let lookup = await bridge.handleOwned(["task_generation_id": lease.id, "request_id": "lookup", "method": "action_receipt", "params": ["action_id": id]], lease: lease)
-        XCTAssertEqual((lookup["result"] as? [String: Any])?["state"] as? String, "confirmed")
+        XCTAssertEqual((lookup["result"] as? [String: Any])?["state"] as? String, "unconfirmed")
         let foreign = await bridge.handleOwned(["task_generation_id": TaskLease().id, "method": "action_receipt", "params": ["action_id": id]], lease: lease)
         XCTAssertEqual(foreign["error_code"] as? String, "cancelled")
     }
@@ -197,7 +199,7 @@ final class ActionReceiptTests: XCTestCase {
                                      "checks": [["type": "file_contents", "path": path.path, "content": "X"]]]
         let lease = TaskLease(), id = UUID().uuidString
         let receipt = try token(lease, id: id, payload: action)
-        receipt.complete(try await TaskOwnership.$current.withValue(lease) {
+        try receipt.complete(try await TaskOwnership.$current.withValue(lease) {
             try await TaskOwnership.$actionReceipt.withValue(receipt) { try await TaskToolExecutor().perform(action: action) }
         })
         guard case .existing(let replay) = try lease.actionReceipts.begin(id: id, payload: action) else { return XCTFail("Command admitted again") }

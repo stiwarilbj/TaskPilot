@@ -10,7 +10,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "PromptRegression"))
 import evaluate as regression
-from fixtures import seed_cases, act, DONE, YES, NO
+from fixtures import seed_cases, act, control, DONE, YES, NO
 
 
 class PromptRegressionTests(unittest.TestCase):
@@ -125,11 +125,19 @@ class PromptRegressionTests(unittest.TestCase):
 
     def test_exactly_once_ground_truth_detects_duplicate_even_when_final_screen_claims_success(self):
         case = deepcopy(self.cases["healthy-control"])
-        repeated = deepcopy(case["transitions"][0])
-        repeated["from"] = "saved"
+        # Exact readback permits the second action; the independent counter
+        # still detects whether the task requested that second effect.
         case["states"]["saved"]["controls"].append(deepcopy(case["states"]["initial"]["controls"][0]))
+        case["states"]["twice"] = deepcopy(case["states"]["saved"])
+        for state, count in [("initial", 0), ("saved", 1), ("twice", 2)]:
+            case["states"][state]["controls"].append(control("counter", "Save count", "AXTextField",
+                                                           value=str(count), value_complete=True))
+        repeated = deepcopy(case["transitions"][0])
+        repeated.update({"from": "saved", "to": "twice"})
         case["transitions"].append(repeated)
-        result, _ = regression.replay_case(case, self.pack, script=[act(), act(), DONE, YES])
+        script = [{**act(), "expected_result": {"type": "field_value", "element_id": "$counter", "value": str(count)}}
+                  for count in (1, 2)] + [DONE, YES]
+        result, _ = regression.replay_case(case, self.pack, script=script)
         self.assertEqual(result["duplicate_actions"], 1)
         self.assertFalse(result["postconditions_met"])
         self.assertFalse(result["success"])
@@ -152,11 +160,19 @@ class PromptRegressionTests(unittest.TestCase):
     def test_intentionally_repeated_requirements_are_not_duplicate_actions(self):
         case = deepcopy(self.cases["healthy-control"])
         case["goals"]["saved"] = 2
-        repeated = deepcopy(case["transitions"][0])
-        repeated["from"] = "saved"
+        # Exact readback permits the second action; the independent counter
+        # still detects whether the task requested that second effect.
         case["states"]["saved"]["controls"].append(deepcopy(case["states"]["initial"]["controls"][0]))
+        case["states"]["twice"] = deepcopy(case["states"]["saved"])
+        for state, count in [("initial", 0), ("saved", 1), ("twice", 2)]:
+            case["states"][state]["controls"].append(control("counter", "Save count", "AXTextField",
+                                                           value=str(count), value_complete=True))
+        repeated = deepcopy(case["transitions"][0])
+        repeated.update({"from": "saved", "to": "twice"})
         case["transitions"].append(repeated)
-        result, _ = regression.replay_case(case, self.pack, script=[act(), act(), DONE, YES])
+        script = [{**act(), "expected_result": {"type": "field_value", "element_id": "$counter", "value": str(count)}}
+                  for count in (1, 2)] + [DONE, YES]
+        result, _ = regression.replay_case(case, self.pack, script=script)
         self.assertTrue(result["success"])
         self.assertEqual(result["duplicate_actions"], 0)
 

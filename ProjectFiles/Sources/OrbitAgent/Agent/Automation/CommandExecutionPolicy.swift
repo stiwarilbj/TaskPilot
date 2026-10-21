@@ -23,7 +23,8 @@ struct CommandExecutionPolicy {
         let text: String?
 
         func evaluate(stdout: String, stdoutTruncated: Bool) -> [String: Any] {
-            var result: [String: Any] = ["type": type, "verified": false]
+            var result: [String: Any] = ["type": type, "verified": false,
+                "outcome": "delivered_unconfirmed", "verification_scope": type]
             if let path { result["path"] = path.path }
             do {
                 let matches: Bool
@@ -52,6 +53,7 @@ struct CommandExecutionPolicy {
                     }
                 }
                 result["verified"] = matches
+                result["outcome"] = matches ? "verified" : "delivered_unconfirmed"
                 if matches, let expected {
                     result["content_sha256"] = SHA256.hash(data: expected).map { String(format: "%02x", $0) }.joined()
                 }

@@ -17,18 +17,18 @@ final class ActionReceiptStore: @unchecked Sendable {
             self.id = id; self.generation = store.generation; self.store = store
         }
         func dispatched() throws { try store.dispatched(id) }
-        func complete(_ result: [String: Any]) { store.complete(id, result: result) }
+        func complete(_ result: [String: Any]) throws { try store.complete(id, result: result) }
         func fail(_ error: Error, code: String) { store.fail(id, error: error, code: code) }
         var receipt: [String: Any] { store.lookup(id) }
     }
     enum Claim { case new(Token), existing([String: Any]) }
     private struct Entry {
         let fingerprint: String
+        let action: [String: Any]?
         var state = "pending"
         var terminal = false
         var result: [String: Any]?
-        var error: String?
-        var errorCode: String?
+        var failure: [String: Any]?
     }
     let generation: String
     private let lock = NSLock()
@@ -56,7 +56,7 @@ final class ActionReceiptStore: @unchecked Sendable {
             duplicates += 1
             return .existing(snapshot(id, previous))
         }
-        entries[id] = Entry(fingerprint: fingerprint)
+        entries[id] = Entry(fingerprint: fingerprint, action: payload["action"] as? [String: Any] ?? (payload["type"] != nil ? payload : nil))
         return .new(Token(id: id, store: self))
     }
 
@@ -74,8 +74,7 @@ final class ActionReceiptStore: @unchecked Sendable {
     private func snapshot(_ id: String, _ entry: Entry) -> [String: Any] {
         var value: [String: Any] = ["action_id": id, "state": entry.state, "terminal": entry.terminal]
         if let result = entry.result { value["result"] = result }
-        if let error = entry.error { value["error"] = error }
-        if let code = entry.errorCode { value["error_code"] = code }
+        if let failure = entry.failure { value.merge(failure) { _, new in new } }
         return value
     }
     private func dispatched(_ id: String) throws {
@@ -83,11 +82,15 @@ final class ActionReceiptStore: @unchecked Sendable {
         guard var entry = entries[id], !entry.terminal else { throw CancellationError() }
         entry.state = "dispatched"; entries[id] = entry
     }
-    private func complete(_ id: String, result: [String: Any]) {
+    private func complete(_ id: String, result: [String: Any]) throws {
         lock.lock(); defer { lock.unlock() }
         guard var entry = entries[id], !entry.terminal else { return }
+        // Validate before mutating the receipt. A malformed reply never means
+        // confirmed; the bridge records a protocol error with delivery certainty.
+        try ActionContract.validateNativeResult(result, action: entry.action)
         entry.terminal = true; entry.result = result
         entry.state = result["outcome"] as? String == "delivered_unconfirmed" ? "unconfirmed" : "confirmed"
+        try ActionContract.validateNativeReceipt(snapshot(id, entry), actionID: id, action: entry.action)
         entries[id] = entry
     }
     private func fail(_ id: String, error: Error, code: String) {
@@ -95,9 +98,13 @@ final class ActionReceiptStore: @unchecked Sendable {
         guard var entry = entries[id], !entry.terminal else { return }
         let uncertain = entry.state == "dispatched" || code == "delivery_uncertain"
         entry.terminal = true; entry.state = uncertain ? "unconfirmed" : "rejected"
-        entry.error = error.localizedDescription
-        entry.errorCode = uncertain && !["cancelled", "permission_denied", "protected_target", "secure_input"].contains(code)
-            ? "delivery_uncertain" : code
+        entry.failure = ActionContract.nativeFailure(error, code: code,
+            outcome: uncertain ? "delivered_unconfirmed" : "rejected")
+        do { try ActionContract.validateNativeReceipt(snapshot(id, entry)) }
+        catch {
+            entry.failure = ActionContract.nativeFailure(ActionContract.NativeProtocolError(message: "Native failure fields did not satisfy the protocol contract"), code: "protocol_error",
+                outcome: uncertain ? "delivered_unconfirmed" : "rejected")
+        }
         entries[id] = entry
     }
 }

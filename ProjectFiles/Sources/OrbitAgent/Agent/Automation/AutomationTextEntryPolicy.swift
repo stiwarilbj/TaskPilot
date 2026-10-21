@@ -19,7 +19,7 @@ struct AutomationTextEntryResult {
     }
 
     func dictionary(pid: Int32) -> [String: Any] {
-        ["message": message, "delivery_method": method,
+        ["message": message, "delivery_method": method, "verified": verified,
          "outcome": verified ? "verified" : "delivered_unconfirmed",
          "verification_scope": "text_value", "text_verification": verification, "pid": Int(pid)]
     }

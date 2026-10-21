@@ -9,6 +9,7 @@ import queue
 import os
 import threading
 import time
+from action_contract_generated import validate_native_receipt
 
 
 class BridgeReplyLost(RuntimeError):
@@ -67,7 +68,7 @@ class RuntimeInbox:
         return line
 
 
-def reconcile_receipt(action_id, lookup, metrics, *, budget=5.0, clock=time.monotonic, sleep=time.sleep):
+def reconcile_receipt(action_id, lookup, metrics, *, budget=5.0, clock=time.monotonic, sleep=time.sleep, action=None):
     """Recover a terminal reply. Unfinished/unknown work must stop, not overlap.
 
     lookup is a read-only private bridge operation. Caller retains the same
@@ -81,27 +82,20 @@ def reconcile_receipt(action_id, lookup, metrics, *, budget=5.0, clock=time.mono
                 raise RuntimeError("The previous action has not ended safely; TaskPilot stopped without repeating it")
             metrics["receipt_queries"] += 1
             receipt = lookup(action_id, remaining)
-            if (not isinstance(receipt, dict) or receipt.get("action_id") != action_id or
-                    type(receipt.get("terminal")) is not bool):
-                raise RuntimeError("The action receipt does not match this task's pending action; no action was repeated")
-            state, terminal = receipt.get("state"), receipt["terminal"]
-            if state in {"pending", "dispatched"} and not terminal:
+            validate_native_receipt(receipt, action_id, action)
+            state = receipt['state']
+            if state in {'pending', 'dispatched'}:
                 sleep(min(0.1, max(0, deadline - clock())))
                 continue
-            if state not in {"confirmed", "unconfirmed", "rejected"} or not terminal:
-                raise RuntimeError("The native action outcome is unknown; TaskPilot stopped without repeating it")
-            result = receipt.get("result")
-            if state in {"confirmed", "unconfirmed"} and isinstance(result, dict):
-                if (result.get("outcome") == "delivered_unconfirmed") != (state == "unconfirmed"):
-                    raise RuntimeError("The action receipt's outcome is inconsistent; no action was repeated")
-                response = {"ok": True, "result": result}
-            elif state in {"rejected", "unconfirmed"} and isinstance(receipt.get("error"), str) and isinstance(receipt.get("error_code"), str):
-                code = receipt["error_code"]
-                if state == "unconfirmed" and code not in {"cancelled", "permission_denied", "protected_target", "secure_input"}:
-                    code = "delivery_uncertain"
-                response = {"ok": False, "error": receipt["error"], "error_code": code}
+            if state == 'unknown':
+                raise RuntimeError('The native action outcome is unknown; TaskPilot stopped without repeating it')
+            if 'result' in receipt:
+                response = {'ok': True, 'result': receipt['result']}
             else:
-                raise RuntimeError("The native action receipt lacks a terminal result; no action was repeated")
+                # Preserve both the precise error and explicit delivery certainty.
+                # The runtime stops on protocol errors; none authorize replay.
+                response = {'ok': False, **{key: receipt[key] for key in
+                    ('error', 'error_code', 'outcome', 'verified', 'verification_scope', 'terminal')}}
             metrics["receipt_recoveries"] += 1
             return response
     except Exception:

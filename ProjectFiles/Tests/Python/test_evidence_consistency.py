@@ -9,10 +9,12 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
+from evidence_fixtures import native_result, native_batch
 import openclaw_runtime as runtime
 from evidence_consistency import EvidenceConsistency, normalize, screen_conflicts
 from response_validation import ResponseValidationError, validate_response
 from task_evidence import TaskEvidenceLedger, content_hash
+from action_contract_generated import NativeProtocolError
 from test_local_text_recognition import observation as text_observation
 from test_response_validation import FakeClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'PromptRegression'))
@@ -43,15 +45,14 @@ def plan(obs, **fields):
 
 
 def read_result(content='Ready', **changes):
-    return dict(path=PATH, content=content, encoding='utf-8', bytes_returned=len(content.encode()),
-                content_sha256=hashlib.sha256(content.encode()).hexdigest(), truncated=False, **changes)
+    return native_result({'type':'read_file', 'path':PATH}, content=content, **changes)
 
 
 def checked(check, verified, reason='The requested outcome did not match'):
     actual = dict(type=check['type'], path=check['path'], verified=verified)
     if verified and check['type'] == 'file_contents': actual['content_sha256'] = content_hash(check)
     if not verified: actual['reason'] = reason
-    return dict(requested_checks=[deepcopy(check)], checks=[actual])
+    return native_batch([deepcopy(check)], [actual])
 
 
 class Inspection:
@@ -228,8 +229,10 @@ class EvidenceConsistencyTests(unittest.TestCase):
         evidence_id = next(k for k, e in ledger.evidence.items() if e['fact']['type'] == 'file_read')
         decision = plan(before, evidence_disagreement=dict(element_id='current:save', screenshot_text='Ready', evidence_id=evidence_id))
         conflicts = guard.conflicts(decision, before, ledger)
-        for invalid in [dict(read_result(), truncated=True), dict(read_result(), content_sha256='wrong'),
-                        dict(read_result(), path='/fixture/other.txt')]:
+        for invalid in [dict(read_result(), content_sha256='wrong'), dict(read_result(), path='/fixture/other.txt')]:
+            io = Inspection([observation('fresh', title='Ready', text='Ready')], [invalid]*3)
+            with self.assertRaises(NativeProtocolError): io.run(guard, conflicts, before, ledger)
+        for invalid in [dict(read_result(), truncated=True)]:
             io = Inspection([observation('fresh', title='Ready', text='Ready')], [invalid]*3)
             _, report = io.run(guard, conflicts, before, ledger)
             self.assertEqual(report['resolution'], 'unresolved')
@@ -254,8 +257,9 @@ class EvidenceConsistencyTests(unittest.TestCase):
         self.assertFalse(prior['valid']); self.assertFalse(report['refreshed_evidence'][0]['verified'])
         self.assertTrue(all(c[0] in {'observe', 'check_effect'} for c in io.calls))
         self.assertTrue(all(c[1] is None for c in io.calls if c[0] == 'observe'))
-        for raw in [checked(check, False, 'The requested outcome could not be inspected'), {'checks': []}]:
-            guard.note_native_check(check, raw, prior); self.assertFalse(guard.native_conflicts)
+        guard.note_native_check(check, checked(check, False, 'The requested outcome could not be inspected'), prior)
+        self.assertFalse(guard.native_conflicts)
+        with self.assertRaises(NativeProtocolError): guard.note_native_check(check, {'checks': []}, prior)
 
     def test_native_read_changes_need_two_new_matching_hashes_and_fail_closed_on_errors(self):
         before = observation(text='Save'); guard = EvidenceConsistency(); ledger = self.ledger(before)

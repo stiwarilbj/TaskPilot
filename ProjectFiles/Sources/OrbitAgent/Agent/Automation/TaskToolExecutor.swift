@@ -165,7 +165,10 @@ final class TaskToolExecutor {
                                                        expected: expected, text: nil).evaluate(stdout: "", stdoutTruncated: false))
         }
         try TaskOwnership.check()
-        return ["requested_checks": requested, "checks": checks]
+        let verified = !checks.isEmpty && checks.allSatisfy { $0["verified"] as? Bool == true }
+        return try ActionContract.validateCheckBatch(["requested_checks": requested, "checks": checks,
+            "outcome": verified ? "verified" : "delivered_unconfirmed", "verified": verified,
+            "verification_scope": "requested_outcomes"])
     }
 
     func pauseActiveCommand() {
@@ -227,6 +230,7 @@ final class TaskToolExecutor {
             encoding = "base64"
         }
         return [
+            "action_type": "read_file", "outcome": "verified", "verified": true, "verification_scope": "file_read",
             "message": "Read \(bounded.count) bytes from \(url.lastPathComponent)" +
                 (truncated ? " (output truncated)" : ""),
             "path": url.path,
@@ -325,6 +329,7 @@ final class TaskToolExecutor {
         }
 
         return [
+            "action_type": "write_file", "verification_scope": "file_write",
             "message": "\(mode == "append" ? "Appended" : "Wrote") and verified \(data.count) bytes in \(url.lastPathComponent)",
             "path": url.path,
             "bytes_written": data.count,
@@ -522,6 +527,7 @@ final class TaskToolExecutor {
         let executed = !execution.timedOut && execution.status == 0
         let verified = executed && !checks.isEmpty && checks.allSatisfy { $0["verified"] as? Bool == true }
         var result: [String: Any] = [
+            "action_type": "run_command",
             "message": execution.timedOut
                 ? "Command timed out; inspect its effects before retrying"
                 : verified ? "Command finished and its requested outcome checks passed"

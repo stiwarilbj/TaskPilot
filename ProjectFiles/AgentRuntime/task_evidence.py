@@ -15,12 +15,13 @@ import threading
 from copy import deepcopy
 from typing import Any
 
-from action_contract_generated import CONTRACT, ActionContractError, _field, validate_action, validate_outcome_check
+from action_contract_generated import (CONTRACT, ActionContractError, _field, validate_action, validate_outcome_check,
+    validate_native_result, validate_check_batch, validate_native_readback, validate_native_payload, validate_native_evidence)
 from task_inputs import TaskInputBindings
 from expected_effects import ExpectedEffect, ExpectedEffectError, validate_expectation
 from observation_context import coordinate_targets, observation_indexes
 
-CHECKLIST_VERSION = 4
+CHECKLIST_VERSION = 5
 FILE_CHECKS = {"file_exists", "directory_exists", "path_absent", "file_contents"}
 OBSERVATION_CHECKS = {"window_active", "field_value", "dialog_present"}
 READ_PATTERN = r'\s*(?:read|show|print)\s+(?:the\s+)?(?:contents of\s+)?file\s+(["`\'])((?:/|~/)(?:(?!\1)[^\n])+)\1\s*[.!]?\s*'
@@ -99,7 +100,7 @@ def path_key(path: str) -> str:
 
 
 def content_bytes(check: dict) -> bytes:
-    return (base64.b64decode(check["content"], validate=True) if check.get("encoding") == "base64"
+    return (base64.b64decode(check["content"], validate=True) if check.get("encoding", "utf-8").lower() == "base64"
             else check["content"].encode("utf-8"))
 
 
@@ -493,11 +494,15 @@ class TaskEvidenceLedger:
         return None
 
     def add_evidence(self, fact: dict, *, mutable=False, action=None) -> str:
+        validate_native_payload('evidence_fact', fact, 'evidence.fact')
         identifier = f"e{len(self.evidence) + 1}"
-        self.evidence[identifier] = {"fact": deepcopy(fact), "mutable": mutable, "valid": True,
-                                     "action": deepcopy(action), "generation": self.generation,
-                                     "origin": ({"action_id": f"a{self.action_sequence}", "method": "readback" if self.readback else "execution"} if action else None),
-                                     "fact_fingerprint": digest(fact), "action_fingerprint": digest(action)}
+        evidence = {"fact": deepcopy(fact), "mutable": mutable, "valid": True,
+                    "verified": True, "verification_scope": fact.get("type"),
+                    "action": deepcopy(action), "generation": self.generation,
+                    "origin": ({"action_id": f"a{self.action_sequence}", "method": "readback" if self.readback else "execution"} if action else None),
+                    "fact_fingerprint": digest(fact), "action_fingerprint": digest(action)}
+        validate_native_evidence(evidence)
+        self.evidence[identifier] = evidence
         self.refresh()
         return identifier
 
@@ -534,7 +539,9 @@ class TaskEvidenceLedger:
         try: action = validate_action(action)
         except ActionContractError: return
         kind = action["type"]
-        if not isinstance(result, dict): return
+        if kind in {"none", "wait"}: return
+        if recheck: validate_native_readback(result, action)
+        else: validate_native_result(result, action)
         self.action_sequence += 1
         self.readback = recheck
         if recheck:
@@ -554,7 +561,7 @@ class TaskEvidenceLedger:
                                "encoding": result["encoding"], "content_sha256": result["content_sha256"]}, mutable=True, action=action)
         elif kind == "write_file":
             if (result.get("verified") is not True or result.get("path") != path_key(action["path"]) or
-                    result.get("mode") != action.get("mode", "overwrite") or
+                    result.get("mode") != action.get("mode", "overwrite").lower() or
                     result.get("content_sha256") != content_hash(action) or
                     type(result.get("bytes_written")) is not int or result["bytes_written"] != len(content_bytes(action))): return
             self.add_evidence({"type": "file_written", "path": result["path"], "mode": result["mode"],
@@ -605,6 +612,7 @@ class TaskEvidenceLedger:
         return check['type'] == 'stdout_equals' and actual.get('text_sha256') == hashlib.sha256(check['text'].encode()).hexdigest()
 
     def record_check(self, check: dict, actual: dict, action: dict) -> None:
+        validate_native_payload('check_result', actual, 'check_result')
         if (not isinstance(check, dict) or not isinstance(actual, dict) or
                 actual.get("verified") is not True or actual.get("type") != check.get("type")): return
         kind = check["type"]
@@ -623,6 +631,7 @@ class TaskEvidenceLedger:
         """Only validated local checks enter this path; model claims do not."""
         try: check = validate_outcome_check(check)
         except ActionContractError: return
+        validate_native_payload('check_result', actual, 'check_result')
         if check.get('type') not in FILE_CHECKS: return
         if any(self.matches(check, evidence) for evidence in self.evidence.values()): return
         self.checks += 1

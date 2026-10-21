@@ -8,6 +8,7 @@ from unittest import mock
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
+from evidence_fixtures import native_result
 import openclaw_runtime as runtime
 from coordinate_fixtures import fixture_coordinates
 from action_contract_generated import CONTRACT_HASH, CONTRACT_VERSION, TASK_PROTOCOL_VERSION
@@ -43,9 +44,11 @@ class TaskOwnershipTests(unittest.TestCase):
         self.assertEqual(runtime._bridge_observation_revision, 'current')
         self.assertNotIn('task_generation_id', result)  # Not model evidence.
         self.assertEqual(emit.call_count, 1)
-        action_reply = {**replies[1], 'action_receipt': {'action_id': 'same', 'state': 'confirmed', 'terminal': True}}
-        with mock.patch.object(runtime.uuid, 'uuid4', return_value='same'), mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(action_reply))), mock.patch.object(runtime, 'emit') as emit:
-            runtime.bridge_call('act', 1, action={'type': 'none'})
+        action_id='a710196f-89ed-4762-8df1-1b8b6f20db58'
+        action={'type':'focus','element_id':'current:field'}
+        action_reply = {**replies[1], 'request_id':action_id,'result':native_result(action), 'action_receipt': {'action_id':action_id,'state':'confirmed','terminal':True}}
+        with mock.patch.object(runtime.uuid, 'uuid4', return_value=action_id), mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(action_reply))), mock.patch.object(runtime, 'emit') as emit:
+            runtime.bridge_call('act', 1, action=action)
         self.assertEqual(emit.call_args.kwargs['params']['observation_revision'], 'current')
 
     def test_cross_task_observation_never_reaches_planning(self):

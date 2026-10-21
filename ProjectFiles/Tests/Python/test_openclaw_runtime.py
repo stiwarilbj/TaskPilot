@@ -12,6 +12,7 @@ from unittest import mock
 RUNTIME_DIRECTORY = Path(__file__).resolve().parents[2] / "AgentRuntime"
 sys.path.insert(0, str(RUNTIME_DIRECTORY))
 
+from evidence_fixtures import native_result, native_failure
 import openclaw_runtime as runtime
 
 
@@ -31,7 +32,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
 
     def test_bridge_forwards_revision_and_structured_rejection(self):
         response = {"kind": "bridge_response", "request_id": "fixture", "ok": False,
-                    "error": "Target changed", "error_code": "stale_target"}
+                    **native_failure("stale_target", message="Target changed")}
         with mock.patch.object(runtime, "_bridge_observation_revision", "revision-1"), \
              mock.patch.object(runtime.uuid, "uuid4", return_value="fixture"), \
              mock.patch.object(runtime, "emit") as emitted, \
@@ -438,8 +439,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
             [{
                 "step": 1,
                 "action": {"type": "write_file", "path": "/tmp/note.txt", "content": "note"},
-                "result": {"verified": True, "path": "/tmp/note.txt", "mode": "overwrite", "bytes_written": 4,
-                           "content_sha256": runtime.hashlib.sha256(b"note").hexdigest()},
+                "result": native_result({"type":"write_file","path":"/tmp/note.txt","content":"note"}),
             }],
         )
         self.assertIn("validated native action results", prompt)

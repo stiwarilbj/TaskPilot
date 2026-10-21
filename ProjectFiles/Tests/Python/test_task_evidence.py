@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
+from evidence_fixtures import native_result, native_check, native_batch
 import openclaw_runtime as runtime
 from evidence_fixtures import VerificationSessions
 from response_validation import ResponseValidationError, validate_response
@@ -27,14 +28,11 @@ def write(path='/fixture/a.txt', content='A', **fields):
 
 
 def written(action):
-    return {'verified': True, 'outcome': 'verified', 'path': action['path'],
-            'mode': action.get('mode', 'overwrite'), 'content_sha256': content_hash(action),
-            'bytes_written': len(base64.b64decode(action['content']) if action.get('encoding') == 'base64' else action['content'].encode())}
+    return native_result(action)
 
 
 def read_result(target, content, **fields):
-    return {'path': target, 'content': content, 'encoding': 'utf-8', 'bytes_returned': len(content.encode()),
-            'truncated': False, 'content_sha256': hashlib.sha256(content.encode()).hexdigest(), **fields}
+    return native_result({'type': 'read_file', 'path': target}, content=content, **fields)
 
 
 def audit(ledger, **fields):
@@ -76,7 +74,7 @@ class EvidenceLedgerTests(unittest.TestCase):
         for changes in [{'path': '/fixture/other.txt'}, {'content_sha256': 'wrong'}, {'bytes_written': True},
                         {'verified': False}, {'mode': 'append'}]:
             ledger = self.ledger(); action = write()
-            ledger.record_action(action, {**written(action), **changes})
+            with self.assertRaises(runtime.NativeProtocolError): ledger.record_action(action, native_result(action, **{**written(action), **changes}))
             self.assertFalse(ledger.evidence, changes)
 
     def test_later_mutation_invalidates_state_but_retains_history_and_recheck_targets(self):
@@ -86,9 +84,8 @@ class EvidenceLedgerTests(unittest.TestCase):
         self.assertEqual(ledger.requirements['r1']['state'], 'invalidated')
         self.assertEqual(len(ledger.evidence), original)
         self.assertEqual(ledger.recheck_actions(), [action])
-        ledger.record_action(action, {'requested_checks': [{'type': 'file_contents', 'path': action['path'], 'content': 'A'}],
-                                    'checks': [{'type': 'file_contents', 'path': action['path'], 'verified': True,
-                                                'content_sha256': content_hash(action)}]}, recheck=True)
+        check = {'type': 'file_contents', 'path': action['path'], 'content': 'A'}
+        ledger.record_action(action, native_batch([check], [native_check(check)]), recheck=True)
         self.assertEqual(ledger.requirements['r1']['state'], 'proven')
 
     def test_commands_prove_each_check_individually_and_execution_is_historical(self):
@@ -97,17 +94,17 @@ class EvidenceLedgerTests(unittest.TestCase):
                    'checks': [{'type': 'file_contents', 'path': '/fixture/a.txt', 'content': 'A'},
                               {'type': 'file_contents', 'path': '/fixture/b.txt', 'content': 'B'}]}
         ledger.add_requirements([requirement(TASK, 'command_executed', argv=command['argv'], working_directory='/fixture')])
-        ledger.record_action(command, {'exit_code': 0, 'timed_out': False, 'working_directory': '/fixture',
+        ledger.record_action(command, native_result(command, **{'exit_code': 0, 'timed_out': False, 'working_directory': '/fixture',
                                        'verified': False, 'checks': [
                                            {'type': 'file_contents', 'path': '/fixture/a.txt', 'verified': True, 'content_sha256': content_hash(write())},
-                                           {'type': 'file_contents', 'path': '/fixture/b.txt', 'verified': False}]})
+                                           {'type': 'file_contents', 'path': '/fixture/b.txt', 'verified': False}]}))
         self.assertEqual([r['state'] for r in ledger.requirements.values()], ['proven', 'pending', 'proven'])
         ledger.before_action({'type': 'run_command', 'argv': ['/fixture/other']})
         self.assertEqual([r['state'] for r in ledger.requirements.values()], ['invalidated', 'pending', 'proven'])
 
     def test_exit_zero_only_proves_execution(self):
         ledger = self.ledger()
-        ledger.record_action({'type': 'run_command', 'argv': ['/fixture/noop']}, {'exit_code': 0, 'timed_out': False})
+        ledger.record_action({'type': 'run_command', 'argv': ['/fixture/noop']}, native_result({'type': 'run_command', 'argv': ['/fixture/noop']}, **{'exit_code': 0, 'timed_out': False}))
         self.assertEqual([r['state'] for r in ledger.requirements.values()], ['pending', 'pending'])
         self.assertEqual(next(iter(ledger.evidence.values()))['fact']['type'], 'command_executed')
 
@@ -140,7 +137,8 @@ class EvidenceLedgerTests(unittest.TestCase):
         for changes in [{'truncated': True}, {'bytes_returned': True}, {'bytes_returned': 1},
                         {'content_sha256': 'fake'}, {'encoding': 'unknown'}, {'path': '/fixture/wrong'}]:
             ledger = self.ledger()
-            ledger.record_action({'type': 'read_file', 'path': '/fixture/a.txt'}, read_result('/fixture/a.txt', 'ABC', **changes))
+            try: ledger.record_action({'type': 'read_file', 'path': '/fixture/a.txt'}, read_result('/fixture/a.txt', 'ABC', **changes))
+            except runtime.NativeProtocolError: pass
             self.assertFalse(ledger.evidence, changes)
 
     def test_exact_output_requires_native_contents_or_explicit_output_reference(self):
@@ -161,7 +159,7 @@ class EvidenceLedgerTests(unittest.TestCase):
         result = audit(ledger); result['proofs'][0]['evidence_ids'] = ['e1']
         with self.assertRaisesRegex(ResponseValidationError, 'target and outcome'):
             validate_response(result, 'verification', ledger=ledger)
-        ledger.record_action({'type': 'press', 'element_id': 'x'}, {'outcome': 'verified'})
+        ledger.record_action({'type': 'press', 'element_id': 'x'}, native_result({'type': 'press', 'element_id': 'x'}))
         self.assertEqual(len(ledger.evidence), 1)
 
     def test_visual_proof_requires_fresh_observation_not_event_delivery(self):
@@ -279,7 +277,7 @@ class EvidenceTaskLoopTests(unittest.TestCase):
                 check = {'type': 'file_contents', 'path': action['path'], 'content': action['content']}
                 actual = {'type': 'file_contents', 'path': action['path'], 'verified': files.get(action['path']) == action['content'],
                           'content_sha256': content_hash(action)}
-                return {'requested_checks': [check], 'checks': [actual]}
+                return native_batch([check], [actual])
             self.assertEqual(method, 'act'); self.actions.append(deepcopy(action))
             if action['type'] == 'read_file': return read_result(action['path'], files[action['path']])
             files[action['path']] = action['content']; return written(action)

@@ -252,7 +252,7 @@ class EvidenceConsistency:
             try: return readback(method, payload)
             except Exception as error:
                 code = getattr(error, "code", "inspection_unavailable")
-                if code in {"cancelled", "permission_denied", "protected_target", "secure_input"}: raise
+                if code in {"cancelled", "permission_denied", "protected_target", "secure_input", "protocol_error"}: raise
                 return {"inspection_error": code}
         for conflict in conflicts:
             if conflict.get("evidence_id"):
@@ -279,7 +279,8 @@ class EvidenceConsistency:
                         known = set(ledger.evidence)
                         action = conflict["read_action"]
                         value = inspect_read("recheck", action)
-                        ledger.record_action(action, value, recheck=True)
+                        if "inspection_error" not in value:
+                            ledger.record_action(action, value, recheck=True)
                         fresh = [e for key, e in ledger.evidence.items() if key not in known and e["valid"] and
                                  e["fact"].get("type") == "file_read" and e["fact"].get("path") == path]
                         actual = fresh[-1]["fact"] if fresh else {}
@@ -295,7 +296,9 @@ class EvidenceConsistency:
                         check = conflict["check"]
                         ledger.invalidate(lambda e: e["mutable"] and ledger.matches(check, e))
                         value = inspect_read("check_effect", check)
-                        checked = ExpectedEffect(check, {}).native_check(value)
+                        effect = ExpectedEffect(check, {})
+                        checked = (effect.result(reason="check_unavailable") if "inspection_error" in value
+                                   else effect.native_check(value))
                         rows = value.get("checks", []) if isinstance(value, dict) else []
                         actual = rows[0] if len(rows) == 1 and isinstance(rows[0], dict) else {}
                         negative = (checked.get("reason") == "expected_file_mismatch" and actual.get("verified") is False and
@@ -337,7 +340,8 @@ class EvidenceConsistency:
                         value = inspect_read("recheck", action)
                         try: action = validate_action(action)
                         except ActionContractError: resolved = False; continue
-                        ledger.record_action(action, value, recheck=True)
+                        if "inspection_error" not in value:
+                            ledger.record_action(action, value, recheck=True)
                         fresh = [e for key, e in ledger.evidence.items() if key not in known and e["valid"] and
                                  e["fact"].get("type") == "file_read" and e["fact"].get("path") == fact["path"]]
                         actual = fresh[-1]["fact"] if fresh else {}

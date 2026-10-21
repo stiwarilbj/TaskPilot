@@ -1,0 +1,3373 @@
+{
+  "cases": [
+    {
+      "name": "valid press",
+      "schema": "action_result",
+      "value": {
+        "action_type": "press",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "press",
+        "element_id": "<current element_id>"
+      }
+    },
+    {
+      "name": "press missing outcome",
+      "schema": "action_result",
+      "value": {
+        "action_type": "press",
+        "verified": false,
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "press",
+        "element_id": "<current element_id>"
+      },
+      "error": "result.outcome is required"
+    },
+    {
+      "name": "press missing verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "press",
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "press",
+        "element_id": "<current element_id>"
+      },
+      "error": "result.verified is required"
+    },
+    {
+      "name": "press missing verification_scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "press",
+        "verified": false,
+        "outcome": "delivered_unconfirmed"
+      },
+      "action": {
+        "type": "press",
+        "element_id": "<current element_id>"
+      },
+      "error": "result.verification_scope is required"
+    },
+    {
+      "name": "press numeric verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "press",
+        "verified": 1,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "press",
+        "element_id": "<current element_id>"
+      },
+      "error": "result.verified must be a boolean"
+    },
+    {
+      "name": "press contradictory verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "press",
+        "verified": true,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "press",
+        "element_id": "<current element_id>"
+      },
+      "error": "result.verified must agree with outcome"
+    },
+    {
+      "name": "press unknown scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "press",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "everything"
+      },
+      "action": {
+        "type": "press",
+        "element_id": "<current element_id>"
+      },
+      "error": "result.verification_scope must be delivery_only"
+    },
+    {
+      "name": "valid focus",
+      "schema": "action_result",
+      "value": {
+        "action_type": "focus",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "focus"
+      },
+      "action": {
+        "type": "focus",
+        "element_id": "<current field_id>"
+      }
+    },
+    {
+      "name": "focus missing outcome",
+      "schema": "action_result",
+      "value": {
+        "action_type": "focus",
+        "verified": true,
+        "verification_scope": "focus"
+      },
+      "action": {
+        "type": "focus",
+        "element_id": "<current field_id>"
+      },
+      "error": "result.outcome is required"
+    },
+    {
+      "name": "focus missing verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "focus",
+        "outcome": "verified",
+        "verification_scope": "focus"
+      },
+      "action": {
+        "type": "focus",
+        "element_id": "<current field_id>"
+      },
+      "error": "result.verified is required"
+    },
+    {
+      "name": "focus missing verification_scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "focus",
+        "verified": true,
+        "outcome": "verified"
+      },
+      "action": {
+        "type": "focus",
+        "element_id": "<current field_id>"
+      },
+      "error": "result.verification_scope is required"
+    },
+    {
+      "name": "focus numeric verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "focus",
+        "verified": 1,
+        "outcome": "verified",
+        "verification_scope": "focus"
+      },
+      "action": {
+        "type": "focus",
+        "element_id": "<current field_id>"
+      },
+      "error": "result.verified must be a boolean"
+    },
+    {
+      "name": "focus contradictory verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "focus",
+        "verified": false,
+        "outcome": "verified",
+        "verification_scope": "focus"
+      },
+      "action": {
+        "type": "focus",
+        "element_id": "<current field_id>"
+      },
+      "error": "result.verified must agree with outcome"
+    },
+    {
+      "name": "focus unknown scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "focus",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "everything"
+      },
+      "action": {
+        "type": "focus",
+        "element_id": "<current field_id>"
+      },
+      "error": "result.verification_scope must name the verified effect"
+    },
+    {
+      "name": "valid set_value",
+      "schema": "action_result",
+      "value": {
+        "action_type": "set_value",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "text_value",
+        "text_verification": "matched",
+        "pid": 42,
+        "delivery_method": "accessibility_value"
+      },
+      "action": {
+        "type": "set_value",
+        "element_id": "<current field_id>",
+        "text": "Example text"
+      }
+    },
+    {
+      "name": "set_value missing outcome",
+      "schema": "action_result",
+      "value": {
+        "action_type": "set_value",
+        "verified": true,
+        "verification_scope": "text_value",
+        "text_verification": "matched",
+        "pid": 42,
+        "delivery_method": "accessibility_value"
+      },
+      "action": {
+        "type": "set_value",
+        "element_id": "<current field_id>",
+        "text": "Example text"
+      },
+      "error": "result.outcome is required"
+    },
+    {
+      "name": "set_value missing verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "set_value",
+        "outcome": "verified",
+        "verification_scope": "text_value",
+        "text_verification": "matched",
+        "pid": 42,
+        "delivery_method": "accessibility_value"
+      },
+      "action": {
+        "type": "set_value",
+        "element_id": "<current field_id>",
+        "text": "Example text"
+      },
+      "error": "result.verified is required"
+    },
+    {
+      "name": "set_value missing verification_scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "set_value",
+        "verified": true,
+        "outcome": "verified",
+        "text_verification": "matched",
+        "pid": 42,
+        "delivery_method": "accessibility_value"
+      },
+      "action": {
+        "type": "set_value",
+        "element_id": "<current field_id>",
+        "text": "Example text"
+      },
+      "error": "result.verification_scope is required"
+    },
+    {
+      "name": "set_value numeric verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "set_value",
+        "verified": 1,
+        "outcome": "verified",
+        "verification_scope": "text_value",
+        "text_verification": "matched",
+        "pid": 42,
+        "delivery_method": "accessibility_value"
+      },
+      "action": {
+        "type": "set_value",
+        "element_id": "<current field_id>",
+        "text": "Example text"
+      },
+      "error": "result.verified must be a boolean"
+    },
+    {
+      "name": "set_value contradictory verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "set_value",
+        "verified": false,
+        "outcome": "verified",
+        "verification_scope": "text_value",
+        "text_verification": "matched",
+        "pid": 42,
+        "delivery_method": "accessibility_value"
+      },
+      "action": {
+        "type": "set_value",
+        "element_id": "<current field_id>",
+        "text": "Example text"
+      },
+      "error": "result.verified must agree with outcome"
+    },
+    {
+      "name": "set_value unknown scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "set_value",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "everything",
+        "text_verification": "matched",
+        "pid": 42,
+        "delivery_method": "accessibility_value"
+      },
+      "action": {
+        "type": "set_value",
+        "element_id": "<current field_id>",
+        "text": "Example text"
+      },
+      "error": "result.verification_scope must be text_value"
+    },
+    {
+      "name": "valid click",
+      "schema": "action_result",
+      "value": {
+        "action_type": "click",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "click",
+        "pid": 1,
+        "x": 500,
+        "y": 500
+      }
+    },
+    {
+      "name": "click missing outcome",
+      "schema": "action_result",
+      "value": {
+        "action_type": "click",
+        "verified": false,
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "click",
+        "pid": 1,
+        "x": 500,
+        "y": 500
+      },
+      "error": "result.outcome is required"
+    },
+    {
+      "name": "click missing verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "click",
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "click",
+        "pid": 1,
+        "x": 500,
+        "y": 500
+      },
+      "error": "result.verified is required"
+    },
+    {
+      "name": "click missing verification_scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "click",
+        "verified": false,
+        "outcome": "delivered_unconfirmed"
+      },
+      "action": {
+        "type": "click",
+        "pid": 1,
+        "x": 500,
+        "y": 500
+      },
+      "error": "result.verification_scope is required"
+    },
+    {
+      "name": "click numeric verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "click",
+        "verified": 1,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "click",
+        "pid": 1,
+        "x": 500,
+        "y": 500
+      },
+      "error": "result.verified must be a boolean"
+    },
+    {
+      "name": "click contradictory verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "click",
+        "verified": true,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "click",
+        "pid": 1,
+        "x": 500,
+        "y": 500
+      },
+      "error": "result.verified must agree with outcome"
+    },
+    {
+      "name": "click unknown scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "click",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "everything"
+      },
+      "action": {
+        "type": "click",
+        "pid": 1,
+        "x": 500,
+        "y": 500
+      },
+      "error": "result.verification_scope must be delivery_only"
+    },
+    {
+      "name": "valid double_click",
+      "schema": "action_result",
+      "value": {
+        "action_type": "double_click",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "double_click",
+        "element_id": "<current element_id>"
+      }
+    },
+    {
+      "name": "double_click missing outcome",
+      "schema": "action_result",
+      "value": {
+        "action_type": "double_click",
+        "verified": false,
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "double_click",
+        "element_id": "<current element_id>"
+      },
+      "error": "result.outcome is required"
+    },
+    {
+      "name": "double_click missing verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "double_click",
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "double_click",
+        "element_id": "<current element_id>"
+      },
+      "error": "result.verified is required"
+    },
+    {
+      "name": "double_click missing verification_scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "double_click",
+        "verified": false,
+        "outcome": "delivered_unconfirmed"
+      },
+      "action": {
+        "type": "double_click",
+        "element_id": "<current element_id>"
+      },
+      "error": "result.verification_scope is required"
+    },
+    {
+      "name": "double_click numeric verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "double_click",
+        "verified": 1,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "double_click",
+        "element_id": "<current element_id>"
+      },
+      "error": "result.verified must be a boolean"
+    },
+    {
+      "name": "double_click contradictory verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "double_click",
+        "verified": true,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "double_click",
+        "element_id": "<current element_id>"
+      },
+      "error": "result.verified must agree with outcome"
+    },
+    {
+      "name": "double_click unknown scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "double_click",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "everything"
+      },
+      "action": {
+        "type": "double_click",
+        "element_id": "<current element_id>"
+      },
+      "error": "result.verification_scope must be delivery_only"
+    },
+    {
+      "name": "valid type_text",
+      "schema": "action_result",
+      "value": {
+        "action_type": "type_text",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "text_value",
+        "text_verification": "matched",
+        "pid": 42,
+        "delivery_method": "accessibility_value"
+      },
+      "action": {
+        "type": "type_text",
+        "element_id": "<current field_id>",
+        "text": "Example text"
+      }
+    },
+    {
+      "name": "type_text missing outcome",
+      "schema": "action_result",
+      "value": {
+        "action_type": "type_text",
+        "verified": true,
+        "verification_scope": "text_value",
+        "text_verification": "matched",
+        "pid": 42,
+        "delivery_method": "accessibility_value"
+      },
+      "action": {
+        "type": "type_text",
+        "element_id": "<current field_id>",
+        "text": "Example text"
+      },
+      "error": "result.outcome is required"
+    },
+    {
+      "name": "type_text missing verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "type_text",
+        "outcome": "verified",
+        "verification_scope": "text_value",
+        "text_verification": "matched",
+        "pid": 42,
+        "delivery_method": "accessibility_value"
+      },
+      "action": {
+        "type": "type_text",
+        "element_id": "<current field_id>",
+        "text": "Example text"
+      },
+      "error": "result.verified is required"
+    },
+    {
+      "name": "type_text missing verification_scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "type_text",
+        "verified": true,
+        "outcome": "verified",
+        "text_verification": "matched",
+        "pid": 42,
+        "delivery_method": "accessibility_value"
+      },
+      "action": {
+        "type": "type_text",
+        "element_id": "<current field_id>",
+        "text": "Example text"
+      },
+      "error": "result.verification_scope is required"
+    },
+    {
+      "name": "type_text numeric verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "type_text",
+        "verified": 1,
+        "outcome": "verified",
+        "verification_scope": "text_value",
+        "text_verification": "matched",
+        "pid": 42,
+        "delivery_method": "accessibility_value"
+      },
+      "action": {
+        "type": "type_text",
+        "element_id": "<current field_id>",
+        "text": "Example text"
+      },
+      "error": "result.verified must be a boolean"
+    },
+    {
+      "name": "type_text contradictory verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "type_text",
+        "verified": false,
+        "outcome": "verified",
+        "verification_scope": "text_value",
+        "text_verification": "matched",
+        "pid": 42,
+        "delivery_method": "accessibility_value"
+      },
+      "action": {
+        "type": "type_text",
+        "element_id": "<current field_id>",
+        "text": "Example text"
+      },
+      "error": "result.verified must agree with outcome"
+    },
+    {
+      "name": "type_text unknown scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "type_text",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "everything",
+        "text_verification": "matched",
+        "pid": 42,
+        "delivery_method": "accessibility_value"
+      },
+      "action": {
+        "type": "type_text",
+        "element_id": "<current field_id>",
+        "text": "Example text"
+      },
+      "error": "result.verification_scope must be text_value"
+    },
+    {
+      "name": "valid key",
+      "schema": "action_result",
+      "value": {
+        "action_type": "key",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "key",
+        "pid": 1,
+        "key": "return"
+      }
+    },
+    {
+      "name": "key missing outcome",
+      "schema": "action_result",
+      "value": {
+        "action_type": "key",
+        "verified": false,
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "key",
+        "pid": 1,
+        "key": "return"
+      },
+      "error": "result.outcome is required"
+    },
+    {
+      "name": "key missing verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "key",
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "key",
+        "pid": 1,
+        "key": "return"
+      },
+      "error": "result.verified is required"
+    },
+    {
+      "name": "key missing verification_scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "key",
+        "verified": false,
+        "outcome": "delivered_unconfirmed"
+      },
+      "action": {
+        "type": "key",
+        "pid": 1,
+        "key": "return"
+      },
+      "error": "result.verification_scope is required"
+    },
+    {
+      "name": "key numeric verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "key",
+        "verified": 1,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "key",
+        "pid": 1,
+        "key": "return"
+      },
+      "error": "result.verified must be a boolean"
+    },
+    {
+      "name": "key contradictory verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "key",
+        "verified": true,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "key",
+        "pid": 1,
+        "key": "return"
+      },
+      "error": "result.verified must agree with outcome"
+    },
+    {
+      "name": "key unknown scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "key",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "everything"
+      },
+      "action": {
+        "type": "key",
+        "pid": 1,
+        "key": "return"
+      },
+      "error": "result.verification_scope must be delivery_only"
+    },
+    {
+      "name": "valid scroll",
+      "schema": "action_result",
+      "value": {
+        "action_type": "scroll",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "scroll",
+        "pid": 1,
+        "delta_y": -300
+      }
+    },
+    {
+      "name": "scroll missing outcome",
+      "schema": "action_result",
+      "value": {
+        "action_type": "scroll",
+        "verified": false,
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "scroll",
+        "pid": 1,
+        "delta_y": -300
+      },
+      "error": "result.outcome is required"
+    },
+    {
+      "name": "scroll missing verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "scroll",
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "scroll",
+        "pid": 1,
+        "delta_y": -300
+      },
+      "error": "result.verified is required"
+    },
+    {
+      "name": "scroll missing verification_scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "scroll",
+        "verified": false,
+        "outcome": "delivered_unconfirmed"
+      },
+      "action": {
+        "type": "scroll",
+        "pid": 1,
+        "delta_y": -300
+      },
+      "error": "result.verification_scope is required"
+    },
+    {
+      "name": "scroll numeric verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "scroll",
+        "verified": 1,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "scroll",
+        "pid": 1,
+        "delta_y": -300
+      },
+      "error": "result.verified must be a boolean"
+    },
+    {
+      "name": "scroll contradictory verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "scroll",
+        "verified": true,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "scroll",
+        "pid": 1,
+        "delta_y": -300
+      },
+      "error": "result.verified must agree with outcome"
+    },
+    {
+      "name": "scroll unknown scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "scroll",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "everything"
+      },
+      "action": {
+        "type": "scroll",
+        "pid": 1,
+        "delta_y": -300
+      },
+      "error": "result.verification_scope must be delivery_only"
+    },
+    {
+      "name": "valid launch_app",
+      "schema": "action_result",
+      "value": {
+        "action_type": "launch_app",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "window_visible"
+      },
+      "action": {
+        "type": "launch_app",
+        "app": "Example App"
+      }
+    },
+    {
+      "name": "launch_app missing outcome",
+      "schema": "action_result",
+      "value": {
+        "action_type": "launch_app",
+        "verified": true,
+        "verification_scope": "window_visible"
+      },
+      "action": {
+        "type": "launch_app",
+        "app": "Example App"
+      },
+      "error": "result.outcome is required"
+    },
+    {
+      "name": "launch_app missing verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "launch_app",
+        "outcome": "verified",
+        "verification_scope": "window_visible"
+      },
+      "action": {
+        "type": "launch_app",
+        "app": "Example App"
+      },
+      "error": "result.verified is required"
+    },
+    {
+      "name": "launch_app missing verification_scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "launch_app",
+        "verified": true,
+        "outcome": "verified"
+      },
+      "action": {
+        "type": "launch_app",
+        "app": "Example App"
+      },
+      "error": "result.verification_scope is required"
+    },
+    {
+      "name": "launch_app numeric verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "launch_app",
+        "verified": 1,
+        "outcome": "verified",
+        "verification_scope": "window_visible"
+      },
+      "action": {
+        "type": "launch_app",
+        "app": "Example App"
+      },
+      "error": "result.verified must be a boolean"
+    },
+    {
+      "name": "launch_app contradictory verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "launch_app",
+        "verified": false,
+        "outcome": "verified",
+        "verification_scope": "window_visible"
+      },
+      "action": {
+        "type": "launch_app",
+        "app": "Example App"
+      },
+      "error": "result.verified must agree with outcome"
+    },
+    {
+      "name": "launch_app unknown scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "launch_app",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "everything"
+      },
+      "action": {
+        "type": "launch_app",
+        "app": "Example App"
+      },
+      "error": "result.verification_scope must name the verified effect"
+    },
+    {
+      "name": "valid open_route",
+      "schema": "action_result",
+      "value": {
+        "action_type": "open_route",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "open_route",
+        "route_id": "fixture"
+      }
+    },
+    {
+      "name": "open_route missing outcome",
+      "schema": "action_result",
+      "value": {
+        "action_type": "open_route",
+        "verified": false,
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "open_route",
+        "route_id": "fixture"
+      },
+      "error": "result.outcome is required"
+    },
+    {
+      "name": "open_route missing verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "open_route",
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "open_route",
+        "route_id": "fixture"
+      },
+      "error": "result.verified is required"
+    },
+    {
+      "name": "open_route missing verification_scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "open_route",
+        "verified": false,
+        "outcome": "delivered_unconfirmed"
+      },
+      "action": {
+        "type": "open_route",
+        "route_id": "fixture"
+      },
+      "error": "result.verification_scope is required"
+    },
+    {
+      "name": "open_route numeric verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "open_route",
+        "verified": 1,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "open_route",
+        "route_id": "fixture"
+      },
+      "error": "result.verified must be a boolean"
+    },
+    {
+      "name": "open_route contradictory verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "open_route",
+        "verified": true,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "open_route",
+        "route_id": "fixture"
+      },
+      "error": "result.verified must agree with outcome"
+    },
+    {
+      "name": "open_route unknown scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "open_route",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "everything"
+      },
+      "action": {
+        "type": "open_route",
+        "route_id": "fixture"
+      },
+      "error": "result.verification_scope must be delivery_only"
+    },
+    {
+      "name": "valid read_file",
+      "schema": "action_result",
+      "value": {
+        "action_type": "read_file",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "file_read",
+        "path": "/example/report.txt",
+        "content": "",
+        "encoding": "utf-8",
+        "bytes_returned": 0,
+        "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "truncated": false
+      },
+      "action": {
+        "type": "read_file",
+        "path": "/example/report.txt"
+      }
+    },
+    {
+      "name": "read_file missing outcome",
+      "schema": "action_result",
+      "value": {
+        "action_type": "read_file",
+        "verified": true,
+        "verification_scope": "file_read",
+        "path": "/example/report.txt",
+        "content": "",
+        "encoding": "utf-8",
+        "bytes_returned": 0,
+        "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "truncated": false
+      },
+      "action": {
+        "type": "read_file",
+        "path": "/example/report.txt"
+      },
+      "error": "result.outcome is required"
+    },
+    {
+      "name": "read_file missing verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "read_file",
+        "outcome": "verified",
+        "verification_scope": "file_read",
+        "path": "/example/report.txt",
+        "content": "",
+        "encoding": "utf-8",
+        "bytes_returned": 0,
+        "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "truncated": false
+      },
+      "action": {
+        "type": "read_file",
+        "path": "/example/report.txt"
+      },
+      "error": "result.verified is required"
+    },
+    {
+      "name": "read_file missing verification_scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "read_file",
+        "verified": true,
+        "outcome": "verified",
+        "path": "/example/report.txt",
+        "content": "",
+        "encoding": "utf-8",
+        "bytes_returned": 0,
+        "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "truncated": false
+      },
+      "action": {
+        "type": "read_file",
+        "path": "/example/report.txt"
+      },
+      "error": "result.verification_scope is required"
+    },
+    {
+      "name": "read_file numeric verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "read_file",
+        "verified": 1,
+        "outcome": "verified",
+        "verification_scope": "file_read",
+        "path": "/example/report.txt",
+        "content": "",
+        "encoding": "utf-8",
+        "bytes_returned": 0,
+        "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "truncated": false
+      },
+      "action": {
+        "type": "read_file",
+        "path": "/example/report.txt"
+      },
+      "error": "result.verified must be a boolean"
+    },
+    {
+      "name": "read_file contradictory verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "read_file",
+        "verified": false,
+        "outcome": "verified",
+        "verification_scope": "file_read",
+        "path": "/example/report.txt",
+        "content": "",
+        "encoding": "utf-8",
+        "bytes_returned": 0,
+        "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "truncated": false
+      },
+      "action": {
+        "type": "read_file",
+        "path": "/example/report.txt"
+      },
+      "error": "result.verified must agree with outcome"
+    },
+    {
+      "name": "read_file unknown scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "read_file",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "everything",
+        "path": "/example/report.txt",
+        "content": "",
+        "encoding": "utf-8",
+        "bytes_returned": 0,
+        "content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "truncated": false
+      },
+      "action": {
+        "type": "read_file",
+        "path": "/example/report.txt"
+      },
+      "error": "result.verification_scope must be file_read"
+    },
+    {
+      "name": "valid write_file",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "file_write",
+        "path": "/example/note.txt",
+        "mode": "overwrite",
+        "bytes_written": 12,
+        "file_size": 12,
+        "content_sha256": "96381f47203ead02dd11162bf74b09f5d44b9136149d42001e6475757e9cbe64"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/example/note.txt",
+        "content": "Example text"
+      }
+    },
+    {
+      "name": "write_file missing outcome",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "verified": true,
+        "verification_scope": "file_write",
+        "path": "/example/note.txt",
+        "mode": "overwrite",
+        "bytes_written": 12,
+        "file_size": 12,
+        "content_sha256": "96381f47203ead02dd11162bf74b09f5d44b9136149d42001e6475757e9cbe64"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/example/note.txt",
+        "content": "Example text"
+      },
+      "error": "result.outcome is required"
+    },
+    {
+      "name": "write_file missing verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "outcome": "verified",
+        "verification_scope": "file_write",
+        "path": "/example/note.txt",
+        "mode": "overwrite",
+        "bytes_written": 12,
+        "file_size": 12,
+        "content_sha256": "96381f47203ead02dd11162bf74b09f5d44b9136149d42001e6475757e9cbe64"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/example/note.txt",
+        "content": "Example text"
+      },
+      "error": "result.verified is required"
+    },
+    {
+      "name": "write_file missing verification_scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "verified": true,
+        "outcome": "verified",
+        "path": "/example/note.txt",
+        "mode": "overwrite",
+        "bytes_written": 12,
+        "file_size": 12,
+        "content_sha256": "96381f47203ead02dd11162bf74b09f5d44b9136149d42001e6475757e9cbe64"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/example/note.txt",
+        "content": "Example text"
+      },
+      "error": "result.verification_scope is required"
+    },
+    {
+      "name": "write_file numeric verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "verified": 1,
+        "outcome": "verified",
+        "verification_scope": "file_write",
+        "path": "/example/note.txt",
+        "mode": "overwrite",
+        "bytes_written": 12,
+        "file_size": 12,
+        "content_sha256": "96381f47203ead02dd11162bf74b09f5d44b9136149d42001e6475757e9cbe64"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/example/note.txt",
+        "content": "Example text"
+      },
+      "error": "result.verified must be a boolean"
+    },
+    {
+      "name": "write_file contradictory verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "verified": false,
+        "outcome": "verified",
+        "verification_scope": "file_write",
+        "path": "/example/note.txt",
+        "mode": "overwrite",
+        "bytes_written": 12,
+        "file_size": 12,
+        "content_sha256": "96381f47203ead02dd11162bf74b09f5d44b9136149d42001e6475757e9cbe64"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/example/note.txt",
+        "content": "Example text"
+      },
+      "error": "result.verified must agree with outcome"
+    },
+    {
+      "name": "write_file unknown scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "everything",
+        "path": "/example/note.txt",
+        "mode": "overwrite",
+        "bytes_written": 12,
+        "file_size": 12,
+        "content_sha256": "96381f47203ead02dd11162bf74b09f5d44b9136149d42001e6475757e9cbe64"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/example/note.txt",
+        "content": "Example text"
+      },
+      "error": "result.verification_scope must be file_write"
+    },
+    {
+      "name": "valid run_command",
+      "schema": "action_result",
+      "value": {
+        "action_type": "run_command",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "execution_only",
+        "working_directory": "/fixture",
+        "exit_code": 0,
+        "timed_out": false,
+        "executed": true,
+        "checks": [],
+        "stdout": "",
+        "stderr": "",
+        "stdout_truncated": false,
+        "stderr_truncated": false
+      },
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "/bin/pwd"
+        ]
+      }
+    },
+    {
+      "name": "run_command missing outcome",
+      "schema": "action_result",
+      "value": {
+        "action_type": "run_command",
+        "verified": false,
+        "verification_scope": "execution_only",
+        "working_directory": "/fixture",
+        "exit_code": 0,
+        "timed_out": false,
+        "executed": true,
+        "checks": [],
+        "stdout": "",
+        "stderr": "",
+        "stdout_truncated": false,
+        "stderr_truncated": false
+      },
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "/bin/pwd"
+        ]
+      },
+      "error": "result.outcome is required"
+    },
+    {
+      "name": "run_command missing verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "run_command",
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "execution_only",
+        "working_directory": "/fixture",
+        "exit_code": 0,
+        "timed_out": false,
+        "executed": true,
+        "checks": [],
+        "stdout": "",
+        "stderr": "",
+        "stdout_truncated": false,
+        "stderr_truncated": false
+      },
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "/bin/pwd"
+        ]
+      },
+      "error": "result.verified is required"
+    },
+    {
+      "name": "run_command missing verification_scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "run_command",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "working_directory": "/fixture",
+        "exit_code": 0,
+        "timed_out": false,
+        "executed": true,
+        "checks": [],
+        "stdout": "",
+        "stderr": "",
+        "stdout_truncated": false,
+        "stderr_truncated": false
+      },
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "/bin/pwd"
+        ]
+      },
+      "error": "result.verification_scope is required"
+    },
+    {
+      "name": "run_command numeric verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "run_command",
+        "verified": 1,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "execution_only",
+        "working_directory": "/fixture",
+        "exit_code": 0,
+        "timed_out": false,
+        "executed": true,
+        "checks": [],
+        "stdout": "",
+        "stderr": "",
+        "stdout_truncated": false,
+        "stderr_truncated": false
+      },
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "/bin/pwd"
+        ]
+      },
+      "error": "result.verified must be a boolean"
+    },
+    {
+      "name": "run_command contradictory verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "run_command",
+        "verified": true,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "execution_only",
+        "working_directory": "/fixture",
+        "exit_code": 0,
+        "timed_out": false,
+        "executed": true,
+        "checks": [],
+        "stdout": "",
+        "stderr": "",
+        "stdout_truncated": false,
+        "stderr_truncated": false
+      },
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "/bin/pwd"
+        ]
+      },
+      "error": "result.verified must agree with outcome"
+    },
+    {
+      "name": "run_command unknown scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "run_command",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "everything",
+        "working_directory": "/fixture",
+        "exit_code": 0,
+        "timed_out": false,
+        "executed": true,
+        "checks": [],
+        "stdout": "",
+        "stderr": "",
+        "stdout_truncated": false,
+        "stderr_truncated": false
+      },
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "/bin/pwd"
+        ]
+      },
+      "error": "result.verification_scope must describe command verification"
+    },
+    {
+      "name": "valid navigate_browser",
+      "schema": "action_result",
+      "value": {
+        "action_type": "navigate_browser",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "navigate_browser",
+        "url": "https://example.com"
+      }
+    },
+    {
+      "name": "navigate_browser missing outcome",
+      "schema": "action_result",
+      "value": {
+        "action_type": "navigate_browser",
+        "verified": false,
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "navigate_browser",
+        "url": "https://example.com"
+      },
+      "error": "result.outcome is required"
+    },
+    {
+      "name": "navigate_browser missing verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "navigate_browser",
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "navigate_browser",
+        "url": "https://example.com"
+      },
+      "error": "result.verified is required"
+    },
+    {
+      "name": "navigate_browser missing verification_scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "navigate_browser",
+        "verified": false,
+        "outcome": "delivered_unconfirmed"
+      },
+      "action": {
+        "type": "navigate_browser",
+        "url": "https://example.com"
+      },
+      "error": "result.verification_scope is required"
+    },
+    {
+      "name": "navigate_browser numeric verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "navigate_browser",
+        "verified": 1,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "navigate_browser",
+        "url": "https://example.com"
+      },
+      "error": "result.verified must be a boolean"
+    },
+    {
+      "name": "navigate_browser contradictory verified",
+      "schema": "action_result",
+      "value": {
+        "action_type": "navigate_browser",
+        "verified": true,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "delivery_only"
+      },
+      "action": {
+        "type": "navigate_browser",
+        "url": "https://example.com"
+      },
+      "error": "result.verified must agree with outcome"
+    },
+    {
+      "name": "navigate_browser unknown scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "navigate_browser",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "everything"
+      },
+      "action": {
+        "type": "navigate_browser",
+        "url": "https://example.com"
+      },
+      "error": "result.verification_scope must be delivery_only"
+    },
+    {
+      "name": "file_existsTrue",
+      "schema": "check_result",
+      "value": {
+        "type": "file_exists",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "file_exists",
+        "path": "/fixture/a"
+      }
+    },
+    {
+      "name": "file_exists missing scope True",
+      "schema": "check_result",
+      "value": {
+        "type": "file_exists",
+        "verified": true,
+        "outcome": "verified",
+        "path": "/fixture/a"
+      },
+      "error": "check_result.verification_scope is required"
+    },
+    {
+      "name": "file_existsFalse",
+      "schema": "check_result",
+      "value": {
+        "type": "file_exists",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "file_exists",
+        "path": "/fixture/a"
+      }
+    },
+    {
+      "name": "file_exists missing scope False",
+      "schema": "check_result",
+      "value": {
+        "type": "file_exists",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "path": "/fixture/a"
+      },
+      "error": "check_result.verification_scope is required"
+    },
+    {
+      "name": "file_exists batch",
+      "schema": "check_batch",
+      "value": {
+        "requested_checks": [
+          {
+            "type": "file_exists",
+            "path": "/fixture/a"
+          }
+        ],
+        "checks": [
+          {
+            "type": "file_exists",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "file_exists",
+            "path": "/fixture/a"
+          }
+        ],
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes"
+      }
+    },
+    {
+      "name": "directory_existsTrue",
+      "schema": "check_result",
+      "value": {
+        "type": "directory_exists",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "directory_exists",
+        "path": "/fixture/a"
+      }
+    },
+    {
+      "name": "directory_exists missing scope True",
+      "schema": "check_result",
+      "value": {
+        "type": "directory_exists",
+        "verified": true,
+        "outcome": "verified",
+        "path": "/fixture/a"
+      },
+      "error": "check_result.verification_scope is required"
+    },
+    {
+      "name": "directory_existsFalse",
+      "schema": "check_result",
+      "value": {
+        "type": "directory_exists",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "directory_exists",
+        "path": "/fixture/a"
+      }
+    },
+    {
+      "name": "directory_exists missing scope False",
+      "schema": "check_result",
+      "value": {
+        "type": "directory_exists",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "path": "/fixture/a"
+      },
+      "error": "check_result.verification_scope is required"
+    },
+    {
+      "name": "directory_exists batch",
+      "schema": "check_batch",
+      "value": {
+        "requested_checks": [
+          {
+            "type": "directory_exists",
+            "path": "/fixture/a"
+          }
+        ],
+        "checks": [
+          {
+            "type": "directory_exists",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "directory_exists",
+            "path": "/fixture/a"
+          }
+        ],
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes"
+      }
+    },
+    {
+      "name": "path_absentTrue",
+      "schema": "check_result",
+      "value": {
+        "type": "path_absent",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "path_absent",
+        "path": "/fixture/a"
+      }
+    },
+    {
+      "name": "path_absent missing scope True",
+      "schema": "check_result",
+      "value": {
+        "type": "path_absent",
+        "verified": true,
+        "outcome": "verified",
+        "path": "/fixture/a"
+      },
+      "error": "check_result.verification_scope is required"
+    },
+    {
+      "name": "path_absentFalse",
+      "schema": "check_result",
+      "value": {
+        "type": "path_absent",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "path_absent",
+        "path": "/fixture/a"
+      }
+    },
+    {
+      "name": "path_absent missing scope False",
+      "schema": "check_result",
+      "value": {
+        "type": "path_absent",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "path": "/fixture/a"
+      },
+      "error": "check_result.verification_scope is required"
+    },
+    {
+      "name": "path_absent batch",
+      "schema": "check_batch",
+      "value": {
+        "requested_checks": [
+          {
+            "type": "path_absent",
+            "path": "/fixture/a"
+          }
+        ],
+        "checks": [
+          {
+            "type": "path_absent",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "path_absent",
+            "path": "/fixture/a"
+          }
+        ],
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes"
+      }
+    },
+    {
+      "name": "file_contentsTrue",
+      "schema": "check_result",
+      "value": {
+        "type": "file_contents",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "file_contents",
+        "path": "/fixture/a",
+        "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+      }
+    },
+    {
+      "name": "file_contents missing scope True",
+      "schema": "check_result",
+      "value": {
+        "type": "file_contents",
+        "verified": true,
+        "outcome": "verified",
+        "path": "/fixture/a",
+        "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+      },
+      "error": "check_result.verification_scope is required"
+    },
+    {
+      "name": "file_contentsFalse",
+      "schema": "check_result",
+      "value": {
+        "type": "file_contents",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "file_contents",
+        "path": "/fixture/a"
+      }
+    },
+    {
+      "name": "file_contents missing scope False",
+      "schema": "check_result",
+      "value": {
+        "type": "file_contents",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "path": "/fixture/a"
+      },
+      "error": "check_result.verification_scope is required"
+    },
+    {
+      "name": "file_contents batch",
+      "schema": "check_batch",
+      "value": {
+        "requested_checks": [
+          {
+            "type": "file_contents",
+            "path": "/fixture/a",
+            "content": "A"
+          }
+        ],
+        "checks": [
+          {
+            "type": "file_contents",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "file_contents",
+            "path": "/fixture/a",
+            "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+          }
+        ],
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes"
+      }
+    },
+    {
+      "name": "stdout_equalsTrue",
+      "schema": "check_result",
+      "value": {
+        "type": "stdout_equals",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "stdout_equals",
+        "text_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+      }
+    },
+    {
+      "name": "stdout_equals missing scope True",
+      "schema": "check_result",
+      "value": {
+        "type": "stdout_equals",
+        "verified": true,
+        "outcome": "verified",
+        "text_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+      },
+      "error": "check_result.verification_scope is required"
+    },
+    {
+      "name": "stdout_equalsFalse",
+      "schema": "check_result",
+      "value": {
+        "type": "stdout_equals",
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "stdout_equals"
+      }
+    },
+    {
+      "name": "stdout_equals missing scope False",
+      "schema": "check_result",
+      "value": {
+        "type": "stdout_equals",
+        "verified": false,
+        "outcome": "delivered_unconfirmed"
+      },
+      "error": "check_result.verification_scope is required"
+    },
+    {
+      "name": "stdout_equals batch",
+      "schema": "check_batch",
+      "value": {
+        "requested_checks": [
+          {
+            "type": "stdout_equals",
+            "text": "A"
+          }
+        ],
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "stdout_equals",
+            "text_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+          }
+        ],
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes"
+      }
+    },
+    {
+      "name": "empty readback",
+      "schema": "check_batch",
+      "value": {
+        "requested_checks": [],
+        "checks": [],
+        "verified": false,
+        "outcome": "delivered_unconfirmed",
+        "verification_scope": "requested_outcomes"
+      },
+      "error": "result.requested_checks must be a list of 1 to 16 outcome checks"
+    },
+    {
+      "name": "batch true with false child",
+      "schema": "check_batch",
+      "value": {
+        "requested_checks": [
+          {
+            "type": "file_contents",
+            "path": "/fixture/a",
+            "content": "A"
+          }
+        ],
+        "checks": [
+          {
+            "type": "file_contents",
+            "verified": false,
+            "outcome": "delivered_unconfirmed",
+            "verification_scope": "file_contents",
+            "path": "/fixture/a"
+          }
+        ],
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes"
+      },
+      "error": "result.checks must all verify the requested outcomes"
+    },
+    {
+      "name": "batch missing child",
+      "schema": "check_batch",
+      "value": {
+        "requested_checks": [
+          {
+            "type": "file_contents",
+            "path": "/fixture/a",
+            "content": "A"
+          }
+        ],
+        "checks": [],
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes"
+      },
+      "error": "result.checks must all verify the requested outcomes"
+    },
+    {
+      "name": "wrong check target",
+      "schema": "check_batch",
+      "value": {
+        "requested_checks": [
+          {
+            "type": "file_contents",
+            "path": "/fixture/a",
+            "content": "A"
+          }
+        ],
+        "checks": [
+          {
+            "type": "file_contents",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "file_contents",
+            "path": "/fixture/b",
+            "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+          }
+        ],
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes"
+      },
+      "error": "result.checks[0] must match the requested target and check"
+    },
+    {
+      "name": "missing content digest",
+      "schema": "check_result",
+      "value": {
+        "type": "file_contents",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "file_contents",
+        "path": "/fixture/a"
+      },
+      "error": "check_result.content_sha256 is required for verified content"
+    },
+    {
+      "name": "valid error rejected",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "rejected",
+        "verified": false,
+        "verification_scope": "none",
+        "terminal": true
+      }
+    },
+    {
+      "name": "error rejected invalid verified",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "rejected",
+        "verified": true,
+        "verification_scope": "none",
+        "terminal": true
+      },
+      "error": "error.verified must be false for errors"
+    },
+    {
+      "name": "error rejected invalid terminal",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "rejected",
+        "verified": false,
+        "verification_scope": "none",
+        "terminal": false
+      },
+      "error": "error.terminal must be true for terminal errors"
+    },
+    {
+      "name": "error rejected invalid verification_scope",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "rejected",
+        "verified": false,
+        "verification_scope": "file_write",
+        "terminal": true
+      },
+      "error": "error.verification_scope must be none for errors"
+    },
+    {
+      "name": "error rejected invalid error_code",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "",
+        "outcome": "rejected",
+        "verified": false,
+        "verification_scope": "none",
+        "terminal": true
+      },
+      "error": "error.error_code must be a nonempty string"
+    },
+    {
+      "name": "valid error dispatched",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "dispatched",
+        "verified": false,
+        "verification_scope": "none",
+        "terminal": false
+      }
+    },
+    {
+      "name": "error dispatched invalid verified",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "dispatched",
+        "verified": true,
+        "verification_scope": "none",
+        "terminal": false
+      },
+      "error": "error.verified must be false for errors"
+    },
+    {
+      "name": "error dispatched invalid terminal",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "dispatched",
+        "verified": false,
+        "verification_scope": "none",
+        "terminal": true
+      },
+      "error": "error.terminal must be false for dispatched work"
+    },
+    {
+      "name": "error dispatched invalid verification_scope",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "dispatched",
+        "verified": false,
+        "verification_scope": "file_write",
+        "terminal": false
+      },
+      "error": "error.verification_scope must be none for errors"
+    },
+    {
+      "name": "error dispatched invalid error_code",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "",
+        "outcome": "dispatched",
+        "verified": false,
+        "verification_scope": "none",
+        "terminal": false
+      },
+      "error": "error.error_code must be a nonempty string"
+    },
+    {
+      "name": "valid error delivered_unconfirmed",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "delivered_unconfirmed",
+        "verified": false,
+        "verification_scope": "none",
+        "terminal": true
+      }
+    },
+    {
+      "name": "error delivered_unconfirmed invalid verified",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "delivered_unconfirmed",
+        "verified": true,
+        "verification_scope": "none",
+        "terminal": true
+      },
+      "error": "error.verified must be false for errors"
+    },
+    {
+      "name": "error delivered_unconfirmed invalid terminal",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "delivered_unconfirmed",
+        "verified": false,
+        "verification_scope": "none",
+        "terminal": false
+      },
+      "error": "error.terminal must be true for terminal errors"
+    },
+    {
+      "name": "error delivered_unconfirmed invalid verification_scope",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "delivered_unconfirmed",
+        "verified": false,
+        "verification_scope": "file_write",
+        "terminal": true
+      },
+      "error": "error.verification_scope must be none for errors"
+    },
+    {
+      "name": "error delivered_unconfirmed invalid error_code",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "",
+        "outcome": "delivered_unconfirmed",
+        "verified": false,
+        "verification_scope": "none",
+        "terminal": true
+      },
+      "error": "error.error_code must be a nonempty string"
+    },
+    {
+      "name": "receipt unknown",
+      "schema": "receipt",
+      "value": {
+        "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+        "state": "unknown",
+        "terminal": false
+      },
+      "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc"
+    },
+    {
+      "name": "receipt pending",
+      "schema": "receipt",
+      "value": {
+        "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+        "state": "pending",
+        "terminal": false
+      },
+      "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc"
+    },
+    {
+      "name": "receipt dispatched",
+      "schema": "receipt",
+      "value": {
+        "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+        "state": "dispatched",
+        "terminal": false
+      },
+      "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc"
+    },
+    {
+      "name": "confirmed receipt",
+      "schema": "receipt",
+      "value": {
+        "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+        "state": "confirmed",
+        "terminal": true,
+        "result": {
+          "action_type": "write_file",
+          "verified": true,
+          "outcome": "verified",
+          "verification_scope": "file_write",
+          "path": "/fixture/a",
+          "mode": "overwrite",
+          "bytes_written": 1,
+          "file_size": 1,
+          "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+        }
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc"
+    },
+    {
+      "name": "receipt missing result",
+      "schema": "receipt",
+      "value": {
+        "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+        "state": "confirmed",
+        "terminal": true,
+        "result": null
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+      "error": "receipt.result must be an object"
+    },
+    {
+      "name": "receipt nonterminal",
+      "schema": "receipt",
+      "value": {
+        "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+        "state": "confirmed",
+        "terminal": false,
+        "result": {
+          "action_type": "write_file",
+          "verified": true,
+          "outcome": "verified",
+          "verification_scope": "file_write",
+          "path": "/fixture/a",
+          "mode": "overwrite",
+          "bytes_written": 1,
+          "file_size": 1,
+          "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+        }
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+      "error": "receipt.terminal must be true for terminal receipts"
+    },
+    {
+      "name": "receipt inconsistent state",
+      "schema": "receipt",
+      "value": {
+        "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+        "state": "unconfirmed",
+        "terminal": true,
+        "result": {
+          "action_type": "write_file",
+          "verified": true,
+          "outcome": "verified",
+          "verification_scope": "file_write",
+          "path": "/fixture/a",
+          "mode": "overwrite",
+          "bytes_written": 1,
+          "file_size": 1,
+          "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+        }
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+      "error": "receipt.state must agree with result.outcome"
+    },
+    {
+      "name": "receipt result and error",
+      "schema": "receipt",
+      "value": {
+        "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+        "state": "confirmed",
+        "terminal": true,
+        "result": {
+          "action_type": "write_file",
+          "verified": true,
+          "outcome": "verified",
+          "verification_scope": "file_write",
+          "path": "/fixture/a",
+          "mode": "overwrite",
+          "bytes_written": 1,
+          "file_size": 1,
+          "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+        },
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "rejected",
+        "verified": false,
+        "verification_scope": "none"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+      "error": "receipt.error cannot accompany a result"
+    },
+    {
+      "name": "receipt missing verified",
+      "schema": "receipt",
+      "value": {
+        "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+        "state": "confirmed",
+        "terminal": true,
+        "result": {
+          "action_type": "write_file",
+          "outcome": "verified",
+          "verification_scope": "file_write",
+          "path": "/fixture/a",
+          "mode": "overwrite",
+          "bytes_written": 1,
+          "file_size": 1,
+          "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+        }
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+      "error": "receipt.result.verified is required"
+    },
+    {
+      "name": "foreign receipt",
+      "schema": "receipt",
+      "value": {
+        "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+        "state": "confirmed",
+        "terminal": true,
+        "result": {
+          "action_type": "write_file",
+          "verified": true,
+          "outcome": "verified",
+          "verification_scope": "file_write",
+          "path": "/fixture/a",
+          "mode": "overwrite",
+          "bytes_written": 1,
+          "file_size": 1,
+          "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+        }
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "action_id": "21a6bb3b-b88b-4bdc-9ea0-ab3f3da433e0",
+      "error": "receipt.action_id must match the pending action"
+    },
+    {
+      "name": "receipt error rejected",
+      "schema": "receipt",
+      "value": {
+        "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+        "state": "rejected",
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "rejected",
+        "verified": false,
+        "verification_scope": "none",
+        "terminal": true
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc"
+    },
+    {
+      "name": "receipt error unconfirmed",
+      "schema": "receipt",
+      "value": {
+        "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc",
+        "state": "unconfirmed",
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "delivered_unconfirmed",
+        "verified": false,
+        "verification_scope": "none",
+        "terminal": true
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "action_id": "4d22d7bf-6eea-43a6-9267-5aa5eae5f8cc"
+    },
+    {
+      "name": "wrong action type",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "file_write",
+        "path": "/fixture/a",
+        "mode": "overwrite",
+        "bytes_written": 1,
+        "file_size": 1,
+        "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+      },
+      "action": {
+        "type": "read_file",
+        "path": "/fixture/a"
+      },
+      "error": "result.action_type must match the requested action"
+    },
+    {
+      "name": "wrong write target",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "file_write",
+        "path": "/fixture/b",
+        "mode": "overwrite",
+        "bytes_written": 1,
+        "file_size": 1,
+        "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "error": "result.path must match the requested target"
+    },
+    {
+      "name": "wrong written bytes",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "file_write",
+        "path": "/fixture/a",
+        "mode": "overwrite",
+        "bytes_written": 2,
+        "file_size": 1,
+        "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "error": "result.file_size must match bytes_written for overwrite"
+    },
+    {
+      "name": "wrong written digest",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "file_write",
+        "path": "/fixture/a",
+        "mode": "overwrite",
+        "bytes_written": 1,
+        "file_size": 1,
+        "content_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "error": "result must verify the requested write"
+    },
+    {
+      "name": "nonfinite byte count",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "file_write",
+        "path": "/fixture/a",
+        "mode": "overwrite",
+        "bytes_written": 1,
+        "file_size": "NaN",
+        "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "error": "result.file_size must be an integer"
+    },
+    {
+      "name": "wrong final file size",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "file_write",
+        "path": "/fixture/a",
+        "mode": "overwrite",
+        "bytes_written": 1,
+        "file_size": 2,
+        "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "error": "result.file_size must match bytes_written for overwrite"
+    },
+    {
+      "name": "read exceeds requested limit",
+      "schema": "action_result",
+      "value": {
+        "action_type": "read_file",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "file_read",
+        "path": "/fixture/a",
+        "content": "AA",
+        "encoding": "utf-8",
+        "bytes_returned": 2,
+        "content_sha256": "58bb119c35513a451d24dc20ef0e9031ec85b35bfc919d263e7e5d9868909cb5",
+        "truncated": false
+      },
+      "action": {
+        "type": "read_file",
+        "path": "/fixture/a",
+        "max_bytes": 1
+      },
+      "error": "result.bytes_returned must not exceed the requested read limit"
+    },
+    {
+      "name": "valid stdout command",
+      "schema": "action_result",
+      "value": {
+        "action_type": "run_command",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes",
+        "working_directory": "/fixture",
+        "exit_code": 0,
+        "timed_out": false,
+        "executed": true,
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "stdout_equals",
+            "text_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+          }
+        ],
+        "stdout": "A",
+        "stderr": "",
+        "stdout_truncated": false,
+        "stderr_truncated": false
+      },
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "fixture"
+        ],
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "text": "A"
+          }
+        ]
+      }
+    },
+    {
+      "name": "wrong returned stdout",
+      "schema": "action_result",
+      "value": {
+        "action_type": "run_command",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes",
+        "working_directory": "/fixture",
+        "exit_code": 0,
+        "timed_out": false,
+        "executed": true,
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "stdout_equals",
+            "text_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+          }
+        ],
+        "stdout": "wrong",
+        "stderr": "",
+        "stdout_truncated": false,
+        "stderr_truncated": false
+      },
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "fixture"
+        ],
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "text": "A"
+          }
+        ]
+      },
+      "error": "result.checks[0] must verify the returned stdout without truncation"
+    },
+    {
+      "name": "truncated verified stdout",
+      "schema": "action_result",
+      "value": {
+        "action_type": "run_command",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes",
+        "working_directory": "/fixture",
+        "exit_code": 0,
+        "timed_out": false,
+        "executed": true,
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "stdout_equals",
+            "text_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+          }
+        ],
+        "stdout": "A",
+        "stderr": "",
+        "stdout_truncated": true,
+        "stderr_truncated": false
+      },
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "fixture"
+        ],
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "text": "A"
+          }
+        ]
+      },
+      "error": "result.checks[0] must verify the returned stdout without truncation"
+    },
+    {
+      "name": "wrong verified check digest",
+      "schema": "check_batch",
+      "value": {
+        "requested_checks": [
+          {
+            "type": "file_contents",
+            "path": "/fixture/a",
+            "content": "A"
+          }
+        ],
+        "checks": [
+          {
+            "type": "file_contents",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "file_contents",
+            "path": "/fixture/a",
+            "content_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        ],
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes"
+      },
+      "error": "result.checks[0].content_sha256 must match the requested contents"
+    },
+    {
+      "name": "missing error outcome",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "verified": false,
+        "verification_scope": "none",
+        "terminal": true
+      },
+      "error": "error.outcome is required"
+    },
+    {
+      "name": "missing error verified",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "rejected",
+        "verification_scope": "none",
+        "terminal": true
+      },
+      "error": "error.verified is required"
+    },
+    {
+      "name": "missing error verification_scope",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "rejected",
+        "verified": false,
+        "terminal": true
+      },
+      "error": "error.verification_scope is required"
+    },
+    {
+      "name": "missing error error_code",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "outcome": "rejected",
+        "verified": false,
+        "verification_scope": "none",
+        "terminal": true
+      },
+      "error": "error.error_code is required"
+    },
+    {
+      "name": "missing error error",
+      "schema": "error",
+      "value": {
+        "error_code": "stale_target",
+        "outcome": "rejected",
+        "verified": false,
+        "verification_scope": "none",
+        "terminal": true
+      },
+      "error": "error.error is required"
+    },
+    {
+      "name": "missing error terminal",
+      "schema": "error",
+      "value": {
+        "error": "Fixture failure",
+        "error_code": "stale_target",
+        "outcome": "rejected",
+        "verified": false,
+        "verification_scope": "none"
+      },
+      "error": "error.terminal is required"
+    },
+    {
+      "name": "valid command operation",
+      "schema": "action_result",
+      "value": {
+        "action_type": "run_command",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes",
+        "working_directory": "/fixture",
+        "exit_code": 0,
+        "timed_out": false,
+        "executed": true,
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "stdout_equals",
+            "text_sha256": "d4a028c1e75230222482b166236ec871c8076e3d3c73acfcf2bc39ee97938c87"
+          }
+        ],
+        "stdout": "Example output",
+        "stderr": "",
+        "stdout_truncated": false,
+        "stderr_truncated": false,
+        "command_operation": {
+          "type": "print_text",
+          "text": "Example output"
+        },
+        "outcome_checks": [
+          {
+            "type": "stdout_equals",
+            "text": "Example output"
+          }
+        ]
+      },
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "print_text",
+          "text": "Example output"
+        },
+        "argv": [
+          "/usr/bin/printf",
+          "%s",
+          "Example output"
+        ],
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "text": "Example output"
+          }
+        ]
+      }
+    },
+    {
+      "name": "wrong returned operation",
+      "schema": "action_result",
+      "value": {
+        "action_type": "run_command",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes",
+        "working_directory": "/fixture",
+        "exit_code": 0,
+        "timed_out": false,
+        "executed": true,
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "stdout_equals",
+            "text_sha256": "d4a028c1e75230222482b166236ec871c8076e3d3c73acfcf2bc39ee97938c87"
+          }
+        ],
+        "stdout": "Example output",
+        "stderr": "",
+        "stdout_truncated": false,
+        "stderr_truncated": false,
+        "command_operation": {
+          "type": "print_text",
+          "text": "wrong"
+        },
+        "outcome_checks": [
+          {
+            "type": "stdout_equals",
+            "text": "Example output"
+          }
+        ]
+      },
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "print_text",
+          "text": "Example output"
+        },
+        "argv": [
+          "/usr/bin/printf",
+          "%s",
+          "Example output"
+        ],
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "text": "Example output"
+          }
+        ]
+      },
+      "error": "result.command_operation must match the requested operation"
+    },
+    {
+      "name": "dropped command operation checks",
+      "schema": "action_result",
+      "value": {
+        "action_type": "run_command",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes",
+        "working_directory": "/fixture",
+        "exit_code": 0,
+        "timed_out": false,
+        "executed": true,
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "stdout_equals",
+            "text_sha256": "d4a028c1e75230222482b166236ec871c8076e3d3c73acfcf2bc39ee97938c87"
+          }
+        ],
+        "stdout": "Example output",
+        "stderr": "",
+        "stdout_truncated": false,
+        "stderr_truncated": false,
+        "command_operation": {
+          "type": "print_text",
+          "text": "Example output"
+        },
+        "outcome_checks": []
+      },
+      "action": {
+        "type": "run_command",
+        "operation": {
+          "type": "print_text",
+          "text": "Example output"
+        },
+        "argv": [
+          "/usr/bin/printf",
+          "%s",
+          "Example output"
+        ],
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "text": "Example output"
+          }
+        ]
+      },
+      "error": "result.outcome_checks must be a list of 1 to 16 outcome checks"
+    },
+    {
+      "name": "wrong command scope",
+      "schema": "action_result",
+      "value": {
+        "action_type": "run_command",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "execution_only",
+        "working_directory": "/fixture",
+        "exit_code": 0,
+        "timed_out": false,
+        "executed": true,
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "stdout_equals",
+            "text_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+          }
+        ],
+        "stdout": "A",
+        "stderr": "",
+        "stdout_truncated": false,
+        "stderr_truncated": false
+      },
+      "action": {
+        "type": "run_command",
+        "argv": [
+          "fixture"
+        ],
+        "checks": [
+          {
+            "type": "stdout_equals",
+            "text": "A"
+          }
+        ]
+      },
+      "error": "result.verified requires successful execution and verified requested outcomes"
+    },
+    {
+      "name": "unknown result fields",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "file_write",
+        "path": "/fixture/a",
+        "mode": "overwrite",
+        "bytes_written": 1,
+        "file_size": 1,
+        "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd",
+        "assume_success": true
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "error": "result contains unsupported parameters"
+    },
+    {
+      "name": "valid write readback",
+      "schema": "readback",
+      "value": {
+        "requested_checks": [
+          {
+            "type": "file_contents",
+            "path": "/fixture/a",
+            "content": "A"
+          }
+        ],
+        "checks": [
+          {
+            "type": "file_contents",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "file_contents",
+            "path": "/fixture/a",
+            "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+          }
+        ],
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      }
+    },
+    {
+      "name": "foreign requested readback",
+      "schema": "readback",
+      "value": {
+        "requested_checks": [
+          {
+            "type": "file_exists",
+            "path": "/fixture/b"
+          }
+        ],
+        "checks": [
+          {
+            "type": "file_exists",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "file_exists",
+            "path": "/fixture/b"
+          }
+        ],
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "error": "result.requested_checks must match the pending readback"
+    },
+    {
+      "name": "changed requested contents",
+      "schema": "readback",
+      "value": {
+        "requested_checks": [
+          {
+            "type": "file_contents",
+            "path": "/fixture/a",
+            "content": "wrong"
+          }
+        ],
+        "checks": [
+          {
+            "type": "file_contents",
+            "verified": true,
+            "outcome": "verified",
+            "verification_scope": "file_contents",
+            "path": "/fixture/a",
+            "content_sha256": "8810ad581e59f2bc3928b261707a71308f7e139eb04820366dc4d5c18d980225"
+          }
+        ],
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "requested_outcomes"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/fixture/a",
+        "content": "A"
+      },
+      "error": "result.requested_checks must match the pending readback"
+    },
+    {
+      "name": "valid evidence",
+      "schema": "evidence",
+      "value": {
+        "fact": {
+          "type": "file_contents",
+          "path": "/fixture/a",
+          "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+        },
+        "verified": true,
+        "verification_scope": "file_contents",
+        "mutable": true,
+        "valid": true,
+        "generation": null,
+        "origin": null,
+        "action": null,
+        "fact_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+        "action_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "evidence invalid verified",
+      "schema": "evidence",
+      "value": {
+        "fact": {
+          "type": "file_contents",
+          "path": "/fixture/a",
+          "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+        },
+        "verified": false,
+        "verification_scope": "file_contents",
+        "mutable": true,
+        "valid": true,
+        "generation": null,
+        "origin": null,
+        "action": null,
+        "fact_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+        "action_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "error": "evidence.verified must be true for evidence"
+    },
+    {
+      "name": "evidence invalid verification_scope",
+      "schema": "evidence",
+      "value": {
+        "fact": {
+          "type": "file_contents",
+          "path": "/fixture/a",
+          "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+        },
+        "verified": true,
+        "verification_scope": "file_exists",
+        "mutable": true,
+        "valid": true,
+        "generation": null,
+        "origin": null,
+        "action": null,
+        "fact_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+        "action_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "error": "evidence.verification_scope must name the verified fact"
+    },
+    {
+      "name": "evidence invalid valid",
+      "schema": "evidence",
+      "value": {
+        "fact": {
+          "type": "file_contents",
+          "path": "/fixture/a",
+          "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+        },
+        "verified": true,
+        "verification_scope": "file_contents",
+        "mutable": true,
+        "valid": 1,
+        "generation": null,
+        "origin": null,
+        "action": null,
+        "fact_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+        "action_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "error": "evidence.valid must be a boolean"
+    },
+    {
+      "name": "evidence invalid fact",
+      "schema": "evidence",
+      "value": {
+        "fact": {
+          "type": "file_contents",
+          "path": "/fixture/a",
+          "content_sha256": true
+        },
+        "verified": true,
+        "verification_scope": "file_contents",
+        "mutable": true,
+        "valid": true,
+        "generation": null,
+        "origin": null,
+        "action": null,
+        "fact_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+        "action_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "error": "evidence.fact.content_sha256 must be a string"
+    },
+    {
+      "name": "evidence invalid origin",
+      "schema": "evidence",
+      "value": {
+        "fact": {
+          "type": "file_contents",
+          "path": "/fixture/a",
+          "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+        },
+        "verified": true,
+        "verification_scope": "file_contents",
+        "mutable": true,
+        "valid": true,
+        "generation": null,
+        "origin": {
+          "method": "delivery"
+        },
+        "action": null,
+        "fact_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+        "action_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "error": "evidence.origin.method must be a supported value"
+    },
+    {
+      "name": "evidence missing verified",
+      "schema": "evidence",
+      "value": {
+        "fact": {
+          "type": "file_contents",
+          "path": "/fixture/a",
+          "content_sha256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+        },
+        "verification_scope": "file_contents",
+        "mutable": true,
+        "valid": true,
+        "generation": null,
+        "origin": null,
+        "action": null,
+        "fact_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+        "action_fingerprint": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "error": "evidence.verified is required"
+    }
+  ]
+}

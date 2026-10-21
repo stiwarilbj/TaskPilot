@@ -31,6 +31,8 @@ from response_validation import extract_json_object, ResponseValidationError
 from action_contract_generated import CONTRACT_HASH
 from prompt_compiler import PROMPT_COMPILER_VERSION, EXAMPLE_MARKERS, REPAIR_HEADER, phase_header, prompt_phase
 from recovery_cycles import RECOVERY_CYCLE_VERSION
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'Python'))
+from evidence_fixtures import native_batch
 from fixtures import seed_cases
 
 VERSION = 1
@@ -359,7 +361,7 @@ class World:
             elif check["type"] == "path_absent": actual["verified"] = content is None
             elif check["type"] == "file_contents" and content == check["content"]:
                 actual.update(verified=True, content_sha256=hashlib.sha256(content.encode()).hexdigest())
-            return {"requested_checks": [check], "checks": [actual]}
+            return native_batch([check], [actual])
         if method == "recheck":
             action = params["action"]
             checks = ([{"type": "file_contents", "path": action["path"], "content": action["content"],
@@ -375,7 +377,7 @@ class World:
                 elif check["type"] == "file_exists": value["verified"] = content is not None
                 elif check["type"] == "path_absent": value["verified"] = content is None
                 actual.append(value)
-            return {"requested_checks": [c for c in checks if c["type"] != "stdout_equals"], "checks": actual}
+            return native_batch([c for c in checks if c["type"] != "stdout_equals"], actual)
         if method != "act":
             raise RecordingMismatch("unsupported_fixture_bridge_method")
         action = deepcopy(params["action"])

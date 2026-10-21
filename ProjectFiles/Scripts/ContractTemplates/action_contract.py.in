@@ -1,7 +1,9 @@
 import base64
 import copy
+import hashlib
 import math
 import os
+import re
 from urllib.parse import urlsplit
 
 
@@ -9,11 +11,32 @@ class ActionContractError(RuntimeError):
     pass
 
 
+class NativeProtocolError(RuntimeError):
+    """A native payload cannot acquire meaning through permissive defaults."""
+    code = 'protocol_error'
+
+
 def _fail(path, error):
     raise ActionContractError(f"{path} {error}")
 
 
 def _condition(test, value):
+    def get(path):
+        current = value
+        for part in path.split('.'):
+            if not isinstance(current, dict) or part not in current: return None
+            current = current[part]
+        return current
+    if 'equals' in test:
+        key, expected = test['equals']
+        actual = get(key)
+        return type(actual) is type(expected) and actual == expected
+    if 'same_value' in test:
+        a, b = (get(key) for key in test['same_value'])
+        return type(a) is type(b) and a == b
+    if 'all_verified' in test:
+        items = get(test['all_verified'])
+        return isinstance(items, list) and bool(items) and all(isinstance(item, dict) and item.get('verified') is True for item in items)
     if 'has' in test: return test['has'] in value
     if 'truthy' in test: return bool(value.get(test['truthy']))
     if 'not' in test: return not _condition(test['not'], value)
@@ -45,12 +68,17 @@ def _rules(rules, value, path):
 
 
 def _field(value, spec, path):
+    if value is None and spec.get('nullable'): return
     kind = spec['type']
     if kind == 'string':
         if not isinstance(value, str): _fail(path, 'must be a string')
         if spec.get('nonempty') and not value.strip(): _fail(path, 'must be a nonempty string')
         try: encoded = value.encode('utf-8')
         except UnicodeEncodeError: _fail(path, 'must contain valid UTF-8 text')
+        if spec.get('format') in {'sha256', 'requirement_id', 'uuid'}:
+            pattern = {'sha256': r'[0-9a-f]{64}', 'requirement_id': r'r[1-9][0-9]*',
+                       'uuid': r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'}[spec['format']]
+            if not re.fullmatch(pattern, value): _fail(path, 'must be a valid ' + spec['format'])
         if spec.get('format') == 'path' and (not value.startswith(('/', '~/')) or '\0' in value):
             _fail(path, 'must be an absolute or ~/ path without NUL bytes')
         if spec.get('format') == 'http_url':
@@ -94,6 +122,13 @@ def _field(value, spec, path):
             _fail(path, 'contains unsupported parameters')
         _object(value, definition['fields'], definition['required'], path)
         _rules(definition['rules'], value, path)
+    elif kind == 'object':
+        if not isinstance(value, dict): _fail(path, 'must be an object')
+        if spec.get('reject_unknown') and set(value) - set(spec['fields']): _fail(path, 'contains unsupported parameters')
+        _object(value, spec['fields'], spec['required'], path)
+        _rules(spec['rules'], value, path)
+    elif kind == 'reference':
+        _field(value, CONTRACT['native_schemas'][spec['schema']], path)
     else: raise RuntimeError('Unsupported generated contract field')
 
 
@@ -185,3 +220,131 @@ PROMPT_BOUNDS = CONTRACT['prompt_bounds']
 COMMAND_OPERATION_REFERENCE = '; '.join(recipe['reference'] for recipe in CONTRACT['command_operations'].values())
 
 TASK_PROTOCOL_VERSION = CONTRACT["task_protocol_version"]
+
+
+def validate_native_payload(schema, value, path=None):
+    path = path or schema
+    try:
+        _field(value, CONTRACT['native_schemas'][schema], path)
+    except ActionContractError as error:
+        raise NativeProtocolError(str(error)) from error
+    return value
+
+
+def validate_check_batch(value, path='result', requested_checks=None):
+    validate_native_payload('check_batch', value, path)
+    _validate_check_pairs(value['requested_checks'], value['checks'], path)
+    if requested_checks is not None:
+        def identity(check):
+            validate_outcome_check(check)
+            target = os.path.normpath(os.path.expanduser(check['path'])) if 'path' in check else None
+            data = None
+            if check['type'] == 'file_contents':
+                data = base64.b64decode(check['content'], validate=True) if check.get('encoding', '').lower() == 'base64' else check['content'].encode()
+            elif check['type'] == 'stdout_equals': data = check['text'].encode()
+            return check['type'], target, data
+        try: matches = [identity(c) for c in value['requested_checks']] == [identity(c) for c in requested_checks]
+        except ActionContractError as error: raise NativeProtocolError(str(error)) from error
+        if not matches: raise NativeProtocolError(path + '.requested_checks must match the pending readback')
+    return value
+
+
+def validate_native_readback(value, action, path='result'):
+    try: action = validate_action(action)
+    except ActionContractError as error: raise NativeProtocolError(str(error)) from error
+    if action['type'] == 'read_file': return validate_native_result(value, action, path)
+    if action['type'] == 'write_file' and action.get('mode', 'overwrite').lower() == 'overwrite':
+        requested = [{'type': 'file_contents', **{key: action[key] for key in ('path', 'content', 'encoding') if key in action}}]
+    elif action['type'] == 'run_command':
+        requested = [c for c in action.get('checks', []) if c['type'] != 'stdout_equals']
+    else: raise NativeProtocolError(path + ' cannot acknowledge an unsupported readback')
+    return validate_check_batch(value, path, requested)
+
+
+def _validate_check_pairs(requested, actual, path):
+    if len(requested) != len(actual): raise NativeProtocolError(path + '.checks must match requested_checks')
+    for index, (check, checked) in enumerate(zip(requested, actual)):
+        if (check['type'] != checked['type'] or
+                ('path' in check and os.path.normpath(os.path.expanduser(check['path'])) != checked.get('path'))):
+            raise NativeProtocolError(f'{path}.checks[{index}] must match the requested target and check')
+        if checked['verified'] and check['type'] in {'file_contents', 'stdout_equals'}:
+            content = check['text'] if check['type'] == 'stdout_equals' else check['content']
+            data = base64.b64decode(content, validate=True) if check.get('encoding', '').lower() == 'base64' else content.encode()
+            key = 'text_sha256' if check['type'] == 'stdout_equals' else 'content_sha256'
+            if checked[key] != hashlib.sha256(data).hexdigest():
+                raise NativeProtocolError(f'{path}.checks[{index}].{key} must match the requested contents')
+
+
+def validate_native_result(value, action=None, path='result'):
+    validate_native_payload('action_result', value, path)
+    if action is not None:
+        try: action = validate_action(action)
+        except ActionContractError as error: raise NativeProtocolError(str(error)) from error
+        if value['action_type'] != action.get('type'):
+            raise NativeProtocolError(path + '.action_type must match the requested action')
+        if action['type'] in {'read_file', 'write_file'} and value['path'] != os.path.normpath(os.path.expanduser(action['path'])):
+            raise NativeProtocolError(path + '.path must match the requested target')
+        if action['type'] == 'read_file' and value['bytes_returned'] > action.get('max_bytes', action_default('read_file', 'max_bytes')):
+            raise NativeProtocolError(path + '.bytes_returned must not exceed the requested read limit')
+        if action['type'] == 'write_file':
+            data = base64.b64decode(action['content'], validate=True) if action.get('encoding', '').lower() == 'base64' else action['content'].encode()
+            if (value['mode'] != action.get('mode', action_default('write_file', 'mode')).lower() or
+                    value['bytes_written'] != len(data) or value['content_sha256'] != hashlib.sha256(data).hexdigest()):
+                raise NativeProtocolError(path + ' must verify the requested write')
+        if action['type'] == 'run_command':
+            requested = value.get('outcome_checks', action.get('checks', []))
+            if value.get('command_operation') != action.get('operation'):
+                raise NativeProtocolError(path + '.command_operation must match the requested operation')
+            if 'operation' in action:
+                expected = action['checks']
+                snapshot = CONTRACT['command_operations'][action['operation']['type']].get('snapshot')
+                if requested[:len(expected)] != expected or (not snapshot and requested != expected):
+                    raise NativeProtocolError(path + '.outcome_checks must include exactly the requested operation checks')
+                if snapshot:
+                    extra = requested[len(expected):]
+                    candidates = extra or expected
+                    if len(extra) > 1 or not any(c.get('type') == 'file_contents' and c.get('encoding') == 'base64' and
+                            c.get('path') == action['operation'][snapshot['destination']] for c in candidates):
+                        raise NativeProtocolError(path + '.outcome_checks must include the bound source snapshot')
+            _validate_check_pairs(requested, value['checks'], path)
+    if value['action_type'] == 'run_command':
+        for index, checked in enumerate(value['checks']):
+            if checked['type'] == 'stdout_equals' and checked['verified'] and (value['stdout_truncated'] or
+                    checked['text_sha256'] != hashlib.sha256(value['stdout'].encode()).hexdigest()):
+                raise NativeProtocolError(f'{path}.checks[{index}] must verify the returned stdout without truncation')
+    if value['action_type'] == 'read_file':
+        try: data = base64.b64decode(value['content'], validate=True) if value['encoding'] == 'base64' else value['content'].encode()
+        except (ValueError, UnicodeEncodeError) as error: raise NativeProtocolError(path + '.content must match encoding') from error
+        if len(data) != value['bytes_returned'] or hashlib.sha256(data).hexdigest() != value['content_sha256']:
+            raise NativeProtocolError(path + '.content must match returned length and digest')
+    return value
+
+
+def validate_native_receipt(value, action_id=None, action=None, path='receipt'):
+    validate_native_payload('receipt', value, path)
+    if action_id is not None and value['action_id'].lower() != action_id.lower():
+        raise NativeProtocolError(path + '.action_id must match the pending action')
+    result = value.get('result')
+    state = value['state']
+    if result is not None:
+        validate_native_result(result, action, path + '.result')
+        if CONTRACT['receipt_outcomes'].get(state) != result['outcome']:
+            raise NativeProtocolError(path + '.state must agree with result.outcome')
+        if any(key in value for key in CONTRACT['native_schemas']['error']['fields'] if key != 'terminal'):
+            raise NativeProtocolError(path + ' cannot contain both result and error fields')
+    elif 'error' in value:
+        failure = {key: value[key] for key in CONTRACT['native_schemas']['error']['fields'] if key in value}
+        validate_native_payload('error', failure, path + '.error_payload')
+        if CONTRACT['receipt_outcomes'].get(state) != value['outcome']:
+            raise NativeProtocolError(path + '.state must agree with error.outcome')
+    return value
+
+
+def validate_native_evidence(value, path='evidence'):
+    validate_native_payload('evidence', value, path)
+    if value['verification_scope'] != value['fact']['type']:
+        raise NativeProtocolError(path + '.verification_scope must name the verified fact')
+    if value['action'] is not None:
+        try: validate_action(value['action'])
+        except ActionContractError as error: raise NativeProtocolError(str(error)) from error
+    return value

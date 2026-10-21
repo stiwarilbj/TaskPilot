@@ -4,6 +4,10 @@
         let expectation: String
         var errorDescription: String? { "\(path) \(expectation)" }
     }
+    struct NativeProtocolError: LocalizedError {
+        let message: String
+        var errorDescription: String? { "Native protocol error: \(message)" }
+    }
 
     static var keyCodes: [String: UInt16] {
         (definition["key_codes"] as! [String: NSNumber]).mapValues { $0.uint16Value }
@@ -29,6 +33,28 @@
         return true
     }
     private static func condition(_ test: [String: Any], _ value: [String: Any]) -> Bool {
+        func get(_ path: String) -> Any? {
+            var current: Any = value
+            for part in path.split(separator: ".") {
+                guard let object = current as? [String: Any], let next = object[String(part)] else { return nil }
+                current = next
+            }
+            return current
+        }
+        func equal(_ first: Any?, _ second: Any?) -> Bool {
+            guard let first, let second else { return false }
+            if let a = first as? NSNumber, let b = second as? NSNumber {
+                guard (CFGetTypeID(a) == CFBooleanGetTypeID()) == (CFGetTypeID(b) == CFBooleanGetTypeID()) else { return false }
+                return a == b
+            }
+            return (first as? String) != nil && (first as? String) == (second as? String)
+        }
+        if let pair = test["equals"] as? [Any] { return equal(get(pair[0] as! String), pair[1]) }
+        if let pair = test["same_value"] as? [String] { return equal(get(pair[0]), get(pair[1])) }
+        if let key = test["all_verified"] as? String {
+            guard let items = get(key) as? [[String: Any]], !items.isEmpty else { return false }
+            return items.allSatisfy { equal($0["verified"], true) }
+        }
         if let key = test["has"] as? String { return value[key] != nil }
         if let key = test["truthy"] as? String { return truthy(value[key]) }
         if let inner = test["not"] as? [String: Any] { return !condition(inner, value) }
@@ -65,9 +91,14 @@
         }
     }
     private static func field(_ value: Any, _ spec: [String: Any], _ path: String) throws {
+        if value is NSNull, spec["nullable"] as? Bool == true { return }
         switch spec["type"] as! String {
         case "string":
             guard let text = value as? String else { try fail(path, "must be a string") }
+            if let format = spec["format"] as? String,
+               let pattern = ["sha256": "^[0-9a-f]{64}$", "requirement_id": "^r[1-9][0-9]*$",
+                              "uuid": "^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$"][format],
+               text.range(of: pattern, options: .regularExpression) == nil { try fail(path, "must be a valid " + format) }
             if spec["nonempty"] as? Bool == true, text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 try fail(path, "must be a nonempty string")
             }
@@ -127,6 +158,16 @@
             }
             try validateObject(object, fields, variant["field_order"] as! [String], variant["required"] as! [String], path)
             try rules(variant["rules"] as! [[String: Any]], object, path)
+        case "object":
+            guard let object = value as? [String: Any] else { try fail(path, "must be an object") }
+            let fields = spec["fields"] as! [String: [String: Any]]
+            if spec["reject_unknown"] as? Bool == true, !Set(object.keys).isSubset(of: Set(fields.keys)) {
+                try fail(path, "contains unsupported parameters")
+            }
+            try validateObject(object, fields, spec["field_order"] as! [String], spec["required"] as! [String], path)
+            try rules(spec["rules"] as! [[String: Any]], object, path)
+        case "reference":
+            try field(value, (definition["native_schemas"] as! [String: [String: Any]])[spec["schema"] as! String]!, path)
         default: preconditionFailure("Unsupported generated contract field")
         }
     }
@@ -202,4 +243,167 @@
         }
         action["argv"] = argv; action["checks"] = checks
         return action
+    }
+    @discardableResult
+    static func validateNativePayload(_ schema: String, _ value: Any, path: String? = nil) throws -> [String: Any] {
+        do { try field(value, (definition["native_schemas"] as! [String: [String: Any]])[schema]!, path ?? schema) }
+        catch { throw NativeProtocolError(message: error.localizedDescription) }
+        return value as! [String: Any]
+    }
+    private static func validateCheckPairs(_ requested: [[String: Any]], _ actual: [[String: Any]], _ path: String) throws {
+        guard requested.count == actual.count else { throw NativeProtocolError(message: path + ".checks must match requested_checks") }
+        for (index, pair) in zip(requested, actual).enumerated() {
+            let (check, checked) = pair
+            if check["type"] as? String != checked["type"] as? String ||
+                (check["path"] != nil && URL(fileURLWithPath: (check["path"] as! NSString).expandingTildeInPath).standardizedFileURL.path != checked["path"] as? String) {
+                throw NativeProtocolError(message: "\(path).checks[\(index)] must match the requested target and check")
+            }
+            if checked["verified"] as! Bool, ["file_contents", "stdout_equals"].contains(check["type"] as! String) {
+                let stdout = check["type"] as! String == "stdout_equals"
+                let text = check[stdout ? "text" : "content"] as! String
+                let data = (check["encoding"] as? String)?.lowercased() == "base64" ? Data(base64Encoded: text)! : Data(text.utf8)
+                let key = stdout ? "text_sha256" : "content_sha256"
+                if checked[key] as! String != SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() {
+                    throw NativeProtocolError(message: "\(path).checks[\(index)].\(key) must match the requested contents")
+                }
+            }
+        }
+    }
+    @discardableResult
+    static func validateCheckBatch(_ value: [String: Any], path: String = "result", requestedChecks: [[String: Any]]? = nil) throws -> [String: Any] {
+        try validateNativePayload("check_batch", value, path: path)
+        try validateCheckPairs(value["requested_checks"] as! [[String: Any]], value["checks"] as! [[String: Any]], path)
+        if let requestedChecks {
+            func identity(_ check: [String: Any]) throws -> [String] {
+                do { _ = try validateOutcomeCheck(check) } catch { throw NativeProtocolError(message: error.localizedDescription) }
+                let target = (check["path"] as? NSString).map { URL(fileURLWithPath: $0.expandingTildeInPath).standardizedFileURL.path } ?? ""
+                var data = Data()
+                if check["type"] as? String == "file_contents" {
+                    let text = check["content"] as! String
+                    data = (check["encoding"] as? String)?.lowercased() == "base64" ? Data(base64Encoded: text)! : Data(text.utf8)
+                } else if let text = check["text"] as? String { data = Data(text.utf8) }
+                return [check["type"] as! String, target, data.base64EncodedString()]
+            }
+            guard try (value["requested_checks"] as! [[String: Any]]).map(identity) == requestedChecks.map(identity) else {
+                throw NativeProtocolError(message: path + ".requested_checks must match the pending readback")
+            }
+        }
+        return value
+    }
+    @discardableResult
+    static func validateNativeReadback(_ value: [String: Any], action input: [String: Any], path: String = "result") throws -> [String: Any] {
+        let action: [String: Any]
+        do { action = try validate(input) } catch { throw NativeProtocolError(message: error.localizedDescription) }
+        if action["type"] as? String == "read_file" { return try validateNativeResult(value, action: action, path: path) }
+        let requested: [[String: Any]]
+        if action["type"] as? String == "write_file", (action["mode"] as? String ?? "overwrite").lowercased() == "overwrite" {
+            requested = [["type": "file_contents"].merging(action.filter { ["path", "content", "encoding"].contains($0.key) }) { _, new in new }]
+        } else if action["type"] as? String == "run_command" {
+            requested = (action["checks"] as? [[String: Any]] ?? []).filter { $0["type"] as? String != "stdout_equals" }
+        } else { throw NativeProtocolError(message: path + " cannot acknowledge an unsupported readback") }
+        return try validateCheckBatch(value, path: path, requestedChecks: requested)
+    }
+    @discardableResult
+    static func validateNativeResult(_ value: [String: Any], action: [String: Any]? = nil, path: String = "result") throws -> [String: Any] {
+        try validateNativePayload("action_result", value, path: path)
+        if let input = action {
+            let action: [String: Any]
+            do { action = try validate(input) } catch { throw NativeProtocolError(message: error.localizedDescription) }
+            guard value["action_type"] as? String == action["type"] as? String else {
+                throw NativeProtocolError(message: path + ".action_type must match the requested action")
+            }
+            if ["read_file", "write_file"].contains(action["type"] as? String ?? ""),
+               value["path"] as? String != URL(fileURLWithPath: (action["path"] as! NSString).expandingTildeInPath).standardizedFileURL.path {
+                throw NativeProtocolError(message: path + ".path must match the requested target")
+            }
+            if action["type"] as? String == "read_file", (value["bytes_returned"] as! Int) > (action["max_bytes"] as? Int ?? defaultValue(.read_file, "max_bytes") as! Int) {
+                throw NativeProtocolError(message: path + ".bytes_returned must not exceed the requested read limit")
+            }
+            if action["type"] as? String == "write_file" {
+                let content = action["content"] as! String
+                let data = (action["encoding"] as? String)?.lowercased() == "base64" ? Data(base64Encoded: content)! : Data(content.utf8)
+                guard value["mode"] as? String == (action["mode"] as? String ?? defaultValue(.write_file, "mode") as! String).lowercased(),
+                      value["bytes_written"] as? Int == data.count,
+                      value["content_sha256"] as? String == SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() else {
+                    throw NativeProtocolError(message: path + " must verify the requested write")
+                }
+            }
+            if action["type"] as? String == "run_command" {
+                let requested = value["outcome_checks"] as? [[String: Any]] ?? action["checks"] as? [[String: Any]] ?? []
+                let operation = action["operation"] as? [String: Any], returned = value["command_operation"] as? [String: Any]
+                guard (operation == nil && returned == nil) || (operation != nil && returned != nil && NSDictionary(dictionary: operation!).isEqual(to: returned!)) else {
+                    throw NativeProtocolError(message: path + ".command_operation must match the requested operation")
+                }
+                if let operation {
+                    let expected = action["checks"] as! [[String: Any]], snapshot = operationDefinition(operation["type"] as! String)!["snapshot"] as? [String: Any]
+                    guard NSArray(array: Array(requested.prefix(expected.count))).isEqual(to: expected),
+                          snapshot != nil || NSArray(array: requested).isEqual(to: expected) else {
+                        throw NativeProtocolError(message: path + ".outcome_checks must include exactly the requested operation checks")
+                    }
+                    if let snapshot {
+                        let extra = Array(requested.dropFirst(expected.count)), candidates = extra.isEmpty ? expected : extra
+                        guard extra.count <= 1, candidates.contains(where: { $0["type"] as? String == "file_contents" && $0["encoding"] as? String == "base64" && $0["path"] as? String == operation[snapshot["destination"] as! String] as? String }) else {
+                            throw NativeProtocolError(message: path + ".outcome_checks must include the bound source snapshot")
+                        }
+                    }
+                }
+                try validateCheckPairs(requested, value["checks"] as! [[String: Any]], path)
+            }
+        }
+        if value["action_type"] as? String == "run_command" {
+            let digest = SHA256.hash(data: Data((value["stdout"] as! String).utf8)).map { String(format: "%02x", $0) }.joined()
+            for (index, checked) in (value["checks"] as! [[String: Any]]).enumerated() {
+                if checked["type"] as? String == "stdout_equals", checked["verified"] as! Bool,
+                   value["stdout_truncated"] as! Bool || checked["text_sha256"] as? String != digest {
+                    throw NativeProtocolError(message: "\(path).checks[\(index)] must verify the returned stdout without truncation")
+                }
+            }
+        }
+        if value["action_type"] as? String == "read_file" {
+            let text = value["content"] as! String
+            guard let data = value["encoding"] as? String == "base64" ? Data(base64Encoded: text) : Data(text.utf8),
+                  data.count == value["bytes_returned"] as? Int,
+                  SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == value["content_sha256"] as? String else {
+                throw NativeProtocolError(message: path + ".content must match returned length and digest")
+            }
+        }
+        return value
+    }
+    @discardableResult
+    static func validateNativeReceipt(_ value: [String: Any], actionID: String? = nil, action: [String: Any]? = nil, path: String = "receipt") throws -> [String: Any] {
+        try validateNativePayload("receipt", value, path: path)
+        if let actionID, (value["action_id"] as! String).lowercased() != actionID.lowercased() {
+            throw NativeProtocolError(message: path + ".action_id must match the pending action")
+        }
+        let expected = (definition["receipt_outcomes"] as! [String: String])[value["state"] as! String]
+        if let result = value["result"] as? [String: Any] {
+            try validateNativeResult(result, action: action, path: path + ".result")
+            guard expected == result["outcome"] as? String else { throw NativeProtocolError(message: path + ".state must agree with result.outcome") }
+            guard nativeErrorFields.filter({ $0 != "terminal" }).allSatisfy({ value[$0] == nil }) else {
+                throw NativeProtocolError(message: path + " cannot contain both result and error fields")
+            }
+        } else if value["error"] != nil {
+            try validateNativePayload("error", value.filter { nativeErrorFields.contains($0.key) }, path: path + ".error_payload")
+            guard expected == value["outcome"] as? String else { throw NativeProtocolError(message: path + ".state must agree with error.outcome") }
+        }
+        return value
+    }
+    static var nativeErrorFields: Set<String> {
+        let schemas = definition["native_schemas"] as! [String: [String: Any]]
+        return Set((schemas["error"]!["fields"] as! [String: Any]).keys)
+    }
+    static func nativeFailure(_ error: Error, code: String, outcome: String) -> [String: Any] {
+        ["error": error.localizedDescription, "error_code": code, "outcome": outcome,
+         "verified": false, "verification_scope": "none", "terminal": outcome != "dispatched"]
+    }
+    @discardableResult
+    static func validateNativeEvidence(_ value: [String: Any], path: String = "evidence") throws -> [String: Any] {
+        try validateNativePayload("evidence", value, path: path)
+        guard value["verification_scope"] as? String == (value["fact"] as! [String: Any])["type"] as? String else {
+            throw NativeProtocolError(message: path + ".verification_scope must name the verified fact")
+        }
+        if let action = value["action"] as? [String: Any] {
+            do { _ = try validate(action) } catch { throw NativeProtocolError(message: error.localizedDescription) }
+        }
+        return value
     }

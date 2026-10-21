@@ -51,10 +51,10 @@ final class MemoryPressureTests: XCTestCase {
         let monitor = MemoryPressureMonitor(listen: false)
         let cache = PressureSensitiveCache<Int>(monitor: monitor)
         let lease = TaskLease(), id = UUID().uuidString
-        let payload: [String: Any] = ["action": ["type": "write_file", "path": "/fixture/a", "content": "A"]]
+        let payload: [String: Any] = ["action": ["type": "focus", "element_id": "fixture:field"]]
         if case .new(let token) = try lease.actionReceipts.begin(id: id, payload: payload) {
             try token.dispatched()
-            token.complete(["outcome": "verified", "content_sha256": "fixture"])
+            try token.complete(["action_type": "focus", "outcome": "verified", "verified": true, "verification_scope": "focus"])
         } else { XCTFail("Missing new receipt") }
         let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try Data("accepted evidence".utf8).write(to: file)

@@ -10,12 +10,13 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import openclaw_runtime as runtime
-from evidence_fixtures import VerificationSessions
+from evidence_fixtures import VerificationSessions, native_result, native_batch
 from coordinate_fixtures import fixture_coordinates
 from expected_effects import ExpectedEffect, validate_expectation
 from response_validation import validate_response, ResponseValidationError
 from task_evidence import TaskEvidenceLedger
 from action_receipts import BridgeReplyLost
+from action_contract_generated import NativeProtocolError
 
 
 def digest(text): return hashlib.sha256(text.encode()).hexdigest()
@@ -30,7 +31,7 @@ def observation(value='', revision='before', **changes):
 def checked(spec, verified=True, **changes):
     actual = {'type': spec['type'], 'path': spec['path'], 'verified': verified, **changes}
     if spec['type'] == 'file_contents': actual.setdefault('content_sha256', digest(spec['content']))
-    return {'requested_checks': [spec], 'checks': [actual]}
+    return native_batch([spec], [actual])
 
 
 class ExpectedEffectTests(unittest.TestCase):
@@ -118,32 +119,32 @@ class ExpectedEffectTests(unittest.TestCase):
     def test_exact_native_file_proof_is_scoped_to_path_hash_and_check(self):
         effect = ExpectedEffect(self.file, self.before)
         self.assertEqual(effect.native_check(checked(self.file))['outcome'], 'verified')
-        for reply in [checked(self.file, False), checked(self.file, path='/fixture/other'), checked(self.file, content_sha256=digest('wrong')),
-                      {'requested_checks': [], 'checks': checked(self.file)['checks']}, {'requested_checks': [self.file], 'checks': []}]:
-            self.assertEqual(effect.native_check(reply)['outcome'], 'unconfirmed')
+        self.assertEqual(effect.native_check(checked(self.file, False))['outcome'], 'unconfirmed')
+        for reply in [checked(self.file, path='/fixture/other'), checked(self.file, content_sha256=digest('wrong')),
+                      native_batch([], checked(self.file)['checks']), native_batch([self.file], [])]:
+            with self.assertRaises(NativeProtocolError): effect.native_check(reply)
 
     def test_native_write_and_read_reuse_avoid_additional_requests(self):
         action = {'type': 'write_file', 'path': self.file['path'], 'content': self.file['content']}
-        result = {'verified': True, 'outcome': 'verified', 'path': self.file['path'], 'mode': 'overwrite',
-                  'bytes_written': 6, 'content_sha256': digest('wanted')}
+        result = native_result(action)
         with mock.patch.object(runtime, 'bridge_call') as bridge, mock.patch.object(runtime, 'routed_json_prompt') as model:
             observation_result, final = runtime.verify_expected_effect(1, self.before, action, result, self.file, None, {})
             self.assertIsNone(observation_result); self.assertEqual(final['expected_effect']['outcome'], 'verified')
             bridge.assert_not_called(); model.assert_not_called()
         read = {'type': 'read_file', 'path': self.file['path']}
-        read_result = {'path': self.file['path'], 'content': 'wanted', 'encoding': 'utf-8', 'truncated': False,
-                       'bytes_returned': 6, 'content_sha256': digest('wanted')}
+        read_result = native_result(read, content='wanted', bytes_returned=6, content_sha256=digest('wanted'))
         self.assertEqual(ExpectedEffect(self.file, self.before).reuse_native(read, read_result)['outcome'], 'verified')
         self.assertIsNone(ExpectedEffect(self.file, self.before).reuse_native(read, {**read_result, 'truncated': True}))
-        self.assertIsNone(ExpectedEffect(self.file, self.before).reuse_native(action, {**result, 'path': '/fixture/wrong'}))
+        with self.assertRaises(NativeProtocolError):
+            ExpectedEffect(self.file, self.before).reuse_native(action, {**result, 'path': '/fixture/wrong'})
 
     def test_exit_zero_and_unrelated_command_check_are_not_file_proof(self):
         effect = ExpectedEffect(self.file, self.before)
-        self.assertIsNone(effect.reuse_native({'type': 'run_command', 'argv': ['fixture']},
-                                            {'exit_code': 0, 'timed_out': False, 'verified': True}))
+        action = {'type': 'run_command', 'argv': ['fixture']}
+        self.assertIsNone(effect.reuse_native(action, native_result(action)))
         other = {**self.file, 'path': '/fixture/other'}
-        self.assertIsNone(effect.reuse_native({'type': 'run_command', 'argv': ['fixture'], 'checks': [other]},
-                                            {'exit_code': 0, 'timed_out': False, **checked(other)}))
+        action = {**action, 'checks': [other]}
+        self.assertIsNone(effect.reuse_native(action, native_result(action)))
 
     def test_local_file_polling_waits_for_expected_contents_without_mutating(self):
         effect = ExpectedEffect(self.file, self.before); clock = [0.0]; calls = []
@@ -304,8 +305,7 @@ class ExpectedTaskLoopTests(unittest.TestCase):
                             'applications': [{'pid': 42, 'name': 'Fixture'}], 'elements': [{'id': revision + ':save', 'pid': 42, 'role': 'AXButton', 'title': 'Save'}]}}
                     if method == 'act':
                         actions.append(params['action']); files[spec['path']] = 'wanted'
-                        native = ({'outcome': 'verified', 'verified': True, 'path': spec['path'], 'mode': 'overwrite', 'bytes_written': 6, 'content_sha256': digest('wanted')}
-                                  if kind == 'write_file' else {'outcome': 'delivered_unconfirmed', 'pid': 42, 'verification_scope': 'delivery_only'})
+                        native = native_result(params['action'])
                         receipt = {'action_id': params['action_id'], 'state': 'confirmed' if kind == 'write_file' else 'unconfirmed', 'terminal': True, 'result': native}
                         receipts[params['action_id']] = receipt
                         if kind == 'press': raise BridgeReplyLost('Lost GUI delivery response')

@@ -8,9 +8,11 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
+from evidence_fixtures import native_result, native_batch
 import openclaw_runtime as runtime
 from response_validation import ResponseValidationError, validate_response
 from task_evidence import TaskEvidenceLedger, EvidenceValidationError, content_hash, digest
+from action_contract_generated import NativeProtocolError
 
 TASK = 'Select Draft, fill Title with Ready, verify the destination, and save it once.'
 
@@ -138,8 +140,8 @@ class DependencyTests(unittest.TestCase):
         self.assertIsNone(ledger.check_prerequisites(save, retain=True))
         ledger.before_action(save['action'])
         action = save['action']
-        ledger.record_action(action, {'path': action['path'], 'mode': 'overwrite', 'verified': True,
-            'bytes_written': 5, 'content_sha256': content_hash(action)})
+        ledger.record_action(action, native_result(action, **{'path': action['path'], 'mode': 'overwrite', 'verified': True,
+            'bytes_written': 5, 'content_sha256': content_hash(action)}))
         after = observation('closed', active='Other'); after['elements'] = []
         ledger.observe(after)
         self.assertEqual([r['state'] for r in ledger.requirements.values()], ['proven'] * 3)
@@ -208,8 +210,8 @@ class DependencyTests(unittest.TestCase):
                                  req({'type': 'file_contents', 'path': '/fixture/destination/a', 'content': 'A'}, ['r1'])])
         plan = {'status': 'act', 'requirement_ids': ['r2'], 'action': {'type': 'write_file', 'path': '/fixture/destination/a', 'content': 'A'}}
         for available in [False, True, False]:
-            result = {'requested_checks': [ledger.requirements['r1']['check']], 'checks': [
-                {'type': 'directory_exists', 'path': '/fixture/destination', 'verified': available}]}
+            result = native_batch([ledger.requirements['r1']['check']], [
+                {'type': 'directory_exists', 'path': '/fixture/destination', 'verified': available}])
             with mock.patch.object(runtime, 'bridge_call', return_value=result) as bridge, mock.patch.object(runtime, 'routed_json_prompt') as model:
                 metrics = {}; blocked = runtime.prepare_dependency_action(plan, 1, ledger, metrics)
                 self.assertEqual(blocked is None, available)
@@ -234,7 +236,9 @@ class DependencyTests(unittest.TestCase):
         ledger.accept_plan({'completed_requirements': ['r1'], 'proofs': [{'requirement_id': 'r1', 'evidence_ids': ['e1'], 'rationale': 'claimed'}]})
         plan = {'status': 'act', 'requirement_ids': ['r2'], 'action': {'type': 'write_file', 'path': '/fixture/a', 'content': 'A'}}
         self.assertEqual(ledger.check_prerequisites(plan)['blocked_by'], ['r1'])
-        ledger.add_evidence({'type': 'prerequisite_checked', 'requirement_id': 'r1', 'check_fingerprint': digest(ledger.requirements['r1']['check'])})
+        forged = {'type': 'prerequisite_checked', 'requirement_id': 'r1', 'check_fingerprint': digest(ledger.requirements['r1']['check'])}
+        with self.assertRaises(NativeProtocolError): ledger.add_evidence(forged)
+        ledger.add_evidence({**forged, 'before_action': 1, 'witnesses': []})
         ledger.evidence['e2']['generation'] = 'task-b'
         self.assertFalse(ledger.requirement_matches('r1', ledger.evidence['e2']))
 

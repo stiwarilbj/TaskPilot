@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
+from evidence_fixtures import native_result
 import openclaw_runtime as runtime
 from evidence_fixtures import VerificationSessions
 import prompt_compiler
@@ -285,8 +286,8 @@ class InputRoutingTests(unittest.TestCase):
         ledger.add_requirements([requirement(ledger.task, {'type': 'file_contents', 'path': PATH, 'content': TEXT})])
         import hashlib
         ledger.record_action({'type': 'write_file', 'path': PATH, 'content': TEXT},
-            {'verified': True, 'path': PATH, 'mode': 'overwrite', 'bytes_written': len(TEXT.encode()),
-             'content_sha256': hashlib.sha256(TEXT.encode()).hexdigest()})
+            native_result({'type': 'write_file', 'path': PATH, 'content': TEXT}, **{'verified': True, 'path': PATH, 'mode': 'overwrite', 'bytes_written': len(TEXT.encode()),
+             'content_sha256': hashlib.sha256(TEXT.encode()).hexdigest()}))
         self.assertFalse(ledger.can_complete())
         proof = next(e for e, evidence in ledger.evidence.items() if evidence['mutable'])
         result = self.route([{'verified': True, 'coverage_complete': True, 'message': ref(ledger.inputs, TEXT),

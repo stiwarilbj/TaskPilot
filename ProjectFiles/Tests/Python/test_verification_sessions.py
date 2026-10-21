@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
+from evidence_fixtures import native_result
 import openclaw_runtime as runtime
 import prompt_compiler as compiler
 from provider_errors import ProviderRequestError
@@ -328,8 +329,8 @@ class VerificationEvidenceTests(unittest.TestCase):
         ledger.add_requirements([{'source': task, 'description': 'Requested report',
                                  'check': {'type': 'file_contents', 'path': '/fixture/report', 'content': 'Exact'}}])
         ledger.record_action({'type': 'write_file', 'path': '/fixture/report', 'content': 'Exact'},
-            {'verified': True, 'path': '/fixture/report', 'mode': 'overwrite', 'bytes_written': 5,
-             'content_sha256': hashlib.sha256(b'Exact').hexdigest()})
+            native_result({'type': 'write_file', 'path': '/fixture/report', 'content': 'Exact'}, **{'verified': True, 'path': '/fixture/report', 'mode': 'overwrite', 'bytes_written': 5,
+             'content_sha256': hashlib.sha256(b'Exact').hexdigest()}))
         ledger.coverage_complete = True
         discarded = ledger.add_evidence({'type': 'file_exists', 'path': '/fixture/stale'}, mutable=True)
         ledger.evidence[discarded]['valid'] = False
@@ -353,15 +354,14 @@ class VerificationEvidenceTests(unittest.TestCase):
     def test_legacy_prompt_history_requires_native_hash_and_exact_readback(self):
         content = 'Exact observed result'
         action = {'type': 'read_file', 'path': '/fixture/input'}
-        result = {'path': '/fixture/input', 'content': content, 'encoding': 'utf-8', 'bytes_returned': len(content),
-                  'content_sha256': hashlib.sha256(content.encode()).hexdigest(), 'truncated': False}
+        result = native_result(action, content=content)
         entry = {'action': action, 'result': result, 'completed_requirements': ['Untrusted completion claim']}
         prompt = runtime.verification_instruction('Return the file contents', {'output': 'Wrong result'}, {}, [entry])
         self.assertIn(content, prompt)
         self.assertNotIn('Wrong result', prompt)
         self.assertNotIn('Untrusted completion claim', prompt)
-        for bad in [{**result, 'content_sha256': '0' * 64}, {**result, 'truncated': True}]:
-            self.assertNotIn(content, runtime.verification_instruction('Return the file contents', {}, {}, [{**entry, 'result': bad}]))
+        with self.assertRaises(runtime.NativeProtocolError): runtime.verification_instruction('Return the file contents', {}, {}, [{**entry,'result':{**result,'content_sha256':'0'*64}}])
+        self.assertNotIn(content, runtime.verification_instruction('Return the file contents', {}, {}, [{**entry,'result':{**result,'truncated':True}}]))
 
     def test_completion_compiler_cannot_reintroduce_history_through_optional_arguments(self):
         prompt = compiler.compile_prompt('completion', instructions='Verify independently', examples='{}', task='Requested task',

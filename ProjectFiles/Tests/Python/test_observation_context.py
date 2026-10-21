@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
+from evidence_fixtures import native_result
 import openclaw_runtime as runtime
 from observation_context import historical_progress, select_elements, MAX_PROGRESS_CHARACTERS
 from response_validation import normalize_action
@@ -134,7 +135,7 @@ class HistoricalProgressTests(unittest.TestCase):
 
     def read(self, step=1, content='Quarterly revenue: 42'):
         return {'step': step, 'action': {'type': 'read_file', 'path': f'/tmp/report-{step}.txt'},
-                'result': {'path': f'/tmp/report-{step}.txt', 'content': content, 'encoding': 'utf-8',
+                'result': {'action_type':'read_file','outcome':'verified','verified':True,'verification_scope':'file_read', 'path': f'/tmp/report-{step}.txt', 'content': content, 'encoding': 'utf-8',
                            'bytes_returned': len(content), 'truncated': False,
                            'content_sha256': hashlib.sha256(content.encode()).hexdigest()}}
 
@@ -171,6 +172,7 @@ class HistoricalProgressTests(unittest.TestCase):
                     'target': {'app': 'Notes', 'window_title': 'Budget', 'title': 'Save', 'role': 'AXButton', 'window_id': 'stale-window'},
                     'result': {'outcome': 'verified', 'verification_scope': 'action_effect', 'message': 'Observed effect'},
                     'completed_requirements': ['Unproven complete task']}]
+        entries[0]['result'] = native_result(entries[0]['action'])
         progress = self.progress(entries + self.tail())
         self.assertEqual(len(progress['facts']), 2)
         self.assertEqual(progress['facts'][1]['target']['window_title'], 'Budget')
@@ -186,6 +188,7 @@ class HistoricalProgressTests(unittest.TestCase):
                    {'step': 2, 'action': {'type': 'run_command', 'argv': ['cat', '/tmp/report.txt'], 'checks': checks},
                     'result': {'verified': True, 'verification_scope': 'requested_outcomes', 'exit_code': 0, 'timed_out': False,
                                'checks': [{'type': 'file_contents', 'path': '/tmp/report.txt', 'verified': True}]}}]
+        for entry in entries: entry['result'] = native_result(entry['action'])
         facts = self.progress(entries + self.tail())['facts']
         self.assertEqual(facts[0]['evidence']['written_content'], 'Revenue: 42')
         self.assertEqual(facts[1]['evidence']['checks'][0]['content'], 'Revenue: 42')

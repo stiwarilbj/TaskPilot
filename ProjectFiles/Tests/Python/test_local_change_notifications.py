@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
+from evidence_fixtures import native_result
 import openclaw_runtime as runtime
 from expected_effects import ExpectedEffect
 from test_expected_effects import checked
@@ -130,12 +131,12 @@ class LocalChangeTests(unittest.TestCase):
 
     def testFileWaitUsesOneNativeExchangeAndCountsReadbacksWithoutModelCalls(self):
         spec = {'type': 'file_contents', 'path': '/fixture/note', 'content': 'wanted'}
-        response = {**checked(spec), 'local_wait': {'effect_ready': True, 'targeted_checks': 3, 'notifications': 2}}
+        response = {**checked(spec), 'local_wait': {'reason': 'condition_candidate', 'effect_ready': True, 'targeted_checks': 3, 'notifications': 2}}
         metrics = {}
         with mock.patch.object(runtime, 'bridge_call', return_value=response) as bridge, \
              mock.patch.object(runtime, 'routed_json_prompt') as model:
-            frame, result = runtime.verify_expected_effect(1, self.before, {'type': 'run_command'},
-                {'outcome': 'delivered_unconfirmed'}, spec, None, metrics)
+            frame, result = runtime.verify_expected_effect(1, self.before, {'type': 'run_command','argv':['fixture']},
+                native_result({'type':'run_command','argv':['fixture']}), spec, None, metrics)
         bridge.assert_called_once_with('wait_file_effect', 1, check=spec, timeout_ms=2000)
         model.assert_not_called(); self.assertIsNone(frame)
         self.assertEqual(result['expected_effect']['outcome'], 'verified'); self.assertEqual(metrics['effect_checks'], 3)
@@ -144,10 +145,10 @@ class LocalChangeTests(unittest.TestCase):
 
     def testFileNotificationWithoutMatchingContentsNeverProvesEffect(self):
         spec = {'type': 'file_contents', 'path': '/fixture/note', 'content': 'wanted'}
-        response = {**checked(spec, False), 'local_wait': {'effect_ready': True, 'targeted_checks': 2, 'notifications': 20}}
+        response = {**checked(spec, False), 'local_wait': {'reason': 'condition_candidate', 'effect_ready': True, 'targeted_checks': 2, 'notifications': 20}}
         with mock.patch.object(runtime, 'bridge_call', return_value=response) as bridge:
-            _, result = runtime.verify_expected_effect(1, self.before, {'type': 'run_command'},
-                {'outcome': 'delivered_unconfirmed'}, spec, None, {})
+            _, result = runtime.verify_expected_effect(1, self.before, {'type': 'run_command','argv':['fixture']},
+                native_result({'type':'run_command','argv':['fixture']}), spec, None, {})
         self.assertEqual(bridge.call_count, 1); self.assertEqual(result['expected_effect']['outcome'], 'unconfirmed')
         self.assertEqual(result['outcome'], 'delivered_unconfirmed')
 

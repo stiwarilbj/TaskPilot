@@ -81,7 +81,7 @@ MAX_RECENT_ACTIONS = 8
 VERIFICATION_SESSION_VERSION = 1
 STATE_FINGERPRINT_VERSION = 1
 from action_contract_generated import (
-    TASK_PROTOCOL_VERSION,
+    TASK_PROTOCOL_VERSION, NativeProtocolError, validate_native_payload, validate_native_result, validate_native_receipt, validate_check_batch, validate_native_readback,
     CONTRACT_HASH, CONTRACT_VERSION, VALID_ACTIONS, TRUSTED_NATIVE_ACTIONS,
     action_example, action_default, ACTION_REFERENCE, PROMPT_BOUNDS, ACTION_CAPABILITIES,
     CONTRACT, operation_example, COMMAND_OPERATION_REFERENCE,
@@ -384,26 +384,33 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
             timeout += float(params["action"].get("timeout_seconds", action_default("run_command", "timeout_seconds")))
     try:
         response = bridge_exchange(method, display_id, params, timeout)
-        if method == "act":
-            receipt = response.get("action_receipt")
-            if receipt is not None:
-                if (not isinstance(receipt, dict) or receipt.get("action_id") != params["action_id"] or
-                        type(receipt.get("terminal")) is not bool):
-                    raise BridgeReplyLost("The native action reply has an invalid receipt")
-                if not receipt["terminal"]:
-                    raise BridgeReplyLost("The native action is still pending")
-                state = receipt.get("state")
-                if state not in {"confirmed", "unconfirmed", "rejected"}:
-                    raise BridgeReplyLost("The native action receipt has an invalid state")
-                if response.get("ok"):
-                    result = response.get("result")
-                    if (not isinstance(result, dict) or state == "rejected" or
-                            (result.get("outcome") == "delivered_unconfirmed") != (state == "unconfirmed")):
-                        raise BridgeReplyLost("The native action reply and receipt disagree")
-                elif state == "confirmed":
-                    raise BridgeReplyLost("The native action reply and receipt disagree")
-            elif response.get("ok"):
-                raise BridgeReplyLost("The native action reply lacks its receipt")
+        if not isinstance(response, dict) or type(response.get('ok')) is not bool:
+            raise NativeProtocolError('bridge_response.ok must be a boolean')
+        if response['ok']:
+            if not isinstance(response.get('result'), dict):
+                raise NativeProtocolError('bridge_response.result must be an object')
+            if any(key in response for key in CONTRACT['native_schemas']['error']['fields'] if key != 'terminal'):
+                raise NativeProtocolError('bridge_response cannot contain both a result and error fields')
+        else:
+            if 'result' in response: raise NativeProtocolError('bridge_response cannot contain both a result and error fields')
+            validate_native_payload('error', {key: response[key] for key in
+                CONTRACT['native_schemas']['error']['fields'] if key in response}, 'bridge_response.error_payload')
+        if method == 'act':
+            header = response.get('action_receipt')
+            if header is not None:
+                if not isinstance(header, dict) or set(header) != {'action_id', 'state', 'terminal'}:
+                    raise NativeProtocolError('bridge_response.action_receipt must contain only action_id, state and terminal')
+                if header.get('terminal') is False:
+                    validate_native_receipt(header, params['action_id'])
+                    if response['ok'] or response['outcome'] != 'dispatched' or header['state'] not in {'pending', 'dispatched'}:
+                        raise NativeProtocolError('bridge_response.action_receipt must agree with dispatched work')
+                    raise BridgeReplyLost('The native action is still pending')
+                receipt = dict(header)
+                if response['ok']: receipt['result'] = response['result']
+                else: receipt.update({key: response[key] for key in CONTRACT['native_schemas']['error']['fields']})
+                validate_native_receipt(receipt, params['action_id'], params['action'])
+            elif response['ok']:
+                raise NativeProtocolError('bridge_response.action_receipt is required for native actions')
     except BridgeReplyLost as error:
         if method != "act": raise
         if not error.connected:
@@ -412,12 +419,18 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
         response = reconcile_receipt(params["action_id"],
             lambda action_id, remaining: bridge_call("action_receipt", display_id,
                 action_id=action_id, _reply_timeout=remaining), _receipt_metrics,
-            clock=time.monotonic, sleep=time.sleep)
-    if not response.get("ok"):
-        raise ActionRejected(str(response.get("error") or f"{PRODUCT_NAME} rejected the request"),
-                             str(response.get("error_code") or "action_rejected"))
+            clock=time.monotonic, sleep=time.sleep, action=params['action'])
+    if not response['ok']:
+        if response['error_code'] == 'protocol_error': raise NativeProtocolError(response['error'])
+        raise ActionRejected(response['error'], response['error_code'],
+                             {'outcome': response['outcome'], 'verification_scope': response['verification_scope']})
     result = response.get("result")
     if isinstance(result, dict):
+        if method == 'act': validate_native_result(result, params['action'])
+        elif method == 'action_receipt': validate_native_receipt(result, params['action_id'])
+        elif method in {'check_effect', 'wait_file_effect'}:
+            validate_check_batch(result, requested_checks=[params['check']])
+        elif method == 'recheck': validate_native_readback(result, params['action'])
         if method == "observe" and isinstance(result, dict):
             if _task_generation_id is not None and result.get("task_generation_id") != _task_generation_id:
                 raise ActionRejected("Observation belongs to another task", "cancelled")
@@ -433,7 +446,7 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
                 raise ActionRejected(str(error), "observation_unstable") from error
             _bridge_observation_revision = result.get("observation_revision")
         return result
-    return {}
+    raise NativeProtocolError('bridge_response.result must be an object')
 
 
 def find_openclaw(explicit_path: str | None = None) -> str:
@@ -1209,6 +1222,8 @@ def record_local_wake(wake: dict[str, Any]) -> None:
 
 
 def command_outcome_verified(action: dict[str, Any], result: dict[str, Any]) -> bool:
+    try: validate_native_result(result, action)
+    except NativeProtocolError: return False
     expected = action.get("checks")
     actual = result.get("checks")
     if (result.get("verified") is not True or result.get("verification_scope") != "requested_outcomes"
@@ -1259,7 +1274,7 @@ def verify_expected_effect(display_id: int, before: dict[str, Any], action: dict
     outcome = checked['outcome']
     if effect.supported:
         result = {**result, 'delivery_outcome': result.get('outcome'),
-                  'outcome': 'verified' if outcome == 'verified' else 'delivered_unconfirmed',
+                  'outcome': 'verified' if outcome == 'verified' else 'delivered_unconfirmed', 'verified': outcome == 'verified',
                   'verification_scope': 'expected_effect' if outcome == 'verified' else 'expected_effect_unconfirmed'}
     key = 'verified_effects' if outcome == 'verified' else 'unconfirmed_effects'
     metrics[key] = metrics.get(key, 0) + 1
@@ -2498,6 +2513,9 @@ def verification_evidence(task: str, history: list[dict[str, Any]],
             if not isinstance(entry, dict) or not isinstance(entry.get("action"), dict): continue
             if entry.get("private_input") or entry["action"].get("private_input"): continue
             ledger.before_action(entry["action"])
+            # History includes local waits, suppressed proposals and failures.
+            # Untyped legacy success flags establish no native proof.
+            if not isinstance(entry.get('result'), dict) or 'action_type' not in entry['result']: continue
             ledger.record_action(entry["action"], entry.get("result"))
     state = ledger.prompt_state()
     # Checklist definitions are useful; a previous proof/coverage conclusion
@@ -2597,7 +2615,8 @@ def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int
         ledger.record_action(action, result, recheck=True)
         for check, actual in zip(result.get("requested_checks", []), result.get("checks", [])):
             prior = next((e for e in reversed(prior_evidence) if ledger.matches(check, {**e, "valid": True})), None)
-            evidence_guard.note_native_check(check, {"requested_checks": [check], "checks": [actual]}, prior)
+            evidence_guard.note_native_check(check, {"requested_checks": [check], "checks": [actual],
+                "outcome": actual['outcome'], "verified": actual['verified'], "verification_scope": "requested_outcomes"}, prior)
         if action.get("type") == "read_file":
             fresh = next((e for key, e in reversed(list(ledger.evidence.items())) if key not in known and e["valid"] and e["fact"].get("type") == "file_read"), None)
             prior = next((e for e in reversed(prior_evidence) if e["fact"].get("path") == path_key(action["path"]) and e["fact"].get("content_sha256")), None)
@@ -3116,14 +3135,16 @@ def _run_task(task: str, display_id: int, openclaw_path: str | None, api_key: st
                     if code in {"cancelled", "permission_denied", "protected_target", "secure_input"}:
                         raise
                     consecutive_action_failures += 1
+                    uncertain = code == 'delivery_uncertain' or action_error.details.get('outcome') == 'delivered_unconfirmed'
+                    recovery_code = 'delivery_uncertain' if uncertain else code
                     model_router.metrics["action_rejections"] += 1
                     failure_result = {"message": str(action_error),
-                                      "outcome": "delivered_unconfirmed" if code == "delivery_uncertain" else "rejected",
-                                      "error_code": code, "recovery": action_failure_recovery(code), **action_error.details}
-                    recovery.rejected(action, observation, code)
+                                      "outcome": "delivered_unconfirmed" if uncertain else "rejected",
+                                      "error_code": code, "recovery": action_failure_recovery(recovery_code), **action_error.details}
+                    recovery.rejected(action, observation, recovery_code)
                     recovery_cycles.record(action, observation, failure_result, ledger, screenshot_digest)
                     record_action_diagnostic(action, failure_result)
-                    if code == "delivery_uncertain":
+                    if uncertain:
                         model_router.metrics["unconfirmed_actions"] += 1
                     history.append({
                         "step": step,
@@ -3139,7 +3160,7 @@ def _run_task(task: str, display_id: int, openclaw_path: str | None, api_key: st
                             "OpenClaw could not produce a valid action after three fresh screen checks"
                         ) from action_error
                     pending_observation = bridge_call("observe", display_id)
-                    if target_pid is not None and (code == "delivery_uncertain" or observation_is_loading(pending_observation, target_pid)):
+                    if target_pid is not None and (uncertain or observation_is_loading(pending_observation, target_pid)):
                         fresh = pending_observation
                         pending_observation = None
                         try:
@@ -3157,6 +3178,7 @@ def _run_task(task: str, display_id: int, openclaw_path: str | None, api_key: st
                 action = bind_command_outcomes(action, result)
                 consecutive_evidence_conflicts = 0
                 evidence_guard.remember_native(action, observation, result)
+                ledger.record_action(action, result)
                 result_message = result
                 model_router.metrics["action_deliveries"] += 1
                 pending_observation, result_message = verify_expected_effect(
@@ -3179,7 +3201,6 @@ def _run_task(task: str, display_id: int, openclaw_path: str | None, api_key: st
                 "remaining_requirements": decision.get("remaining_requirements") or [],
             })
             if isinstance(result_message, dict):
-                ledger.record_action(action, result_message)
                 effect_proof = result_message.get('expected_effect', {})
                 if effect_proof.get('outcome') == 'verified' and effect_proof.get('check') in FILE_EFFECTS:
                     ledger.record_effect(decision['expected_result'], effect_proof['evidence'], action)

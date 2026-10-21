@@ -12,7 +12,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import openclaw_runtime as runtime
-from evidence_fixtures import VerificationSessions
+from evidence_fixtures import VerificationSessions, native_result, native_failure
 from coordinate_fixtures import fixture_coordinates
 from action_receipts import BridgeReplyLost, RuntimeInbox
 
@@ -31,7 +31,7 @@ class ActionReceiptTests(unittest.TestCase):
             patch.start(); self.addCleanup(patch.stop)
 
     def receipt(self, state='confirmed', **fields):
-        return dict(action_id=self.action_id, state=state, terminal=state not in {'pending', 'dispatched', 'unknown'}, **fields)
+        return {'action_id':self.action_id,'state':state,'terminal':state not in {'pending','dispatched','unknown'}, **fields}
 
     def lost(self, *receipts, connected=True):
         replies = iter(receipts)
@@ -57,22 +57,22 @@ class ActionReceiptTests(unittest.TestCase):
     def test_healthy_reply_needs_no_receipt_queries_or_model_calls(self):
         def exchange(method, display, params, timeout):
             self.calls.append((method, params, timeout))
-            return {'ok': True, 'result': {'verified': True}, 'action_receipt': self.receipt()}
-        self.assertEqual(self.execute(exchange), {'verified': True})
+            return {'ok': True, 'result': native_result(self.action), 'action_receipt': self.receipt()}
+        self.assertEqual(self.execute(exchange), native_result(self.action))
         self.assert_once()
         self.assertEqual(self.metrics, dict(receipt_queries=0, receipt_recoveries=0, receipt_unresolved=0))
 
     def test_lost_confirmed_reply_is_recovered_without_replaying_append(self):
-        result = {'verified': True, 'path': '/fixture/note', 'bytes_written': 1, 'mode': 'append'}
+        result = native_result(self.action)
         self.assertEqual(self.execute(self.lost(self.receipt(result=result))), result)
         self.assert_once()
         self.assertEqual(self.metrics['receipt_queries'], 1)
         self.assertEqual(self.metrics['receipt_recoveries'], 1)
 
     def test_pending_work_is_polled_until_its_terminal_reply(self):
-        result = {'exit_code': 0, 'timed_out': False, 'verified': False}
+        result = native_result({'type':'run_command','argv':['fixture'],'timeout_seconds':120})
         self.action = {'type': 'run_command', 'argv': ['fixture'], 'timeout_seconds': 120}
-        self.assertEqual(self.execute(self.lost(self.receipt('pending'), self.receipt('dispatched'), self.receipt(result=result))), result)
+        self.assertEqual(self.execute(self.lost(self.receipt('pending'), self.receipt('dispatched'), self.receipt('unconfirmed', result=result))), result)
         self.assert_once()
         self.assertEqual(self.calls[0][2], 150)
         self.assertEqual(self.metrics['receipt_queries'], 3)
@@ -90,7 +90,7 @@ class ActionReceiptTests(unittest.TestCase):
     def test_unknown_mismatched_and_malformed_receipts_never_authorize_replay(self):
         for receipt in [self.receipt('unknown'), {**self.receipt(), 'action_id': 'another'},
                         {**self.receipt(), 'terminal': 1}, self.receipt(result='not an object'),
-                        self.receipt('confirmed', result={'outcome': 'delivered_unconfirmed'})]:
+                        self.receipt('unconfirmed', result=native_result(self.action))]:
             self.calls.clear()
             with self.subTest(receipt=receipt), self.assertRaises(RuntimeError):
                 self.execute(self.lost(receipt))
@@ -98,7 +98,7 @@ class ActionReceiptTests(unittest.TestCase):
 
     def test_uncertain_gui_result_requires_fresh_evidence_not_duplicate_input(self):
         self.action = {'type': 'press', 'element_id': 'old:save'}
-        outcome = self.execute(self.lost(self.receipt('unconfirmed', result={'outcome': 'delivered_unconfirmed'})))
+        outcome = self.execute(self.lost(self.receipt('unconfirmed', result=native_result(self.action))))
         self.assertEqual(outcome['outcome'], 'delivered_unconfirmed')
         self.assert_once()
         recovery = runtime.ActionRecovery()
@@ -112,8 +112,8 @@ class ActionReceiptTests(unittest.TestCase):
                             ('unconfirmed', 'cancelled'), ('unconfirmed', 'secure_input')]:
             self.calls.clear()
             with self.subTest(code=code), self.assertRaises(runtime.ActionRejected) as error:
-                self.execute(self.lost(self.receipt(state, error='fixture', error_code=code)))
-            self.assertEqual(error.exception.code, 'delivery_uncertain' if code == 'unsupported_action' else code)
+                self.execute(self.lost(self.receipt(state, **native_failure(code, outcome='rejected' if state=='rejected' else 'delivered_unconfirmed'))))
+            self.assertEqual(error.exception.code, code)
             self.assert_once()
 
     def test_disconnected_pipe_cannot_be_repaired_or_replayed(self):
@@ -139,7 +139,7 @@ class ActionReceiptTests(unittest.TestCase):
     def test_late_response_and_other_task_receipt_are_rejected_on_the_wire(self):
         replies = [dict(kind='bridge_response', request_id='old-request', task_generation_id=self.generation, ok=True, result={'old': True}),
                    dict(kind='bridge_response', request_id='lookup', task_generation_id='old-task', ok=True, result={'wrong': True}),
-                   dict(kind='bridge_response', request_id='lookup', task_generation_id=self.generation, ok=True, result=self.receipt(result={'verified': True}))]
+                   dict(kind='bridge_response', request_id='lookup', task_generation_id=self.generation, ok=True, result=self.receipt(result=native_result(self.action)))]
         with mock.patch.object(sys, 'stdin', io.StringIO('\n'.join(map(json.dumps, replies)))), \
              mock.patch.object(runtime.uuid, 'uuid4', return_value='lookup'), mock.patch.object(runtime, 'emit') as emitted:
             result = runtime.bridge_call('action_receipt', 1, action_id=self.action_id, _reply_timeout=1)
@@ -167,15 +167,13 @@ class ActionReceiptTests(unittest.TestCase):
             os.close(write_fd)
             stream.close()
 
-    def test_invalid_initial_receipt_is_reconciled_instead_of_trusted(self):
+    def test_invalid_initial_receipt_is_a_protocol_error_and_never_replayed(self):
         def exchange(method, display, params, timeout):
             self.calls.append((method, dict(params), timeout))
-            if method == 'act':
-                return {'ok': True, 'action_receipt': {**self.receipt(), 'action_id': 'stale'}, 'result': {'wrong': True}}
-            return {'ok': True, 'result': self.receipt(result={'correct': True})}
-        self.assertEqual(self.execute(exchange), {'correct': True})
+            return {'ok': True, 'action_receipt': {**self.receipt(), 'action_id': 'stale'}, 'result': native_result(self.action)}
+        with self.assertRaises(runtime.NativeProtocolError): self.execute(exchange)
         self.assert_once()
-        self.assertEqual(self.metrics['receipt_recoveries'], 1)
+        self.assertEqual(self.metrics['receipt_queries'], 0)
 
     def test_runtime_exits_cleanly_while_the_controller_input_pipe_stays_open(self):
         script = 'import sys; from action_receipts import RuntimeInbox; assert RuntimeInbox(sys.stdin).read(1) == "fixture\\n"'
@@ -194,7 +192,7 @@ class ActionReceiptTests(unittest.TestCase):
         ids = []
         def exchange(method, display, params, timeout):
             ids.append(params['action_id'])
-            return {'ok': True, 'result': {'verified': True}, 'action_receipt': dict(action_id=ids[-1], state='confirmed', terminal=True)}
+            return {'ok': True, 'result': native_result(self.action), 'action_receipt': dict(action_id=ids[-1], state='confirmed', terminal=True)}
         with mock.patch.object(runtime, 'bridge_exchange', side_effect=exchange):
             for _ in range(2):
                 result = runtime.bridge_call('act', 1, action=self.action)
@@ -234,8 +232,7 @@ class ActionReceiptTests(unittest.TestCase):
                 if method == 'act':
                     delivered.append(params['action'])
                     native_receipts[params['action_id']] = dict(action_id=params['action_id'], state='confirmed', terminal=True,
-                        result=dict(verified=True, path='/fixture/note', mode='append', bytes_written=1,
-                                    content_sha256=hashlib.sha256(b'X').hexdigest()))
+                        result=native_result(self.action))
                     raise BridgeReplyLost('fixture dropped reply')
                 if method == 'action_receipt': return {'ok': True, 'result': native_receipts[params['action_id']]}
                 self.assertEqual(method, 'observe')

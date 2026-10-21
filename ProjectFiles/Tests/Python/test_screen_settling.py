@@ -5,7 +5,7 @@ import unittest
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import openclaw_runtime as runtime
-from evidence_fixtures import VerificationSessions, with_requirements, proof_response
+from evidence_fixtures import VerificationSessions, native_delivery, with_requirements, proof_response
 
 
 class ScreenSettlingTests(unittest.TestCase):
@@ -248,7 +248,7 @@ class ScreenSettlingTests(unittest.TestCase):
                 if len(attempts) == 1:
                     raise runtime.ActionRejected('Control moved; observe again', 'stale_target')
                 delivered.append(target)
-                return {'message': 'Delivered once', 'outcome': 'verified', 'pid': 42}
+                return native_delivery(params['action'], {'message': 'Delivered once', 'pid': 42})
             return self.observation('ready' if delivered else 'Save')
         def instruction(task, observation, history, ledger=None):
             nonlocal current
@@ -300,8 +300,7 @@ class ScreenSettlingTests(unittest.TestCase):
         def bridge(method, display_id, **params):
             if method == 'act':
                 deliveries.append(params['action'])
-                return {'message': 'Read-back mismatch', 'outcome': 'delivered_unconfirmed',
-                        'text_verification': 'mismatch', 'pid': 42}
+                return native_delivery(params['action'], {'message': 'Read-back mismatch', 'outcome': 'delivered_unconfirmed', 'text_verification': 'mismatch', 'pid': 42})
             return self.observation('Body', role='AXTextField', focused=True,
                                     value='partial' if deliveries else '')
         def instruction(task, observation, history, ledger=None):
@@ -357,7 +356,7 @@ class ScreenSettlingTests(unittest.TestCase):
             if method == 'act':
                 act_calls.append(params['action'])
                 after_action = True
-                return {'message': 'Delivered', 'outcome': 'verified', 'pid': 42}
+                return native_delivery(params['action'], {'message': 'Delivered', 'pid': 42})
             frame = self.observation('ready') if after_action else initial
             revisions.append(frame['observation_revision'])
             return frame

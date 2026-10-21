@@ -92,17 +92,21 @@ final class AgentAutomationBridge {
                     // A readback completed across Pause/Resume cannot become
                     // current proof. Reconcile afresh; never replay the action.
                     last = ["requested_checks": [check], "checks": [["type": check["type"]!,
-                        "path": TaskToolExecutor.expandedFileURL(path).path, "verified": false]]]
+                        "path": TaskToolExecutor.expandedFileURL(path).path, "verified": false,
+                        "outcome": "delivered_unconfirmed", "verification_scope": check["type"]!]],
+                        "outcome": "delivered_unconfirmed", "verified": false, "verification_scope": "requested_outcomes"]
                 }
+                last = try ActionContract.validateCheckBatch(last.merging(["local_wait": wait.dictionary]) { _, new in new })
                 return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
-                        "ok": true, "result": last.merging(["local_wait": wait.dictionary]) { _, new in new }]
+                        "ok": true, "result": last]
             }
             // Lookup and replay never require a connected display or a current
             // element map, and never dispatch the original operation again.
             if method == "action_receipt" {
                 let id = try ActionReceiptStore.validateID(params["action_id"] as? String)
+                let receipt = try ActionContract.validateNativeReceipt(lease.actionReceipts.lookup(id), actionID: id)
                 return ["task_generation_id": lease.id, "kind": "bridge_response",
-                        "request_id": requestID, "ok": true, "result": lease.actionReceipts.lookup(id)]
+                        "request_id": requestID, "ok": true, "result": receipt]
             }
             if method == "check_effect" {
                 guard let check = params["check"] else { throw BridgeError.invalidRequest("Missing expected effect check") }
@@ -123,7 +127,7 @@ final class AgentAutomationBridge {
                 identity["action"] = action
                 switch try lease.commit({ try lease.actionReceipts.begin(id: id, payload: identity) }) {
                 case .existing(let receipt):
-                    return receiptResponse(receipt, requestID: requestID, generation: lease.id)
+                    return try receiptResponse(receipt, requestID: requestID, generation: lease.id)
                 case .new(let token): receiptToken = token
                 }
                 validatedAction = action
@@ -265,7 +269,7 @@ final class AgentAutomationBridge {
                 guard let action = params["action"] as? [String: Any] else {
                     throw BridgeError.invalidRequest("Missing readback payload")
                 }
-                result = try await taskTools.recheck(action: action)
+                result = try ActionContract.validateNativeReadback(try await taskTools.recheck(action: action), action: action)
 
             case "act":
                 let action = validatedAction!
@@ -287,14 +291,14 @@ final class AgentAutomationBridge {
                             })
                     }
                 }
-                receiptToken?.complete(result)
+                try receiptToken?.complete(result)
 
             default:
                 throw BridgeError.invalidRequest("Unknown bridge method: \(method)")
             }
             try TaskOwnership.check()
             if let receiptToken {
-                return receiptResponse(receiptToken.receipt, requestID: requestID, generation: lease.id)
+                return try receiptResponse(receiptToken.receipt, requestID: requestID, generation: lease.id)
             }
             return [
                 "task_generation_id": lease.id,
@@ -304,23 +308,21 @@ final class AgentAutomationBridge {
                 "result": result
             ]
         } catch {
-            let code = error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" :
+            let code = error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" :
                 (error as? ActionReceiptStore.ReceiptError)?.code ?? (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? "action_rejected"
             receiptToken?.fail(error, code: code)
             // Cancellation must remain a stop even if an acknowledged result
             // raced with revocation. The receipt still retains that result.
             if let receiptToken, code != "cancelled" {
-                return receiptResponse(receiptToken.receipt, requestID: requestID, generation: lease?.id ?? "")
+                if let response = try? receiptResponse(receiptToken.receipt, requestID: requestID, generation: lease?.id ?? "") { return response }
             }
             return [
                 "task_generation_id": lease?.id ?? "",
                 "kind": "bridge_response",
                 "request_id": requestID,
-                "ok": false,
-                "error": error.localizedDescription,
-                "error_code": code,
-                "outcome": code == "delivery_uncertain" ? "delivered_unconfirmed" : "rejected"
-            ]
+                "ok": false
+            ].merging(ActionContract.nativeFailure(error, code: code,
+                outcome: receiptToken?.receipt["state"] as? String == "unconfirmed" || code == "delivery_uncertain" ? "delivered_unconfirmed" : "rejected")) { _, new in new }
         }
     }
 
@@ -361,16 +363,20 @@ final class AgentAutomationBridge {
         }
     }
 
-    private func receiptResponse(_ receipt: [String: Any], requestID: String, generation: String) -> [String: Any] {
+    private func receiptResponse(_ receipt: [String: Any], requestID: String, generation: String) throws -> [String: Any] {
+        try ActionContract.validateNativeReceipt(receipt)
         var response: [String: Any] = ["task_generation_id": generation, "kind": "bridge_response", "request_id": requestID,
                                      "action_receipt": receipt.filter { ["action_id", "state", "terminal"].contains($0.key) }]
         if let result = receipt["result"] as? [String: Any] {
             response["ok"] = true; response["result"] = result
         } else {
             response["ok"] = false
-            response["error"] = receipt["error"] ?? "The action is still pending; inspect its receipt before further work"
-            response["error_code"] = receipt["error_code"] ?? "action_pending"
-            response["outcome"] = receipt["state"] as? String == "rejected" ? "rejected" : "delivered_unconfirmed"
+            if receipt["terminal"] as! Bool {
+                response.merge(receipt.filter { ActionContract.nativeErrorFields.contains($0.key) }) { _, new in new }
+            } else {
+                response.merge(ActionContract.nativeFailure(BridgeError.invalidRequest("The action is still pending; inspect its receipt before further work"),
+                    code: "action_pending", outcome: "dispatched")) { _, new in new }
+            }
         }
         return response
     }

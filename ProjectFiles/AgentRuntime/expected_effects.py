@@ -141,6 +141,8 @@ class ExpectedEffect:
         return self.result(True, element_id=target['id'], observation_revision=observation.get('observation_revision'))
 
     def native_check(self, response: dict) -> dict:
+        from action_contract_generated import validate_check_batch
+        validate_check_batch(response, requested_checks=[self.spec])
         if not isinstance(response, dict) or response.get('requested_checks') != [self.spec]: return self.result(reason='check_response_mismatch')
         checks = response.get('checks')
         if not isinstance(checks, list) or len(checks) != 1 or not isinstance(checks[0], dict): return self.result(reason='check_response_mismatch')
@@ -154,6 +156,8 @@ class ExpectedEffect:
     def reuse_native(self, action: dict, result: dict) -> dict | None:
         """Reuse exact native readback, never a generic successful exit/change."""
         if self.kind not in FILE_EFFECTS: return None
+        from action_contract_generated import validate_native_result
+        validate_native_result(result, action)
         kind = action.get('type')
         actual = None
         if kind == 'run_command' and result.get('timed_out') is False:
@@ -173,7 +177,12 @@ class ExpectedEffect:
                 if len(data) == result['bytes_returned'] and hashlib.sha256(data).hexdigest() == result.get('content_sha256') \
                         and self.kind == 'file_contents' and data == content_bytes(self.spec):
                     actual = {'type': self.kind, 'path': result['path'], 'verified': True, 'content_sha256': result['content_sha256']}
-        return self.native_check({'requested_checks': [self.spec], 'checks': [actual]}) if actual else None
+        if actual:
+            actual.update(outcome='verified' if actual['verified'] else 'delivered_unconfirmed', verification_scope=self.kind)
+            if self.kind != 'file_contents': actual.pop('content_sha256', None)
+            return self.native_check({'requested_checks': [self.spec], 'checks': [actual],
+                'verified': actual['verified'], 'outcome': actual['outcome'], 'verification_scope': 'requested_outcomes'})
+        return None
 
     def wait_file(self, check: Callable[[dict], dict], timeout=2.0, now=time.monotonic, sleep=time.sleep, count=lambda: None) -> dict:
         deadline = now() + timeout
@@ -181,7 +190,7 @@ class ExpectedEffect:
             count()
             try: result = self.native_check(check(self.spec))
             except Exception as error:
-                if getattr(error, 'code', None) in {'cancelled', 'permission_denied', 'protected_target', 'secure_input'}: raise
+                if getattr(error, 'code', None) in {'cancelled', 'permission_denied', 'protected_target', 'secure_input', 'protocol_error'}: raise
                 return self.result(reason='check_unavailable')
             if result['outcome'] == 'verified' or now() >= deadline: return result
             sleep(max(0.0, min(0.15, deadline - now())))

@@ -11,6 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import action_contract_generated as contract
+from evidence_fixtures import native_result, native_batch
 import openclaw_runtime as runtime
 from evidence_fixtures import VerificationSessions
 from coordinate_fixtures import fixture_coordinates
@@ -37,9 +38,9 @@ def reply(action, content=b'exact', correct=True):
         if check['type'] == 'file_contents': value['content_sha256'] = hashlib.sha256(base64.b64decode(check['content'])).hexdigest()
         if check['type'] == 'stdout_equals': value['text_sha256'] = hashlib.sha256(check['text'].encode()).hexdigest()
         actual.append(value)
-    return {'command_operation': action['operation'], 'outcome_checks': checks, 'checks': actual,
+    return native_result(action, **{'command_operation': action['operation'], 'outcome_checks': checks, 'checks': actual,
             'exit_code': 0, 'timed_out': False, 'verified': correct, 'outcome': 'verified' if correct else 'delivered_unconfirmed',
-            'verification_scope': 'requested_outcomes', 'working_directory': '/fixture'}
+            'verification_scope': 'requested_outcomes', 'working_directory': '/fixture'})
 
 
 class CommandOperationTests(unittest.TestCase):
@@ -136,7 +137,7 @@ class CommandOperationTests(unittest.TestCase):
         ledger.before_action({'type': 'key', 'key': 'return'})
         self.assertEqual(ledger.requirements['r1']['state'], 'invalidated')
         self.assertEqual(ledger.recheck_actions(), [bound])
-        ledger.record_action(bound, {'requested_checks': bound['checks'], 'checks': result['checks']}, recheck=True)
+        ledger.record_action(bound, native_batch(bound['checks'], result['checks']), recheck=True)
         self.assertEqual(ledger.requirements['r1']['state'], 'proven')
         self.assertNotIn('content', next(e['fact'] for e in ledger.evidence.values() if e['fact']['type'] == 'command_operation'))
 
@@ -145,7 +146,8 @@ class CommandOperationTests(unittest.TestCase):
         ledger = TaskEvidenceLedger(task, 'owned')
         ledger.add_requirements([{'source': task, 'description': 'Copy', 'check': {'type': 'command_operation', 'operation': operation}}])
         for result in [{'exit_code': 0, 'timed_out': False}, {**reply(action), 'outcome_checks': action['checks'], 'checks': reply(action)['checks'][:1]}]:
-            ledger.record_action(action, result)
+            try: ledger.record_action(action, result)
+            except runtime.NativeProtocolError: pass
             self.assertNotEqual(ledger.requirements['r1']['state'], 'proven')
         result = reply(action, correct=False); bound = bind_command_outcomes(action, result); ledger.record_action(bound, result)
         self.assertNotEqual(ledger.requirements['r1']['state'], 'proven')
@@ -161,7 +163,7 @@ class CommandOperationTests(unittest.TestCase):
     def test_recheck_cannot_manufacture_a_command_operation_that_never_executed(self):
         action = compiled('create_directory', path='/fixture/folder'); result = reply(action)
         ledger = TaskEvidenceLedger('Create a directory at /fixture/folder', 'owned')
-        ledger.record_action(action, {'requested_checks': action['checks'], 'checks': result['checks']}, recheck=True)
+        ledger.record_action(action, native_batch(action['checks'], result['checks']), recheck=True)
         self.assertFalse(any(e['fact']['type'] == 'command_operation' for e in ledger.evidence.values()))
 
     def test_native_source_snapshots_stay_out_of_recent_and_historical_model_context(self):
@@ -262,7 +264,7 @@ class CommandOperationTaskLoopTests(unittest.TestCase):
                     if method == 'recheck':
                         checks = params['action']['checks']; original = next(iter(receipts.values()))['result']
                         self.assertEqual(checks, original['outcome_checks'])
-                        return {'ok': True, 'result': {'requested_checks': checks, 'checks': original['checks']}}
+                        return {'ok': True, 'result': native_batch(checks, original['checks'])}
                     self.fail('Unexpected native method ' + method)
                 with mock.patch.object(runtime, '_task_generation_id', generation), mock.patch.object(runtime, 'find_openclaw', return_value='fixture'), \
                      mock.patch.object(runtime, 'prepare_runtime', return_value=mock.Mock()), mock.patch.object(runtime, 'ACPClient', return_value=client), \
