@@ -57,8 +57,10 @@ class ScreenshotBufferTests(unittest.TestCase):
             secure_reply = '{"kind":"user_input_response","request_id":"fixture","value":"fixture"}\n'
             stream = io.StringIO(self.pressure() + bridge_reply + self.pressure(level="critical") + secure_reply)
             inbox = RuntimeInbox(stream, control_handler=runtime.handle_runtime_control)
-            self.assertEqual(inbox.read(1), bridge_reply)
-            self.assertEqual(inbox.read(1), secure_reply)
+            bridge = inbox.register('bridge_response', 'fixture', None)
+            secure = inbox.register('user_input_response', 'fixture', None)
+            self.assertEqual(inbox.read(1, key=bridge), bridge_reply)
+            self.assertEqual(inbox.read(1, key=secure), secure_reply)
             self.assertIsNone(image._base64)
             self.assertEqual(image._data, self.pixels)
 

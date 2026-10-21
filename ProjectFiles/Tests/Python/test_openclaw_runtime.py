@@ -700,8 +700,8 @@ raise SystemExit(0)
         client = runtime.ACPClient.__new__(runtime.ACPClient)
         client.process = mock.Mock()
         client.process.poll.return_value = None
-        client.messages = mock.Mock()
-        client.messages.empty.return_value = True
+        client.transport = runtime.ACPTransport()
+        client._send = mock.Mock()
         client.next_request_id = 1
         client.session_id = "test-session"
         client.agent_chunks = []
@@ -713,17 +713,16 @@ raise SystemExit(0)
                 "content": {"type": "text", "text": '{"status":"done"}'},
             }},
         }
-        client.messages.get.side_effect = [
-            queue.Empty(), update, queue.Empty(),
-            {"id": 1, "result": {"stopReason": "end_turn"}},
-        ]
+        def send(_):
+            client.transport.route(update)
+            client.transport.route({"id": 1, "result": {"stopReason": "end_turn"}})
+        client._send.side_effect = send
         with tempfile.TemporaryDirectory() as directory:
             screenshot = Path(directory) / "screen.png"
             screenshot.write_bytes(b"image")
-            with mock.patch.object(runtime.time, "monotonic", side_effect=AssertionError("Unexpected deadline")):
-                self.assertEqual(client.prompt("Return JSON", screenshot), '{"status":"done"}')
-        self.assertEqual(client.messages.get.call_count, 4)
-        self.assertEqual(client.process.stdin.write.call_count, 1)
+            self.assertEqual(client.prompt("Return JSON", screenshot), '{"status":"done"}')
+        self.assertEqual(client._send.call_count, 1)
+        self.assertEqual(client.transport.bytes, 0)
 
     def test_acp_client_completes_image_prompt_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:

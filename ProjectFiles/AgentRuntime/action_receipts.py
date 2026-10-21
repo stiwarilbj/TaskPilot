@@ -5,67 +5,78 @@ module never executes an action, persists a payload, or makes model requests.
 """
 from __future__ import annotations
 
-import queue
-import os
+import json
 import threading
 import time
 from action_contract_generated import validate_native_receipt
+from bounded_transport import RequestTransport, TransportFailure, read_frames
 
 
 class BridgeReplyLost(RuntimeError):
-    def __init__(self, message: str, *, connected: bool = True):
+    def __init__(self, message: str, *, connected: bool = True, code=None):
         super().__init__(message)
         self.connected = connected
+        self.code = code
 
 
 class RuntimeInbox:
     def __init__(self, stream, control_handler=None):
         self.stream = stream
         self.control_handler = control_handler
-        self.lines = queue.Queue()
-        threading.Thread(target=self._read, daemon=True).start()
+        self.transport = RequestTransport()
+        self.transport.register(('runtime_configuration', None, None))
+        self._started = False
+        self._start_lock = threading.Lock()
 
-    def _enqueue(self, line):
+    def register(self, kind, request_id, generation):
+        key = (kind, request_id, generation)
+        self.transport.register(key)
+        return key
+
+    def start(self):
+        with self._start_lock:
+            if not self._started:
+                self._started = True
+                threading.Thread(target=self._read, daemon=True).start()
+
+    def _enqueue(self, frame):
         # Control messages must not enter a bridge/secure-input reply wait.
         # The sole reader can release disposable caches during a model wait.
-        if self.control_handler is None or not self.control_handler(line):
-            self.lines.put(line)
+        try:
+            line = frame.decode('utf-8')
+            message = json.loads(line)
+            if not isinstance(message, dict):
+                raise ValueError()
+        except (ValueError, RecursionError):
+            self.transport.fail(TransportFailure('transport_malformed_frame'))
+            return
+        if self.control_handler is not None and self.control_handler(line):
+            return
+        kind = message.get('kind')
+        request_id = message.get('request_id')
+        generation = message.get('task_generation_id')
+        if kind == 'runtime_configuration':
+            key = (kind, None, None)
+        elif isinstance(kind, str) and isinstance(request_id, str) and (generation is None or isinstance(generation, str)):
+            key = (kind, request_id, generation)
+        else:
+            return
+        self.transport.put(key, line + '\n', size=len(frame), terminal=True)
 
     def _read(self):
         try:
-            try:
-                descriptor = self.stream.fileno()
-            except (AttributeError, OSError, ValueError):
-                descriptor = None
-            if descriptor is None:
-                for line in self.stream:
-                    self._enqueue(line)
-            else:
-                # Reading the real pipe directly avoids holding stdin's
-                # BufferedReader lock on a daemon thread during process exit.
-                # This is the sole reader, including startup configuration.
-                pending = bytearray()
-                while chunk := os.read(descriptor, 65536):
-                    pending.extend(chunk)
-                    while (newline := pending.find(b'\n')) >= 0:
-                        self._enqueue(bytes(pending[:newline + 1]).decode('utf-8'))
-                        del pending[:newline + 1]
-                if pending:
-                    self._enqueue(bytes(pending).decode('utf-8'))
-        except (OSError, ValueError):
-            pass
+            read_frames(self.stream, self._enqueue, self.transport.fail)
         finally:
-            self.lines.put(None)
+            self.transport.close()
 
-    def read(self, timeout=None):
+    def read(self, timeout=None, *, key=('runtime_configuration', None, None)):
+        self.start()
         try:
-            line = self.lines.get(timeout=timeout)
-        except queue.Empty as error:
+            return self.transport.get(key, timeout)
+        except TimeoutError as error:
             raise BridgeReplyLost("The native action reply did not arrive; checking its receipt") from error
-        if line is None:
-            self.lines.put(None)
-            raise BridgeReplyLost("Lost contact with the native TaskPilot controller", connected=False)
-        return line
+        except TransportFailure as error:
+            raise BridgeReplyLost(str(error), connected=error.connected, code=error.code) from error
 
 
 def reconcile_receipt(action_id, lookup, metrics, *, budget=5.0, clock=time.monotonic, sleep=time.sleep, action=None):

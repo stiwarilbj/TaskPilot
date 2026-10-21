@@ -5,6 +5,12 @@ import Foundation
 /// Offsets are relative to the storage's bytes, including after Data compaction.
 struct RuntimeLineBuffer {
     static let compactionThreshold = 64 * 1024
+    static let maximumFrameBytes = 8 * 1024 * 1024
+    static let maximumBatchBytes = 32 * 1024 * 1024
+    private let frameLimit: Int
+    private let batchLimit: Int
+    private(set) var failureCode: String?
+    private var discarding = false
 
     private var storage = Data()
     private var readCursor = 0
@@ -13,8 +19,51 @@ struct RuntimeLineBuffer {
     var pendingByteCount: Int { storage.count - readCursor }
     var retainedByteCount: Int { storage.count }
 
+    init(frameLimit: Int = Self.maximumFrameBytes, batchLimit: Int = Self.maximumBatchBytes) {
+        precondition(frameLimit > 0 && batchLimit > 0)
+        self.frameLimit = frameLimit; self.batchLimit = batchLimit
+    }
+
     mutating func append(_ data: Data, flush: Bool = false) -> [Data] {
-        storage.append(data)
+        var lines: [Data] = []
+        var offset = 0, batchBytes = 0
+        while offset < data.count {
+            if discarding {
+                let next = data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) -> Int? in
+                    guard let base = bytes.baseAddress,
+                          let newline = memchr(base.advanced(by: offset), 0x0A, bytes.count - offset) else { return nil }
+                    return base.distance(to: UnsafeRawPointer(newline)) + 1
+                }
+                guard let next else { break }
+                offset = next; discarding = false
+            }
+            // Never copy an unbounded input chunk into retained storage. The
+            // extra byte detects a frame exceeding its limit immediately.
+            let count = min(64 * 1024, data.count - offset, frameLimit - pendingByteCount + 1)
+            if count == 0 { continue }
+            storage.append(data[data.index(data.startIndex, offsetBy: offset)..<data.index(data.startIndex, offsetBy: offset + count)])
+            offset += count
+            for line in extract(flush: false) {
+                if batchBytes + line.count <= batchLimit && lines.count < 65536 {
+                    lines.append(line); batchBytes += line.count
+                } else { failureCode = failureCode ?? "transport_buffer_limit" }
+            }
+            if pendingByteCount > frameLimit {
+                failureCode = failureCode ?? "transport_frame_limit"
+                storage = Data(); readCursor = 0; scanCursor = 0; discarding = true
+            }
+        }
+        if flush {
+            for line in extract(flush: true) {
+                if batchBytes + line.count <= batchLimit && lines.count < 65536 { lines.append(line); batchBytes += line.count }
+                else { failureCode = failureCode ?? "transport_buffer_limit" }
+            }
+            discarding = false
+        }
+        return lines
+    }
+
+    private mutating func extract(flush: Bool) -> [Data] {
         var lines: [Data] = []
         var lineStart = readCursor
         storage.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
@@ -23,7 +72,9 @@ struct RuntimeLineBuffer {
             // Native byte search also avoids per-byte Swift checks in debug builds.
             while search < bytes.count, let newline = memchr(base.advanced(by: search), 0x0A, bytes.count - search) {
                 let offset = base.distance(to: UnsafeRawPointer(newline))
-                if offset > lineStart {
+                if offset - lineStart > frameLimit {
+                    failureCode = failureCode ?? "transport_frame_limit"
+                } else if offset > lineStart {
                     lines.append(Data(bytes: base.advanced(by: lineStart), count: offset - lineStart))
                 }
                 lineStart = offset + 1

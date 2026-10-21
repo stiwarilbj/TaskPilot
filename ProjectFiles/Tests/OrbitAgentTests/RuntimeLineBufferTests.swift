@@ -82,14 +82,15 @@ final class RuntimeLineBufferTests: XCTestCase {
         XCTAssertEqual(buffer.retainedByteCount, 0)
     }
 
-    func testLargePendingLineDefersCompactionUntilPrefixIsHalfTheBuffer() {
+    func testLargeInputChunksCompactWithoutChangingPendingBytes() {
         var buffer = RuntimeLineBuffer()
         let line = Data(repeating: 0x61, count: RuntimeLineBuffer.compactionThreshold)
         let pending = Data(repeating: 0x62, count: line.count * 2)
         var bytes = line; bytes.append(0x0A); bytes.append(pending)
         XCTAssertEqual(buffer.append(bytes), [line])
         XCTAssertEqual(buffer.pendingByteCount, pending.count)
-        XCTAssertEqual(buffer.retainedByteCount, bytes.count)
+        XCTAssertLessThanOrEqual(buffer.retainedByteCount, bytes.count)
+        XCTAssertGreaterThanOrEqual(buffer.retainedByteCount, pending.count)
         XCTAssertEqual(buffer.append(Data([0x0A])), [pending])
         XCTAssertEqual(buffer.retainedByteCount, 0)
     }

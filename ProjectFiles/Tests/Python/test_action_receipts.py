@@ -147,8 +147,15 @@ class ActionReceiptTests(unittest.TestCase):
         self.assertEqual(emitted.call_count, 1)
 
     def test_one_inbox_preserves_buffered_config_bridge_and_secure_input_lines(self):
-        inbox = RuntimeInbox(io.StringIO('config\npartial reply\nsecure value\n'))
-        self.assertEqual([inbox.read(1) for _ in range(3)], ['config\n', 'partial reply\n', 'secure value\n'])
+        lines = [json.dumps(message) + '\n' for message in [
+            {'kind': 'runtime_configuration'}, {'kind': 'bridge_response', 'request_id': 'bridge'},
+            {'kind': 'user_input_response', 'request_id': 'secure', 'value': 'fixture'}]]
+        inbox = RuntimeInbox(io.StringIO(''.join(lines)))
+        bridge = inbox.register('bridge_response', 'bridge', None)
+        secure = inbox.register('user_input_response', 'secure', None)
+        self.assertEqual(inbox.read(1, key=secure), lines[2])
+        self.assertEqual(inbox.read(1, key=bridge), lines[1])
+        self.assertEqual(inbox.read(1), lines[0])
         for _ in range(2):
             with self.assertRaises(BridgeReplyLost) as error: inbox.read(1)
             self.assertFalse(error.exception.connected)
@@ -158,11 +165,11 @@ class ActionReceiptTests(unittest.TestCase):
         stream = os.fdopen(read_fd, 'r', encoding='utf-8')
         try:
             inbox = RuntimeInbox(stream)
-            os.write(write_fd, b'{"partial":')
+            os.write(write_fd, b'{"kind":"runtime_configuration","partial":')
             with self.assertRaises(BridgeReplyLost) as error: inbox.read(0.01)
             self.assertTrue(error.exception.connected)
             os.write(write_fd, b'true}\n')
-            self.assertEqual(inbox.read(1), '{"partial":true}\n')
+            self.assertEqual(inbox.read(1), '{"kind":"runtime_configuration","partial":true}\n')
         finally:
             os.close(write_fd)
             stream.close()
@@ -176,11 +183,11 @@ class ActionReceiptTests(unittest.TestCase):
         self.assertEqual(self.metrics['receipt_queries'], 0)
 
     def test_runtime_exits_cleanly_while_the_controller_input_pipe_stays_open(self):
-        script = 'import sys; from action_receipts import RuntimeInbox; assert RuntimeInbox(sys.stdin).read(1) == "fixture\\n"'
+        script = 'import sys, json; from action_receipts import RuntimeInbox; assert json.loads(RuntimeInbox(sys.stdin).read(1))["kind"] == "runtime_configuration"'
         child = subprocess.Popen([sys.executable, '-c', script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, cwd=str(Path(runtime.__file__).parent))
         try:
-            child.stdin.write(b'fixture\n')
+            child.stdin.write(b'{"kind":"runtime_configuration"}\n')
             child.stdin.flush()
             self.assertEqual(child.wait(timeout=3), 0) # stdin remains open through exit
             self.assertEqual(child.stderr.read(), b'')

@@ -128,6 +128,8 @@ def classify_failure(error: BaseException, now: float, model: str | None = None,
     lowered = message.lower()
     payload = error.payload if isinstance(error, ProviderRequestError) else message
     fields = facts(payload, getattr(error, "model", None) or model)
+    if str(getattr(error, 'code', '')).startswith('transport_'):
+        fields['code'] = error.code
     code, status, reason = fields.get("code"), fields.get("status"), fields.get("reason")
     tokens = {str(t).lower().replace('-', '_') for t in (*fields.get("codes", []), status, reason) if t is not None}
     http = fields.get("http_status")
@@ -143,7 +145,7 @@ def classify_failure(error: BaseException, now: float, model: str | None = None,
         kind, scope = "credentials", "credential"
     elif "cancelled" in tokens or "canceled" in tokens or any(s in lowered for s in ("cancelled the", "canceled the", "lost contact with the native", "task cancelled")):
         kind = "cancelled"
-    elif tokens & {"transport", "econnreset", "econnrefused", "epipe", "socket_closed"} or any(s in lowered for s in ("acp exited", "acp stopped", "broken pipe", "gateway disconnected", "connection closed", "connection refused", "econnreset", "econnrefused", "socket closed", "transport closed")):
+    elif str(getattr(error, 'code', '')).startswith('transport_') or tokens & {"transport", "econnreset", "econnrefused", "epipe", "socket_closed"} or any(s in lowered for s in ("acp exited", "acp stopped", "broken pipe", "gateway disconnected", "connection closed", "connection refused", "econnreset", "econnrefused", "socket closed", "transport closed")):
         kind = "transport"
     elif tokens & {"model_not_found", "unknown_model", "unsupported_model", "model_not_allowed"} or any(s in lowered for s in ("unknown model", "model not found", "model_not_found", "model is unavailable", "model unavailable", "unsupported model", "no such model")):
         kind, scope = "unavailable", "model"

@@ -34,7 +34,7 @@
 		</data>
 		<key>Resources/AgentRuntime/_internal/base_library.zip</key>
 		<data>
-		jm+cMMT6fHXs2Ra8I1PbecipYzk=
+		J86i0WvPlNs3WnTls6X+jOfWizg=
 		</data>
 		<key>Resources/AgentRuntime/_internal/libcrypto.3.dylib</key>
 		<data>
@@ -140,10 +140,6 @@
 		<data>
 		dGTor/NaLoqhJ96ZVWCXAFEjEWw=
 		</data>
-		<key>Resources/AgentRuntime/_internal/python3.11/lib-dynload/_queue.cpython-311-darwin.so</key>
-		<data>
-		1UKvZa3zhEKBf87kpFyusZcjz0E=
-		</data>
 		<key>Resources/AgentRuntime/_internal/python3.11/lib-dynload/_random.cpython-311-darwin.so</key>
 		<data>
 		lysfQMfb2jQu0YtuyIkrOhrqllQ=
@@ -238,7 +234,7 @@
 		</data>
 		<key>Resources/AgentRuntime/orbit_openclaw_runtime</key>
 		<data>
-		RG52lDT008QFDeHGNHnk7dbt3FA=
+		bta1oI9fUFTrOzaXcjfmeQjCmTY=
 		</data>
 		<key>Resources/OpenClaw/action-contract.sh</key>
 		<data>
@@ -312,7 +308,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			Zf4/qEqvXyKqz+0YGKcXxwJYHTil/yykx/DJlm3xcQw=
+			h9/fErO7OwdmaZTE7uK1sc5yQzOEYa5k3/KmzLlcjV0=
 			</data>
 		</dict>
 		<key>Resources/AgentRuntime/_internal/libcrypto.3.dylib</key>
@@ -497,13 +493,6 @@
 			TmDzJOqePjSxwwDBOJ2wkRJI24/f01RosZNNw807zJ0=
 			</data>
 		</dict>
-		<key>Resources/AgentRuntime/_internal/python3.11/lib-dynload/_queue.cpython-311-darwin.so</key>
-		<dict>
-			<key>hash2</key>
-			<data>
-			Bxuuh6YmmzPmpc52j4V1DDXM02/BQK0FiGoNPxPk+LE=
-			</data>
-		</dict>
 		<key>Resources/AgentRuntime/_internal/python3.11/lib-dynload/_random.cpython-311-darwin.so</key>
 		<dict>
 			<key>hash2</key>
@@ -669,7 +658,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			d1o54Furx5faDAQyBpMkd32mOQ63RSjZZPHDXT63YmM=
+			bZroB9uCcLPIYYuXfUKi9Nfozfor/1LHiwTT2/hsbyo=
 			</data>
 		</dict>
 		<key>Resources/OpenClaw/action-contract.sh</key>

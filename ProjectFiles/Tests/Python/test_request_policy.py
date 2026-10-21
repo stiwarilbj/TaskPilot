@@ -307,10 +307,10 @@ class RequestPolicyTests(unittest.TestCase):
     def test_queued_previous_turn_stream_is_drained(self):
         import queue
         client = runtime.ACPClient.__new__(runtime.ACPClient)
-        client.session_id = 'session'; client.messages = queue.Queue()
+        client.session_id = 'session'; client.transport = runtime.ACPTransport()
         client.agent_chunks = []; client.turn_errors = []
         for update in [{'sessionUpdate':'error','message':'old error'}, {'sessionUpdate':'agent_message_chunk','content':{'text':'old output'}}]:
-            client.messages.put({'method':'session/update','params':{'sessionId':'session','update':update}})
+            client.transport.route({'method':'session/update','params':{'sessionId':'session','update':update}})
         def request(*args, **kwargs):
             client._handle_server_message({'method':'session/update','params':{'sessionId':'session','update':{'sessionUpdate':'agent_message_chunk','content':{'text':'{"status":"done"}'}}}})
             return {'stopReason':'end_turn'}
@@ -340,7 +340,7 @@ class RequestPolicyTests(unittest.TestCase):
     def test_sqlite_transcript_recovery_rejects_stale_turn_errors(self):
         import queue
         client = runtime.ACPClient.__new__(runtime.ACPClient)
-        client.session_id = 'session'; client.session_key = 'unique'; client.messages = queue.Queue()
+        client.session_id = 'session'; client.session_key = 'unique'; client.transport = runtime.ACPTransport()
         client.request = mock.Mock(return_value={'stopReason':'end_turn'})
         client.gateway_configuration = mock.Mock(return_value={'messages':[
             {'role':'assistant','timestamp':900,'stopReason':'error','errorMessage':'old error'},

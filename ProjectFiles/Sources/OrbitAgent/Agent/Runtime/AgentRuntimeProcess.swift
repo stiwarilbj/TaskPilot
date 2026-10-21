@@ -85,6 +85,12 @@ final class AgentRuntimeProcess {
         let handler: (@MainActor (RuntimeEvent) -> Void)?
         let metricsDecoder: JSONDecoder
         var outputBuffer = RuntimeLineBuffer()
+        var writer: RuntimePipeWriter?
+        var transportFailure: String?
+        var receiptIDs: Set<String> = []
+        var queuedEventBytes = 0
+        var queuedEventCount = 0
+        var pendingBridgeBytes = 0
         var snapshots = RuntimeSnapshotFilter()
         var supportsMemoryPressure = false
         var startupSpan: BackendTelemetry.Span?
@@ -162,7 +168,13 @@ final class AgentRuntimeProcess {
         let run = Invocation(lease: lease, process: process, input: input, handler: onEvent)
         run.startupSpan = startup
         startupTransferred = true
-        ioQueue.sync { invocation = run }
+        ioQueue.sync {
+            invocation = run
+            run.writer = RuntimePipeWriter(handle: input.fileHandleForWriting, queue: ioQueue) { [weak self, weak run] code in
+                guard let self, let run else { return }
+                self.failTransport(code, for: run)
+            }
+        }
         installOutputHandler(output.fileHandleForReading, for: run)
         installErrorHandler(error.fileHandleForReading, for: run)
 
@@ -173,8 +185,12 @@ final class AgentRuntimeProcess {
                 guard self.invocation === run, run.process === terminated else { return }
                 output.fileHandleForReading.readabilityHandler = nil
                 error.fileHandleForReading.readabilityHandler = nil
-                self.appendOutput(output.fileHandleForReading.readDataToEndOfFile(), for: run, flush: true)
-                self.appendError(error.fileHandleForReading.readDataToEndOfFile(), for: run)
+                // A descendant may keep a pipe open after helper exit. Drain
+                // available bytes without an unbounded read-to-EOF allocation
+                // or a blocking wait that could prevent Stop.
+                self.drainAvailable(output.fileHandleForReading) { self.appendOutput($0, for: run) }
+                self.appendOutput(Data(), for: run, flush: true)
+                self.drainAvailable(error.fileHandleForReading) { self.appendError($0, for: run) }
                 run.exited = true
                 if !run.requestedStop && run.pendingTerminalEvent == nil {
                     run.pendingTerminalEvent = .failed(run.lastErrorLine.isEmpty ? "The OpenClaw bridge exited unexpectedly" : run.lastErrorLine)
@@ -204,8 +220,11 @@ final class AgentRuntimeProcess {
                 "command_capability_version": CommandCapabilities.version
             ], recordSize: false) // Credential-bearing frames expose timing only.
             configuration.append(0x0A)
-            try telemetry.measure(.ipcSend) { _ in
-                try input.fileHandleForWriting.write(contentsOf: configuration)
+            let sendSpan = telemetry.begin(.ipcSend)
+            ioQueue.sync {
+                run.writer?.enqueue(configuration, priority: true) { delivered in
+                    sendSpan.finish(delivered ? .succeeded : .failed)
+                }
             }
         } catch let launchError {
             if launched {
@@ -225,7 +244,7 @@ final class AgentRuntimeProcess {
             lease.revoke()
             run.startupSpan?.finish(.failed)
             run.startupSpan = nil
-            ioQueue.sync { run.exited = true; run.pendingTerminalEvent = nil; run.lease.retire() }
+            ioQueue.sync { run.writer?.cancel(); run.exited = true; run.pendingTerminalEvent = nil; run.lease.retire() }
             throw launchError
         }
     }
@@ -260,6 +279,7 @@ final class AgentRuntimeProcess {
         signalRuntime(SIGCONT)
         signalRuntime(SIGTERM)
         if run.process.isRunning { run.process.terminate() }
+        enforceTermination(run)
     }
 
     func submitUserInput(requestID: String, value: String, taskGenerationID: String) {
@@ -317,13 +337,31 @@ final class AgentRuntimeProcess {
     }
 
     private func appendError(_ data: Data, for run: Invocation) {
-        guard let text = String(data: data, encoding: .utf8), let last = text.split(whereSeparator: \.isNewline).last else { return }
+        guard let text = String(data: data.suffix(4096), encoding: .utf8), let last = text.split(whereSeparator: \.isNewline).last else { return }
         run.lastErrorLine = String(last)
+    }
+
+    private func drainAvailable(_ handle: FileHandle, consume: (Data) -> Void) {
+        let fd = handle.fileDescriptor
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+        var buffer = [UInt8](repeating: 0, count: 65536)
+        // Kernel pipes are bounded; do not follow a noisy surviving descendant
+        // indefinitely after the originating helper has exited.
+        var remaining = RuntimeLineBuffer.maximumBatchBytes
+        while remaining > 0 {
+            let count = Darwin.read(fd, &buffer, min(buffer.count, remaining))
+            if count <= 0 { break }
+            consume(Data(buffer.prefix(count))); remaining -= count
+        }
     }
 
     // Also used after process exit; the final event need not end with a newline.
     private func appendOutput(_ data: Data, for run: Invocation, flush: Bool = false) {
         let lines = run.outputBuffer.append(data, flush: flush)
+        if let code = run.outputBuffer.failureCode {
+            failTransport(code, for: run)
+            return
+        }
         for line in lines { processLine(line, for: run) }
     }
 
@@ -333,7 +371,9 @@ final class AgentRuntimeProcess {
         defer { receive.finish(accepted ? .succeeded : .failed) }
         guard let object = try? telemetry.measure(.jsonDecoding, inputBytes: data.count, { _ -> Any in try JSONSerialization.jsonObject(with: data) }),
               let message = object as? [String: Any],
-              let kind = message["kind"] as? String else { return }
+              let kind = message["kind"] as? String else {
+            failTransport("transport_malformed_frame", for: run); return
+        }
 
         guard invocation === run, run.lease.accepts(message["task_generation_id"] as? String) else {
             if !run.requestedStop && run.lease.state != .draining && run.lease.state != .retired {
@@ -362,8 +402,21 @@ final class AgentRuntimeProcess {
         case "request_metrics":
             if let metrics = try? run.metricsDecoder.decode(AgentRequestMetrics.self, from: data) { emit(.diagnostics(metrics), for: run) }
         case "bridge_request":
+            let requestBytes = data.count
+            let receiptLookup = message["method"] as? String == "action_receipt"
+            let allowance = (receiptLookup ? 32 : 24) * 1024 * 1024
+            guard run.operations.count < (receiptLookup ? 32 : 31) else { failTransport("transport_request_limit", for: run); return }
+            guard run.pendingBridgeBytes + requestBytes <= allowance else { failTransport("transport_buffer_limit", for: run); return }
+            if message["method"] as? String == "act",
+               let params = message["params"] as? [String: Any], let id = params["action_id"] as? String {
+                guard run.receiptIDs.count < 1024 || run.receiptIDs.contains(id) else {
+                    failTransport("transport_request_limit", for: run); return
+                }
+                run.receiptIDs.insert(id)
+            }
             let bridgeSpan = telemetry.begin(.ipcBridge, inputBytes: data.count)
             let operationID = UUID()
+            run.pendingBridgeBytes += requestBytes
             let operation = Task { [weak self] in
                 guard let self else { bridgeSpan.finish(.cancelled); return }
                 let response = await TaskOwnership.$current.withValue(run.lease) {
@@ -375,6 +428,7 @@ final class AgentRuntimeProcess {
                 self.ioQueue.async {
                     self.send(response, for: run, bridgeSpan: bridgeSpan)
                     run.operations.removeValue(forKey: operationID)
+                    run.pendingBridgeBytes -= requestBytes
                 }
             }
             run.operations[operationID] = operation
@@ -406,10 +460,12 @@ final class AgentRuntimeProcess {
             run.receivedTerminalEvent = true
             run.pendingTerminalEvent = .completed(message["message"] as? String ?? "Task complete")
             beginDrain(run)
+            enforceTermination(run, after: 5)
         case "error":
             run.receivedTerminalEvent = true
             run.pendingTerminalEvent = .failed(message["message"] as? String ?? "The task failed")
             beginDrain(run)
+            enforceTermination(run, after: 5)
         default:
             break
         }
@@ -423,20 +479,35 @@ final class AgentRuntimeProcess {
             let recordSize = object["kind"] as? String != "user_input_response"
             guard var data = try? self.telemetry.encodeJSON(object, recordSize: recordSize) else { bridgeSpan?.finish(.failed); return }
             data.append(0x0A)
-            do {
-                try self.telemetry.measure(.ipcSend, inputBytes: recordSize ? data.count : nil) { span in
-                    try run.input.fileHandleForWriting.write(contentsOf: data)
-                    if recordSize { span.record(outputBytes: data.count) }
-                }
-                bridgeSpan?.record(outputBytes: data.count)
-                bridgeSpan?.finish(.succeeded)
+            let span = self.telemetry.begin(.ipcSend, inputBytes: recordSize ? data.count : nil)
+            let count = data.count
+            let priority = ["bridge_response", "user_input_response"].contains(object["kind"] as? String ?? "")
+            run.writer?.enqueue(data, priority: priority) { delivered in
+                if recordSize && delivered { span.record(outputBytes: count) }
+                span.finish(delivered ? .succeeded : .failed)
+                if delivered { bridgeSpan?.record(outputBytes: count) }
+                bridgeSpan?.finish(delivered ? .succeeded : .failed)
             }
-            catch {
-                bridgeSpan?.finish(.failed)
-                run.pendingTerminalEvent = .failed("Lost contact with the native screen controller")
-                self.beginDrain(run)
-                if run.process.isRunning { run.process.terminate() }
-            }
+        }
+    }
+
+    private func failTransport(_ code: String, for run: Invocation) {
+        guard invocation === run, run.transportFailure == nil, !run.requestedStop, !run.receivedTerminalEvent else { return }
+        run.transportFailure = code
+        run.pendingTerminalEvent = .failed("TaskPilot transport failure (\(code)). Pending actions are being reconciled and will not be repeated.")
+        beginDrain(run)
+        if run.process.isRunning {
+            kill(run.process.processIdentifier, SIGCONT)
+            run.process.terminate()
+        }
+        enforceTermination(run)
+    }
+
+    private func enforceTermination(_ run: Invocation, after delay: TimeInterval = 2) {
+        ioQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.invocation === run, !run.exited, run.process.isRunning else { return }
+            let pid = run.process.processIdentifier
+            if kill(-pid, SIGKILL) != 0 { kill(pid, SIGKILL) }
         }
     }
 
@@ -446,6 +517,7 @@ final class AgentRuntimeProcess {
         run.startupSpan = nil
         run.drainStarted = .now
         run.lease.revoke()
+        run.writer?.cancel()
         for operation in run.operations.values { operation.cancel() }
         bridge.cancelActiveTool()
         pollDrain(run)
@@ -454,6 +526,17 @@ final class AgentRuntimeProcess {
     private func pollDrain(_ run: Invocation) {
         guard invocation === run, !run.terminalDelivered else { return }
         if run.exited && run.operations.isEmpty {
+            if let code = run.transportFailure {
+                // Receipt inspection happens after owned execution has drained.
+                // A dispatched/uncertain GUI effect never authorizes a replay
+                // or task completion, even when its response could not be sent.
+                let uncertain = run.receiptIDs.contains { id in
+                    let receipt = run.lease.actionReceipts.lookup(id)
+                    return ["unknown", "pending", "dispatched", "unconfirmed"].contains(receipt["state"] as? String ?? "unknown")
+                }
+                run.pendingTerminalEvent = .failed("TaskPilot transport failure (\(code)). " +
+                    (uncertain ? "An action’s effect could not be confirmed; it was not repeated." : "Action receipts were checked; no action was repeated."))
+            }
             run.terminalDelivered = true
             emit(run.requestedStop ? .stopped : (run.pendingTerminalEvent ?? .failed("Runtime ended without a result")), for: run, terminal: true, retireAfterDelivery: true)
             return
@@ -469,10 +552,23 @@ final class AgentRuntimeProcess {
         // Suppress redundant snapshots before they allocate main-queue work.
         // Invocation ownership and terminal delivery guards remain unchanged.
         guard terminal || run.snapshots.shouldSchedule(event) else { return }
+        let bytes: Int
+        switch event {
+        case .status(let text), .completed(let text), .failed(let text): bytes = text.utf8.count
+        case .output(let output): bytes = output.content.utf8.count + output.title.utf8.count
+        case .modelHealth(let model, let state, let detail): bytes = model.utf8.count + state.utf8.count + detail.utf8.count
+        case .userInputRequired(let request): bytes = request.title.utf8.count + request.message.utf8.count
+        default: bytes = 1024
+        }
+        guard terminal || (run.queuedEventCount < 4096 && run.queuedEventBytes + bytes <= 8 * 1024 * 1024) else {
+            failTransport("transport_event_limit", for: run); return
+        }
+        run.queuedEventCount += 1; run.queuedEventBytes += bytes
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             let delivery = self.ioQueue.sync {
-                (self.invocation === run && (terminal || !run.requestedStop), retireAfterDelivery && run.requestedStop)
+                run.queuedEventCount -= 1; run.queuedEventBytes -= bytes
+                return (self.invocation === run && (terminal || !run.requestedStop), retireAfterDelivery && run.requestedStop)
             }
             guard delivery.0 else { return }
             run.handler?(delivery.1 ? .stopped : event)

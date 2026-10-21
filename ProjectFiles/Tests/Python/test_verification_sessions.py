@@ -40,7 +40,7 @@ class ACPFixture:
         client.process = mock.Mock()
         client.process.poll.return_value = None
         client.process.stdout = client.process.stderr = client.process.stdin = None
-        client.messages = queue.Queue()
+        client.transport = runtime.ACPTransport()
         client.stdout_finished = threading.Event()
         client.stderr_tail = deque()
         client.openclaw_path = 'fixture'
@@ -241,14 +241,15 @@ class VerificationSessionTests(unittest.TestCase):
 
     def test_reconnect_reader_uses_only_originating_pipes_and_queues(self):
         fixture = ACPFixture([]); client = fixture.client
-        old = mock.Mock(stdout=io.StringIO('{"method":"old"}\n'), stderr=io.StringIO('old error\n'))
-        old_queue, old_finished, old_tail = queue.Queue(), threading.Event(), deque()
+        old = mock.Mock(stdout=io.StringIO('{"id":1,"result":{"old":true}}\n'), stderr=io.StringIO('old error\n'))
+        old_queue, old_finished, old_tail = runtime.ACPTransport(), threading.Event(), deque()
+        old_queue.register(1)
         client._read_stdout(old, old_queue, old_finished)
         client._read_stderr(old, old_tail)
-        self.assertEqual(old_queue.get_nowait(), {'method': 'old'})
+        self.assertEqual(old_queue.get(1, 0), {'id': 1, 'result': {'old': True}})
         self.assertTrue(old_finished.is_set())
         self.assertEqual(list(old_tail), ['old error'])
-        self.assertTrue(client.messages.empty())
+        self.assertEqual(client.transport.bytes, 0)
         self.assertFalse(client.stdout_finished.is_set())
         self.assertEqual(list(client.stderr_tail), [])
 

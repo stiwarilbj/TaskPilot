@@ -264,7 +264,7 @@ class ProviderErrorTests(unittest.TestCase):
     def client(self):
         client = runtime.ACPClient.__new__(runtime.ACPClient)
         client.session_id = 'current'; client.selected_model = policy.PRIMARY_MODELS[0]
-        client.next_request_id = 2; client.messages = queue.Queue()
+        client.next_request_id = 2; client.transport = runtime.ACPTransport()
         client.agent_chunks = []; client.turn_errors = []; client.stderr_tail = []
         client.process = mock.Mock(); client.process.poll.return_value = None
         client._send = mock.Mock()
@@ -272,8 +272,10 @@ class ProviderErrorTests(unittest.TestCase):
 
     def test_acp_rpc_response_keeps_nested_error_envelope(self):
         client = self.client()
-        client.messages.put({'id': 1, 'error': {'code': 401, 'message': 'stale'}})
-        client.messages.put({'id': 2, 'error': {'code': -32000, 'data': quota()}})
+        def send(_):
+            client.transport.route({'id': 1, 'error': {'code': 401, 'message': 'stale'}})
+            client.transport.route({'id': 2, 'error': {'code': -32000, 'data': quota()}})
+        client._send.side_effect = send
         with self.assertRaises(errors.ProviderRequestError) as caught: client.request('session/prompt', {'sessionId': 'current'}, timeout=None)
         failure = self.failure(caught.exception.payload)
         self.assertEqual((failure.code, failure.rpc_code, failure.scope), (429, -32000, 'credential'))

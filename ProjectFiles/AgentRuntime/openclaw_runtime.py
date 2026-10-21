@@ -19,7 +19,6 @@ import json
 import math
 import os
 from pathlib import Path
-import queue
 import re
 import shutil
 import shlex
@@ -51,6 +50,7 @@ from request_policy import (
 )
 from provider_errors import ProviderRequestError, facts as provider_error_facts, message_text, response_error
 from action_receipts import BridgeReplyLost, RuntimeInbox, reconcile_receipt
+from bounded_transport import ACPTransport, TransportFailure, FRAME_BYTES, read_frames, write_frame
 from prompt_compiler import (
     PROMPT_COMPILER_VERSION, COMPLETION_RULES, json_data, recovery_condition,
     decision_rules, compile_prompt, compile_repair,
@@ -131,11 +131,16 @@ def handle_runtime_control(line: str) -> bool:
     return True
 
 
-def runtime_line(timeout: float | None = None) -> str:
+def runtime_inbox() -> RuntimeInbox:
     global _runtime_inbox
     if _runtime_inbox is None or _runtime_inbox.stream is not sys.stdin:
         _runtime_inbox = RuntimeInbox(sys.stdin, control_handler=handle_runtime_control)
-    return _runtime_inbox.read(timeout)
+    return _runtime_inbox
+
+
+def runtime_line(timeout: float | None = None, *, key=None) -> str:
+    inbox = runtime_inbox()
+    return inbox.read(timeout, **({'key': key} if key is not None else {}))
 
 
 class ActionRejected(RuntimeError):
@@ -340,29 +345,14 @@ def _check_models(path: str, key: str, read_only: bool = False) -> bool:
 
 def bridge_exchange(method: str, display_id: int, params: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
     request_id = str(uuid.uuid4())
-    emit(
-        "bridge_request",
-        request_id=request_id,
-        method=method,
-        params={"display_id": display_id, **params},
-    )
-    deadline = None if timeout is None else time.monotonic() + timeout
-    while True:
-        remaining = None if deadline is None else deadline - time.monotonic()
-        if remaining is not None and remaining <= 0:
-            raise BridgeReplyLost("The native action reply did not arrive; checking its receipt")
-        line = runtime_line(remaining)
-        try:
-            response = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(response, dict) or response.get("kind") != "bridge_response":
-            continue
-        if response.get("request_id") != request_id:
-            continue
-        if _task_generation_id is not None and response.get("task_generation_id") != _task_generation_id:
-            continue
-        return response
+    inbox = runtime_inbox()
+    key = inbox.register('bridge_response', request_id, _task_generation_id)
+    try:
+        emit("bridge_request", request_id=request_id, method=method,
+             params={"display_id": display_id, **params})
+        return json.loads(runtime_line(timeout, key=key))
+    finally:
+        inbox.transport.unregister(key)
 
 
 def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
@@ -416,6 +406,8 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
         if not error.connected:
             _receipt_metrics["receipt_unresolved"] += 1
             raise
+        if error.code:
+            emit('status', message=f'Native transport failure ({error.code}); checking the action receipt without repeating it…')
         response = reconcile_receipt(params["action_id"],
             lambda action_id, remaining: bridge_call("action_receipt", display_id,
                 action_id=action_id, _reply_timeout=remaining), _receipt_metrics,
@@ -1390,25 +1382,21 @@ def decision_user_input_target(decision: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def wait_for_user_input(request_id: str) -> str:
-    while True:
-        line = runtime_line()
-        try:
-            response = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(response, dict) or response.get("kind") != "user_input_response":
-            continue
-        if response.get("request_id") != request_id:
-            continue
-        if _task_generation_id is not None and response.get("task_generation_id") != _task_generation_id:
-            continue
+def wait_for_user_input(request_id: str, *, key=None) -> str:
+    inbox = runtime_inbox()
+    owns_key = key is None
+    key = key or inbox.register('user_input_response', request_id, _task_generation_id)
+    try:
+        response = json.loads(runtime_line(key=key))
         value = response.get("value")
         if not isinstance(value, str) or not value:
             raise RuntimeError(f"{PRODUCT_NAME} did not receive the requested secure value")
         if len(value) > 4096:
             raise RuntimeError("The secure value is unexpectedly long")
         return value
+    finally:
+        if owns_key:
+            inbox.transport.unregister(key)
 
 
 def request_and_enter_user_input(
@@ -1416,14 +1404,14 @@ def request_and_enter_user_input(
     display_id: int,
 ) -> dict[str, Any]:
     request_id = str(uuid.uuid4())
-    emit(
-        "user_input_required",
-        request_id=request_id,
-        title=target["title"],
-        message=target["message"],
-        input_kind=target["input_kind"],
-    )
-    secret = wait_for_user_input(request_id)
+    inbox = runtime_inbox()
+    key = inbox.register('user_input_response', request_id, _task_generation_id)
+    try:
+        emit("user_input_required", request_id=request_id, title=target["title"],
+             message=target["message"], input_kind=target["input_kind"])
+        secret = wait_for_user_input(request_id, key=key)
+    finally:
+        inbox.transport.unregister(key)
     try:
         delivery = bridge_call(
             "act", display_id,
@@ -1881,7 +1869,7 @@ class ACPClient:
             env=environment,
         )
         _active_acp_process = self.process
-        self.messages: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.transport = ACPTransport()
         self.stderr_tail: deque[str] = deque(maxlen=12)
         self.next_request_id = 1
         self.accepting_prompt_updates = False
@@ -1892,7 +1880,8 @@ class ACPClient:
         self.selected_model: str | None = None
         self._session_ids: set[str] = set()
         self.stdout_finished = threading.Event()
-        threading.Thread(target=self._read_stdout, args=(self.process, self.messages, self.stdout_finished), daemon=True).start()
+        self._send_lock = threading.Lock()
+        threading.Thread(target=self._read_stdout, args=(self.process, self.transport, self.stdout_finished), daemon=True).start()
         threading.Thread(target=self._read_stderr, args=(self.process, self.stderr_tail), daemon=True).start()
         try:
             initialized = self.request(
@@ -1981,33 +1970,40 @@ class ACPClient:
                 # cancellation/failure must not start further configuration work.
                 self._new_session(session_key=planning[1])
 
-    def _read_stdout(self, process, messages, finished) -> None:
+    def _read_stdout(self, process, transport, finished) -> None:
+        def receive(frame):
+            try:
+                message = json.loads(frame)
+                if not isinstance(message, dict): raise ValueError()
+            except (ValueError, RecursionError):
+                transport.fail(TransportFailure('transport_malformed_frame'))
+                return
+            transport.route(message, len(frame))
         try:
             assert process.stdout is not None
-            for line in process.stdout:
-                try:
-                    message = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(message, dict):
-                    messages.put(message)
+            read_frames(process.stdout, receive, transport.fail)
         finally:
+            transport.close()
             finished.set()
 
     def _read_stderr(self, process, tail) -> None:
         assert process.stderr is not None
-        for line in process.stderr:
-            cleaned = line.strip()
+        def receive(frame):
+            cleaned = frame.decode('utf-8', errors='replace').strip()
             if cleaned:
                 tail.append(cleaned)
+        # Diagnostics have a separate tiny frame budget; oversized diagnostics
+        # cannot starve stdout or allocate an unbounded tail/unfinished line.
+        read_frames(process.stderr, receive, lambda _: None, frame_limit=4096)
 
     def _send(self, message: dict[str, Any]) -> None:
         if self.process.poll() is not None:
             detail = self.stderr_tail[-1] if self.stderr_tail else "Process ended"
             raise RuntimeError(f"OpenClaw ACP stopped: {detail}")
         assert self.process.stdin is not None
-        self.process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
-        self.process.stdin.flush()
+        with self._send_lock:
+            write_frame(self.process.stdin, message,
+                        timeout=0.1 if message.get('method') == 'session/cancel' else 5.0)
 
     def _handle_server_message(self, message: dict[str, Any]) -> None:
         method = message.get("method")
@@ -2024,17 +2020,26 @@ class ACPClient:
                 return
             content = update.get("content") or {}
             if update_kind in {"agent_message_chunk", "agent_message", "message"}:
+                if not isinstance(content, (dict, list)):
+                    raise TransportFailure('transport_malformed_envelope')
                 contents = content if isinstance(content, list) else [content]
                 for part in contents:
                     if isinstance(part, dict):
                         text = part.get("text")
                         if isinstance(text, str):
+                            self.response_bytes = getattr(self, 'response_bytes', 0) + len(text.encode('utf-8'))
+                            self.response_events = getattr(self, 'response_events', 0) + 1
+                            if self.response_bytes > FRAME_BYTES or self.response_events > 65536:
+                                raise TransportFailure('transport_response_limit')
                             if update_kind == "agent_message_chunk":
                                 self.agent_chunks.append(text)
                             else:
                                 self.agent_chunks = [text]
             elif update_kind in {"error", "session_error", "agent_error"}:
                 if update.get("message") or update.get("error") or update.get("code"):
+                    self.response_bytes = getattr(self, 'response_bytes', 0) + len(json.dumps(update).encode())
+                    if len(self.turn_errors) >= 128 or self.response_bytes > FRAME_BYTES:
+                        raise TransportFailure('transport_response_limit')
                     self.turn_errors.append(update)
             elif update_kind == "tool_call":
                 title = update.get("title") or "OpenClaw tool"
@@ -2063,40 +2068,43 @@ class ACPClient:
         if method == "session/prompt":
             self.pending_prompt_request_id = request_id
             self.pending_prompt_session_id = params["sessionId"]
-        self._send({
-            "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
-        })
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while deadline is None or time.monotonic() < deadline:
-            if self.process.poll() is not None and self.messages.empty() and (not hasattr(self, "stdout_finished") or self.stdout_finished.is_set()):
-                detail = self.stderr_tail[-1] if self.stderr_tail else "Process ended"
-                raise RuntimeError(f"OpenClaw ACP exited: {detail}")
-            try:
-                message = self.messages.get(
-                    timeout=0.25 if deadline is None else min(0.25, max(0.01, deadline - time.monotonic()))
-                )
-            except queue.Empty:
-                continue
-            if message.get("id") == request_id and ("result" in message or "error" in message):
-                if method == "session/prompt":
-                    self.pending_prompt_session_id = None
-                if "error" in message:
-                    error = message.get("error") or {}
-                    raise ProviderRequestError(error, getattr(self, "selected_model", None), "OpenClaw ACP request failed")
-                result = message.get("result")
-                return result if isinstance(result, dict) else {}
-            self._handle_server_message(message)
-        raise RuntimeError(f"OpenClaw timed out while handling {method}")
+        transport = self.transport  # Reconnect cannot redirect an old waiter.
+        transport.register(request_id, method=method, session=params.get('sessionId'))
+        try:
+            self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+            deadline = None if timeout is None else time.monotonic() + timeout
+            while True:
+                remaining = None if deadline is None else max(0, deadline - time.monotonic())
+                try:
+                    message = transport.get(request_id, remaining)
+                except TimeoutError as error:
+                    raise TransportFailure('transport_request_timeout') from error
+                if message.get("id") == request_id and ("result" in message or "error" in message) and 'method' not in message:
+                    if method == "session/prompt":
+                        self.pending_prompt_session_id = None
+                    if "error" in message:
+                        raise ProviderRequestError(message.get("error") or {}, getattr(self, "selected_model", None), "OpenClaw ACP request failed")
+                    result = message.get("result")
+                    return result if isinstance(result, dict) else {}
+                self._handle_server_message(message)
+        except TransportFailure:
+            # A lost stream cannot be interpreted as complete output. Stop the
+            # originating child; existing reconnect must also acknowledge the
+            # Gateway abort before any inference can be retried.
+            self.close()
+            raise
+        finally:
+            transport.unregister(request_id)
 
     def _run_prompt(self, prompt: list[dict[str, Any]], timeout: float | None) -> tuple[dict[str, Any], str]:
         # ACP notifications carry session identity; request responses carry the
-        # JSON-RPC request id. Drain earlier-turn updates before admitting a
-        # new prompt, and only collect output while its response is pending.
+        # JSON-RPC request id. Unregistered/retired updates are discarded by
+        # the reader, never buffered for a later decision.
         self.accepting_prompt_updates = False
-        while not self.messages.empty():
-            self._handle_server_message(self.messages.get_nowait())
         self.agent_chunks = []
         self.turn_errors = []
+        self.response_bytes = 0
+        self.response_events = 0
         self.accepting_prompt_updates = True
         started_at = time.time() * 1000
         cursor = session_transcript_cursor(self.session_id)

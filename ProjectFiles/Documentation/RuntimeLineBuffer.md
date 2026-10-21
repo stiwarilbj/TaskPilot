@@ -9,13 +9,17 @@ for the existing JSON decoder. Returned lines own their bytes independently.
 
 Consumed storage is compacted once per append when the prefix reaches 64 KiB
 and occupies at least half the buffer. Fully consumed storage is cleared; a
-large burst or exit flush also releases retained capacity. An unfinished line
-keeps the existing unrestricted framing behavior. Byte-relative cursors remain
+large burst or exit flush also releases retained capacity. Frames are limited
+to 8 MiB; oversized unfinished frames are rejected immediately and drained
+through their delimiter. Appends copy at most 64 KiB at a time and return at
+most 32 MiB or 65,536 lines. Byte-relative cursors remain
 valid when Foundation Data has a nonzero start index after compaction.
 
-The runtime's serialized I/O queue, generation ownership, message handling, and
-termination drainage are unchanged. No prompts, model calls, actions, setup,
-or interface behavior are added.
+The runtime's serialized I/O queue and generation ownership remain in place.
+Limit violations enter the existing failure/drain path, including receipt
+reconciliation. Nonblocking input writes keep Stop responsive. Process-exit
+drainage uses bounded nonblocking reads, including a final unterminated frame.
+See `BoundedTransport.md` for mailbox and cancellation policy.
 
 ## Regression coverage
 
@@ -48,7 +52,9 @@ both implementations, alternates their order across five samples, and reports
 median milliseconds per full stream. Fixture construction is outside timing;
 line collection and an equal checksum are included. Data is synthetic only.
 
-An optimized run on arm64 macOS with Apple Swift 6.3.3 on 2026-10-13 measured:
+The earlier unbounded cursor implementation on arm64 macOS with Apple Swift
+6.3.3 on 2026-10-13 measured the following historical baseline (these numbers
+do not measure the current bounded transport):
 
 | Fixture | Bytes | Chunks | Previous median ms | Cursor median ms | Ratio |
 | --- | ---: | ---: | ---: | ---: | ---: |
