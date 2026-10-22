@@ -173,12 +173,11 @@ final class AgentAutomationBridge {
                     keywords = values
                 } else { keywords = [] }
                 var observationDisplay = display
-                var capturedCoordinates: ScreenCoordinateMapping?
-                var stagedSnapshot: AccessibilitySnapshot?
+                var encodedScreen: CapturedScreen?
                 var recognitionDeadline = ProcessInfo.processInfo.systemUptime
                 var screenText = ScreenTextSnapshot()
                 var textMetadata: [String: Any] = [:]
-                let (accepted, screenshotURL) = try await ObservationConsistency.collect(
+                let (accepted, acceptedFrame) = try await ObservationConsistency.collect(
                     budget: budget,
                     checkpoint: { try await TaskOwnership.checkpoint() },
                     suspensionRevision: { lease.suspensionRevision },
@@ -190,7 +189,6 @@ final class AgentAutomationBridge {
                         observationDisplay = try self.targetDisplay(from: params)
                         recognitionDeadline = ProcessInfo.processInfo.systemUptime + remaining
                         let staged = try self.accessibility.stageSnapshot(on: observationDisplay, keywords: keywords, budget: remaining, forceFreshTopology: false)
-                        stagedSnapshot = staged.snapshot
                         return staged
                     },
                     stageAfter: { remaining in
@@ -199,20 +197,23 @@ final class AgentAutomationBridge {
                     },
                     signature: { $0.consistencySignature },
                     capture: { refresh in
-                        let captured = try await self.capture.capture(display: observationDisplay, forceRefresh: refresh)
-                        capturedCoordinates = captured.coordinates
-                        do {
-                            guard let snapshot = stagedSnapshot else { throw ScreenCoordinateError.invalidGeometry }
-                            screenText = try await LocalTextRecognition.supplement(image: captured.image,
-                                coordinates: captured.coordinates, snapshot: snapshot,
-                                scene: self.accessibility.observationScene(on: observationDisplay), keywords: keywords,
-                                budget: recognitionDeadline - ProcessInfo.processInfo.systemUptime, inspectionPID: inspectionPID)
-                        } catch { lease.discardArtifact(captured.url); throw error }
-                        return captured.url
+                        try await self.capture.acquire(display: observationDisplay, forceRefresh: refresh)
                     },
-                    discard: { lease.discardArtifact($0) },
+                    discard: { frame in
+                        if let encoded = encodedScreen, encoded.frameID == frame.id {
+                            lease.discardArtifact(encoded.url); encodedScreen = nil
+                        }
+                    },
+                    prepare: { candidate, frame, pairedScene in
+                        screenText = try await LocalTextRecognition.supplement(image: frame.image,
+                            coordinates: frame.coordinates, snapshot: candidate.snapshot, scene: pairedScene,
+                            keywords: keywords, budget: recognitionDeadline - ProcessInfo.processInfo.systemUptime,
+                            inspectionPID: inspectionPID)
+                        encodedScreen = try await self.capture.encode(frame)
+                    },
                     publish: { candidate in
-                        guard let coordinates = capturedCoordinates else { throw ScreenCoordinateError.invalidGeometry }
+                        guard let encoded = encodedScreen else { throw ScreenCoordinateError.invalidGeometry }
+                        let coordinates = encoded.coordinates
                         let metadata = try screenText.metadata(revision: candidate.snapshot.revision, coordinates: coordinates)
                         // Text evidence, AX IDs and image coordinates become
                         // authoritative together, under the same epoch check.
@@ -233,15 +234,17 @@ final class AgentAutomationBridge {
                             }
                         }
                     })
+                guard let encoded = encodedScreen, encoded.frameID == acceptedFrame.id else {
+                    if let encoded = encodedScreen { lease.discardArtifact(encoded.url) }
+                    throw ScreenCoordinateError.invalidGeometry
+                }
+                let screenshotURL = encoded.url
+                let coordinates = acceptedFrame.coordinates
                 let snapshot = accepted.snapshot
                 try TaskOwnership.check()
                 let expansion = snapshot.completeness["local_expansion"] as? [String: Int] ?? [:]
                 let gaps = snapshot.completeness["reason_counts"] as? [String: Int] ?? [:]
                 observationLogger.debug("Collected controls: \(snapshot.elements.count), gap scopes: \(gaps.values.reduce(0, +)), expanded subtrees: \(expansion["subtrees_attempted", default: 0]), read retries: \(expansion["read_retries", default: 0])")
-                guard let coordinates = capturedCoordinates else {
-                    lease.discardArtifact(screenshotURL)
-                    throw ScreenCoordinateError.invalidGeometry
-                }
                 observationLogger.debug("Local text candidates: \(screenText.targets.count), detail crops: \(screenText.crops.count)")
                 result = [
                     "task_generation_id": lease.id,
@@ -344,8 +347,8 @@ final class AgentAutomationBridge {
         guard LocalTextRecognition.windows(scene: scene).contains(target.window) else {
             throw AccessibilityActionError.staleObservation
         }
-        let captured = try await capture.capture(display: display, forceRefresh: true)
-        defer { lease.discardArtifact(captured.url) }
+        // Read-only text reconciliation needs pixels, not a PNG artifact.
+        let captured = try await capture.acquire(display: display, forceRefresh: true)
         let region = target.match.frame.insetBy(dx: -40, dy: -25).intersection(target.window.frame).intersection(display.frame)
         guard let (image, mapping) = try LocalTextRecognition.crop(captured.image, coordinates: captured.coordinates, frame: region) else {
             throw AccessibilityActionError.staleObservation

@@ -7,12 +7,14 @@ import ScreenCaptureKit
 import UniformTypeIdentifiers
 
 enum ScreenCaptureError: LocalizedError {
+    case pipelineBusy
     case displayUnavailable
     case couldNotWriteImage
     case permissionDenied(String)
 
     var errorDescription: String? {
         switch self {
+        case .pipelineBusy: return "The local capture pipeline has reached its bounded capacity"
         case .displayUnavailable: return "The agent display is not available to ScreenCaptureKit"
         case .couldNotWriteImage: return "The agent-screen image could not be written"
         case .permissionDenied(let detail):
@@ -32,8 +34,10 @@ enum ScreenCaptureAuthorization: Equatable {
 
 struct CapturedScreen {
     let url: URL
-    let coordinates: ScreenCoordinateMapping
-    let image: CGImage
+    let frame: CapturedFrame
+    var coordinates: ScreenCoordinateMapping { frame.coordinates }
+    var image: CGImage { frame.image }
+    var frameID: UUID { frame.id }
 }
 
 actor ScreenCaptureService {
@@ -44,6 +48,15 @@ actor ScreenCaptureService {
 
     private let contentCache = PressureSensitiveCache<(content: SCShareableContent, created: ContinuousClock.Instant)>()
     private let contentCacheLifetime: Duration = .milliseconds(750)
+    typealias Acquirer = @Sendable (DisplayDescriptor, Bool, Bool) async throws -> CGImage
+    private let acquisitionQueue: CaptureAcquisitionQueue
+    private let encoder: CapturePNGEncoder
+    private let acquirer: Acquirer?
+
+    init(acquisitionQueue: CaptureAcquisitionQueue = CaptureAcquisitionQueue(),
+         encoder: CapturePNGEncoder = CapturePNGEncoder(), acquirer: Acquirer? = nil) {
+        self.acquisitionQueue = acquisitionQueue; self.encoder = encoder; self.acquirer = acquirer
+    }
 
     /// Reads macOS' existing TCC decision without invoking ScreenCaptureKit.
     ///
@@ -71,42 +84,83 @@ actor ScreenCaptureService {
         }
 
         do {
-            let content = try await shareableContent(forceRefresh: true)
-            guard let display = content.displays.first else {
-                return .unavailable("macOS returned no capturable display")
+            let reservation = try await acquisitionQueue.acquire(.evidence)
+            do {
+                let status = try await verifyAuthorizationPixels()
+                await acquisitionQueue.acquired(reservation)
+                try reservation.check()
+                return status
+            } catch {
+                await acquisitionQueue.acquired(reservation)
+                throw error
             }
-            let excludedApps = controllerApplications(in: content)
-            let filter = SCContentFilter(
-                display: display,
-                excludingApplications: excludedApps,
-                exceptingWindows: []
-            )
-            let configuration = SCStreamConfiguration()
-            configuration.width = 2
-            configuration.height = 2
-            configuration.showsCursor = false
-            configuration.capturesAudio = false
-            _ = try await SCScreenshotManager.captureImage(
-                contentFilter: filter,
-                configuration: configuration
-            )
-            return .authorized
-        } catch {
+        } catch is CancellationError { return .unavailable("The capture permission check was cancelled") }
+        catch {
             contentCache.evict()
-            // macOS commonly updates the Settings switch before the running
-            // process receives a usable ScreenCaptureKit authorization. Report
-            // the switch as On while requiring an automatic relaunch before a
-            // task can start.
             return .restartRequired(error.localizedDescription)
         }
+    }
+
+    private func verifyAuthorizationPixels() async throws -> ScreenCaptureAuthorization {
+        let content = try await shareableContent(forceRefresh: true)
+        guard let display = content.displays.first else {
+            return .unavailable("macOS returned no capturable display")
+        }
+        let excludedApps = controllerApplications(in: content)
+        let filter = SCContentFilter(
+            display: display,
+            excludingApplications: excludedApps,
+            exceptingWindows: []
+        )
+        let configuration = SCStreamConfiguration()
+        configuration.width = 2
+        configuration.height = 2
+        configuration.showsCursor = false
+        configuration.capturesAudio = false
+        _ = try await SCScreenshotManager.captureImage(
+            contentFilter: filter,
+            configuration: configuration
+        )
+        return .authorized
     }
 
     func isAuthorized() async -> Bool {
         await authorizationStatus(verifyPixels: false) == .authorized
     }
 
-    func capture(display: DisplayDescriptor, forceRefresh: Bool = false) async throws -> CapturedScreen {
+    /// Acquisition and compression have separate capacity and execution lanes.
+    func acquire(display: DisplayDescriptor, forceRefresh: Bool = false) async throws -> CapturedFrame {
         try await TaskOwnership.checkpoint()
+        let reservation = try await acquisitionQueue.acquire(.evidence, owner: TaskOwnership.current)
+        do {
+            try reservation.check()
+            let image: CGImage
+            if let acquirer { image = try await acquirer(display, forceRefresh, false) }
+            else { image = try await acquireTaskImage(display: display, forceRefresh: forceRefresh) }
+            try reservation.check()
+            let coordinates = try ScreenCoordinateMapping(displayID: display.id, displayBounds: display.frame,
+                imageSize: CGSize(width: image.width, height: image.height))
+            let frame = CapturedFrame(image: image, coordinates: coordinates, reservation: reservation)
+            await acquisitionQueue.acquired(reservation)
+            try frame.check()
+            return frame
+        } catch {
+            await acquisitionQueue.acquired(reservation)
+            throw error
+        }
+    }
+
+    func encode(_ frame: CapturedFrame) async throws -> CapturedScreen {
+        let url = try await encoder.encode(frame)
+        return CapturedScreen(url: url, frame: frame)
+    }
+
+    func capture(display: DisplayDescriptor, forceRefresh: Bool = false) async throws -> CapturedScreen {
+        let frame = try await acquire(display: display, forceRefresh: forceRefresh)
+        return try await encode(frame)
+    }
+
+    private func acquireTaskImage(display: DisplayDescriptor, forceRefresh: Bool) async throws -> CGImage {
         let captureSpan = BackendTelemetry.current.begin(.capture)
         defer { captureSpan.finish(Task.isCancelled ? .cancelled : .failed) }
         guard Self.preflightAuthorizationStatus() == .authorized else {
@@ -157,20 +211,11 @@ actor ScreenCaptureService {
             contentCache.evict()
             throw permissionError(for: error)
         }
-        try await TaskOwnership.checkpoint()
+        try TaskOwnership.check()
         guard CGDisplayBounds(display.id) == display.frame else { throw ScreenCoordinateError.captureChanged }
-        let coordinates = try ScreenCoordinateMapping(displayID: display.id, displayBounds: display.frame,
-            imageSize: CGSize(width: image.width, height: image.height))
         captureSpan.record(items: image.width * image.height)
         captureSpan.finish(.succeeded)
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("OrbitAgent", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let url = directory.appendingPathComponent("screen-\(UUID().uuidString).png")
-        try Self.writePNG(image, to: url)
-        do { try TaskOwnership.check(); try TaskOwnership.current?.ownArtifact(url) }
-        catch { try? FileManager.default.removeItem(at: url); throw error }
-        return CapturedScreen(url: url, coordinates: coordinates, image: image)
+        return image
     }
 
     static func writePNG(_ image: CGImage, to url: URL) throws {
@@ -196,6 +241,22 @@ actor ScreenCaptureService {
     /// TaskPilot's click-through cursor overlay so the user can watch exactly where
     /// the agent is pointing without moving their hardware cursor.
     func capturePreview(display: DisplayDescriptor) async throws -> CGImage {
+        let reservation = try await acquisitionQueue.acquire(.preview)
+        do {
+            try reservation.check()
+            let image: CGImage
+            if let acquirer { image = try await acquirer(display, false, true) }
+            else { image = try await acquirePreviewImage(display: display) }
+            await acquisitionQueue.acquired(reservation)
+            try reservation.check()
+            return image
+        } catch {
+            await acquisitionQueue.acquired(reservation)
+            throw error
+        }
+    }
+
+    private func acquirePreviewImage(display: DisplayDescriptor) async throws -> CGImage {
         let span = BackendTelemetry.current.begin(.previewCapture)
         defer { span.finish(Task.isCancelled ? .cancelled : .failed) }
         let content: SCShareableContent

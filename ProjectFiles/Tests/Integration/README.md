@@ -201,3 +201,27 @@ the previous linear index. This excludes native AX communication, graph storage,
 and end-to-end capture latency; no live speed or accuracy claim follows. No
 fixer, live-control tester, Chrome interaction, live desktop task, or provider
 request was used. Live validation remains incomplete.
+
+Capture acquisition, accepted-frame ownership, and PNG compression now have
+separate stages. The native acquisition lane is serial, prioritizes eligible task
+evidence, and retains at most two evidence frames and one preview reservation.
+At most eight evidence requests and one replaceable preview request may wait;
+waiting requests retain metadata rather than pixels. The existing viewer retains
+its displayed image separately. Preview acquisition remains eligible when both
+evidence slots are occupied, and superseded previews cannot publish late results.
+
+Consistency checks pair a raw frame with the second fresh control tree before
+OCR or encoding. One detached compression worker and one queued job encode only
+that immutable frame; later screen changes cannot substitute newer pixels.
+Read-only text-target reconciliation consumes raw pixels without creating a PNG.
+Queued cancellation releases buffers promptly. Native acquisitions and ImageIO
+compression already running retain capacity until drainage, then discard cancelled
+results and partial files. Task revocation and suspension epochs prevent stale
+publication; accepted evidence retains its own frame lifetime.
+
+Synthetic-image fixtures block compression while exercising acquisition and
+preview progress, preview floods, queue limits, exact encoded pixels, duplicate
+encoding rejection, partial-file cleanup, task revocation, queued cancellation,
+and consistency rejection before compression. These are offline tests: no fixer,
+live-control tester, Chrome interaction, live desktop task, or provider request
+is used. Live capture latency and accuracy validation remain incomplete.

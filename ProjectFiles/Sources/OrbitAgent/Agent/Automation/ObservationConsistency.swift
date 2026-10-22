@@ -18,7 +18,7 @@ struct ObservationConsistencyDiagnostics {
 enum ObservationConsistency {
     private enum Retry: Error { case changed(String), resumed }
 
-    static func collect<Candidate, Scene: Equatable>(
+    static func collect<Candidate, Scene: Equatable, Frame>(
         budget: TimeInterval = 5,
         now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         checkpoint: () async throws -> Void,
@@ -27,12 +27,13 @@ enum ObservationConsistency {
         stage: (TimeInterval) throws -> Candidate,
         stageAfter: ((TimeInterval) throws -> Candidate)? = nil,
         signature: (Candidate) throws -> String,
-        capture: (Bool) async throws -> URL,
-        discard: (URL) -> Void,
+        capture: (Bool) async throws -> Frame,
+        discard: (Frame) -> Void,
+        prepare: (Candidate, Frame, Scene) async throws -> Void = { _, _, _ in },
         publish: (Candidate) throws -> Void,
         sleep: (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) },
         report: (ObservationConsistencyDiagnostics) -> Void = { _ in }
-    ) async throws -> (Candidate, URL) {
+    ) async throws -> (Candidate, Frame) {
         try await checkpoint()
         let started = now()
         var deadline = started + min(5, max(0, budget))
@@ -49,7 +50,7 @@ enum ObservationConsistency {
         }
 
         while true {
-            var image: URL?
+            var image: Frame?
             do {
                 // A macOS read already in flight cannot be preempted. The
                 // deadline bounds new attempts, not a healthy read's return.
@@ -74,11 +75,15 @@ enum ObservationConsistency {
                 try await check()
                 guard try scene() == firstScene else { throw Retry.changed("window_during_controls") }
                 guard try signature(after) == beforeSignature else { throw Retry.changed("control_layout") }
+                // The pair is now fixed. Encoding/OCR may only consume this
+                // frame, never ask the capture service for its latest pixels.
+                try await prepare(after, image!, firstScene)
                 try await check()
                 try publish(after)
                 return (after, image!)
             } catch {
-                if let image { discard(image) }
+                if let rejected = image { discard(rejected) }
+                image = nil // Release queued pixels before Pause/backoff.
                 // Pause can occur during a wait or immediately before commit.
                 // Cancellation/revocation still wins over a resumption retry.
                 try await checkpoint()
