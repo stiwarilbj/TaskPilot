@@ -179,6 +179,7 @@ class ExpectedEffect:
                     actual = {'type': self.kind, 'path': result['path'], 'verified': True, 'content_sha256': result['content_sha256']}
         if actual:
             actual.update(outcome='verified' if actual['verified'] else 'delivered_unconfirmed', verification_scope=self.kind)
+            actual.update({key: result[key] for key in ('file_identity','file_version','parent_identity') if key in result})
             if self.kind != 'file_contents': actual.pop('content_sha256', None)
             return self.native_check({'requested_checks': [self.spec], 'checks': [actual],
                 'verified': actual['verified'], 'outcome': actual['outcome'], 'verification_scope': 'requested_outcomes'})

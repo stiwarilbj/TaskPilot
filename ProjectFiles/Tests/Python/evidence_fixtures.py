@@ -30,6 +30,12 @@ def proof_response(ledger):
                        for key in ledger.requirements]}
 
 
+def filesystem_identity(path):
+    import hashlib
+    return {key: hashlib.sha256((key + path).encode()).hexdigest()
+            for key in ('file_identity', 'file_version', 'parent_identity')}
+
+
 def native_check(check, verified=True, **fields):
     """Explicit synthetic native checker, not a production compatibility shim."""
     import hashlib
@@ -39,6 +45,10 @@ def native_check(check, verified=True, **fields):
               'outcome': 'verified' if verified else 'delivered_unconfirmed',
               'verification_scope': check['type']}
     if 'path' in check: result['path'] = os.path.normpath(os.path.expanduser(check['path']))
+    if verified and 'path' in check:
+        result.update(filesystem_identity(result['path']))
+        if check['type'] == 'path_absent':
+            result.pop('file_identity'); result.pop('file_version')
     if verified and check['type'] == 'file_contents' and 'content' in check:
         data = base64.b64decode(check['content']) if check.get('encoding') == 'base64' else check['content'].encode()
         result['content_sha256'] = hashlib.sha256(data).hexdigest()
@@ -66,7 +76,7 @@ def native_result(action, **fields):
         data = base64.b64decode(action['content']) if action.get('encoding') == 'base64' else action['content'].encode()
         result.update(verified=True, outcome='verified', verification_scope='file_write',
                       path=os.path.normpath(os.path.expanduser(action['path'])), mode=action.get('mode', 'overwrite'),
-                      bytes_written=len(data), file_size=len(data), content_sha256=hashlib.sha256(data).hexdigest())
+                      bytes_written=len(data), file_size=len(data), content_sha256=hashlib.sha256(data).hexdigest(), file_sha256=hashlib.sha256(data).hexdigest())
     elif kind == 'read_file':
         content = fields.get('content', '')
         data = base64.b64decode(content) if fields.get('encoding') == 'base64' else content.encode()
@@ -89,6 +99,7 @@ def native_result(action, **fields):
                       delivery_method='accessibility_value', verified=True, outcome='verified')
     elif kind in {'focus', 'launch_app'}:
         result.update(verified=True, outcome='verified', verification_scope='focus' if kind=='focus' else 'window_visible')
+    if kind in {'read_file','write_file'}: result.update(filesystem_identity(result['path']))
     return {**result, **fields}
 
 

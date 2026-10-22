@@ -4,16 +4,16 @@ from __future__ import annotations
 import json
 from typing import Any
 
-PROMPT_COMPILER_VERSION = 9
+PROMPT_COMPILER_VERSION = 10
 PHASE_PREFIX = "EXECUTION PHASE: "
 REPAIR_HEADER = "RESPONSE FORMAT REPAIR:"
 EXAMPLE_MARKERS = {"planning": "RELEVANT ACTION EXAMPLES", "recovery": "RELEVANT ACTION EXAMPLES",
                    "completion": "RESPONSE EXAMPLES"}
 
 DECISION_CONTRACT = (
-    "Return one JSON object for one action via TaskPilot cross-app control. Do not call OpenClaw's own tools. "
+    "Return one JSON object; one action; TaskPilot cross-app control. Do not call OpenClaw's own tools. "
     "Each task is a new execution; earlier tasks are not completion evidence.\n"
-    "Select the current intended control; copy its complete element_id. Set intended_target/expected_result. "
+    "Select the intended control; copy its complete element_id. Set intended_target/expected_result. "
     "Prefer element_id; missing AX: inspect screenshot; coordinates need observed app PID. "
     "Incomplete coverage means unobserved, not unavailable.\n"
     "Never count an attempted action as completion. done needs ALL requirements proved and the exact result.\n"
@@ -34,6 +34,7 @@ RECOVERY_RULES = (
     "Do not repeat rejected actions or assume an uncertain mutation failed.\n"
 )
 RECOVERY_CONDITIONS = {
+    "file_conflict": "Inspect the destination and parent again with read-only file checks. A concurrent filesystem change invalidated the binding; reconcile uncertain delivery before another mutation.",
     "stale_target": "Select the intended control again from the fresh observation; reconsider its app, window and current bounds.",
     "disabled_target": "Inspect whether the target is ready; wait locally if loading, or choose an enabled valid route.",
     "focus_mismatch": "Inspect the intended field and refocus it before text entry; do not repeat text already delivered.",

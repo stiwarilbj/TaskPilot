@@ -135,7 +135,7 @@ class HistoricalProgressTests(unittest.TestCase):
 
     def read(self, step=1, content='Quarterly revenue: 42'):
         return {'step': step, 'action': {'type': 'read_file', 'path': f'/tmp/report-{step}.txt'},
-                'result': {'action_type':'read_file','outcome':'verified','verified':True,'verification_scope':'file_read', 'path': f'/tmp/report-{step}.txt', 'content': content, 'encoding': 'utf-8',
+                'result': {'action_type':'read_file','outcome':'verified','verified':True,'verification_scope':'file_read', 'file_identity':'1'*64, 'file_version':'2'*64, 'parent_identity':'3'*64, 'path': f'/tmp/report-{step}.txt', 'content': content, 'encoding': 'utf-8',
                            'bytes_returned': len(content), 'truncated': False,
                            'content_sha256': hashlib.sha256(content.encode()).hexdigest()}}
 

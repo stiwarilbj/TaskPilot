@@ -309,7 +309,7 @@ final class AgentAutomationBridge {
             ]
         } catch {
             let code = error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" :
-                (error as? ActionReceiptStore.ReceiptError)?.code ?? (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? "action_rejected"
+                (error as? ActionReceiptStore.ReceiptError)?.code ?? (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? (error is BoundFileOperation.Conflict ? "file_conflict" : "action_rejected")
             receiptToken?.fail(error, code: code)
             // Cancellation must remain a stop even if an acknowledged result
             // raced with revocation. The receipt still retains that result.
@@ -322,7 +322,7 @@ final class AgentAutomationBridge {
                 "request_id": requestID,
                 "ok": false
             ].merging(ActionContract.nativeFailure(error, code: code,
-                outcome: receiptToken?.receipt["state"] as? String == "unconfirmed" || code == "delivery_uncertain" ? "delivered_unconfirmed" : "rejected")) { _, new in new }
+                outcome: receiptToken?.receipt["state"] as? String == "unconfirmed" || code == "delivery_uncertain" || (error as? BoundFileOperation.Conflict)?.delivered == true ? "delivered_unconfirmed" : "rejected")) { _, new in new }
         }
     }
 

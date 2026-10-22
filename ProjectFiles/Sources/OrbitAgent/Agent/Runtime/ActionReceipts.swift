@@ -112,7 +112,7 @@ final class ActionReceiptStore: @unchecked Sendable {
     private func fail(_ id: String, error: Error, code: String) {
         lock.lock(); defer { lock.unlock() }
         guard var entry = entries[id], !entry.terminal else { return }
-        let uncertain = entry.state == "dispatched" || code == "delivery_uncertain"
+        let uncertain = entry.state == "dispatched" || code == "delivery_uncertain" || (error as? BoundFileOperation.Conflict)?.delivered == true
         entry.terminal = true; entry.state = uncertain ? "unconfirmed" : "rejected"
         entry.failure = ActionContract.nativeFailure(error, code: code,
             outcome: uncertain ? "delivered_unconfirmed" : "rejected")

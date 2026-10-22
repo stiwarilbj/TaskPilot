@@ -792,7 +792,7 @@ def target_identity(target: dict[str, Any] | None, observation: dict[str, Any]) 
 
 
 def action_failure_recovery(code: str) -> str:
-    return {"stale_target": "observe_again", "disabled_target": "wait_or_choose_enabled",
+    return {"file_conflict": "inspect_filesystem_again", "stale_target": "observe_again", "disabled_target": "wait_or_choose_enabled",
             "focus_mismatch": "observe_and_refocus", "activation_failed": "observe_and_activate",
             "unsupported_action": "choose_supported_method", "ambiguous_target": "select_specific_control",
             "delivery_uncertain": "inspect_effect", "command_tool_missing": "select_installed_tool",

@@ -193,32 +193,10 @@ final class TaskToolExecutor {
 
     private func readFile(_ action: [String: Any]) throws -> [String: Any] {
         let url = try Self.fileURL(from: action)
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
-              !isDirectory.boolValue else {
-            throw TaskToolError.operationFailed("No readable file exists at \(url.path)")
-        }
-
         let requestedLimit = (action["max_bytes"] as? NSNumber)?.intValue ?? (ActionContract.defaultValue(.read_file, "max_bytes") as! NSNumber).intValue
         let limit = min(Self.maximumReadBytes, max(1, requestedLimit))
-        let handle: FileHandle
-        do {
-            handle = try FileHandle(forReadingFrom: url)
-        } catch {
-            throw TaskToolError.operationFailed(
-                "\(TaskPilotIdentity.displayName) could not open \(url.lastPathComponent): \(error.localizedDescription)"
-            )
-        }
-        defer { try? handle.close() }
-
-        let data: Data
-        do {
-            data = try handle.read(upToCount: limit + 1) ?? Data()
-        } catch {
-            throw TaskToolError.operationFailed(
-                "\(TaskPilotIdentity.displayName) could not read \(url.lastPathComponent): \(error.localizedDescription)"
-            )
-        }
+        let snapshot = try BoundFileOperation(url).read(limit: limit + 1)
+        let data = snapshot.data
         let truncated = data.count > limit
         let bounded = Data(data.prefix(limit))
         let content: String
@@ -240,7 +218,7 @@ final class TaskToolExecutor {
             "bytes_returned": bounded.count,
             "content_sha256": SHA256.hash(data: bounded).map { String(format: "%02x", $0) }.joined(),
             "truncated": truncated
-        ]
+        ].merging(snapshot.fields) { _, new in new }
     }
 
     private func writeFile(_ action: [String: Any]) throws -> [String: Any] {
@@ -271,63 +249,10 @@ final class TaskToolExecutor {
         guard mode == "overwrite" || mode == "append" else {
             throw TaskToolError.invalidAction("write_file mode must be overwrite or append")
         }
-        var isDirectory: ObjCBool = false
-        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
-           isDirectory.boolValue {
-            throw TaskToolError.invalidAction("write_file cannot replace a directory")
-        }
-        if Self.isSymbolicLink(url) {
-            throw TaskToolError.invalidAction("write_file will not overwrite a symbolic link")
-        }
-
         let createParents = action["create_parents"] as? Bool ?? ActionContract.defaultValue(.write_file, "create_parents") as! Bool
-        let parent = url.deletingLastPathComponent()
-        if createParents {
-            do {
-                try TaskOwnership.commit {
-                    try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-                }
-            } catch {
-                throw TaskToolError.operationFailed(
-                    "\(TaskPilotIdentity.displayName) could not create the destination folder: \(error.localizedDescription)"
-                )
-            }
-        }
-
-        do {
-            try TaskOwnership.commit {
-            if mode == "append", FileManager.default.fileExists(atPath: url.path) {
-                let handle = try FileHandle(forWritingTo: url)
-                defer { try? handle.close() }
-                try handle.seekToEnd()
-                try handle.write(contentsOf: data)
-            } else {
-                try data.write(to: url, options: .atomic)
-            }
-            }
-        } catch {
-            throw TaskToolError.uncertainDelivery(
-                "\(TaskPilotIdentity.displayName) could not write \(url.lastPathComponent): \(error.localizedDescription)"
-            )
-        }
-
-        try TaskOwnership.check()
-        let verified: Bool
-        let finalSize: Int
-        do {
-            let written = try Data(contentsOf: url)
-            finalSize = written.count
-            verified = mode == "append" ? written.suffix(data.count) == data : written == data
-        } catch {
-            throw TaskToolError.uncertainDelivery(
-                "\(TaskPilotIdentity.displayName) wrote \(url.lastPathComponent), but could not verify it: \(error.localizedDescription)"
-            )
-        }
-        guard verified else {
-            throw TaskToolError.uncertainDelivery(
-                "\(TaskPilotIdentity.displayName) wrote \(url.lastPathComponent), but its contents did not verify"
-            )
-        }
+        let operation = try BoundFileOperation(url, createParents: createParents)
+        let (finalSize, identity) = try operation.replace(with: data, append: mode == "append",
+            mustBeAbsent: action["precondition"] as? String == "absent")
 
         return [
             "action_type": "write_file", "verification_scope": "file_write",
@@ -339,7 +264,7 @@ final class TaskToolExecutor {
             "mode": mode,
             "verified": true,
             "outcome": "verified"
-        ]
+        ].merging(identity) { _, new in new }
     }
 
     private func prepareCommand(_ input: [String: Any], diagnostics: ((Int, Int) -> Void)? = nil) throws -> CommandCapabilities.Binding {
@@ -675,12 +600,6 @@ final class TaskToolExecutor {
                 .path
         }
         return URL(fileURLWithPath: absolute).standardizedFileURL
-    }
-
-    private static func isSymbolicLink(_ url: URL) -> Bool {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let type = attributes[.type] as? FileAttributeType else { return false }
-        return type == .typeSymbolicLink
     }
 
     private static func signal(_ process: SubprocessSupervisor?, _ signal: Int32) {

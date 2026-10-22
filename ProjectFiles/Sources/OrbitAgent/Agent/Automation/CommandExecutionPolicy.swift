@@ -32,25 +32,10 @@ struct CommandExecutionPolicy {
                 switch kind {
                 case .stdout_equals:
                     matches = !stdoutTruncated && stdout == text
-                case .path_absent:
-                    var info = stat()
-                    let status = Darwin.lstat(path!.path, &info)
-                    matches = status != 0 && (errno == ENOENT || errno == ENOTDIR)
-                case .file_exists, .directory_exists, .file_contents:
-                    let values = try path!.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
-                    if type == "directory_exists" {
-                        matches = values.isDirectory == true
-                    } else if type == "file_exists" {
-                        matches = values.isRegularFile == true
-                    } else if values.isRegularFile == true {
-                        let handle = try FileHandle(forReadingFrom: path!)
-                        defer { try? handle.close() }
-                        // Bound reads and reject a matching prefix of a larger file.
-                        let bytes = try handle.read(upToCount: expected!.count + 1) ?? Data()
-                        matches = bytes == expected!
-                    } else {
-                        matches = false
-                    }
+                case .path_absent, .file_exists, .directory_exists, .file_contents:
+                    let inspection = try BoundFileOperation(path!).inspect(kind: type, expected: expected)
+                    matches = inspection.0
+                    if matches { result.merge(inspection.1) { _, new in new } }
                 }
                 result["verified"] = matches
                 result["outcome"] = matches ? "verified" : "delivered_unconfirmed"
@@ -61,6 +46,8 @@ struct CommandExecutionPolicy {
                     result["text_sha256"] = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
                 }
                 if !matches { result["reason"] = "The requested outcome did not match" }
+            } catch is BoundFileOperation.Conflict {
+                result["reason"] = "Filesystem conflict; fresh inspection is required"
             } catch {
                 result["reason"] = "The requested outcome could not be inspected"
             }
