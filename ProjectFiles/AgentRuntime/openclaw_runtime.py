@@ -50,6 +50,7 @@ from request_policy import (
 )
 from provider_errors import ProviderRequestError, facts as provider_error_facts, message_text, response_error
 from action_receipts import BridgeReplyLost, RuntimeInbox, reconcile_receipt
+from local_budget import LocalBudget, LocalBudgetExpired, current_budget, local_scope, local_operation
 from task_execution import TaskContext, Phase, ExecutionStateError, current_task
 from bounded_transport import ACPTransport, TransportFailure, FRAME_BYTES, read_frames, write_frame
 from prompt_compiler import (
@@ -405,6 +406,14 @@ def bridge_exchange(method: str, display_id: int, params: dict[str, Any], timeou
 
 
 def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
+    budget = current_budget.get()
+    if budget is None:
+        seconds = 30.0 if method == 'act' else 5.0
+        if method == 'act' and params.get('action', {}).get('type') == 'run_command':
+            seconds += float(params['action'].get('timeout_seconds', action_default('run_command', 'timeout_seconds')))
+        with local_scope(seconds, method):
+            return bridge_call(method, display_id, **params)
+    budget.check(method)
     context = current_task.get()
     if context is not None:
         effect = {"act": "execute", "observe": "observe", "action_receipt": "receipt",
@@ -428,6 +437,10 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
         if params.get("action", {}).get("type") == "run_command":
             timeout += float(params["action"].get("timeout_seconds", action_default("run_command", "timeout_seconds")))
         if context is not None: context.machine.dispatch(params["action_id"])
+    # Pass a remaining allowance, never a monotonic timestamp across processes.
+    remaining = budget.check(method)
+    params['local_budget_ms'] = max(1, math.floor(remaining * 1000))
+    timeout = remaining if timeout is None else min(timeout, remaining)
     try:
         response = bridge_exchange(method, display_id, params, timeout)
         if not isinstance(response, dict) or type(response.get('ok')) is not bool:
@@ -828,7 +841,7 @@ def target_identity(target: dict[str, Any] | None, observation: dict[str, Any]) 
 
 
 def action_failure_recovery(code: str) -> str:
-    return {"file_conflict": "inspect_filesystem_again", "stale_target": "observe_again", "disabled_target": "wait_or_choose_enabled",
+    return {"local_budget_exhausted": "inspect_after_local_budget", "file_conflict": "inspect_filesystem_again", "stale_target": "observe_again", "disabled_target": "wait_or_choose_enabled",
             "focus_mismatch": "observe_and_refocus", "activation_failed": "observe_and_activate",
             "unsupported_action": "choose_supported_method", "ambiguous_target": "select_specific_control",
             "delivery_uncertain": "inspect_effect", "command_tool_missing": "select_installed_tool",
@@ -1160,6 +1173,12 @@ def observation_is_loading(observation: dict[str, Any], pid: int | None) -> bool
                for e in observation.get("elements", []) if isinstance(e, dict) and (pid is None or e.get("pid") == pid))
 
 
+def screen_operation_allowance(display_id, before, action, baseline_image=None, timeout=None, **_):
+    # timeout=0 requests one accepted observation without subsequent polling.
+    return max(5.0, timeout or 0)
+
+
+@local_operation(screen_operation_allowance, 'screen_settling')
 def wait_for_screen_change(display_id: int, before: dict[str, Any], action: dict[str, Any],
                            baseline_image: str | None = None, timeout: float | None = None,
                            target_pid: int | None = None,
@@ -1177,7 +1196,9 @@ def wait_for_screen_change(display_id: int, before: dict[str, Any], action: dict
     baseline_image = baseline_image or observation_image_digest(before)
     limit = screen_wait_limit(str(action.get("type"))) if timeout is None else timeout
     start = time.monotonic()
-    deadline = start + limit
+    budget = current_budget.get()
+    budget.check('screen_settling')
+    deadline = min(start + limit, budget.deadline)
     latest = None
     stable_signature = None
     stable_since = start
@@ -1187,6 +1208,10 @@ def wait_for_screen_change(display_id: int, before: dict[str, Any], action: dict
     notifications = before.get("local_change_notifications") is True
     try:
         while True:
+            if budget.remaining <= 0:
+                if latest is None: raise LocalBudgetExpired(budget.phase)
+                reason = 'local_budget_exhausted'
+                break
             remaining = deadline - time.monotonic()
             used_notification_wait = False
             if latest is not None and remaining <= 0:
@@ -1226,6 +1251,7 @@ def wait_for_screen_change(display_id: int, before: dict[str, Any], action: dict
             # The native consistency loop shares this wait's remaining budget.
             # An unstable capture is not a provider failure or permission to use
             # an older revision (native observation authority was invalidated).
+            budget.check('screen_settling')
             current = bridge_call("observe", display_id,
                                   consistency_budget_ms=max(1, min(5000, math.ceil(remaining * 1000))))
             discard_observation_image(latest)
@@ -1240,7 +1266,7 @@ def wait_for_screen_change(display_id: int, before: dict[str, Any], action: dict
                         and (pid is None or e.get("pid") == pid)]
             loading = observation_is_loading(current, pid)
             if loading and timeout is None:
-                deadline = max(deadline, start + 5.0)
+                deadline = min(budget.deadline, max(deadline, start + 5.0))
             if signature != stable_signature or loading:
                 stable_signature, stable_since = signature, now
             if expected_effect:
@@ -1308,36 +1334,47 @@ def command_outcome_verified(action: dict[str, Any], result: dict[str, Any]) -> 
     return True
 
 
+@local_operation(5.0, 'effect_verification')
 def verify_expected_effect(display_id: int, before: dict[str, Any], action: dict[str, Any],
                            result: dict[str, Any], expectation: Any, baseline_image: str | None,
                            metrics: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     effect = ExpectedEffect(expectation, before)
     checked = effect.unknown()
     observation = None
-    if effect.kind in FILE_EFFECTS:
-        checked = effect.reuse_native(action, result)
-        if not checked or checked['outcome'] != 'verified':
-            def count(): metrics['effect_checks'] = metrics.get('effect_checks', 0) + 1
-            if before.get('local_change_notifications') is True:
-                response = bridge_call('wait_file_effect', display_id, check=effect.spec, timeout_ms=2000)
-                wake = response.get('local_wait', {})
-                record_local_wake(wake)
-                checks = wake.get('targeted_checks')
-                metrics['effect_checks'] = metrics.get('effect_checks', 0) + (checks if type(checks) is int and 0 <= checks <= 10000 else 1)
-                checked = effect.native_check(response)
-            else:
-                checked = effect.wait_file(lambda check: bridge_call('check_effect', display_id, check=check), count=count)
-    screen_limit = screen_wait_limit(str(action.get('type')))
-    if screen_limit > 0 or effect.kind in {'dialog_appeared', 'field_value'}:
-        observation, settling = wait_for_screen_change(display_id, before, action, baseline_image,
-            target_pid=result.get('pid'), timeout=0 if effect.kind in FILE_EFFECTS else (2.0 if screen_limit == 0 else None),
-            expected_effect=effect if effect.kind not in FILE_EFFECTS else None)
-        result = {**result, 'settling': settling}
-        if effect.kind not in FILE_EFFECTS:
-            checked = settling.get('expected_effect') or checked
-            if effect.supported: metrics['effect_checks'] = metrics.get('effect_checks', 0) + settling['polls']
+    budget = current_budget.get()
+    try:
+        if effect.kind in FILE_EFFECTS:
+            checked = effect.reuse_native(action, result)
+            if not checked or checked['outcome'] != 'verified':
+                def count(): metrics['effect_checks'] = metrics.get('effect_checks', 0) + 1
+                if before.get('local_change_notifications') is True:
+                    response = bridge_call('wait_file_effect', display_id, check=effect.spec, timeout_ms=max(1, min(2000, math.floor(budget.check('file_effect') * 1000))))
+                    wake = response.get('local_wait', {})
+                    record_local_wake(wake)
+                    checks = wake.get('targeted_checks')
+                    metrics['effect_checks'] = metrics.get('effect_checks', 0) + (checks if type(checks) is int and 0 <= checks <= 10000 else 1)
+                    checked = effect.native_check(response)
+                else:
+                    checked = effect.wait_file(lambda check: bridge_call('check_effect', display_id, check=check), count=count)
+        screen_limit = screen_wait_limit(str(action.get('type')))
+        if budget.remaining > 0 and (screen_limit > 0 or effect.kind in {'dialog_appeared', 'field_value'}):
+            observation, settling = wait_for_screen_change(display_id, before, action, baseline_image,
+                target_pid=result.get('pid'), timeout=0 if effect.kind in FILE_EFFECTS else (2.0 if screen_limit == 0 else None),
+                expected_effect=effect if effect.kind not in FILE_EFFECTS else None)
+            result = {**result, 'settling': settling}
+            if effect.kind not in FILE_EFFECTS:
+                checked = settling.get('expected_effect') or checked
+                if effect.supported: metrics['effect_checks'] = metrics.get('effect_checks', 0) + settling['polls']
+    except (LocalBudgetExpired, ActionRejected) as error:
+        if getattr(error, 'code', None) != 'local_budget_exhausted': raise
+        # Expiry of inspection leaves delivery certainty untouched. No retry,
+        # negative proof, or completion shortcut follows from this result.
+        checked = checked or effect.unknown()
+        result = {**result, 'local_budget': {'reason': 'local_budget_exhausted', 'phase': budget.phase, 'message': str(error)}}
     # A check's scope is separate from acknowledgement of event delivery.
     # Unrelated changes never turn a supported unmet expectation into success.
+    if budget.remaining <= 0 and 'local_budget' not in result:
+        result = {**result, 'local_budget': {'reason': 'local_budget_exhausted', 'phase': budget.phase}}
     outcome = checked['outcome']
     if effect.supported:
         result = {**result, 'delivery_outcome': result.get('outcome'),
@@ -2683,12 +2720,9 @@ def verification_checklist_instruction(ledger: TaskEvidenceLedger) -> str:
     )
 
 
-def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int,
-                           history: list[dict[str, Any]], router: TaskModelRouter,
-                           client: ACPClient, ledger: TaskEvidenceLedger,
-                           evidence_guard: EvidenceConsistency | None = None) -> bool:
-    emit("status", message="Checking evidence for every requested requirement…")
-    evidence_guard = evidence_guard or EvidenceConsistency()
+@local_operation(5.0, 'completion_readback')
+def refresh_completion_evidence(display_id: int, ledger: TaskEvidenceLedger,
+                                evidence_guard: EvidenceConsistency, router: TaskModelRouter) -> dict:
     rechecks = ledger.recheck_actions()
     effect_checks = ledger.recheck_effects()
     prior_evidence = [e for e in ledger.evidence.values() if e["valid"] and e["mutable"]]
@@ -2724,6 +2758,23 @@ def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int
         router.metrics['effect_checks'] = router.metrics.get('effect_checks', 0) + 1
         if checked['outcome'] == 'verified': ledger.record_effect(check, checked['evidence'])
     observation = bridge_call("observe", display_id)
+    return observation
+
+
+def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int,
+                           history: list[dict[str, Any]], router: TaskModelRouter,
+                           client: ACPClient, ledger: TaskEvidenceLedger,
+                           evidence_guard: EvidenceConsistency | None = None) -> bool:
+    emit("status", message="Checking evidence for every requested requirement…")
+    evidence_guard = evidence_guard or EvidenceConsistency()
+    try:
+        observation = refresh_completion_evidence(display_id, ledger, evidence_guard, router)
+    except (LocalBudgetExpired, ActionRejected) as error:
+        if error.code != 'local_budget_exhausted': raise
+        history.append({'action': 'completion_rejected', 'result': {'error_code': error.code,
+            'phase': getattr(error, 'phase', 'completion_readback'), 'message': str(error)}})
+        emit('status', message=str(error))
+        return False
     path = Path(str(observation.get("screenshot_path") or ""))
     try:
         if not path.is_file(): raise RuntimeError(f"{PRODUCT_NAME} could not capture the completion check")
@@ -2763,6 +2814,7 @@ def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int
     return True
 
 
+@local_operation(5.0, 'dependency_inspection')
 def prepare_dependency_action(decision: dict, display_id: int, ledger: TaskEvidenceLedger,
                               metrics: dict, evidence_guard: EvidenceConsistency | None = None) -> dict | None:
     """Read-only prerequisite preflight; no model request or action receipt."""
@@ -2794,6 +2846,7 @@ def prepare_dependency_action(decision: dict, display_id: int, ledger: TaskEvide
     return ledger.check_prerequisites(decision, retain=True)
 
 
+@local_operation(5.0, 'evidence_inspection')
 def inspect_evidence(guard: EvidenceConsistency, conflicts: list, observation: dict,
                      display_id: int, ledger: TaskEvidenceLedger, metrics: dict) -> tuple[dict, dict]:
     def observe(pid, budget):
@@ -3159,8 +3212,9 @@ class TaskExecution:
         elif c.reconcile_reason == "failure":
             self.reconcile_failure()
         elif c.reconcile_reason == "effect":
-            c.pending_observation, c.result = verify_expected_effect(c.display_id, c.observation, c.action,
-                c.result, c.decision.get("expected_result"), c.screenshot_digest, c.router.metrics)
+            with local_scope(5.0, 'effect_verification', budget=c.local_budget):
+                c.pending_observation, c.result = verify_expected_effect(c.display_id, c.observation, c.action,
+                    c.result, c.decision.get("expected_result"), c.screenshot_digest, c.router.metrics)
             if c.result.get("outcome") == "verified": c.recovery.succeeded(c.action, c.observation)
             if c.result.get("outcome") == "delivered_unconfirmed":
                 c.router.metrics["unconfirmed_actions"] += 1
@@ -3263,6 +3317,14 @@ class TaskExecution:
 
     def execute(self) -> None:
         c = self.c
+        seconds = 30.0 + (float(c.action.get('timeout_seconds', action_default('run_command', 'timeout_seconds')))
+                          if c.action.get('type') == 'run_command' else 0)
+        c.local_budget = LocalBudget(seconds, 'action_preparation', cancelled=lambda: c.machine.phase in {Phase.DRAINING, Phase.FINISHED})
+        with local_scope(seconds, 'action_preparation', budget=c.local_budget):
+            self.execute_local()
+
+    def execute_local(self) -> None:
+        c = self.c
         action_type = str(c.action["type"])
         if c.recovered_result:
             c.result = c.recovered_result
@@ -3318,6 +3380,7 @@ class TaskExecution:
             raise RuntimeError("OpenClaw could not produce a valid action after three fresh screen checks") from error
         c.reconcile_reason = "failure"
 
+    @local_operation(5.0, 'failure_inspection')
     def reconcile_failure(self) -> None:
         c = self.c
         c.pending_observation = bridge_call("observe", c.display_id)

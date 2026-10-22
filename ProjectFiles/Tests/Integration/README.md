@@ -225,3 +225,33 @@ encoding rejection, partial-file cleanup, task revocation, queued cancellation,
 and consistency rejection before compression. These are offline tests: no fixer,
 live-control tester, Chrome interaction, live desktop task, or provider request
 is used. Live capture latency and accuracy validation remain incomplete.
+
+Local native operations now inherit one monotonic `LocalOperationBudget` through
+TaskLocal ownership checks. Python uses a task-owned `LocalBudget` across command
+inspection, dispatch, receipt recovery, and effect settling; local readback,
+prerequisite, and evidence-inspection groups also share one allowance. Private
+bridge requests carry only remaining milliseconds, not cross-process clock
+values, and native helpers cap their existing limits against that remainder.
+The allowance is excluded from action identity so receipt lookups and retries
+cannot change the meaning of a logical action. No provider-response deadline is
+introduced: final-verifier generation waits remain outside local readback scopes.
+
+Activation/focus, AX reads, notifications, capture queueing, OCR, compression,
+command launch/wait, and local polling check remaining time before additional
+work. Root expiry reports `local_budget_exhausted` with the consuming phase.
+Pause does not renew the monotonic allowance; cancellation/revocation still
+interrupt parked workers. In-flight OS reads or ImageIO work may drain after
+expiry, and subprocess teardown/output drainage must finish before handoff.
+These are admission deadlines, not a claim that native APIs are preemptible.
+Cleanup and foreground restoration keep their existing ownership protections.
+
+Expiry before dispatch leaves the action rejected. Expiry after dispatch leaves
+its receipt unconfirmed and never supplies negative proof or permission to replay.
+A late valid terminal receipt remains authoritative; unresolved work still stops
+without redispatch. Effect-inspection exhaustion leaves proof unconfirmed, while
+completion-readback exhaustion cannot authorize completion. Offline clock, fake
+executor, synthetic-image, and temporary-file fixtures cover shared nested limits,
+phase reporting, cancellation, queue expiry, precommit expiry, compression drainage,
+late receipts, and unchanged model-call budgets. No fixer, live-control tester,
+Chrome interaction, live desktop task, or provider call is run; live validation
+remains incomplete.

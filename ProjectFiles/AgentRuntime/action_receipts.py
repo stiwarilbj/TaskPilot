@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from local_budget import LocalBudget, current_budget
 from action_contract_generated import validate_native_receipt
 from bounded_transport import RequestTransport, TransportFailure, read_frames
 
@@ -85,14 +86,18 @@ def reconcile_receipt(action_id, lookup, metrics, *, budget=5.0, clock=time.mono
     lookup is a read-only private bridge operation. Caller retains the same
     logical ID throughout; no payload-based inference or redispatch occurs.
     """
-    deadline = clock() + budget
+    allowance = current_budget.get() or LocalBudget(budget, 'receipt_reconciliation', clock=clock)
+    deadline = min(clock() + budget, allowance.deadline)
     try:
         while True:
-            remaining = deadline - clock()
+            remaining = min(deadline - clock(), allowance.remaining)
             if remaining <= 0:
-                raise RuntimeError("The previous action has not ended safely; TaskPilot stopped without repeating it")
+                raise RuntimeError(f"The local budget was consumed during {allowance.phase}; the previous action has not ended safely; TaskPilot stopped without repeating it")
+            allowance.check('receipt_reconciliation')
             metrics["receipt_queries"] += 1
             receipt = lookup(action_id, remaining)
+            # A late terminal receipt is still authoritative. Expiry cannot
+            # turn dispatched work into failure or authorize another delivery.
             validate_native_receipt(receipt, action_id, action)
             state = receipt['state']
             if state in {'pending', 'dispatched'}:

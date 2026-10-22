@@ -99,6 +99,7 @@ final class NativeChangeSubscription: LocalChangeSource {
     static func accessibility(pid: pid_t?, elements: [AXUIElement], signal: LocalChangeSignal,
                               deadline: TimeInterval = ProcessInfo.processInfo.systemUptime + 0.5) async -> NativeChangeSubscription {
         let source = NativeChangeSubscription(signal: signal)
+        let deadline = min(deadline, LocalOperationBudget.current?.deadline ?? deadline)
         await MainActor.run {
             guard signal.isCurrent, !Task.isCancelled, ProcessInfo.processInfo.systemUptime < deadline,
                   let pid, pid > 0 else { return }
@@ -249,10 +250,11 @@ enum LocalChangeWait {
                 try await TaskOwnership.checkpoint()
                 return .init(reason: "resumed", candidate: nil, checks: 0, notifications: signal.notifications, pollWakeups: polls, supported: supported)
             }
+            try TaskOwnership.check(); try LocalOperationBudget.check("effect_check")
             candidate = try await check(); if candidate != nil { count += 1 }
             var reason = "condition_candidate"
             while candidate != true, signal.isCurrent, now() < deadline {
-                let interval = max(0, min(0.5, deadline - now()))
+                let interval = LocalOperationBudget.allowance(max(0, min(0.5, deadline - now())))
                 let result: LocalChangeSignal.Wake
                 if let wake { result = await wake(interval) }
                 else { result = await signal.wait(seconds: interval) }
@@ -264,6 +266,7 @@ enum LocalChangeWait {
                     try await sleep(max(0, min(0.05, deadline - now())))
                 }
                 guard signal.isCurrent else { reason = "resumed"; candidate = nil; break }
+                try TaskOwnership.check(); try LocalOperationBudget.check("effect_check")
                 await source.refresh()
                 guard signal.isCurrent else { reason = "resumed"; candidate = nil; break }
                 candidate = try await check(); if candidate != nil { count += 1 }

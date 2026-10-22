@@ -192,8 +192,10 @@ final class TaskLease: @unchecked Sendable {
 enum TaskOwnership {
     @TaskLocal static var current: TaskLease?
     @TaskLocal static var actionReceipt: ActionReceiptStore.Token?
-    static func check() throws { try current?.check(); try Task.checkCancellation() }
-    static func checkpoint() async throws { try await current?.checkpoint(); try Task.checkCancellation() }
+    static func check() throws { try current?.check(); try LocalOperationBudget.check(); try Task.checkCancellation() }
+    static func checkpoint() async throws {
+        try LocalOperationBudget.check(); try await current?.checkpoint(); try LocalOperationBudget.check()
+    }
     static func withCancellationWakeup<T>(_ operation: () async throws -> T) async rethrows -> T {
         let lease = current
         return try await withTaskCancellationHandler(operation: operation, onCancel: { lease?.wakePausedWorkers() })
@@ -201,6 +203,7 @@ enum TaskOwnership {
     static func commit<T>(_ operation: () throws -> T) throws -> T {
         if let current {
             return try current.commit {
+                try LocalOperationBudget.check()
                 if let actionReceipt {
                     guard actionReceipt.generation == current.id else { throw CancellationError() }
                     // Receipt dispatch and delivery share the lease's atomic
@@ -210,6 +213,7 @@ enum TaskOwnership {
                 return try operation()
             }
         }
+        try LocalOperationBudget.check()
         return try operation() // Explicit user/manual and teardown paths.
     }
     static func permitted<T>(_ fallback: T, _ operation: () -> T) -> T {
@@ -217,5 +221,53 @@ enum TaskOwnership {
     }
     static func callback(_ lease: TaskLease?, _ operation: () -> Void) {
         if let lease { _ = try? lease.commit { $current.withValue(lease, operation: operation) } } else { operation() }
+    }
+}
+
+/// A local operation owns one monotonic allowance. Child bounds may shorten it,
+/// never renew it. Expiry revokes additional work, not already-delivered effects.
+final class LocalOperationBudget: @unchecked Sendable {
+    struct Exhausted: LocalizedError {
+        let phase: String
+        var errorDescription: String? { "The local operation budget was consumed during \(phase); any delivered effect still requires reconciliation" }
+    }
+    @TaskLocal static var current: LocalOperationBudget?
+    let deadline: TimeInterval
+    private let now: @Sendable () -> TimeInterval
+    private let lock = NSLock()
+    private var phase: String
+    init(seconds: TimeInterval, phase: String, now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.now = now; self.deadline = now() + max(0, seconds); self.phase = phase
+    }
+    var remaining: TimeInterval { max(0, deadline - now()) }
+    func check(phase next: String? = nil) throws {
+        try Task.checkCancellation()
+        try lock.withLock {
+            guard now() < deadline else { throw Exhausted(phase: phase) }
+            if let next { phase = next }
+        }
+    }
+    static func check(_ phase: String? = nil) throws { try current?.check(phase: phase); try Task.checkCancellation() }
+    static func allowance(_ seconds: TimeInterval) -> TimeInterval { min(max(0, seconds), current?.remaining ?? max(0, seconds)) }
+    static func sleep(_ seconds: TimeInterval, phase: String) async throws {
+        try TaskOwnership.check(); try check(phase)
+        try await Task.sleep(for: .seconds(allowance(seconds)))
+        try TaskOwnership.check()
+    }
+    /// Queue waits are cancellable. In-flight native work must still drain;
+    /// this timer never releases its slot or declares a mutation unsuccessful.
+    static func bounded<T: Sendable>(phase: String, operation: @escaping @Sendable () async throws -> T) async throws -> T {
+        guard let budget = current else { return try await operation() }
+        try budget.check(phase: phase)
+        return try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try await Task.sleep(for: .seconds(budget.remaining))
+                try budget.check()
+                throw Exhausted(phase: phase)
+            }
+            defer { group.cancelAll() }
+            return try await group.next()!
+        }
     }
 }

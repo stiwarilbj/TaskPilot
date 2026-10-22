@@ -163,7 +163,7 @@ enum LocalTextRecognition {
             return aIndex == bIndex ? allWindows.firstIndex(of: a)! < allWindows.firstIndex(of: b)! : aIndex < bIndex
         }
         guard !selected.isEmpty else { return result }
-        let deadline = ProcessInfo.processInfo.systemUptime + min(1.5, max(0, budget))
+        let deadline = ProcessInfo.processInfo.systemUptime + LocalOperationBudget.allowance(min(1.5, max(0, budget)))
         var finished = 0
         for window in selected.prefix(maximumCrops) {
             try await TaskOwnership.checkpoint()
@@ -281,6 +281,8 @@ enum LocalTextRecognition {
     /// request; wait for its worker to end so owned work cannot escape drainage.
     static func recognize(_ image: CGImage, _ coordinates: ScreenCoordinateMapping,
                           _ budget: TimeInterval) async throws -> [ScreenTextMatch] {
+        try LocalOperationBudget.check("text_recognition")
+        let budget = LocalOperationBudget.allowance(budget)
         guard budget > 0 else { throw RecognitionError.expired }
         let work = VisionTextWork()
         let lease = TaskOwnership.current

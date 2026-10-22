@@ -138,7 +138,9 @@ class ObservationCompletenessTests(unittest.TestCase):
                 else:
                     runtime.bridge_call('observe', 1)
                     self.assertEqual(runtime._bridge_observation_revision, 'current')
-                self.assertEqual(exchange.call_args.args[2], dict(observation_keywords=['budget', 'export']))
+                sent = dict(exchange.call_args.args[2])
+                self.assertTrue(0 < sent.pop('local_budget_ms') <= 5000)
+                self.assertEqual(sent, dict(observation_keywords=['budget', 'export']))
                 prompt.assert_not_called()
 
     def test_startup_requires_matching_version_and_readiness_does_not_observe(self):

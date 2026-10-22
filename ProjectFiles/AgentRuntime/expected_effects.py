@@ -5,6 +5,7 @@ import base64
 import hashlib
 import os
 import time
+from local_budget import LocalBudget, LocalBudgetExpired, current_budget
 from typing import Any, Callable
 
 from action_contract_generated import ActionContractError, validate_contract_field, validate_outcome_check
@@ -186,10 +187,15 @@ class ExpectedEffect:
         return None
 
     def wait_file(self, check: Callable[[dict], dict], timeout=2.0, now=time.monotonic, sleep=time.sleep, count=lambda: None) -> dict:
-        deadline = now() + timeout
+        budget = current_budget.get() or LocalBudget(max(timeout, 0.001), 'file_effect', clock=now)
+        deadline = min(now() + timeout, budget.deadline)
         while True:
+            if budget.remaining <= 0: return self.result(reason='local_budget_exhausted')
+            budget.check('file_effect')
             count()
             try: result = self.native_check(check(self.spec))
+            except LocalBudgetExpired:
+                return self.result(reason='local_budget_exhausted')
             except Exception as error:
                 if getattr(error, 'code', None) in {'cancelled', 'permission_denied', 'protected_target', 'secure_input', 'protocol_error'}: raise
                 return self.result(reason='check_unavailable')

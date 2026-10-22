@@ -7,15 +7,19 @@ enum AutomationInputPolicy {
         cancelled: () -> Bool = { false },
         timeoutError: AccessibilityActionError = .activationFailed
     ) async throws {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(timeout))
-        while !ready() {
+        try LocalOperationBudget.check("activation_or_focus")
+        let deadline = ContinuousClock.now.advanced(by: .seconds(LocalOperationBudget.allowance(timeout)))
+        while true {
+            try TaskOwnership.check()
             if cancelled() { throw AccessibilityActionError.cancelled }
-            try Task.checkCancellation()
+            if ready() { break }
+            if cancelled() { throw AccessibilityActionError.cancelled }
+            try TaskOwnership.check()
             guard ContinuousClock.now < deadline else { throw timeoutError }
-            try await Task.sleep(for: .milliseconds(25))
+            try await LocalOperationBudget.sleep(0.025, phase: "activation_or_focus")
         }
         if cancelled() { throw AccessibilityActionError.cancelled }
-        try Task.checkCancellation()
+        try TaskOwnership.check()
     }
 
     static func shouldRestore(

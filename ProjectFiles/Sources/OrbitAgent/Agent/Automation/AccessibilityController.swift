@@ -452,7 +452,8 @@ final class AccessibilityController {
             }
             ending?.close()
         }
-        let collection = ObservationCollection<ObservationNode>(budget: min(1.5, max(0, budget)))
+        try LocalOperationBudget.check("accessibility_collection")
+        let collection = ObservationCollection<ObservationNode>(budget: LocalOperationBudget.allowance(min(1.5, max(0, budget))))
         let reads = ObservationAccessibilityReads.Context(deadline: collection.deadline, now: collection.now,
             report: { collection.issue($0, attribute: $1, code: $2) }, retried: { collection.retriedRead() },
             shouldRetry: { collection.scope.priority > 0 })
@@ -1141,7 +1142,8 @@ final class AccessibilityController {
                                         screenshotPreflight: screenshotPreflight ?? nil)
         let method = ControlDeliveryMethod.delivered(action: ActionKind(rawValue: type)!,
             coordinatePress: message.hasPrefix("Clicked"), hid: requiresHIDFallback(pid))?.rawValue ?? "process_event"
-        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        try LocalOperationBudget.check("delivery_verification")
+        let deadline = ContinuousClock.now.advanced(by: .seconds(LocalOperationBudget.allowance(2)))
         var verified = false
         var changed = false
         repeat {
@@ -1151,7 +1153,7 @@ final class AccessibilityController {
                 verified = intendedElementHasFocus(record)
             } else { changed = actionState(pid) != before }
             if verified || changed { break }
-            try await Task.sleep(for: .milliseconds(80))
+            try await LocalOperationBudget.sleep(0.08, phase: "delivery_verification")
         } while ContinuousClock.now < deadline
         if let record, let profileKey, let controlBefore, let deliveryMethod = ControlDeliveryMethod(rawValue: method),
            (try? validateRecord(record, action: action, on: display)) != nil {
@@ -1591,7 +1593,7 @@ final class AccessibilityController {
             // System Settings loads extension-backed panes asynchronously.
             // Give the selected pane enough time to replace the previous one
             // before the next screenshot is captured and reasoned over.
-            try? await Task.sleep(for: .milliseconds(900))
+            try? await LocalOperationBudget.sleep(0.9, phase: "launch_or_placement")
         }
 
         // A settings deep link can replace or resize the window *after*
@@ -1679,7 +1681,7 @@ final class AccessibilityController {
                 throw AccessibilityActionError.focusMismatch
             }
         })
-        try? await Task.sleep(for: .milliseconds(350))
+        try? await LocalOperationBudget.sleep(0.35, phase: "launch_or_placement")
         return "Opened \(description) in \(browserName); inspect the rendered page before finishing"
     }
 
@@ -1747,7 +1749,7 @@ final class AccessibilityController {
         for pid in placement.candidatePIDs {
             _ = placeAndRaiseWindows(of: pid, on: display)
         }
-        try? await Task.sleep(for: .milliseconds(180))
+        try? await LocalOperationBudget.sleep(0.18, phase: "launch_or_placement")
     }
 
     private func launchApp(_ action: [String: Any], on display: DisplayDescriptor) async throws -> String {
@@ -1843,7 +1845,7 @@ final class AccessibilityController {
                 candidate.unhide()
                 _ = ownedActivate(candidate)
             }
-            try? await Task.sleep(for: .milliseconds(250))
+            try? await LocalOperationBudget.sleep(0.25, phase: "launch_or_placement")
             placement = LaunchPlacementResult(
                 visibleWindowCount: max(
                     placement.visibleWindowCount,
@@ -1878,7 +1880,7 @@ final class AccessibilityController {
                 displays: DisplayService().displays()
             ), fallbackDisplay.id != display.id {
                 for candidate in finalCandidates {
-                    TaskOwnership.callback(TaskOwnership.current) { candidate.unhide() }
+                    _ = try? TaskOwnership.commit { candidate.unhide() }
                     _ = ownedActivate(candidate)
                 }
                 setTaskDisplayOverride(fallbackDisplay.id)
@@ -1925,7 +1927,7 @@ final class AccessibilityController {
         activateCandidates: Bool
     ) async -> LaunchPlacementResult {
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
+        let deadline = clock.now.advanced(by: min(timeout, .seconds(LocalOperationBudget.allowance(Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18))))
         var seenPIDs: Set<pid_t> = []
         var activatedPIDs: Set<pid_t> = []
         repeat {
@@ -1944,7 +1946,7 @@ final class AccessibilityController {
             if activateCandidates {
                 for candidate in candidates
                     where !activatedPIDs.contains(candidate.processIdentifier) {
-                    TaskOwnership.callback(TaskOwnership.current) { candidate.unhide() }
+                    _ = try? TaskOwnership.commit { candidate.unhide() }
                     _ = ownedActivate(candidate)
                     activatedPIDs.insert(candidate.processIdentifier)
                 }
@@ -1966,7 +1968,7 @@ final class AccessibilityController {
                     candidatePIDs: Array(seenPIDs)
                 )
             }
-            try? await Task.sleep(for: .milliseconds(350))
+            try? await LocalOperationBudget.sleep(0.35, phase: "launch_or_placement")
         } while clock.now < deadline
         return LaunchPlacementResult(
             visibleWindowCount: 0,
@@ -2074,13 +2076,13 @@ final class AccessibilityController {
         timeout: Duration
     ) async -> NSRunningApplication? {
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
+        let deadline = clock.now.advanced(by: min(timeout, .seconds(LocalOperationBudget.allowance(Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18))))
         repeat {
             guard (try? await TaskOwnership.checkpoint()) != nil else { return nil }
             if let app = matchingRunningApplication(bundleID: bundleID, name: name) {
                 return app
             }
-            try? await Task.sleep(for: .milliseconds(300))
+            try? await LocalOperationBudget.sleep(0.3, phase: "launch_or_placement")
         } while clock.now < deadline
         return nil
     }
@@ -2664,7 +2666,8 @@ final class AccessibilityController {
             waitForMatch: { matches in
                 guard !self.inputIsCancelled() else { throw AccessibilityActionError.cancelled }
                 try Task.checkCancellation()
-                let deadline = ProcessInfo.processInfo.systemUptime + 2
+                try LocalOperationBudget.check("text_readback")
+                let deadline = ProcessInfo.processInfo.systemUptime + LocalOperationBudget.allowance(2)
                 let signal = LocalChangeSignal()
                 let source = await NativeChangeSubscription.accessibility(pid: record.pid, elements: [record.element], signal: signal, deadline: deadline)
                 _ = try await LocalChangeWait.run(signal: signal, source: source, deadline: deadline, check: {
@@ -3494,6 +3497,12 @@ final class AccessibilityController {
     }
 
     private func attribute(_ element: AXUIElement, _ name: String) -> AnyObject? {
+        guard (try? TaskOwnership.check()) != nil else { return nil }
+        if ObservationAccessibilityReads.current == nil, let budget = LocalOperationBudget.current {
+            guard budget.remaining > 0 else { return nil }
+            AXUIElementSetMessagingTimeout(element, Float(min(0.08, budget.remaining)))
+        }
+        defer { if ObservationAccessibilityReads.current == nil, LocalOperationBudget.current != nil { AXUIElementSetMessagingTimeout(element, 0) } }
         var value: CFTypeRef?
         let result: AXError
         if let read = ObservationAccessibilityReads.current {

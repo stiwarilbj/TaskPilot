@@ -158,6 +158,7 @@ class TaskContext:
     decision: dict | None = None
     action: dict | None = None
     result: Any = None
+    local_budget: Any = None
     recovered_result: Any = None
     input_target: dict | None = None
     failure: Any = None

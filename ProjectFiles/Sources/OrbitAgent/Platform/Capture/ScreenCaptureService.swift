@@ -131,9 +131,12 @@ actor ScreenCaptureService {
     /// Acquisition and compression have separate capacity and execution lanes.
     func acquire(display: DisplayDescriptor, forceRefresh: Bool = false) async throws -> CapturedFrame {
         try await TaskOwnership.checkpoint()
-        let reservation = try await acquisitionQueue.acquire(.evidence, owner: TaskOwnership.current)
+        let queue = acquisitionQueue, owner = TaskOwnership.current
+        let reservation = try await LocalOperationBudget.bounded(phase: "capture_queue") {
+            try await queue.acquire(.evidence, owner: owner)
+        }
         do {
-            try reservation.check()
+            try reservation.check(); try LocalOperationBudget.check("capture_acquisition")
             let image: CGImage
             if let acquirer { image = try await acquirer(display, forceRefresh, false) }
             else { image = try await acquireTaskImage(display: display, forceRefresh: forceRefresh) }
@@ -142,7 +145,7 @@ actor ScreenCaptureService {
                 imageSize: CGSize(width: image.width, height: image.height))
             let frame = CapturedFrame(image: image, coordinates: coordinates, reservation: reservation)
             await acquisitionQueue.acquired(reservation)
-            try frame.check()
+            try frame.check(); try LocalOperationBudget.check("capture_acquisition")
             return frame
         } catch {
             await acquisitionQueue.acquired(reservation)
@@ -151,7 +154,8 @@ actor ScreenCaptureService {
     }
 
     func encode(_ frame: CapturedFrame) async throws -> CapturedScreen {
-        let url = try await encoder.encode(frame)
+        let encoder = encoder
+        let url = try await LocalOperationBudget.bounded(phase: "capture_encoding") { try await encoder.encode(frame) }
         return CapturedScreen(url: url, frame: frame)
     }
 

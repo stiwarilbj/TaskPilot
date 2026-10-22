@@ -168,7 +168,7 @@ class ExpectedEffectTests(unittest.TestCase):
         sleep = mock.Mock()
         result = effect.wait_file(lambda check: checked(check, False), timeout=0.5, now=clock, sleep=sleep)
         self.assertEqual(result['outcome'], 'unconfirmed')
-        sleep.assert_called_once_with(0.0)
+        sleep.assert_not_called()  # No new work after the shared allowance expires.
 
     def test_command_with_gui_expectation_uses_bounded_local_check(self):
         after = observation('wanted', 'after')

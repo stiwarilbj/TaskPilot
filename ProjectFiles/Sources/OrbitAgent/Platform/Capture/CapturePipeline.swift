@@ -155,6 +155,7 @@ actor CapturePNGEncoder {
         let cancellation: CaptureCancellation
         let observer: UUID?
         let telemetry: BackendTelemetry
+        let budget: LocalOperationBudget?
         let continuation: CheckedContinuation<URL, Error>
         func removeObserver() { if let observer { frame.reservation.owner?.removeRevocationObserver(observer) } }
     }
@@ -184,7 +185,7 @@ actor CapturePNGEncoder {
                     cancellation.cancel(); Task { await self?.cancel(id) }
                 }
                 let job = Job(id: id, frame: frame, url: directory.appendingPathComponent("screen-\(UUID().uuidString).png"),
-                    cancellation: cancellation, observer: observer, telemetry: telemetry, continuation: continuation)
+                    cancellation: cancellation, observer: observer, telemetry: telemetry, budget: LocalOperationBudget.current, continuation: continuation)
                 frameIDs.insert(frame.id); waiting.append(job); pump()
             }
         } onCancel: { cancellation.cancel(); Task { await self.cancel(id) } }
@@ -208,21 +209,23 @@ actor CapturePNGEncoder {
         let writer = writer, directory = directory
         worker = Task.detached(priority: .userInitiated) {
             let result: Result<URL, Error> = Result {
-                try BackendTelemetry.$current.withValue(job.telemetry) {
-                    try autoreleasepool {
-                        try job.cancellation.check(); try job.frame.check()
-                        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                        try writer(job.frame.image, job.url)
-                        try job.cancellation.check(); try job.frame.check()
-                        // The file becomes evidence only for its original task,
-                        // after compression, under a short ownership check.
-                        if let owner = job.frame.reservation.owner {
-                            try owner.commit {
-                                try job.cancellation.check(); try job.frame.check()
-                                try owner.ownArtifact(job.url)
+                try LocalOperationBudget.$current.withValue(job.budget) {
+                    try BackendTelemetry.$current.withValue(job.telemetry) {
+                        try autoreleasepool {
+                            try job.cancellation.check(); try job.frame.check(); try LocalOperationBudget.check("capture_encoding")
+                            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                            try writer(job.frame.image, job.url)
+                            try job.cancellation.check(); try job.frame.check(); try LocalOperationBudget.check("capture_encoding")
+                            // The file becomes evidence only for its original task,
+                            // after compression, under a short ownership check.
+                            if let owner = job.frame.reservation.owner {
+                                try owner.commit {
+                                    try job.cancellation.check(); try job.frame.check(); try LocalOperationBudget.check("capture_encoding")
+                                    try owner.ownArtifact(job.url)
+                                }
                             }
+                            return job.url
                         }
-                        return job.url
                     }
                 }
             }
@@ -237,7 +240,7 @@ actor CapturePNGEncoder {
         guard active?.id == job.id else { return }
         active = nil; worker = nil; frameIDs.remove(job.frame.id); job.removeObserver()
         do {
-            try job.cancellation.check(); try job.frame.check()
+            try job.cancellation.check(); try job.frame.check(); try LocalOperationBudget.check("capture_encoding")
             let url = try result.get(); job.continuation.resume(returning: url)
         } catch {
             discard(job.url, owner: job.frame.reservation.owner)

@@ -67,10 +67,17 @@ final class AgentAutomationBridge {
                 throw BridgeError.invalidRequest("Missing bridge method")
             }
             let params = request["params"] as? [String: Any] ?? [:]
+            if LocalOperationBudget.current == nil {
+                let seconds = try localBudgetSeconds(method: method, params: params)
+                return await LocalOperationBudget.$current.withValue(LocalOperationBudget(seconds: seconds, phase: method)) {
+                    await self.handleRequest(request)
+                }
+            }
+            try LocalOperationBudget.check(method)
             if method == "inspect_command" {
                 guard let action = params["action"] as? [String: Any] else { throw BridgeError.invalidRequest("Missing command inspection payload") }
                 let result = try await taskTools.inspectCommand(action: action)
-                try lease.check()
+                try TaskOwnership.check()
                 return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
                         "ok": true, "result": result]
             }
@@ -79,7 +86,7 @@ final class AgentAutomationBridge {
                 let check = try ActionContract.validateOutcomeCheck(input)
                 guard let path = check["path"] as? String else { throw BridgeError.invalidRequest("A local wait requires a file check") }
                 let budget = try localWaitMilliseconds(params["timeout_ms"], maximum: 2000, defaultValue: 2000)
-                let deadline = ProcessInfo.processInfo.systemUptime + Double(budget) / 1000
+                let deadline = ProcessInfo.processInfo.systemUptime + LocalOperationBudget.allowance(Double(budget) / 1000)
                 let signal = LocalChangeSignal(lease: lease)
                 let source = await NativeChangeSubscription.file(TaskToolExecutor.expandedFileURL(path), signal: signal)
                 var last: [String: Any] = [:]
@@ -87,7 +94,7 @@ final class AgentAutomationBridge {
                     last = try await self.taskTools.checkOutcome(check)
                     return (last["checks"] as? [[String: Any]])?.first?["verified"] as? Bool == true
                 })
-                try lease.check()
+                try TaskOwnership.check()
                 if wait.reason == "resumed" {
                     // A readback completed across Pause/Resume cannot become
                     // current proof. Reconcile afresh; never replay the action.
@@ -111,7 +118,7 @@ final class AgentAutomationBridge {
             if method == "check_effect" {
                 guard let check = params["check"] else { throw BridgeError.invalidRequest("Missing expected effect check") }
                 let result = try await taskTools.checkOutcome(check)
-                try lease.check()
+                try TaskOwnership.check()
                 return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
                         "ok": true, "result": result]
             }
@@ -124,6 +131,7 @@ final class AgentAutomationBridge {
                 let id = try ActionReceiptStore.validateID(params["action_id"] as? String)
                 var identity = params
                 identity.removeValue(forKey: "action_id")
+                identity.removeValue(forKey: "local_budget_ms")
                 identity["action"] = action
                 switch try lease.commit({ try lease.actionReceipts.begin(id: id, payload: identity) }) {
                 case .existing(let receipt):
@@ -139,7 +147,7 @@ final class AgentAutomationBridge {
             case "wait_for_change":
                 let budget = try localWaitMilliseconds(params["timeout_ms"], maximum: 500, defaultValue: 500)
                 let delay = try localWaitMilliseconds(params["minimum_delay_ms"], maximum: 300, defaultValue: 50, allowZero: true)
-                let deadline = ProcessInfo.processInfo.systemUptime + Double(budget) / 1000
+                let deadline = ProcessInfo.processInfo.systemUptime + LocalOperationBudget.allowance(Double(budget) / 1000)
                 let target = try accessibility.localChangeTarget(params)
                 let signal = LocalChangeSignal(lease: lease)
                 let source = await NativeChangeSubscription.accessibility(pid: target.pid, elements: target.elements, signal: signal, deadline: deadline)
@@ -178,7 +186,7 @@ final class AgentAutomationBridge {
                 var screenText = ScreenTextSnapshot()
                 var textMetadata: [String: Any] = [:]
                 let (accepted, acceptedFrame) = try await ObservationConsistency.collect(
-                    budget: budget,
+                    budget: LocalOperationBudget.allowance(budget),
                     checkpoint: { try await TaskOwnership.checkpoint() },
                     suspensionRevision: { lease.suspensionRevision },
                     scene: {
@@ -186,6 +194,7 @@ final class AgentAutomationBridge {
                         return try self.accessibility.observationScene(on: current)
                     },
                     stage: { remaining in
+                        try LocalOperationBudget.check("accessibility_collection")
                         observationDisplay = try self.targetDisplay(from: params)
                         recognitionDeadline = ProcessInfo.processInfo.systemUptime + remaining
                         let staged = try self.accessibility.stageSnapshot(on: observationDisplay, keywords: keywords, budget: remaining, forceFreshTopology: false)
@@ -197,7 +206,8 @@ final class AgentAutomationBridge {
                     },
                     signature: { $0.consistencySignature },
                     capture: { refresh in
-                        try await self.capture.acquire(display: observationDisplay, forceRefresh: refresh)
+                        try LocalOperationBudget.check("capture_acquisition")
+                        return try await self.capture.acquire(display: observationDisplay, forceRefresh: refresh)
                     },
                     discard: { frame in
                         if let encoded = encodedScreen, encoded.frameID == frame.id {
@@ -205,10 +215,12 @@ final class AgentAutomationBridge {
                         }
                     },
                     prepare: { candidate, frame, pairedScene in
+                        try LocalOperationBudget.check("text_recognition")
                         screenText = try await LocalTextRecognition.supplement(image: frame.image,
                             coordinates: frame.coordinates, snapshot: candidate.snapshot, scene: pairedScene,
                             keywords: keywords, budget: recognitionDeadline - ProcessInfo.processInfo.systemUptime,
                             inspectionPID: inspectionPID)
+                        try LocalOperationBudget.check("capture_encoding")
                         encodedScreen = try await self.capture.encode(frame)
                     },
                     publish: { candidate in
@@ -298,6 +310,7 @@ final class AgentAutomationBridge {
                             })
                     }
                 }
+                try LocalOperationBudget.check()
                 try receiptToken?.complete(result)
 
             default:
@@ -315,7 +328,7 @@ final class AgentAutomationBridge {
                 "result": result
             ]
         } catch {
-            let code = error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" :
+            let code = error is LocalOperationBudget.Exhausted ? "local_budget_exhausted" : error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" :
                 (error as? ActionReceiptStore.ReceiptError)?.code ?? (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? (error is BoundFileOperation.Conflict ? "file_conflict" : "action_rejected")
             receiptToken?.fail(error, code: code)
             // Cancellation must remain a stop even if an acknowledged result
@@ -411,6 +424,23 @@ final class AgentAutomationBridge {
             preferred: display,
             availableDisplays: displays
         )
+    }
+
+    private func localBudgetSeconds(method: String, params: [String: Any]) throws -> TimeInterval {
+        var limit: Double = method == "act" ? 30 : 5
+        if method == "act", let action = params["action"] as? [String: Any], action["type"] as? String == "run_command" {
+            let validated = try ActionContract.validate(action)
+            limit += (validated["timeout_seconds"] as? NSNumber)?.doubleValue ?? (ActionContract.defaultValue(.run_command, "timeout_seconds") as! NSNumber).doubleValue
+        }
+        if let supplied = params["local_budget_ms"] {
+            guard let number = supplied as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue.isFinite, number.doubleValue.rounded() == number.doubleValue,
+                  number.doubleValue > 0, number.doubleValue <= 3_600_000 else {
+                throw BridgeError.invalidRequest("local_budget_ms must be an integer from 1 to 3600000")
+            }
+            limit = min(limit, number.doubleValue / 1000)
+        }
+        return limit
     }
 
     private func localWaitMilliseconds(_ input: Any?, maximum: Int, defaultValue: Int, allowZero: Bool = false) throws -> Int {

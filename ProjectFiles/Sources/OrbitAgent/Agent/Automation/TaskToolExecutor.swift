@@ -293,7 +293,7 @@ final class TaskToolExecutor {
                 policy: existing.policy, environment: existing.environment, directory: existing.directory, shell: existing.shell,
                 tools: existing.tools, source: existing.source, result: result)
         }
-        let deadline = ProcessInfo.processInfo.systemUptime + CommandCapabilities.probeBudget
+        let deadline = ProcessInfo.processInfo.systemUptime + LocalOperationBudget.allowance(CommandCapabilities.probeBudget)
         if let source = policy.shellSource {
             let syntax = try executeProcess(executable: policy.executable, arguments: ["-f", "-n", "-c", source],
                 policy: policy, environment: environment, prefix: "syntax",
@@ -517,6 +517,7 @@ final class TaskToolExecutor {
         // Always acquire the ownership gate before the command lock. Pause
         // cannot strand a launcher holding the lock Resume needs.
         func launch() throws {
+            try LocalOperationBudget.check(prefix == "command" ? "command_execution" : "command_inspection")
             try validate()
             try TaskOwnership.commit {
                 commandLock.lock(); defer { commandLock.unlock() }
@@ -539,7 +540,7 @@ final class TaskToolExecutor {
             if activeCommand === process { activeCommand = nil; activeCommandExit = nil }
             commandLock.unlock()
         }
-        let deadline = DispatchTime.now() + timeout
+        let deadline = DispatchTime.now() + LocalOperationBudget.allowance(timeout)
         let parentEnded: Bool
         switch exit.wait(until: deadline) {
         case .exited: parentEnded = true
