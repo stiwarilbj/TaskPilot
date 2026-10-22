@@ -111,12 +111,12 @@ final class BackendTelemetryTests: XCTestCase {
         try BackendTelemetry.$current.withValue(telemetry) {
             let collection = ObservationCollection<Int>(budget: 1)
             try collection.collect(roots: [.init(node: 0, scope: .init(pid: 42))], revision: "fixture", check: {},
-                equal: ==, inspect: { _, _ in .init() }, children: { entry, _, _ in
+                equal: ==, identityHash: { UInt($0) }, inspect: { _, _ in .init() }, children: { entry, _, _ in
                     .init(nodes: entry.node == 0 ? [1, 2] : [], total: entry.node == 0 ? 2 : 0)
                 })
             XCTAssertEqual(telemetry.samples().first?.items, 3)
             XCTAssertThrowsError(try collection.collect(roots: [], revision: "fixture", check: { throw CancellationError() },
-                equal: ==, inspect: { _, _ in .init() }, children: { _, _, _ in .init(nodes: [], total: 0) }))
+                equal: ==, identityHash: { UInt($0) }, inspect: { _, _ in .init() }, children: { _, _, _ in .init(nodes: [], total: 0) }))
             XCTAssertEqual(telemetry.samples().last?.outcome, .cancelled)
         }
     }
@@ -268,7 +268,7 @@ final class BackendPhaseFixtureTests: XCTestCase {
                     _ = try telemetry.encodeJSON(payload)
                     let collection = ObservationCollection<Int>(budget: 5)
                     try collection.collect(roots: [.init(node: 0, scope: .init(pid: 42))], revision: "fixture", check: {},
-                        equal: ==, inspect: { _, _ in .init() }, children: { entry, offset, limit in
+                        equal: ==, identityHash: { UInt($0) }, inspect: { _, _ in .init() }, children: { entry, offset, limit in
                             .init(nodes: entry.node == 0 ? Array((1..<count).dropFirst(offset).prefix(limit)) : [], total: entry.node == 0 ? count - 1 : 0)
                         })
                 }

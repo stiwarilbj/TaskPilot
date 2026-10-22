@@ -281,3 +281,136 @@ enum LocalChangeWait {
         }
     }
 }
+
+/// Task-scoped, bounded discovery subscriptions. Missing AX notifications never
+/// imply an unchanged tree: unsupported registration disables topology reuse.
+/// The post-capture pass enumerates afresh even when registration succeeds.
+final class NativeGraphSession: @unchecked Sendable {
+    typealias MonitorInstaller = @MainActor (AutomationApplicationIdentity, [AXUIElement], NativeAccessibilityGraph<AXUIElement>) -> (() -> Void)
+    private final class Application {
+        let identity: AutomationApplicationIdentity
+        let windows: [AXUIElement]
+        let graph = NativeAccessibilityGraph<AXUIElement>(hash: { UInt(CFHash($0)) }, equal: { CFEqual($0, $1) })
+        var observer: AXObserver? // main run loop only
+        var injectedClose: (() -> Void)? // offline notification provider
+        init(_ identity: AutomationApplicationIdentity, windows: [AXUIElement]) {
+            self.identity = identity; self.windows = windows
+        }
+    }
+    private let lock = NSLock()
+    private let lease: TaskLease
+    private let epoch: Int
+    private var applications: [pid_t: Application] = [:]
+    private var closed = false
+    private var revocation: UUID?
+    private let installer: MonitorInstaller?
+    init(lease: TaskLease, installer: MonitorInstaller? = nil) {
+        self.installer = installer
+        self.lease = lease; epoch = lease.suspensionRevision
+        revocation = lease.observeRevocation { [weak self] in self?.close() }
+    }
+    var isCurrent: Bool { lease.state == .running && lease.suspensionRevision == epoch && !lock.withLock { closed } }
+    func matches(_ lease: TaskLease) -> Bool { self.lease === lease && isCurrent }
+
+    func prepare(_ identity: AutomationApplicationIdentity, windows: [AXUIElement]) {
+        guard isCurrent else { return }
+        var old: Application?
+        let app: Application? = lock.withLock {
+            guard !closed else { return nil }
+            if let current = applications[identity.pid], current.identity == identity,
+               current.windows.count == windows.count,
+               zip(current.windows, windows).allSatisfy({ CFEqual($0, $1) }) { return nil }
+            old = applications.removeValue(forKey: identity.pid)
+            // Bound native handles/subscriptions, independently of collection limits.
+            guard applications.count < 16, windows.count <= 16 else { return nil }
+            let next = Application(identity, windows: windows)
+            applications[identity.pid] = next
+            return next
+        }
+        old?.graph.close()
+        guard app != nil || old != nil else { return }
+        Task { @MainActor [weak self] in
+            if let old { Self.remove(old) }
+            guard let self, let app, self.isCurrent,
+                  self.lock.withLock({ self.applications[identity.pid] === app }) else { return }
+            self.install(app)
+        }
+    }
+    func retainProcesses(_ pids: Set<pid_t>) {
+        let removed: [Application] = lock.withLock {
+            let keys = applications.keys.filter { !pids.contains($0) }
+            return keys.compactMap { applications.removeValue(forKey: $0) }
+        }
+        for app in removed { app.graph.close() }
+        guard !removed.isEmpty else { return }
+        Task { @MainActor in for app in removed { Self.remove(app) } }
+    }
+    func gap() {
+        let graphs = lock.withLock { applications.values.map(\.graph) }
+        for graph in graphs { graph.gap() }
+    }
+    func graph(for identity: AutomationApplicationIdentity) -> NativeAccessibilityGraph<AXUIElement>? {
+        guard isCurrent else { return nil }
+        return lock.withLock {
+            guard let app = applications[identity.pid], app.identity == identity else { return nil }
+            return app.graph
+        }
+    }
+    @MainActor private func install(_ app: Application) {
+        guard isCurrent else { return }
+        if let installer { app.injectedClose = installer(app.identity, app.windows, app.graph); return }
+        var observer: AXObserver?
+        guard AXObserverCreate(app.identity.pid, { _, element, notification, context in
+            guard let context else { return }
+            let app = Unmanaged<Application>.fromOpaque(context).takeUnretainedValue()
+            // Unknown roots, destruction, menus and focus changes can alter
+            // ownership outside a known subtree, so rebuild conservatively.
+            let event = notification as String
+            app.graph.changed(element, uncertain: event != kAXLayoutChangedNotification && event != kAXSelectedChildrenChangedNotification)
+        }, &observer) == .success, let observer else { return }
+        app.observer = observer
+        let root = AXUIElementCreateApplication(app.identity.pid)
+        let appEvents = [kAXWindowCreatedNotification, kAXFocusedWindowChangedNotification,
+            kAXMenuOpenedNotification, kAXMenuClosedNotification]
+        let windowEvents = [kAXLayoutChangedNotification, kAXSelectedChildrenChangedNotification,
+            kAXUIElementDestroyedNotification]
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.1
+        var complete = true
+        // Register each event on its owning scope. For example, requiring a
+        // window to emit application menu events would disable useful caching.
+        for (element, events) in [(root, appEvents)] + app.windows.map({ ($0, windowEvents) }) {
+            defer { AXUIElementSetMessagingTimeout(element, 0) }
+            for event in events {
+                guard isCurrent, ProcessInfo.processInfo.systemUptime < deadline else { complete = false; continue }
+                AXUIElementSetMessagingTimeout(element, Float(min(0.01, max(0.001, deadline - ProcessInfo.processInfo.systemUptime))))
+                let result = AXObserverAddNotification(observer, element, event as CFString, Unmanaged.passUnretained(app).toOpaque())
+                if result != .success && result != .notificationAlreadyRegistered { complete = false }
+            }
+        }
+        guard isCurrent, lock.withLock({ applications[app.identity.pid] === app }) else { Self.remove(app); return }
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        app.graph.setMonitoring(complete)
+    }
+    @MainActor private static func remove(_ app: Application) {
+        app.injectedClose?(); app.injectedClose = nil
+        if let observer = app.observer {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        }
+        // Releasing the observer releases its registrations; no potentially
+        // blocking cross-process removals during Stop or generation handoff.
+        app.observer = nil
+    }
+    func close() {
+        let ending: [Application] = lock.withLock {
+            guard !closed else { return [] }; closed = true
+            let values = Array(applications.values); applications.removeAll(); return values
+        }
+        for app in ending { app.graph.close() }
+        guard !ending.isEmpty else { return }
+        Task { @MainActor in for app in ending { Self.remove(app) } }
+    }
+    deinit {
+        if let revocation { lease.removeRevocationObserver(revocation) }
+        close()
+    }
+}

@@ -196,6 +196,7 @@ final class AccessibilityController {
     private var observedGraphicsWindows: [pid_t: [AutomationGraphicsWindow]] = [:]
     private var observedApplications: [pid_t: AutomationApplicationIdentity] = [:]
     private var taskLease: TaskLease?
+    private var discoveryGraph: NativeGraphSession?
     private var teardownForeground: (NSRunningApplication, pid_t)?
     private var taskGenerationID: String?
     private var inputGeneration = 0
@@ -238,6 +239,8 @@ final class AccessibilityController {
         }
 
         lock.lock()
+        let previousGraph = discoveryGraph
+        discoveryGraph = lease.map { NativeGraphSession(lease: $0) }
         taskLease = lease
         taskGenerationID = lease?.id
         elementMap.removeAll(); observationRevision = ""; observationCoordinates = nil
@@ -250,6 +253,7 @@ final class AccessibilityController {
             agentLaunchedPIDs: []
         )
         lock.unlock()
+        previousGraph?.close()
     }
 
     /// Ends task tracking. When cleanup is enabled, only new windows currently
@@ -265,6 +269,7 @@ final class AccessibilityController {
         let baseline = taskApplicationBaseline
         let foreground = teardownForeground
         teardownForeground = nil
+        let endingGraph = discoveryGraph; discoveryGraph = nil
         taskLease = nil
         taskApplicationBaseline = nil
         taskGenerationID = nil
@@ -273,6 +278,7 @@ final class AccessibilityController {
         taskDisplayOverrideID = nil
         lock.unlock()
 
+        endingGraph?.close()
         if let (previous, target) = foreground, !previous.isTerminated,
            NSWorkspace.shared.frontmostApplication?.processIdentifier == target {
             _ = ownedActivate(previous)
@@ -433,17 +439,32 @@ final class AccessibilityController {
         return String(decoding: try JSONSerialization.data(withJSONObject: scene, options: [.sortedKeys]), as: UTF8.self)
     }
 
-    func stageSnapshot(on display: DisplayDescriptor, keywords: [String] = [], budget: TimeInterval = 1.5) throws -> StagedAccessibilitySnapshot {
+    func stageSnapshot(on display: DisplayDescriptor, keywords: [String] = [], budget: TimeInterval = 1.5, forceFreshTopology: Bool = true) throws -> StagedAccessibilitySnapshot {
+        var graph: NativeGraphSession?
+        if let lease = TaskOwnership.current {
+            var ending: NativeGraphSession?
+            graph = lock.withLock {
+                guard taskLease === lease else { return nil }
+                if discoveryGraph?.matches(lease) != true {
+                    ending = discoveryGraph; discoveryGraph = NativeGraphSession(lease: lease)
+                }
+                return discoveryGraph
+            }
+            ending?.close()
+        }
         let collection = ObservationCollection<ObservationNode>(budget: min(1.5, max(0, budget)))
         let reads = ObservationAccessibilityReads.Context(deadline: collection.deadline, now: collection.now,
             report: { collection.issue($0, attribute: $1, code: $2) }, retried: { collection.retriedRead() },
             shouldRetry: { collection.scope.priority > 0 })
+        defer {
+            if reads.failures > 0 || collection.reasonCounts.keys.contains(where: { $0.hasPrefix("accessibility_") }) { graph?.gap() }
+        }
         return try ObservationAccessibilityReads.$current.withValue(reads) {
-            try stageSnapshot(on: display, keywords: keywords, collection: collection)
+            try stageSnapshot(on: display, keywords: keywords, collection: collection, graph: graph, forceFreshTopology: forceFreshTopology)
         }
     }
 
-    private func stageSnapshot(on display: DisplayDescriptor, keywords: [String], collection: ObservationCollection<ObservationNode>) throws -> StagedAccessibilitySnapshot {
+    private func stageSnapshot(on display: DisplayDescriptor, keywords: [String], collection: ObservationCollection<ObservationNode>, graph: NativeGraphSession?, forceFreshTopology: Bool) throws -> StagedAccessibilitySnapshot {
         try TaskOwnership.check()
         let suspension = TaskOwnership.current?.suspensionRevision
         var newMap: [String: ElementRecord] = [:]
@@ -456,14 +477,16 @@ final class AccessibilityController {
         var observedApps: [pid_t: AutomationApplicationIdentity] = [:]
 
         let apps = orderedApplicationsForSnapshot(on: display)
+        graph?.retainProcesses(Set(apps.map(\.processIdentifier)))
 
         func collectRoots(expand: Bool) throws {
             try collection.collect(roots: roots, revision: revision, expand: expand, check: { try TaskOwnership.check() },
-                equal: { CFEqual($0.element, $1.element) }, inspect: { entry, id in
+                equal: { CFEqual($0.element, $1.element) }, identityHash: { UInt(CFHash($0.element)) }, inspect: { entry, id in
                     try self.inspectObservation(entry: entry, id: id, keywords: keywords, map: &newMap,
                         rows: &elementRows, revision: revision, structureCache: &structureCache)
                 }, children: { entry, offset, count in
-                    self.observationChildren(entry: entry, offset: offset, count: count, collection: collection)
+                    self.observationChildren(entry: entry, offset: offset, count: count, collection: collection,
+                        graph: graph?.graph(for: entry.node.application), forceFresh: forceFreshTopology)
                 })
             roots.removeAll(keepingCapacity: true)
         }
@@ -508,6 +531,7 @@ final class AccessibilityController {
             observedGraphics[pid] = graphics
             let appIdentity = applicationIdentity(app)
             observedApps[pid] = appIdentity
+            graph?.prepare(appIdentity, windows: visibleWindows)
 
             applicationRows.append([
                 "name": app.localizedName ?? "Unknown app",
@@ -716,8 +740,12 @@ final class AccessibilityController {
     }
 
     private func observationChildren(entry: ObservationCollection<ObservationNode>.Entry, offset: Int, count: Int,
-                                     collection: ObservationCollection<ObservationNode>) -> ObservationCollection<ObservationNode>.Page {
+                                     collection: ObservationCollection<ObservationNode>, graph: NativeAccessibilityGraph<AXUIElement>?,
+                                     forceFresh: Bool) -> ObservationCollection<ObservationNode>.Page {
         let element = entry.node.element
+        let ticket = graph?.beginRead()
+        let failuresBefore = ObservationAccessibilityReads.current?.failures ?? 0
+        defer { if (ObservationAccessibilityReads.current?.failures ?? 0) > failuresBefore { graph?.gap() } }
         var total = 0
         let read = ObservationAccessibilityReads.current!
         let counted = read.read(element, attribute: kAXChildrenAttribute) {
@@ -728,12 +756,19 @@ final class AccessibilityController {
                 collection.issue("accessibility_incomplete", attribute: kAXChildrenAttribute)
                 return .init(nodes: [], total: 0, incomplete: true)
             }
-            guard total > offset else { return .init(nodes: [], total: total) }
+            if let cached = graph?.page(element, offset: offset, count: count, total: total, fresh: forceFresh) {
+                return .init(nodes: cached.children.map { entry.node.child($0) }, total: cached.total)
+            }
+            func remember(_ nodes: [AXUIElement], total: Int) {
+                if let ticket { graph?.store(element, offset: offset, page: .init(children: nodes, total: total), ticket: ticket) }
+            }
+            guard total > offset else { remember([], total: total); return .init(nodes: [], total: total) }
             var values: CFArray?
             let result = read.read(element, attribute: kAXChildrenAttribute) {
                 AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, offset, min(count, total - offset), &values)
             }
             if result == .success, let nodes = values as? [AXUIElement], nodes.count == min(count, total - offset) {
+                remember(nodes, total: total)
                 return .init(nodes: nodes.map { entry.node.child($0) }, total: total)
             }
             if result == .attributeUnsupported || result == .notImplemented {

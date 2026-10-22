@@ -47,6 +47,7 @@ final class ObservationCollection<Node> {
     private var readIssues: [[String: Any]] = []
     private var readIssueCounts: [String: Int] = [:]
     private var visited: [Node] = []
+    private var identityIndex = NativeIdentityIndex<Node>()
     private var nextID = 1
     private var expanded = false
     private(set) var collected = 0
@@ -72,19 +73,19 @@ final class ObservationCollection<Node> {
     func retriedRead() { readRetries += 1 }
 
     func collect(roots: [Entry], revision: String, expand: Bool = true, check: () throws -> Void,
-                 equal: (Node, Node) -> Bool,
+                 equal: (Node, Node) -> Bool, identityHash: ((Node) -> UInt)? = nil,
                  inspect: (Entry, String) throws -> Inspection,
                  children: (Entry, Int, Int) throws -> Page) throws {
         let before = collected
         try BackendTelemetry.current.measure(.axCollection) { span in
             defer { span.record(items: collected - before) }
             try collectNodes(roots: roots, revision: revision, expand: expand, check: check,
-                             equal: equal, inspect: inspect, children: children)
+                             equal: equal, identityHash: identityHash, inspect: inspect, children: children)
         }
     }
 
     private func collectNodes(roots: [Entry], revision: String, expand: Bool, check: () throws -> Void,
-                              equal: (Node, Node) -> Bool, inspect: (Entry, String) throws -> Inspection,
+                              equal: (Node, Node) -> Bool, identityHash: ((Node) -> UInt)?, inspect: (Entry, String) throws -> Inspection,
                               children: (Entry, Int, Int) throws -> Page) throws {
         func deferNode(_ entry: Entry, _ reason: String) { pending.append(Pending(entry: entry, reason: reason)) }
         func walk(_ entry: Entry) throws {
@@ -97,7 +98,10 @@ final class ObservationCollection<Node> {
             guard entry.scope.depth <= (expanded ? limits.expandedDepth : limits.initialDepth) else {
                 deferNode(entry, "depth_limit"); return
             }
-            let duplicate = visited.contains { equal($0, entry.node) }
+            let duplicate: Bool
+            if let identityHash {
+                duplicate = identityIndex.contains(entry.node, hash: identityHash(entry.node), equal: equal)
+            } else { duplicate = visited.contains { equal($0, entry.node) } }
             let id = "\(revision):e\(nextID)"; nextID += 1
             let info = try inspect(entry, id)
             try check()
@@ -106,7 +110,8 @@ final class ObservationCollection<Node> {
             collected += 1
             if expanded { expandedControls += 1 }
             if duplicate || !info.descend { return }
-            visited.append(entry.node)
+            if let identityHash { _ = identityIndex.insert(entry.node, hash: identityHash(entry.node), equal: equal) }
+            else { visited.append(entry.node) }
             var parent = entry
             parent.scope.parentID = id
             parent.scope.priority += info.relevance

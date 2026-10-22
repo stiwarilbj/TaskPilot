@@ -167,3 +167,37 @@ cover shared settling budgets and failure before provider requests or action del
 Full offline suites and signed-bundle checks pass. No fixer, live-control tester,
 Chrome interaction, live desktop task, or live ACP check was run; live accuracy
 validation remains incomplete. These checks do not make the two macOS APIs atomic.
+
+Native discovery now uses collision-safe hashed identity buckets instead of a
+linear visited list, preserving fresh rows for focused-control aliases while
+expanding each discovered node once. Task-owned app/window graphs cache only
+child handles and parent/child edges: no labels, editable values, geometry,
+executable IDs, or persisted user content. Graphs are bounded to 16 applications,
+16 windows per application, 4,096 nodes and 8,192 child edges per application.
+Complete child pages can assist the pre-capture walk only after notification
+registration succeeds; every control's attributes and each child count are read
+again. Dirty subtrees are refreshed while unaffected pages remain reusable.
+
+Unknown structural notifications, unsupported notification coverage, failed AX
+reads, changed child counts, process identity/window replacement, a two-second
+refresh interval, and Pause/Resume gaps force fresh discovery. Stop closes the
+ending generation's graphs immediately; delayed subscriptions and callbacks
+cannot populate the next generation. Subscriptions for disappeared processes are
+released. Hash collisions always use equality, and cycles cannot suppress another
+branch's invalidation.
+
+The post-capture walk always enumerates children afresh, regardless of cached
+pages or notifications. Only that fresh tree can become the accepted executable
+map. A same-count replacement missed by notifications therefore causes normal
+local recapture instead of publishing stale controls. Existing ownership, target
+identity, bounds, enabled/focus and capture-consistency checks still apply.
+
+Offline fixtures cover warm/dirty branches, cyclic/shared topology, collisions,
+read/notification races, unsupported subscriptions, bounded growth, process
+replacement, stale callbacks, Pause/Stop, new revision IDs and current bounds,
+and same-count replacements around capture. The 1,280-control in-process fixture
+measured 1.40 ms median traversal (30 samples), versus approximately 43.6 ms with
+the previous linear index. This excludes native AX communication, graph storage,
+and end-to-end capture latency; no live speed or accuracy claim follows. No
+fixer, live-control tester, Chrome interaction, live desktop task, or provider
+request was used. Live validation remains incomplete.

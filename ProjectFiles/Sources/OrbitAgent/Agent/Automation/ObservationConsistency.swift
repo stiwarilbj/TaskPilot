@@ -25,6 +25,7 @@ enum ObservationConsistency {
         suspensionRevision: () -> Int = { 0 },
         scene: () throws -> Scene,
         stage: (TimeInterval) throws -> Candidate,
+        stageAfter: ((TimeInterval) throws -> Candidate)? = nil,
         signature: (Candidate) throws -> String,
         capture: (Bool) async throws -> URL,
         discard: (URL) -> Void,
@@ -67,7 +68,9 @@ enum ObservationConsistency {
                 image = try await capture(diagnostics.attempts > 1)
                 try await check()
                 guard try scene() == firstScene else { throw Retry.changed("window_during_capture") }
-                let after = try stage(max(0, deadline - now()))
+                let after: Candidate
+                if let stageAfter { after = try stageAfter(max(0, deadline - now())) }
+                else { after = try stage(max(0, deadline - now())) }
                 try await check()
                 guard try scene() == firstScene else { throw Retry.changed("window_during_controls") }
                 guard try signature(after) == beforeSignature else { throw Retry.changed("control_layout") }

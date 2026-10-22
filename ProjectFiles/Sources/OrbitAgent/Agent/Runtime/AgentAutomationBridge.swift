@@ -189,9 +189,13 @@ final class AgentAutomationBridge {
                     stage: { remaining in
                         observationDisplay = try self.targetDisplay(from: params)
                         recognitionDeadline = ProcessInfo.processInfo.systemUptime + remaining
-                        let staged = try self.accessibility.stageSnapshot(on: observationDisplay, keywords: keywords, budget: remaining)
+                        let staged = try self.accessibility.stageSnapshot(on: observationDisplay, keywords: keywords, budget: remaining, forceFreshTopology: false)
                         stagedSnapshot = staged.snapshot
                         return staged
+                    },
+                    stageAfter: { remaining in
+                        try self.accessibility.stageSnapshot(on: self.targetDisplay(from: params),
+                            keywords: keywords, budget: remaining, forceFreshTopology: true)
                     },
                     signature: { $0.consistencySignature },
                     capture: { refresh in
