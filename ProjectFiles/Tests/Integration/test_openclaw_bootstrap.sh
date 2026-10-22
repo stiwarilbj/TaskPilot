@@ -18,6 +18,10 @@ test_key="AIzaSyOrbitMockGeminiKey1234567890"
 mock_runtime="$test_directory/mock-runtime.sh"
 cat >"$mock_runtime" <<'PROBE'
 #!/bin/bash
+if [[ "${1:-}" == "--configuration-command" ]]; then
+  shift
+  exec "$@"
+fi
 IFS= read -r configuration
 printf 'runtime-check %s\n' "$*" >>"$ORBIT_MOCK_OPENCLAW_LOG"
 [[ "$configuration" == *'"kind":"runtime_configuration"'* ]] || exit 1
@@ -87,6 +91,7 @@ no_key_output="$(
   printf '\n' | \
     HOME="$no_key_home" \
     ORBIT_OPENCLAW_PATH="$mock_openclaw" \
+    ORBIT_RUNTIME_CHECK_PATH="$mock_runtime" \
     ORBIT_MOCK_OPENCLAW_LOG="$no_key_log" \
     /bin/bash "$root_directory/Resources/OpenClaw/taskpilot-openclaw-bootstrap.sh"
 )"

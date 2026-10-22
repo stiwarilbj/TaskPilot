@@ -45,7 +45,7 @@ COMMAND_CAPABILITY_VERSION = 1
 PRODUCT_NAME = "TaskPilot"
 LEGACY_APPLICATION_SUPPORT_FOLDER = "Orbit Agent"
 from request_policy import (
-    ALL_MODELS, PRIMARY_MODELS, FALLBACK_MODELS, CONFIG_VERSION,
+    ALL_MODELS, PRIMARY_MODELS, FALLBACK_MODELS, CONFIG_VERSION, configuration_transaction,
     AdaptiveModelRouter, Failure, ModelAttemptError, RecoveryExhaustedError, RuntimeState, classify_failure, model_route,
 )
 from provider_errors import ProviderRequestError, facts as provider_error_facts, message_text, response_error
@@ -220,7 +220,12 @@ def openclaw_version(path: str) -> str:
 
 
 def synchronize_model_configuration(path: str, state: RuntimeState) -> None:
-    if state.value.get("config_version") == CONFIG_VERSION:
+    with configuration_transaction():
+        _synchronize_model_configuration(path, state)
+
+
+def _synchronize_model_configuration(path: str, state: RuntimeState) -> None:
+    if state.configuration_version() == CONFIG_VERSION:
         return
     removed = {f"google/gemini-{v}-flash" for v in ("3.5", "3.6", "3.7")}
     def read(setting: str) -> Any:
@@ -249,8 +254,7 @@ def synchronize_model_configuration(path: str, state: RuntimeState) -> None:
     aliases = read("agents.defaults.models")
     if isinstance(aliases, dict) and removed.intersection(aliases):
         write("agents.defaults.models", {m: v for m, v in aliases.items() if m not in removed})
-    state.value["config_version"] = CONFIG_VERSION
-    state.invalidate()
+    state.configuration_updated()
 
 
 def model_configuration_fingerprint() -> str:
@@ -264,13 +268,14 @@ def model_configuration_fingerprint() -> str:
 
 
 def prepare_runtime(path: str, key: str) -> RuntimeState:
-    fingerprint, version = runtime_fingerprint(key), openclaw_version(path)
-    state = RuntimeState(fingerprint, version, configuration=model_configuration_fingerprint())
-    synchronize_model_configuration(path, state)
-    state = RuntimeState(fingerprint, version, configuration=model_configuration_fingerprint())
-    if key:
-        sync_openclaw_google_key(path, key)
-    return state
+    with configuration_transaction():
+        fingerprint, version = runtime_fingerprint(key), openclaw_version(path)
+        state = RuntimeState(fingerprint, version, configuration=model_configuration_fingerprint())
+        synchronize_model_configuration(path, state)
+        state = RuntimeState(fingerprint, version, configuration=model_configuration_fingerprint())
+        if key:
+            sync_openclaw_google_key(path, key)
+        return state
 
 
 def synthetic_check_image(path: Path) -> None:
@@ -288,6 +293,18 @@ def check_models(path: str, key: str, read_only: bool = False) -> bool:
 
 def _check_models(path: str, key: str, read_only: bool = False) -> bool:
     state = RuntimeState(runtime_fingerprint(key), openclaw_version(path), configuration=model_configuration_fingerprint()) if read_only else prepare_runtime(path, key)
+    if read_only:
+        return _perform_model_check(path, state, read_only=True)
+    with state.explicit_check() as coalesced:
+        result = False
+        try:
+            result = _perform_model_check(path, state, read_only=coalesced, key=key)
+            return result
+        finally:
+            if not coalesced: state.finish_check(result)
+
+
+def _perform_model_check(path: str, state: RuntimeState, read_only: bool = False, key: str = "") -> bool:
     checks = {m: {"model": m, "state": "configured", "detail": "Configured; not verified through TaskPilot"} for m in ALL_MODELS}
     for model in ALL_MODELS:
         checks[model].update(state.health(model))
@@ -312,7 +329,14 @@ def _check_models(path: str, key: str, read_only: bool = False) -> bool:
         emit("model_checks", checks=list(checks.values()), cached=False, prompt_calls=0, repairs=0)
         return False
     try:
-        client = ACPClient(path)
+        with configuration_transaction():
+            latest = prepare_runtime(path, key)
+            if latest.identity != state.identity:
+                # Configuration changed while waiting for the check lease. Do not
+                # publish a result under a snapshot that no longer describes ACP.
+                emit("model_checks", checks=list(checks.values()), cached=False, prompt_calls=0, repairs=0)
+                return False
+            client = ACPClient(path)
     except Exception as error:
         state.record_failure(PRIMARY_MODELS[0], classify_failure(error, time.time(), PRIMARY_MODELS[0]))
         checks[PRIMARY_MODELS[0]].update(state.health(PRIMARY_MODELS[0]))
@@ -328,6 +352,8 @@ def _check_models(path: str, key: str, read_only: bool = False) -> bool:
                 if model in exhausted or (model not in probes and state.health(model).get("state") == "temporary"):
                     continue
                 try:
+                    health, started_revision = state.attempt_snapshot(model)
+                    if model not in probes and health.get("state") == "temporary": continue
                     client.select_model(model)
                     validated_prompt(client, 'Do not call tools. Inspect this synthetic image and return exactly {"status":"done","check":"TASKPILOT_READY"}.', image, "readiness", budget)
                 except Exception as error:
@@ -354,10 +380,11 @@ def _check_models(path: str, key: str, read_only: bool = False) -> bool:
                     if stop:
                         break
                     continue
-                state.verify(model)
+                verified = state.verify(model, started_revision)
                 for other in ALL_MODELS:
                     checks[other] = {"model": other, "state": "configured", "detail": "Configured; not verified through TaskPilot", **state.health(other)}
-                checks[model].update(state="verified", detail="Verified through TaskPilot with image input and structured output")
+                if verified:
+                    checks[model].update(state="verified", detail="Verified through TaskPilot with image input and structured output")
                 break
     finally:
         client.close()
@@ -504,6 +531,15 @@ def default_openclaw_key_state_path() -> Path:
 
 
 def sync_openclaw_google_key(
+    openclaw_path: str,
+    api_key: str,
+    state_path: Path | None = None,
+) -> None:
+    with configuration_transaction():
+        _sync_openclaw_google_key(openclaw_path, api_key, state_path)
+
+
+def _sync_openclaw_google_key(
     openclaw_path: str,
     api_key: str,
     state_path: Path | None = None,
@@ -1896,6 +1932,10 @@ def largest_downloads_next_action(
 
 class ACPClient:
     def __init__(self, openclaw_path: str) -> None:
+        with configuration_transaction():
+            self._initialize(openclaw_path)
+
+    def _initialize(self, openclaw_path: str) -> None:
         environment = dict(os.environ)
         environment["OPENCLAW_HIDE_BANNER"] = "1"
         environment["OPENCLAW_SUPPRESS_NOTES"] = "1"
@@ -2936,18 +2976,21 @@ class TaskExecution:
             c.evidence_guard = EvidenceConsistency()
             c.machine.require("configure")
             resolved = find_openclaw(openclaw_path)
-            c.runtime_state = prepare_runtime(resolved, api_key)
-            api_key = ""
-            if self.local_task():
-                return
-            c.observation_keywords = sorted(w for w in words(c.task) if len(w) <= 64 and w.isalnum())[:48]
-            c.machine.require("connect")
-            try:
-                c.client = ACPClient(resolved)
-            except Exception as error:
-                c.runtime_state.record_failure(PRIMARY_MODELS[0], classify_failure(error, time.time()))
-                emit("model_health", model=PRIMARY_MODELS[0], state="repair", detail=str(error))
-                raise
+            if is_largest_downloads_file_task(c.task) or c.ledger.local_complete_grammar:
+                c.runtime_state = prepare_runtime(resolved, api_key)
+                api_key = ""
+                if self.local_task(): return
+            with configuration_transaction():
+                c.runtime_state = prepare_runtime(resolved, api_key)
+                api_key = ""
+                c.observation_keywords = sorted(w for w in words(c.task) if len(w) <= 64 and w.isalnum())[:48]
+                c.machine.require("connect")
+                try:
+                    c.client = ACPClient(resolved)
+                except Exception as error:
+                    c.runtime_state.record_failure(PRIMARY_MODELS[0], classify_failure(error, time.time()))
+                    emit("model_health", model=PRIMARY_MODELS[0], state="repair", detail=str(error))
+                    raise
             c.router = TaskModelRouter(state=c.runtime_state)
             c.machine.transition(Phase.OBSERVING)
             emit("status", message=f"OpenClaw is connecting to the {PRODUCT_NAME} screen…")
@@ -3334,6 +3377,7 @@ def _stop_handler(_signal_number: int, _frame: Any) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=f"{PRODUCT_NAME} OpenClaw runtime")
+    parser.add_argument("--configuration-command", nargs=argparse.REMAINDER)
     parser.add_argument("--task")
     parser.add_argument("--display-id", type=int)
     parser.add_argument("--openclaw-path")
@@ -3401,6 +3445,10 @@ def main() -> int:
     signal.signal(signal.SIGINT, _stop_handler)
     args = parse_args()
     try:
+        if args.configuration_command:
+            with configuration_transaction() as lease:
+                # Descendants retain the lease if the wrapper exits first.
+                return subprocess.call(args.configuration_command, stdin=subprocess.DEVNULL, pass_fds=(lease,))
         api_key = read_runtime_configuration(require_generation=args.task is not None)
         if args.check_models or args.read_readiness:
             return 0 if check_models(find_openclaw(args.openclaw_path), api_key, read_only=args.read_readiness) else 1

@@ -8,6 +8,10 @@ from provider_errors import ProviderRequestError, facts, retry_time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
+import fcntl
+from contextlib import contextmanager
+import tempfile
+import threading
 import json
 import math
 import os
@@ -197,27 +201,34 @@ class AdaptiveModelRouter:
         self.cooldowns: dict[str, float] = {}
         self.model_failures: dict[str, Failure] = {}
         self.credential_failures: dict[str, Failure] = {}
-        if state:
-            for model in ALL_MODELS:
-                health = state.health(model)
-                if health.get("state") == "temporary":
-                    failure = Failure.from_health(health)
-                    if failure.scope == "credential":
-                        self.credential_failures[model.split('/', 1)[0]] = failure
-                    else:
-                        self.cooldowns[model] = failure.retry_at
-                        self.model_failures[model] = failure
+        self.refresh_shared_health()
         self.metrics = {"planning": 0, "verification": 0, "retries": 0, "model_switches": 0,
                         "cache_hits": 0, "reconnects": 0, "repairs": 0, "provider_retries": None,
                         "action_deliveries": 0, "action_rejections": 0, "unconfirmed_actions": 0}
 
+    def refresh_shared_health(self) -> None:
+        if not self.cache: return
+        self.cooldowns.clear()
+        self.model_failures.clear()
+        self.credential_failures.clear()
+        for model, health in self.cache.health_snapshot(now=self.clock()).items():
+            if health.get("state") == "temporary":
+                failure = Failure.from_health(health)
+                if failure.scope == "credential":
+                    self.credential_failures[model.split('/', 1)[0]] = failure
+                else:
+                    self.cooldowns[model] = failure.retry_at
+                    self.model_failures[model] = failure
+
     def execute(self, operation: Callable[[str], Any], purpose: str = "planning") -> Any:
+        self.refresh_shared_health()
         order = ([self.active_model] if self.active_model else []) + [m for m in ALL_MODELS if m != self.active_model]
         delayed: list[tuple[str, Failure]] = []
         failures: list[tuple[str, Failure]] = []
         attempted: set[str] = set()
         exhausted: set[str] = set()
         retries = 0
+        started_revision = None
 
         def shared(model: str) -> Failure | None:
             failure = self.credential_failures.get(model.split('/', 1)[0])
@@ -253,7 +264,10 @@ class AdaptiveModelRouter:
             # A terminal successful response proves this credential can run again.
             self.credential_failures.pop(model.split('/', 1)[0], None)
             if self.cache:
-                self.cache.verify(model)
+                if not self.cache.verify(model, started_revision, now=self.clock()):
+                    health = self.cache.health(model, now=self.clock())
+                    self.emit("model_health", model=model, **{k: v for k, v in health.items() if k != "model"})
+                    return result
             self.emit("model_health", model=model, state="verified", detail="Verified through TaskPilot")
             return result
 
@@ -282,6 +296,15 @@ class AdaptiveModelRouter:
                           detail=failure.summary(), **failure.metadata())
 
         def run(model: str, retry: bool = False) -> tuple[bool, Any]:
+            nonlocal started_revision
+            if self.cache:
+                health, started_revision = self.cache.attempt_snapshot(model, now=self.clock())
+                if health.get("state") == "temporary":
+                    failure = Failure.from_health(health)
+                    remember(model, failure)
+                    return False, None
+                if health.get("failure_kind") == "credentials":
+                    raise ModelAttemptError.from_failure(Failure.from_health(health))
             attempted.add(model)
             try:
                 return True, accept(model, attempt(model, retry))
@@ -344,77 +367,193 @@ class AdaptiveModelRouter:
         raise RecoveryExhaustedError(failures)
 
 
-class RuntimeState:
-    """No plaintext credentials, screenshots or user requests are persisted."""
-    def __init__(self, fingerprint: str, version: str, root: Path | None = None, configuration: str = "") -> None:
-        self.root = root or Path(os.environ.get("ORBIT_RUNTIME_STATE_DIRECTORY", str(Path.home() / "Library/Application Support/Orbit Agent")))
-        self.path = self.root / "runtime-readiness.json"
-        self.identity = hashlib.sha256(json.dumps([fingerprint, version, CONFIG_VERSION, ALL_MODELS, configuration, VALIDATION_VERSION, CONTRACT_HASH, ERROR_POLICY_VERSION]).encode()).hexdigest()
+# Stable lock files are never replaced. The data file is replaced only while
+# holding the lock; readers and writers always reload inside that transaction.
+_configuration_local = threading.local()
+
+
+def runtime_state_root() -> Path:
+    return Path(os.environ.get("ORBIT_RUNTIME_STATE_DIRECTORY", str(Path.home() / "Library/Application Support/Orbit Agent")))
+
+
+@contextmanager
+def private_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def configuration_transaction():
+    """Shared with the native setup/probe coordinator; nested calls are local."""
+    if getattr(_configuration_local, "owned", False):
+        yield _configuration_local.descriptor
+        return
+    with private_lock(runtime_state_root() / "openclaw-configuration.lock") as descriptor:
+        _configuration_local.owned = True
+        _configuration_local.descriptor = descriptor
         try:
-            value = json.loads(self.path.read_text())
-            self.value = value if isinstance(value, dict) and value.get("identity") == self.identity else ({"config_version": value.get("config_version")} if isinstance(value, dict) else {})
-            for field in ("verified", "health", "credential_health"):
-                if not isinstance(self.value.get(field, {}), dict):
-                    self.value[field] = {}
-        except (OSError, ValueError, AttributeError):
-            self.value = {}
+            yield descriptor
+        finally:
+            _configuration_local.owned = False
+            _configuration_local.descriptor = None
 
-    def save(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.value["identity"] = self.identity
-        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(self.value, allow_nan=False))
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, self.path)
 
-    def verify(self, model: str) -> None:
-        self.value.setdefault("health", {}).pop(model, None)
-        self.value.setdefault("credential_health", {}).pop(model.split('/', 1)[0], None)
-        self.value.setdefault("verified", {})[model] = time.time()
-        self.save()
+class RuntimeState:
+    """Short cross-process transactions; no plaintext user/provider data."""
+    def __init__(self, fingerprint: str, version: str, root: Path | None = None, configuration: str = "") -> None:
+        self.root = root or runtime_state_root()
+        self.path = self.root / "runtime-readiness.json"
+        self.credential = hashlib.sha256(fingerprint.encode()).hexdigest()
+        self.identity = hashlib.sha256(json.dumps([fingerprint, version, CONFIG_VERSION, ALL_MODELS, configuration, VALIDATION_VERSION, CONTRACT_HASH, ERROR_POLICY_VERSION]).encode()).hexdigest()
+        configuration_path = os.path.abspath(os.path.expanduser(os.environ.get("OPENCLAW_CONFIG_PATH", "~/.openclaw/openclaw.json")))
+        self.configuration_key = hashlib.sha256(configuration_path.encode()).hexdigest()
+        self.value: dict[str, Any] = {}
+        self.refresh()
+
+    @contextmanager
+    def transaction(self, *, write: bool = False):
+        with private_lock(self.root / "runtime-readiness.lock"):
+            try:
+                document = json.loads(self.path.read_text())
+                if not isinstance(document, dict): document = {}
+            except (OSError, ValueError):
+                document = {}
+            # Migrate only the matching old verification identity. Old cooldowns
+            # had no credential namespace and cannot safely transfer to a new key.
+            if "credentials" not in document:
+                old = document
+                document = {"revision": 0, "config_version": old.get("config_version"), "credentials": {}}
+                if old.get("identity") == self.identity:
+                    document["credentials"][self.credential] = {
+                        "health": old.get("health", {}), "credential_health": old.get("credential_health", {}),
+                        "records": {self.identity: {"verified": old.get("verified", {})}}}
+            bucket = document.setdefault("credentials", {}).setdefault(self.credential, {})
+            for field in ("health", "credential_health", "records"):
+                if not isinstance(bucket.get(field), dict): bucket[field] = {}
+            record = bucket["records"].setdefault(self.identity, {})
+            if not isinstance(record.get("verified"), dict): record["verified"] = {}
+            self.value = {**record, "health": bucket["health"], "credential_health": bucket["credential_health"],
+                          "config_version": document.get("configurations", {}).get(self.configuration_key), "revision": document.get("revision", 0)}
+            yield document, bucket, record
+            if write:
+                document["revision"] = int(document.get("revision", 0)) + 1
+                self.value["revision"] = document["revision"]
+                fd, name = tempfile.mkstemp(prefix=".runtime-readiness-", dir=self.root)
+                try:
+                    with os.fdopen(fd, "w") as output:
+                        json.dump(document, output, allow_nan=False)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.replace(name, self.path)
+                finally:
+                    if os.path.exists(name): os.unlink(name)
+
+    def refresh(self) -> int:
+        with self.transaction():
+            return self.value["revision"]
+
+    def configuration_version(self) -> Any:
+        with self.transaction():
+            return self.value.get("config_version")
+
+    def configuration_updated(self) -> None:
+        with self.transaction(write=True) as (document, _, __):
+            document.setdefault("configurations", {})[self.configuration_key] = CONFIG_VERSION
+            for bucket in document["credentials"].values():
+                for record in bucket.get("records", {}).values():
+                    record["verified"] = {}
+                    record.setdefault("invalidations", {})["*"] = document.get("revision", 0) + 1
+
+    def verify(self, model: str, started_revision: int | None = None, *, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        with self.transaction(write=True) as (document, bucket, record):
+            # An old success must never erase a failure observed after it began.
+            boundary = document.get("revision", 0) if started_revision is None else started_revision
+            if max(bucket.get("invalidated_revision", 0), record.get("invalidations", {}).get("*", 0),
+                   record.get("invalidations", {}).get(model, 0)) > boundary: return False
+            for field, key in (("health", model), ("credential_health", model.split('/', 1)[0])):
+                failure = bucket[field].get(key, {})
+                if failure and (failure.get("revision", 0) > boundary or
+                    (failure.get("state") == "temporary" and failure.get("retry_at") is not None and failure["retry_at"] > now)):
+                    return False
+            bucket["health"].pop(model, None)
+            bucket["credential_health"].pop(model.split('/', 1)[0], None)
+            record["verified"][model] = now
+            return True
 
     def invalidate(self, model: str | None = None) -> None:
-        if model:
-            self.value.setdefault("verified", {}).pop(model, None)
-        else:
-            self.value["verified"] = {}
-        self.save()
+        with self.transaction(write=True) as (document, _, record):
+            record.setdefault("invalidations", {})[model or "*"] = document.get("revision", 0) + 1
+            if model: record["verified"].pop(model, None)
+            else: record["verified"].clear()
 
     def record_failure(self, model: str, failure: Failure) -> None:
-        if failure.kind in {"credentials", "transport", "configuration"}:
-            self.value["verified"] = {}
-        else:
-            self.value.setdefault("verified", {}).pop(model, None)
-        health = {
-            "state": "temporary" if failure.kind in {"quota", "temporary"} else "repair",
-            "detail": failure.summary(), **failure.metadata(),
-        }
-        if failure.scope == "credential" and failure.kind in {"quota", "temporary"}:
-            provider = failure.provider or model.split('/', 1)[0]
-            current = self.credential_health(model)
-            if not current or Failure.from_health(current).retry_at <= failure.retry_at:
-                self.value.setdefault("credential_health", {})[provider] = health
-            for other in ALL_MODELS:
-                if other.startswith(provider + '/'):
-                    self.value.setdefault("verified", {}).pop(other, None)
-        else:
-            self.value.setdefault("health", {})[model] = health
-        self.save()
+        with self.transaction(write=True) as (document, bucket, record):
+            health = {"state": "temporary" if failure.kind in {"quota", "temporary"} else "repair",
+                      "detail": failure.summary(), **failure.metadata(), "revision": document.get("revision", 0) + 1}
+            shared = failure.kind == "credentials" or (failure.scope == "credential" and failure.kind in {"quota", "temporary"})
+            if failure.kind in {"credentials", "transport", "configuration"}:
+                bucket["invalidated_revision"] = health["revision"]
+            field, key = ("credential_health", failure.provider or model.split('/', 1)[0]) if shared else ("health", model)
+            current = bucket[field].get(key, {})
+            # Shorter concurrent cooldowns cannot erase a longer applicable one.
+            if current.get("state") == "temporary" and health["state"] == "temporary" and Failure.from_health(current).retry_at > failure.retry_at:
+                health = {**current, "revision": health["revision"]}
+            bucket[field][key] = health
+            for other_record in bucket["records"].values():
+                verified = other_record.setdefault("verified", {})
+                if failure.kind in {"credentials", "transport", "configuration"}: verified.clear()
+                elif shared:
+                    for other in list(verified):
+                        if other.startswith(key + '/'): verified.pop(other, None)
+                else: verified.pop(model, None)
 
     @staticmethod
-    def current_health(result: Any) -> dict[str, Any]:
-        if not isinstance(result, dict):
-            return {}
-        if result.get("state") == "temporary" and result.get("retry_at") and result["retry_at"] <= time.time():
-            return {}
+    def current_health(result: Any, now: float | None = None) -> dict[str, Any]:
+        if not isinstance(result, dict): return {}
+        if result.get("state") == "temporary" and result.get("retry_at") and result["retry_at"] <= (time.time() if now is None else now): return {}
         return result
 
-    def credential_health(self, model: str) -> dict[str, Any]:
-        return self.current_health(self.value.get("credential_health", {}).get(model.split('/', 1)[0], {}))
+    def credential_health(self, model: str, *, now: float | None = None) -> dict[str, Any]:
+        with self.transaction():
+            return self.current_health(self.value.get("credential_health", {}).get(model.split('/', 1)[0], {}), now)
 
-    def health(self, model: str) -> dict[str, Any]:
-        return self.credential_health(model) or self.current_health(self.value.get("health", {}).get(model, {}))
+    def attempt_snapshot(self, model: str, *, now: float | None = None) -> tuple[dict[str, Any], int]:
+        with self.transaction():
+            provider = model.split('/', 1)[0]
+            health = self.current_health(self.value["credential_health"].get(provider, {}), now) or self.current_health(self.value["health"].get(model, {}), now)
+            return health, self.value["revision"]
+
+    def health_snapshot(self, *, now: float | None = None) -> dict[str, dict[str, Any]]:
+        with self.transaction():
+            return {model: self.current_health(self.value["credential_health"].get(model.split('/', 1)[0], {}), now) or
+                           self.current_health(self.value["health"].get(model, {}), now) for model in ALL_MODELS}
+
+    def health(self, model: str, *, now: float | None = None) -> dict[str, Any]:
+        return self.attempt_snapshot(model, now=now)[0]
 
     def verified_model(self) -> str | None:
-        now = time.time()
-        return next((m for m in ALL_MODELS if not self.health(m) and isinstance(self.value.get("verified", {}).get(m), (int, float)) and 0 <= now - self.value["verified"][m] < 600), None)
+        with self.transaction():
+            now = time.time()
+            return next((m for m in ALL_MODELS if not self.current_health(self.value["credential_health"].get(m.split('/', 1)[0], {})) and not self.current_health(self.value["health"].get(m, {})) and isinstance(self.value["verified"].get(m), (int, float)) and 0 <= now - self.value["verified"][m] < 600), None)
+
+    def check_revision(self) -> int:
+        with self.transaction():
+            return self.value.get("check_revision", 0)
+
+    @contextmanager
+    def explicit_check(self):
+        # Followers reuse the leader's terminal result, including a failure.
+        observed = self.check_revision()
+        with private_lock(self.root / ("readiness-" + self.identity + ".lock")):
+            yield self.check_revision() != observed
+
+    def finish_check(self, success: bool) -> None:
+        with self.transaction(write=True) as (document, _, record):
+            record["check_revision"] = document.get("revision", 0) + 1
+            record["check_success"] = success

@@ -288,9 +288,7 @@ class ScreenshotBufferTests(unittest.TestCase):
 
     def test_readiness_probe_shares_one_buffer_with_its_format_repair(self):
         fixture = ACPFixture(['{', '{"status":"done","check":"TASKPILOT_READY"}'])
-        state = mock.Mock()
-        state.verified_model.return_value = None
-        state.health.return_value = {}; state.credential_health.return_value = {}
+        state = runtime.RuntimeState("fixture", "v", Path(self.directory.name))
         with mock.patch.object(runtime, "prepare_runtime", return_value=state), \
              mock.patch.object(runtime, "ACPClient", return_value=fixture.client):
             self.assertTrue(runtime.check_models("fixture", ""))
@@ -312,7 +310,7 @@ class ScreenshotBufferTests(unittest.TestCase):
             fixture.client.ledger = ledger
             return "fixture plan"
         with mock.patch.object(runtime, "find_openclaw", return_value="fixture"), \
-             mock.patch.object(runtime, "prepare_runtime", return_value=mock.Mock()), \
+             mock.patch.object(runtime, "prepare_runtime", return_value=runtime.RuntimeState("fixture", "v", Path(self.directory.name))), \
              mock.patch.object(runtime, "ACPClient", return_value=fixture.client), \
              mock.patch.object(runtime, "bridge_call", side_effect=observe), \
              mock.patch.object(runtime, "desktop_instruction", side_effect=instruction):

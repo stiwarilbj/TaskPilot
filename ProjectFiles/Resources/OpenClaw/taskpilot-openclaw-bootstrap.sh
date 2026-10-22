@@ -4,13 +4,15 @@ set -Eeu -o pipefail
 # TaskPilot sends the Gemini API key over this script's standard input. Never add
 # the key to this script's arguments, environment, progress events, or logs.
 GEMINI_API_KEY=""
-IFS= read -r GEMINI_API_KEY || true
+if [[ "${1:-}" != "--configuration-phase" ]]; then
+  IFS= read -r GEMINI_API_KEY || true
+fi
 if [[ -n "$GEMINI_API_KEY" && ${#GEMINI_API_KEY} -lt 20 ]]; then
   printf 'ORBIT_SETUP|error|Enter a complete Gemini API key from Google AI Studio.\n'
   exit 2
 fi
 has_gemini_api_key=0
-if [[ -n "$GEMINI_API_KEY" ]]; then
+if [[ -n "$GEMINI_API_KEY" || "${2:-}" == "with-key" ]]; then
   has_gemini_api_key=1
 fi
 
@@ -62,6 +64,18 @@ find_openclaw() {
   return 1
 }
 
+runtime="${ORBIT_RUNTIME_CHECK_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../AgentRuntime" && pwd)/orbit_openclaw_runtime}"
+if [[ ! -x "$runtime" ]]; then
+  fail "TaskPilot’s bundled ACP runtime is missing. Reinstall TaskPilot and retry."
+fi
+if [[ "${1:-}" != "--configuration-phase" ]]; then
+  # The coordinator owns the entire setup read/modify/write phase. Verification
+  # runs after release so its ACP startup can take the same lease independently.
+  key_mode="without-key"
+  [[ $has_gemini_api_key -eq 0 ]] || key_mode="with-key"
+  "$runtime" --configuration-command /bin/bash "${BASH_SOURCE[0]}" --configuration-phase "$key_mode" "$temporary_directory/executable"
+  IFS= read -r openclaw_path < "$temporary_directory/executable"
+else
 emit "0.05" "Checking this Mac for OpenClaw…"
 openclaw_path="$(find_openclaw || true)"
 
@@ -148,9 +162,8 @@ done
 if [[ $gateway_ready -ne 1 ]]; then
   fail "The OpenClaw Gateway did not become healthy. Open Terminal for recovery details."
 fi
-runtime="${ORBIT_RUNTIME_CHECK_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../AgentRuntime" && pwd)/orbit_openclaw_runtime}"
-if [[ ! -x "$runtime" ]]; then
-  fail "TaskPilot’s bundled ACP runtime is missing. Reinstall TaskPilot and retry."
+printf '%s\n' "$openclaw_path" > "$3"
+exit 0
 fi
 emit "0.90" "Verifying image input and JSON output through TaskPilot’s ACP client…"
 # Gemini keys use base64url characters, so this JSON does not need shell interpolation escapes.
