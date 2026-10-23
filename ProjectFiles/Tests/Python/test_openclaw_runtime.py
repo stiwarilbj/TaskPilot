@@ -73,6 +73,27 @@ class OpenClawRuntimeTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(json.loads(path.read_text())["outcome"], "delivered_unconfirmed")
 
+    def test_progress_projection_and_delivery_failures_do_not_escape(self):
+        context = runtime.TaskContext("task", 1, "generation")
+        token = runtime.current_task.set(context)
+        try:
+            class BrokenLedger:
+                def presentation_state(self, *_args):
+                    raise RuntimeError("projection unavailable")
+
+            runtime.publish_task_progress(BrokenLedger())
+            self.assertEqual(context.progress_revision, 0)
+
+            class Ledger:
+                def presentation_state(self, *_args):
+                    return {"version": 1, "requirements": []}
+
+            with mock.patch.object(runtime, "emit", side_effect=RuntimeError("event unavailable")):
+                runtime.publish_task_progress(Ledger())
+            self.assertEqual(context.progress_revision, 1)
+        finally:
+            runtime.current_task.reset(token)
+
     def test_blocker_can_launch_the_requested_app_once(self):
         observation = {"installed_applications": [{"name": "Google Chrome", "bundle_id": "com.google.Chrome"}],
                        "applications": []}

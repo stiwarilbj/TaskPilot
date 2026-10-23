@@ -4,15 +4,15 @@ from __future__ import annotations
 import json
 from typing import Any
 
-PROMPT_COMPILER_VERSION = 10
+PROMPT_COMPILER_VERSION = 11
 PHASE_PREFIX = "EXECUTION PHASE: "
 REPAIR_HEADER = "RESPONSE FORMAT REPAIR:"
 EXAMPLE_MARKERS = {"planning": "RELEVANT ACTION EXAMPLES", "recovery": "RELEVANT ACTION EXAMPLES",
                    "completion": "RESPONSE EXAMPLES"}
 
 DECISION_CONTRACT = (
-    "Return one JSON object; one action; TaskPilot cross-app control. Do not call OpenClaw's own tools. "
-    "Each task is a new execution; earlier tasks are not completion evidence.\n"
+    "TaskPilot cross-app control: one JSON object; one action. "
+    "Do not call OpenClaw's own tools. Each task is a new execution; earlier tasks are not completion evidence.\n"
     "Select the intended control; copy its complete element_id. Set intended_target/expected_result. "
     "Prefer element_id; missing AX: inspect screenshot; coordinates need observed app PID. "
     "Incomplete coverage means unobserved, not unavailable.\n"
@@ -21,7 +21,7 @@ DECISION_CONTRACT = (
     "Secrets/destructive/irreversible: explicit user authorization. "
     "Credentials: never guess, retrieve, or type a credential; needs_user uses observed field/PID; "
     "local entry without sending it to you.\n"
-    "Never replay uncertain sends/submissions/deletions/insertions; inspect effects. "
+    "Never replay uncertain mutations; inspect effects. "
     "Launch unopened apps; use supplied route IDs. blocked requires exhausted recovery.\n"
     "Fields: act(action,intended_target,expected_result); done(output,visual_evidence); "
     "needs_user(user_input.kind=password/verification_code/secret,action:focus,element_id,pid); blocked(reason,no action).\n"

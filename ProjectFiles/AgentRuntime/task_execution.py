@@ -145,6 +145,10 @@ class TaskContext:
     active_acp_process: Any = None
     bridge_observation_revision: str | None = None
     presentation_action_id: str | None = None
+    progress_lifecycle: str = "running"
+    progress_active_requirement_ids: list[str] = field(default_factory=list)
+    progress_revision: int = 0
+    progress_fingerprint: str = ""
     observation_keywords: list = field(default_factory=list)
     receipt_metrics: dict = field(default_factory=lambda: dict(receipt_queries=0, receipt_recoveries=0, receipt_unresolved=0))
     local_change_metrics: dict = field(default_factory=lambda: dict(local_notifications=0, local_targeted_checks=0, local_poll_wakeups=0))

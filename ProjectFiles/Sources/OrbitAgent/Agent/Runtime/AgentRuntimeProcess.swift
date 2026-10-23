@@ -52,6 +52,7 @@ enum RuntimeEvent {
     case diagnostics(AgentRequestMetrics)
     case output(AgentTaskOutput)
     case userInputRequired(AgentUserInputRequest)
+    case taskProgress(AgentTaskProgressSnapshot)
     case actionPresentation(actionID: String, taskGenerationID: String, verificationScope: String)
     case completed(String)
     case failed(String)
@@ -113,6 +114,7 @@ final class AgentRuntimeProcess {
         var writer: RuntimePipeWriter?
         var transportFailure: String?
         var receiptIDs: Set<String> = []
+        var progressRevision: UInt64 = 0
         var queuedEventBytes = 0
         var queuedEventCount = 0
         var pendingBridgeBytes = 0
@@ -494,6 +496,11 @@ final class AgentRuntimeProcess {
                 ) ?? .password
             )
             emit(.userInputRequired(request), for: run)
+        case "task_progress":
+            guard let progress = AgentTaskProgressSnapshot.parse(message, generationID: run.lease.id),
+                  progress.revision > run.progressRevision else { return }
+            run.progressRevision = progress.revision
+            emit(.taskProgress(progress), for: run)
         case "action_presentation":
             guard let presentation = AgentActionPresentationMessage.parse(
                 message, generationID: run.lease.id, knownActionIDs: run.receiptIDs
@@ -605,9 +612,13 @@ final class AgentRuntimeProcess {
         case .output(let output): bytes = output.content.utf8.count + output.title.utf8.count
         case .modelHealth(let model, let state, let detail): bytes = model.utf8.count + state.utf8.count + detail.utf8.count
         case .userInputRequired(let request): bytes = request.title.utf8.count + request.message.utf8.count
+        case .taskProgress(let progress): bytes = progress.estimatedByteCount
         default: bytes = 1024
         }
         guard terminal || (run.queuedEventCount < 4096 && run.queuedEventBytes + bytes <= 8 * 1024 * 1024) else {
+            // Progress is a replaceable presentation projection. Dropping it
+            // under pressure must never turn into a task transport failure.
+            if case .taskProgress = event { return }
             failTransport("transport_event_limit", for: run); return
         }
         run.queuedEventCount += 1; run.queuedEventBytes += bytes

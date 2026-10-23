@@ -49,12 +49,23 @@ struct TaskPilotMainView: View {
             VStack(spacing: 18) {
                 header
                 taskComposer
-                statusCard
-                if model.userInputRequest != nil {
-                    userInputCard
-                } else {
-                    outputCard
+                ScrollView {
+                    VStack(spacing: 18) {
+                        statusCard
+                        if let progressMap = model.taskProgressMap {
+                            TaskProgressMapView(map: progressMap, surface: theme.surfaceColor,
+                                                border: theme.borderColor, accent: accent)
+                        }
+                        if model.userInputRequest != nil {
+                            userInputCard
+                        } else {
+                            outputCard
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .top)
                 }
+                .frame(maxHeight: .infinity)
+                .accessibilityIdentifier("task-status-and-progress")
                 controls
             }
             .padding(28)

@@ -110,6 +110,7 @@ final class TaskPilotCoordinator: ObservableObject {
     @Published private(set) var taskHistory: [AgentTaskHistoryEntry] = []
     @Published private(set) var requestMetrics: AgentRequestMetrics?
     @Published private(set) var currentTaskRequest: String?
+    @Published private(set) var taskProgressMap: TaskProgressMap?
     @Published var showingSetup = false
     @Published private(set) var runsOnMainDisplay = UserDefaults.standard.bool(
         forKey: "OrbitAgent.runsOnMainDisplay"
@@ -160,6 +161,7 @@ final class TaskPilotCoordinator: ObservableObject {
     private var currentTaskStartedAt: Date?
     private var currentTaskWasQueued = false
     private var completedQueuedTaskCount = 0
+    private var lastTaskProgressRevision: UInt64 = 0
 
     // MARK: - Derived readiness
 
@@ -1149,6 +1151,8 @@ final class TaskPilotCoordinator: ObservableObject {
         let lease = TaskLease(taskRequest: request, closePersistentProcesses: closesTaskAppsAfterUse,
             recoveryJournal: recoveryJournal, recoveryTask: authorization.id)
         currentTaskLease = lease
+        taskProgressMap = TaskProgressMap(request: request, generationID: lease.id)
+        lastTaskProgressRevision = 0
         viewer.beginTask(lease.id)
         accessibility.beginTaskResourceTracking(on: display, lease: lease)
         agentCursor.hide()
@@ -1175,6 +1179,7 @@ final class TaskPilotCoordinator: ObservableObject {
                 closeOpenedResources: closesTaskAppsAfterUse
             )
             let wasQueued = currentTaskWasQueued
+            setTaskProgressLifecycle(.failed)
             runState = .failed
             let message = "Could not start the agent: \(error.localizedDescription)"
             status = message
@@ -1201,11 +1206,13 @@ final class TaskPilotCoordinator: ObservableObject {
             runtime.pause()
             agentCursor.hide()
             runState = .paused
+            setTaskProgressLifecycle(.paused)
             status = "Paused — the agent cannot click or type"
         case .paused:
             runtime.resume()
             agentCursor.hide()
             runState = .running
+            setTaskProgressLifecycle(.running)
             status = "Resuming on the agent screen…"
         default:
             break
@@ -1222,6 +1229,7 @@ final class TaskPilotCoordinator: ObservableObject {
             windowsPresentedOnMain = false
         }
         runState = .stopping
+        setTaskProgressLifecycle(.stopping)
         status = "Stopping safely…"
         userInputRequest = nil
         userInputDraft = ""
@@ -1237,6 +1245,7 @@ final class TaskPilotCoordinator: ObservableObject {
         userInputRequest = nil
         runtime.submitUserInput(requestID: request.requestID, value: value, taskGenerationID: request.taskGenerationID)
         runState = .running
+        setTaskProgressLifecycle(.running)
         status = "Credential entered securely — continuing the task…"
     }
 
@@ -1255,6 +1264,7 @@ final class TaskPilotCoordinator: ObservableObject {
             windowsPresentedOnMain = false
             if runState == .takingOver {
                 runState = .paused
+                setTaskProgressLifecycle(.paused)
                 pinStatus("Windows returned to the agent screen; the agent remains paused")
             } else {
                 pinStatus("Windows returned to the agent screen")
@@ -1266,7 +1276,10 @@ final class TaskPilotCoordinator: ObservableObject {
         agentCursor.hide()
         takeoverPlacements = accessibility.moveWindowsForTakeover(from: display)
         windowsPresentedOnMain = !takeoverPlacements.isEmpty
-        if runState == .running || runState == .paused { runState = .takingOver }
+        if runState == .running || runState == .paused {
+            runState = .takingOver
+            setTaskProgressLifecycle(.paused)
+        }
         pinStatus(takeoverPlacements.isEmpty
             ? "No controllable agent-screen window is open yet"
             : "Brought \(takeoverPlacements.count) agent window\(takeoverPlacements.count == 1 ? "" : "s") home")
@@ -1318,12 +1331,15 @@ final class TaskPilotCoordinator: ObservableObject {
             if runState == .running || runState == .stopping { status = message }
         case .output(let output):
             taskOutput = output
+        case .taskProgress(let snapshot):
+            acceptTaskProgress(snapshot)
         case .userInputRequired(let request):
             agentCursor.hide()
             viewer.clearActionMagnifier()
             userInputDraft = ""
             userInputRequest = request
             runState = .waitingForUser
+            setTaskProgressLifecycle(.waitingForUser)
             status = "Paused — \(request.title.lowercased())"
             let lease = currentTaskLease
             taskNotification?.cancel()
@@ -1352,6 +1368,7 @@ final class TaskPilotCoordinator: ObservableObject {
             userInputRequest = nil
             userInputDraft = ""
             let wasQueued = currentTaskWasQueued
+            setTaskProgressLifecycle(.completed)
             let cleanup = accessibility.finishTaskResourceTracking(
                 closeOpenedResources: closesTaskAppsAfterUse
             )
@@ -1396,6 +1413,7 @@ final class TaskPilotCoordinator: ObservableObject {
             userInputRequest = nil
             userInputDraft = ""
             let wasQueued = currentTaskWasQueued
+            setTaskProgressLifecycle(.failed)
             let cleanup = accessibility.finishTaskResourceTracking(
                 closeOpenedResources: closesTaskAppsAfterUse
             )
@@ -1428,6 +1446,7 @@ final class TaskPilotCoordinator: ObservableObject {
             userInputRequest = nil
             userInputDraft = ""
             let wasQueued = currentTaskWasQueued
+            setTaskProgressLifecycle(.stopped)
             let cleanup = accessibility.finishTaskResourceTracking(
                 closeOpenedResources: closesTaskAppsAfterUse
             )
@@ -1451,6 +1470,33 @@ final class TaskPilotCoordinator: ObservableObject {
             viewer.actionMagnifier.update(actionID: actionID, generationID: taskGenerationID,
                                           state: .confirmed(verificationScope))
         }
+    }
+
+    private func acceptTaskProgress(_ snapshot: AgentTaskProgressSnapshot) {
+        guard currentTaskLease?.id == snapshot.generationID,
+              snapshot.revision > lastTaskProgressRevision,
+              let request = taskProgressMap?.originalRequest,
+              taskProgressMap?.generationID == snapshot.generationID,
+              TaskProgressSourceMapper.sourceRangesAreValid(
+                  snapshot.requirements.flatMap(\.sourceRanges), in: request
+              ) else { return }
+        lastTaskProgressRevision = snapshot.revision
+        var map = TaskProgressMap(request: request, snapshot: snapshot)
+        switch runState {
+        case .paused, .takingOver: map.lifecycle = .paused
+        case .waitingForUser: map.lifecycle = .waitingForUser
+        case .stopping: map.lifecycle = .stopping
+        case .completed: map.lifecycle = .completed
+        case .failed: map.lifecycle = .failed
+        default: break
+        }
+        taskProgressMap = map
+    }
+
+    private func setTaskProgressLifecycle(_ lifecycle: AgentTaskProgressLifecycle) {
+        guard var map = taskProgressMap else { return }
+        map.lifecycle = lifecycle
+        taskProgressMap = map
     }
 
     private func recordCurrentTask(

@@ -201,6 +201,31 @@ def emit(kind: str, **payload: Any) -> None:
     print(json.dumps(envelope, separators=(",", ":")), flush=True)
 
 
+def publish_task_progress(ledger: TaskEvidenceLedger | None, *, lifecycle: str | None = None,
+                          active_requirement_ids: list[str] | None = None, force: bool = False) -> None:
+    """Publish a bounded, content-safe projection of current task evidence."""
+    context = current_task.get()
+    if context is None or ledger is None or context.generation is None:
+        return
+    if lifecycle is not None:
+        context.progress_lifecycle = lifecycle
+    if active_requirement_ids is not None:
+        context.progress_active_requirement_ids = list(dict.fromkeys(active_requirement_ids))[:512]
+    try:
+        snapshot = ledger.presentation_state(context.progress_active_requirement_ids, context.progress_lifecycle)
+        fingerprint = hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"),
+                                        ensure_ascii=True).encode()).hexdigest()
+        if not force and fingerprint == context.progress_fingerprint:
+            return
+        context.progress_fingerprint = fingerprint
+        context.progress_revision += 1
+        emit("task_progress", revision=context.progress_revision, **snapshot)
+    except Exception:
+        # The progress projection is optional UI state. Its failure must not
+        # change planning, execution, evidence, or completion behavior.
+        return
+
+
 def runtime_fingerprint(key: str) -> str:
     if key:
         return hashlib.sha256(key.encode()).hexdigest()
@@ -1534,6 +1559,8 @@ def request_and_enter_user_input(
     inbox = runtime_inbox()
     key = inbox.register('user_input_response', request_id, _task_value('generation'))
     try:
+        if context is not None:
+            publish_task_progress(context.ledger, lifecycle="waiting_for_user", active_requirement_ids=[])
         emit("user_input_required", request_id=request_id, title=target["title"],
              message=target["message"], input_kind=target["input_kind"])
         secret = wait_for_user_input(request_id, key=key)
@@ -1561,7 +1588,9 @@ def complete_from_decision(decision: dict[str, Any], fallback: str, ledger: Task
     if not ledger.can_complete(message):
         raise RuntimeError("TaskPilot cannot complete without evidence for every requested requirement")
     context = current_task.get()
-    if context is not None: context.machine.complete()
+    if context is not None:
+        context.machine.complete()
+        publish_task_progress(ledger, lifecycle="completed", active_requirement_ids=[])
     title = str(decision.get("output_title") or "OpenClaw result").strip()
     kind = str(decision.get("output_kind") or "result")
     if kind not in {"answer", "result", "completion"}:
@@ -2636,7 +2665,7 @@ def desktop_instruction(
             condition = {**condition, "failed_action": recent[-1].get("action")}
     return compile_prompt("recovery" if condition else "planning",
         instructions=rules + (checklist_instruction(ledger) if ledger else "") + (guidance + "\n" if guidance else ""),
-        examples="Illustrations: replace IDs/PID 1; examples are advisory. Do not copy example inputs.\n"
+        examples="Illustrations: examples are advisory. Do not copy example inputs; replace IDs/PID.\n"
                  + "\n".join(json_data(example) for example in illustrated) + "\n" + " ".join(bounds) + "\n" + reference,
         task=task, context=prompt_capability_context(context), observation=prompt_observation(observation, task),
         history=recent, progress=progress, checklist=ledger.prompt_state() if ledger else None, condition=condition,
@@ -2702,15 +2731,16 @@ class ResponseRepairBudget:
 
 def checklist_instruction(ledger: TaskEvidenceLedger) -> str:
     contract = (
-        "\nCHECKLIST: ALL requirements(source quote,description,check[,depends_on]). "
-        "IDs:r1,r2,...; with edges, use requirement_ids. "
-        "scope:prerequisite=setup; default:outcome. "
+        "\nCHECKLIST: ALL requirements(source,description,check[,depends_on]); quote narrow exact clauses (include punctuation/qualifiers). "
+        "Actions list outcome requirement_ids. "
+        "scope: prerequisite/outcome. "
         "Checks: visual/answer(expected); file_read/file_exists/directory_exists/path_absent(path); "
-        "final file_contents(path,content[,encoding]); historical file_written adds mode; stdout_equals(text); "
-        "command_executed(argv or command[,working_directory]); command_operation(operation). "
+        "final file_contents(path,content[,encoding]); file_written(path,content,mode); stdout_equals(text); "
+        "command_executed(argv|command[,working_directory]); command_operation(operation). "
 
-    ) if not ledger.requirements else ("\nCHECKLIST: Fulfill every requirement; pending/invalidated entries need evidence, not repeated uncertain mutations. "
-        + ("Actions name requirement_ids; prove direct depends_on with fresh checks before acting. "
+    ) if not ledger.requirements else ("\nCHECKLIST: fulfill all entries; pending/invalidated need evidence, not uncertain repeats. "
+        "Sources are narrow exact clauses with punctuation and qualifiers; each action lists advanced requirement_ids. "
+        + ("Prove direct depends_on with fresh checks before acting. "
            if any(r.get("depends_on") for r in ledger.requirements.values()) else ""))
     if ledger.current_observation and ledger.current_observation.get("elements"):
         contract += ("Local checks: window_active(pid,title), field_value(element_id,value[,pid]), "
@@ -2810,11 +2840,13 @@ def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int
     finally:
         discard_observation_image(observation)
     if not ledger.audit(verification):
+        publish_task_progress(ledger, active_requirement_ids=[])
         missing = verification.get("missing") or []
         missing += [r["description"] for r in ledger.requirements.values() if r["state"] != "proven"]
         history.append({"action": "completion_rejected", "result": missing or ["Whole-request coverage is not proven"]})
         emit("status", message="The evidence check found more work — continuing…")
         return False
+    publish_task_progress(ledger, active_requirement_ids=[])
     message = verification.get("message") or "Task completed"
     for ref in verification.get("output_evidence_ids", []):
         fact = ledger.evidence[ref]["fact"]
@@ -3037,6 +3069,7 @@ class TaskExecution:
         c = self.c
         try:
             c.ledger = TaskEvidenceLedger(c.task, c.generation)
+            publish_task_progress(c.ledger, force=True)
             c.recovery = ActionRecovery()
             c.recovery_cycles = RecoveryCycles(rejection_limit=MAX_IDENTICAL_ACTIONS)
             c.evidence_guard = EvidenceConsistency()
@@ -3067,8 +3100,10 @@ class TaskExecution:
             }
             while c.machine.phase != Phase.DRAINING:
                 handlers[c.machine.phase]()
-        except BaseException:
+        except BaseException as error:
             c.machine.drain()  # Includes Stop/SystemExit, not just provider errors.
+            stopped = isinstance(error, KeyboardInterrupt) or (isinstance(error, SystemExit) and error.code in {130, 143})
+            publish_task_progress(c.ledger, lifecycle="stopped" if stopped else "failed", active_requirement_ids=[])
             if c.runtime_state is not None:
                 c.runtime_state.invalidate()
             raise
@@ -3097,6 +3132,7 @@ class TaskExecution:
             message = (f"The largest file in your Downloads folder is '{largest['name']}', "
                        f"which is {formatted_file_size(int(largest['bytes']))} ({int(largest['bytes']):,} bytes).")
             c.ledger.local_answer(message)
+            publish_task_progress(c.ledger)
             c.machine.transition(Phase.VERIFYING, local_request=True)
             self.local_metrics()
             complete_from_decision({"output": message, "output_title": "Largest File in Downloads", "output_kind": "answer"}, message, c.ledger)
@@ -3109,6 +3145,7 @@ class TaskExecution:
         action = {"type": "read_file", "path": check["path"], "max_bytes": action_default("read_file", "max_bytes")}
         result = bridge_call("act", c.display_id, action=action)
         c.ledger.record_action(action, result)
+        publish_task_progress(c.ledger)
         if result.get("truncated") is not False:
             raise RuntimeError("The requested full file contents exceed the bounded 128 KiB read limit; the task is incomplete")
         output = c.ledger.exact_output(check, next(iter(c.ledger.requirements.values()))["evidence_ids"])
@@ -3139,6 +3176,7 @@ class TaskExecution:
         if not c.screenshot_path.is_file():
             raise RuntimeError(f"{PRODUCT_NAME} did not provide a readable screen image")
         c.ledger.observe(c.observation)
+        publish_task_progress(c.ledger, active_requirement_ids=[])
         cycle_report = c.recovery_cycles.observe(c.observation, c.ledger)
         c.router.metrics.update(recovery_cycles=c.recovery_cycles.detections, cycle_suppressions=c.recovery_cycles.suppressions)
         if cycle_report:
@@ -3170,6 +3208,8 @@ class TaskExecution:
         finally:
             discard_observation_image(c.observation)
         c.ledger.accept_plan(c.decision, c.observation)
+        active_ids = c.ledger.action_requirements(c.decision) if effective_decision_status(c.decision) == "act" else []
+        publish_task_progress(c.ledger, lifecycle="running", active_requirement_ids=active_ids)
         emit("status", message=str(c.decision.get("summary") or "OpenClaw inspected the screen"))
         c.reconcile_reason = "decision"
         c.machine.transition(Phase.RECONCILING, decision=True)
@@ -3358,6 +3398,7 @@ class TaskExecution:
             try:
                 command_params = inspect_general_command(c.action, c.display_id, c.observation)
                 c.ledger.before_action(c.action)
+                publish_task_progress(c.ledger)
                 result = bridge_call("act", c.display_id, action=c.action, **command_params)
             except RuntimeError as error:
                 if not isinstance(error, ActionRejected) or error.code in {"cancelled", "permission_denied", "protected_target", "secure_input"}:
@@ -3368,6 +3409,7 @@ class TaskExecution:
             c.action = bind_command_outcomes(c.action, result)
             c.evidence_guard.remember_native(c.action, c.observation, result)
             c.ledger.record_action(c.action, result)
+            publish_task_progress(c.ledger)
             c.result = result
             c.router.metrics["action_deliveries"] += 1
             c.reconcile_reason = "effect"
@@ -3388,6 +3430,7 @@ class TaskExecution:
         c.recovery.rejected(c.action, c.observation, code)
         c.recovery_cycles.record(c.action, c.observation, c.failure, c.ledger, c.screenshot_digest)
         record_action_diagnostic(c.action, c.failure)
+        publish_task_progress(c.ledger, active_requirement_ids=[])
         if uncertain: c.router.metrics["unconfirmed_actions"] += 1
         c.history.append({"step": c.step, "visual_evidence": str(c.decision.get("visual_evidence") or ""),
             "action": c.action, "result": c.failure, **action_history_context(c.decision, c.action, c.observation),
@@ -3426,9 +3469,11 @@ class TaskExecution:
             effect = c.result.get("expected_effect", {})
             if effect.get("outcome") == "verified" and effect.get("check") in FILE_EFFECTS:
                 c.ledger.record_effect(c.decision["expected_result"], effect["evidence"], c.action)
+                publish_task_progress(c.ledger)
             if not c.recovered_result:
                 c.recovery_cycles.record(c.action, c.observation, c.result, c.ledger, c.screenshot_digest)
         c.presentation_action_id = None
+        publish_task_progress(c.ledger, active_requirement_ids=[])
         if (c.decision.get("finish_after_action") is True and c.action["type"] in {"write_file", "run_command"}
                 and isinstance(c.result, dict) and c.result.get("verification_scope") != "expected_effect_unconfirmed"):
             discard_observation_image(c.pending_observation)

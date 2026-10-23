@@ -21,7 +21,7 @@ from task_inputs import TaskInputBindings
 from expected_effects import ExpectedEffect, ExpectedEffectError, validate_expectation
 from observation_context import coordinate_targets, observation_indexes
 
-CHECKLIST_VERSION = 6
+CHECKLIST_VERSION = 7
 FILE_CHECKS = {"file_exists", "directory_exists", "path_absent", "file_contents"}
 OBSERVATION_CHECKS = {"window_active", "field_value", "dialog_present"}
 READ_PATTERN = r'\s*(?:read|show|print)\s+(?:the\s+)?(?:contents of\s+)?file\s+(["`\'])((?:/|~/)(?:(?!\1)[^\n])+)\1\s*[.!]?\s*'
@@ -753,6 +753,130 @@ class TaskEvidenceLedger:
                 "requirements": bounded(self.requirements),
                 "evidence": {key: {**bounded(e["fact"]), **({"origin": e["origin"]} if e["origin"] else {})}
                              for key, e in self.evidence.items() if e["valid"]}}
+
+    def presentation_state(self, active_requirement_ids: list[str] | None = None,
+                           lifecycle: str = "running") -> dict:
+        """Return a bounded, content-safe view for the native progress strip.
+
+        This is deliberately separate from prompt_state(): it never includes
+        commands, entered values, file contents, screenshots, or evidence IDs.
+        Only current evidence already accepted by the task ledger is summarized.
+        """
+        if lifecycle not in {"running", "waiting_for_user", "completed", "failed", "stopped"}:
+            lifecycle = "running"
+        self.refresh()
+        active = set(active_requirement_ids or ())
+        summaries = []
+        task_bytes = self.task.encode("utf-8")
+        range_budget = 4096
+        evidence_budget = 512 * 1024
+        projected_active = []
+        for identifier, requirement in list(self.requirements.items())[:512]:
+            if requirement.get("scope", "outcome") == "prerequisite":
+                continue
+            source = requirement["source"]
+            encoded_source = source.encode("utf-8")
+            ranges = []
+            if encoded_source and len(encoded_source) <= 8192 and range_budget > 0:
+                cursor = 0
+                while cursor < len(task_bytes) and len(ranges) < min(256, range_budget):
+                    start = task_bytes.find(encoded_source, cursor)
+                    if start < 0:
+                        break
+                    ranges.append([start, start + len(encoded_source)])
+                    cursor = start + 1
+                range_budget -= len(ranges)
+            proof = []
+            if requirement["state"] == "proven":
+                for evidence_id in requirement["evidence_ids"]:
+                    evidence = self.evidence.get(evidence_id)
+                    if evidence is None or not self.requirement_matches(identifier, evidence, semantic=True):
+                        continue
+                    summary = self._presentation_evidence(requirement["check"], evidence["fact"])
+                    if summary and summary not in proof:
+                        proof.append(summary)
+                    if len(proof) >= 2:
+                        break
+            evidence_cost = sum(
+                len((item.get("label", "") + item.get("detail", "") + item.get("reveal_path", "")).encode("utf-8"))
+                for item in proof
+            )
+            if evidence_cost > evidence_budget:
+                proof = []
+            else:
+                evidence_budget -= evidence_cost
+            projected_state = requirement["state"]
+            if projected_state == "proven" and not proof:
+                # Never present a confirmed clause unless this projection can
+                # carry at least one matching, currently valid proof summary.
+                projected_state = "pending"
+            summaries.append({
+                "id": identifier,
+                # The UI already owns the original task. Byte ranges avoid
+                # copying commands, literal inputs, or credentials into IPC.
+                "source_ranges": ranges,
+                "state": projected_state,
+                "active": identifier in active and lifecycle == "running" and projected_state != "proven",
+                "evidence": proof,
+            })
+            if identifier in active and lifecycle == "running" and projected_state != "proven":
+                projected_active.append(identifier)
+        return {
+            "version": 1,
+            "lifecycle": lifecycle,
+            "whole_request_coverage": "audited" if self.coverage_complete else "pending",
+            "active_requirement_ids": projected_active,
+            "requirements": summaries,
+        }
+
+    @staticmethod
+    def _presentation_evidence(check: dict, fact: dict) -> dict | None:
+        """Summarize verified scope without exposing private values or output."""
+        kind = check.get("type")
+        if kind in {"file_contents", "file_written", "file_append", "file_exists", "directory_exists"}:
+            path = fact.get("path")
+            if not isinstance(path, str):
+                return None
+            label = {
+                "file_contents": "File contents matched",
+                "file_written": "File write verified",
+                "file_append": "File append verified",
+                "file_exists": "File exists",
+                "directory_exists": "Folder exists",
+            }.get(kind, "File result verified")
+            bounded_path = path[:1024] if len(path.encode("utf-8")) <= 4096 else None
+            result = {"label": label, "detail": path[:512]}
+            if bounded_path is not None:
+                result["reveal_path"] = bounded_path
+            return result
+        if kind == "path_absent":
+            path = fact.get("path")
+            return {"label": "Path is absent", "detail": path[:512]} if isinstance(path, str) else None
+        if kind == "file_read":
+            path = fact.get("path")
+            return {"label": "Full file contents read", "detail": path[:512],
+                    **({"reveal_path": path[:1024]} if isinstance(path, str) and len(path.encode("utf-8")) <= 4096 else {})} if isinstance(path, str) else None
+        if kind == "command_operation":
+            return {"label": "Requested operation verified", "detail": "Its specified outcome checks passed."}
+        if kind == "command_executed":
+            return {"label": "Command completed", "detail": "The validated command finished successfully."}
+        if kind == "stdout_equals":
+            return {"label": "Requested output matched", "detail": "The verified output matched the request."}
+        if kind == "window_active":
+            title = check.get("title")
+            return {"label": "Document window observed",
+                    "detail": str(title)[:256] if isinstance(title, str) else "The expected window was observed."}
+        if kind == "dialog_present":
+            title = check.get("title")
+            return {"label": "Expected dialog observed",
+                    "detail": str(title)[:256] if isinstance(title, str) else "The expected dialog was observed."}
+        if kind == "field_value":
+            return {"label": "Field value verified", "detail": "The requested field state was verified."}
+        if kind == "visual":
+            return {"label": "Screen result verified", "detail": "The existing completion audit accepted the visual evidence."}
+        if kind == "answer":
+            return {"label": "Requested answer verified", "detail": "The existing completion audit accepted the supporting evidence."}
+        return {"label": "Requirement evidence verified", "detail": "The task evidence ledger accepted this result."}
 
     def fingerprint(self) -> str:
         self._sync_state()
