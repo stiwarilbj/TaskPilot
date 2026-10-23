@@ -44,6 +44,9 @@ final class TaskPilotCoordinator: ObservableObject {
     // MARK: - Observable app state
 
     @Published var taskDraft = TaskComposerDraft()
+    @Published private(set) var remixSession: TaskRemixSession?
+    @Published private(set) var pendingRemixHistoryEntryID: UUID?
+    @Published private(set) var requestSubmissionError: String?
     var prompt: String {
         get { taskDraft.expandedText }
         set { taskDraft = TaskComposerDraft(plainText: newValue) }
@@ -188,6 +191,11 @@ final class TaskPilotCoordinator: ObservableObject {
 
     var canQueueCurrentPrompt: Bool {
         isActive && !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var remixReview: TaskRemixReview? {
+        guard let remixSession else { return nil }
+        return TaskRemixReview.make(baseline: remixSession.baselineDraft, current: taskDraft)
     }
 
     var geminiAPIKeyLooksComplete: Bool {
@@ -1034,9 +1042,10 @@ final class TaskPilotCoordinator: ObservableObject {
     func submitCurrentPrompt() {
         let submission = taskDraft.submission().trimmedForSubmission()
         guard !submission.request.isEmpty else { return }
+        guard validateSubmission(submission) else { return }
         if isActive || !queuedTasks.isEmpty {
-            enqueueRequest(submission)
-            taskDraft = TaskComposerDraft()
+            guard enqueueRequest(submission) else { return }
+            acceptComposerSubmission()
             startNextQueuedTaskIfPossible()
             return
         }
@@ -1044,15 +1053,56 @@ final class TaskPilotCoordinator: ObservableObject {
             showingSetup = true
             return
         }
-        taskDraft = TaskComposerDraft()
-        startTask(submission: submission, queuedTask: nil)
+        guard startTask(submission: submission, queuedTask: nil) else { return }
+        acceptComposerSubmission()
     }
 
     func enqueueCurrentPrompt() {
         let submission = taskDraft.submission().trimmedForSubmission()
         guard isActive, !submission.request.isEmpty else { return }
-        enqueueRequest(submission)
-        taskDraft = TaskComposerDraft()
+        guard validateSubmission(submission), enqueueRequest(submission) else { return }
+        acceptComposerSubmission()
+    }
+
+    @discardableResult
+    func beginHistoryRemix(id: UUID) -> Bool {
+        guard let entry = taskHistory.first(where: { $0.id == id }) else { return false }
+        if let remixSession {
+            if remixSession.sourceEntryID == id { return true }
+            pendingRemixHistoryEntryID = id
+            return false
+        }
+        let submission = AgentTaskSubmission(request: entry.request,
+            exactInputReferences: entry.exactInputReferences ?? [])
+        guard validateSubmission(submission) else { return false }
+        let draft = TaskComposerDraft(remixing: submission)
+        remixSession = TaskRemixSession(sourceEntryID: entry.id, sourceRequest: entry.request,
+                                        baselineDraft: draft, preservedDraft: taskDraft)
+        taskDraft = draft
+        pendingRemixHistoryEntryID = nil
+        requestSubmissionError = nil
+        return true
+    }
+
+    func continueCurrentRemix() {
+        pendingRemixHistoryEntryID = nil
+    }
+
+    @discardableResult
+    func discardRemixAndLoadPendingHistoryEntry() -> Bool {
+        guard let id = pendingRemixHistoryEntryID, let session = remixSession else { return false }
+        taskDraft = session.preservedDraft
+        remixSession = nil
+        pendingRemixHistoryEntryID = nil
+        return beginHistoryRemix(id: id)
+    }
+
+    func cancelHistoryRemix() {
+        guard let session = remixSession else { return }
+        taskDraft = session.preservedDraft
+        remixSession = nil
+        pendingRemixHistoryEntryID = nil
+        requestSubmissionError = nil
     }
 
     func rerunHistoryEntry(id: UUID) {
@@ -1203,10 +1253,19 @@ final class TaskPilotCoordinator: ObservableObject {
         persistTaskLedger()
     }
 
-    private func enqueueRequest(_ submission: AgentTaskSubmission) {
-        queuedTasks.append(QueuedAgentTask(request: submission.request,
-                                         exactInputReferences: submission.exactInputReferences))
+    @discardableResult
+    private func enqueueRequest(_ submission: AgentTaskSubmission) -> Bool {
+        guard validateSubmission(submission) else { return false }
+        let task = QueuedAgentTask(request: submission.request,
+                                   exactInputReferences: submission.exactInputReferences)
+        queuedTasks.append(task)
         persistTaskLedger()
+        if recoveryFailure != nil {
+            queuedTasks.removeAll { $0.id == task.id }
+            requestSubmissionError = recoveryFailure
+            return false
+        }
+        return true
     }
 
     private func startNextQueuedTaskIfPossible() {
@@ -1219,14 +1278,19 @@ final class TaskPilotCoordinator: ObservableObject {
             exactInputReferences: next.exactInputReferences ?? []), queuedTask: next)
     }
 
+    @discardableResult
     private func startTask(
         submission: AgentTaskSubmission,
         queuedTask: QueuedAgentTask?
-    ) {
+    ) -> Bool {
+        guard validateSubmission(submission) else {
+            if let queuedTask { queuedTasks.insert(queuedTask, at: 0) }
+            return false
+        }
         guard recoveryFailure == nil, let recoveryJournal else {
             if let queuedTask { queuedTasks.insert(queuedTask, at: 0) }
             status = recoveryFailure ?? ActionRecoveryJournal.unavailable.localizedDescription
-            return
+            return false
         }
         guard !isActive,
               isReady,
@@ -1238,7 +1302,7 @@ final class TaskPilotCoordinator: ObservableObject {
                 persistTaskLedger()
             }
             showingSetup = true
-            return
+            return false
         }
         let request = submission.request
         let authorization = AgentTaskAuthorization(request: request,
@@ -1253,7 +1317,8 @@ final class TaskPilotCoordinator: ObservableObject {
             recoveryFailure = "Could not durably prepare the task. No actions were started: \(error.localizedDescription)"
             runState = .failed
             status = recoveryFailure!
-            return
+            requestSubmissionError = recoveryFailure
+            return false
         }
         currentTaskAuthorization = authorization
         currentTaskRequest = request
@@ -1289,6 +1354,7 @@ final class TaskPilotCoordinator: ObservableObject {
                 exactInputReferences: submission.exactInputReferences,
                 lease: lease
             )
+            return true
         } catch {
             lease.revoke()
             agentCursor.hide()
@@ -1315,7 +1381,28 @@ final class TaskPilotCoordinator: ObservableObject {
                 )
             }
             advanceQueueAfterTerminalTask()
+            return false
         }
+    }
+
+    private func validateSubmission(_ submission: AgentTaskSubmission) -> Bool {
+        do {
+            try submission.validateExactInputReferences()
+            requestSubmissionError = nil
+            return true
+        } catch {
+            requestSubmissionError = error.localizedDescription
+            return false
+        }
+    }
+
+    private func acceptComposerSubmission() {
+        if remixSession != nil {
+            cancelHistoryRemix()
+        } else {
+            taskDraft = TaskComposerDraft()
+        }
+        requestSubmissionError = nil
     }
 
     func togglePause() {

@@ -62,8 +62,26 @@ enum TaskComposerReferenceParser {
         case .url:
             guard let url = URL(string: value), let scheme = url.scheme?.lowercased(),
                   ["http", "https"].contains(scheme), url.host != nil else { return nil }
+        case .text:
+            break
         }
         return TaskComposerReference(kind: kind, value: value)
+    }
+
+    static func remixLiteral(_ value: String) -> TaskComposerReference? {
+        if let url = URL(string: value), let scheme = url.scheme?.lowercased(),
+           ["http", "https"].contains(scheme), url.host != nil {
+            return TaskComposerReference(kind: .url, value: value)
+        }
+        if value.hasPrefix("/") {
+            let url = URL(fileURLWithPath: value)
+            guard FileManager.default.fileExists(atPath: value) else {
+                return TaskComposerReference(kind: .text, value: value)
+            }
+            let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? url.hasDirectoryPath
+            return TaskComposerReference(kind: isDirectory ? .folder : .file, value: value)
+        }
+        return TaskComposerReference(kind: .text, value: value)
     }
 
     private static func localReference(_ url: URL, directoryLookup: ((URL) -> Bool?)?) -> TaskComposerReference? {
@@ -141,6 +159,19 @@ struct TaskComposerDraft: Equatable {
     }
 
     func displayLabel(for reference: TaskComposerReference) -> String {
+        if reference.kind == .text {
+            let firstLine = reference.value.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).first.map(String.init) ?? reference.value
+            let label = firstLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if label.contains("/"), let name = label.split(separator: "/").last,
+               segments.contains(where: { segment in
+                   guard case .reference(let candidate) = segment, candidate.id != reference.id,
+                         candidate.kind != .url else { return false }
+                   return candidate.value.split(separator: "/").last == name
+               }) {
+                return String(label.suffix(72))
+            }
+            return label.isEmpty ? "Exact text" : String(label.prefix(48))
+        }
         guard reference.kind != .url else {
             guard let components = URLComponents(string: reference.value) else { return "Web address" }
             let host = components.host ?? "Web address"
@@ -150,7 +181,8 @@ struct TaskComposerDraft: Equatable {
         let components = URL(fileURLWithPath: reference.value).standardizedFileURL.pathComponents.filter { $0 != "/" }
         let name = components.last ?? reference.value
         let peers = segments.compactMap { segment -> TaskComposerReference? in
-            guard case .reference(let candidate) = segment, candidate.kind != .url else { return nil }
+            guard case .reference(let candidate) = segment,
+                  candidate.kind == .file || candidate.kind == .folder else { return nil }
             return candidate
         }
         guard peers.contains(where: { $0.id != reference.id && URL(fileURLWithPath: $0.value).lastPathComponent == name }) else {
@@ -311,9 +343,14 @@ struct TaskRequestComposer: NSViewRepresentable {
             let popover = NSPopover()
             popover.behavior = .transient
             popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-            popover.contentSize = NSSize(width: 330, height: 190)
+            popover.contentSize = NSSize(width: 360, height: 280)
             popover.contentViewController = NSHostingController(rootView: TaskComposerReferencePopover(
                 reference: reference,
+                onReplace: { [weak self, weak textView] updated in
+                    guard let self, let textView else { return }
+                    self.replace(reference.id, with: updated, in: textView)
+                    self.popover?.close()
+                },
                 onRemove: { [weak self, weak textView] in
                     guard let self, let textView else { return }
                     self.remove(reference.id, from: textView)
@@ -327,6 +364,14 @@ struct TaskRequestComposer: NSViewRepresentable {
         func remove(_ id: UUID, from textView: TaskComposerTextView) {
             guard let range = Self.attachmentRange(id: id, in: textView.attributedString()) else { return }
             textView.insertText("", replacementRange: range)
+        }
+
+        func replace(_ id: UUID, with reference: TaskComposerReference, in textView: TaskComposerTextView) {
+            guard let range = Self.attachmentRange(id: id, in: textView.attributedString()) else { return }
+            let updated = TaskComposerReference(id: id, kind: reference.kind, value: reference.value)
+            let attachment = TaskComposerTextAttachment(reference: updated,
+                label: parent.draft.displayLabel(for: updated))
+            textView.insertText(NSAttributedString(attachment: attachment), replacementRange: range)
         }
 
         func copySelection(from textView: TaskComposerTextView, cut: Bool) {
@@ -452,6 +497,10 @@ struct TaskRequestComposer: NSViewRepresentable {
         }
 
         private static func displayLabel(_ reference: TaskComposerReference) -> String {
+            if reference.kind == .text {
+                let value = reference.value.trimmingCharacters(in: .whitespacesAndNewlines)
+                return value.isEmpty ? "Exact text" : String(value.prefix(48))
+            }
             if reference.kind == .url, let components = URLComponents(string: reference.value) {
                 return components.host.map { $0 + (components.percentEncodedPath == "/" ? "" : components.percentEncodedPath) } ?? "Web address"
             }
@@ -499,13 +548,15 @@ private final class TaskComposerChipCell: NSTextAttachmentCell {
     init(label: String, reference: TaskComposerReference) {
         self.reference = reference
         self.labelText = label
-        if reference.kind == .url {
-            self.icon = NSImage(systemSymbolName: "link", accessibilityDescription: "Web address") ?? NSImage()
+        if reference.kind == .url || reference.kind == .text {
+            let kind = reference.kind == .url ? "Web address" : "Exact text"
+            self.icon = NSImage(systemSymbolName: "link", accessibilityDescription: kind) ?? NSImage()
         } else {
             self.icon = NSWorkspace.shared.icon(forFile: reference.value)
         }
         super.init(textCell: label)
-        setAccessibilityLabel("\(reference.kind == .folder ? "Folder" : reference.kind == .file ? "File" : "Web address"): \(label)")
+        let kindLabel = reference.kind == .folder ? "Folder" : reference.kind == .file ? "File" : reference.kind == .url ? "Web address" : "Exact text"
+        setAccessibilityLabel("\(kindLabel): \(label)")
     }
 
     required init(coder: NSCoder) { fatalError("Task composer chip cells are not archived") }
@@ -606,22 +657,27 @@ final class TaskComposerTextView: NSTextView {
 
 private struct TaskComposerReferencePopover: View {
     let reference: TaskComposerReference
+    let onReplace: (TaskComposerReference) -> Void
     let onRemove: () -> Void
     @State private var showQuickLook = false
     @State private var localDetails: String?
     @State private var previewUnavailable = false
+    @State private var replacementValue = ""
+    @State private var replacementError: String?
 
-    private var fileURL: URL? {
-        guard reference.kind != .url else { return nil }
+    private var localURL: URL? {
+        guard reference.kind == .file || reference.kind == .folder else { return nil }
         return URL(fileURLWithPath: reference.value)
     }
+
+    private var fileURL: URL? { reference.kind == .file ? localURL : nil }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                Image(systemName: reference.kind == .url ? "link" : reference.kind == .folder ? "folder" : "doc")
+            Image(systemName: reference.kind == .url ? "link" : reference.kind == .folder ? "folder" : reference.kind == .text ? "text.quote" : "doc")
                     .foregroundStyle(.tint)
-                Text(reference.kind == .url ? "Web address" : reference.kind == .folder ? "Folder reference" : "File reference")
+                Text(reference.kind == .url ? "Web address" : reference.kind == .folder ? "Folder reference" : reference.kind == .text ? "Exact text" : "File reference")
                     .font(.headline)
                 Spacer()
                 Button("Remove", role: .destructive, action: onRemove)
@@ -638,6 +694,26 @@ private struct TaskComposerReferencePopover: View {
             if previewUnavailable {
                 Text("This reference is currently unavailable.").font(.caption).foregroundStyle(.secondary)
             }
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Replace exact input")
+                    .font(.caption.weight(.semibold))
+                TextField("New exact value", text: $replacementValue, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .lineLimit(1...3)
+                    .accessibilityLabel("Replacement exact input")
+                HStack {
+                    if reference.kind == .file || reference.kind == .folder {
+                        Button("Choose…", action: chooseLocalReference)
+                    }
+                    Spacer()
+                    Button("Replace", action: applyReplacement)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(replacementValue.isEmpty)
+                }
+                if let replacementError {
+                    Text(replacementError).font(.caption).foregroundStyle(.red)
+                }
+            }
             if reference.kind == .file, !previewUnavailable {
                 Button(showQuickLook ? "Hide Quick Look" : "Quick Look") { showQuickLook.toggle() }
                     .buttonStyle(.bordered)
@@ -647,19 +723,51 @@ private struct TaskComposerReferencePopover: View {
             }
         }
         .padding(14)
-        .frame(width: 330, alignment: .leading)
+        .frame(width: 360, alignment: .leading)
         .task(id: reference.id) { await inspectLocalReference() }
+        .onAppear { replacementValue = reference.value }
+    }
+
+    private func chooseLocalReference() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = reference.kind == .file
+        panel.canChooseDirectories = reference.kind == .folder
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            replacementValue = url.path
+        }
+    }
+
+    private func applyReplacement() {
+        guard !replacementValue.isEmpty else { return }
+        if reference.kind == .url {
+            guard let components = URLComponents(string: replacementValue),
+                  ["http", "https"].contains(components.scheme?.lowercased() ?? ""),
+                  components.host != nil else {
+                replacementError = "Enter a complete HTTP or HTTPS address."
+                return
+            }
+        }
+        if reference.kind == .file || reference.kind == .folder {
+            guard replacementValue.hasPrefix("/") else {
+                replacementError = "Enter an absolute local path."
+                return
+            }
+        }
+        onReplace(TaskComposerReference(id: reference.id, kind: reference.kind, value: replacementValue))
     }
 
     @MainActor
     private func inspectLocalReference() async {
-        guard let fileURL else { return }
-        let path = fileURL.path
+        guard let localURL else { return }
+        let path = localURL.path
         let detail = await Task.detached(priority: .utility) { () -> (String?, Bool) in
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else { return (nil, true) }
             guard FileManager.default.isReadableFile(atPath: path) else { return (nil, true) }
-            let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey, .isDirectoryKey])
+            let values = try? localURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey, .isDirectoryKey])
             if isDirectory.boolValue || values?.isDirectory == true {
                 let modified = values?.contentModificationDate.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .short) }
                 return (modified.map { "Folder · modified \($0)" } ?? "Folder exists and is readable", false)

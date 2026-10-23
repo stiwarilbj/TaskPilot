@@ -4,6 +4,12 @@ enum AgentTaskInputKind: String, Codable, Equatable {
     case file
     case folder
     case url
+    /// Exact literal data that is not a verified local file, folder, or URL.
+    case text
+}
+
+enum AgentTaskInputReferenceProtocol {
+    static let version = 2
 }
 
 /// An exact occurrence in the submitted UTF-8 request. Offsets are measured
@@ -15,7 +21,8 @@ struct AgentTaskInputReference: Codable, Equatable, Identifiable {
     let utf8Length: Int
     let value: String
 
-    init(version: Int = 1, kind: AgentTaskInputKind, utf8Start: Int, utf8Length: Int, value: String) {
+    init(version: Int = AgentTaskInputReferenceProtocol.version,
+         kind: AgentTaskInputKind, utf8Start: Int, utf8Length: Int, value: String) {
         self.version = version
         self.kind = kind
         self.utf8Start = utf8Start
@@ -64,5 +71,55 @@ struct AgentTaskSubmission: Codable, Equatable {
                                     utf8Length: $0.utf8Length, value: $0.value)
         }
         return AgentTaskSubmission(request: trimmed, exactInputReferences: adjusted)
+    }
+
+    func validateExactInputReferences() throws {
+        guard exactInputReferences.count <= 128 else {
+            throw AgentTaskSubmissionError.tooManyReferences
+        }
+        let bytes = Array(request.utf8)
+        var previousEnd = 0
+        for (index, reference) in exactInputReferences.enumerated() {
+            guard reference.version == 1 || reference.version == 2 else {
+                throw AgentTaskSubmissionError.invalidReference(index)
+            }
+            guard reference.version == 2 || reference.kind != .text,
+                  reference.utf8Start >= previousEnd,
+                  reference.utf8Length > 0,
+                  reference.utf8Start <= bytes.count,
+                  reference.utf8Length <= bytes.count - reference.utf8Start else {
+                throw AgentTaskSubmissionError.invalidReference(index)
+            }
+            let end = reference.utf8Start + reference.utf8Length
+            guard let value = String(bytes: bytes[reference.utf8Start..<end], encoding: .utf8),
+                  value == reference.value, !value.isEmpty else {
+                throw AgentTaskSubmissionError.invalidReference(index)
+            }
+            switch reference.kind {
+            case .file, .folder:
+                guard value.hasPrefix("/") else { throw AgentTaskSubmissionError.invalidReference(index) }
+            case .url:
+                guard let components = URLComponents(string: value),
+                      ["http", "https"].contains(components.scheme?.lowercased() ?? ""),
+                      components.host != nil else { throw AgentTaskSubmissionError.invalidReference(index) }
+            case .text:
+                break
+            }
+            previousEnd = end
+        }
+    }
+}
+
+enum AgentTaskSubmissionError: LocalizedError {
+    case tooManyReferences
+    case invalidReference(Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .tooManyReferences:
+            "This request contains more than 128 exact inputs. Remove a few and try again."
+        case .invalidReference(let index):
+            "Exact input \(index + 1) no longer matches its text. Review the request and try again."
+        }
     }
 }

@@ -83,6 +83,9 @@ struct TaskPilotMainView: View {
         .onAppear {
             if model.isReady { promptFocused = true }
         }
+        .onChange(of: model.remixSession?.id) { _, remixID in
+            if remixID != nil { promptFocused = true }
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await model.refreshReadiness() }
         }
@@ -279,6 +282,26 @@ struct TaskPilotMainView: View {
 
     private var taskComposer: some View {
         VStack(alignment: .leading, spacing: 9) {
+            if let remix = model.remixSession {
+                HStack(alignment: .top, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Label("Remixing previous request", systemImage: "slider.horizontal.3")
+                            .font(.caption.weight(.semibold))
+                        Text(remix.sourceRequest)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 8)
+                    Button("Cancel Remix") { model.cancelHistoryRemix() }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel("Cancel Remix and restore the previous draft")
+                }
+                .padding(10)
+                .background(accent.opacity(0.09), in: RoundedRectangle(cornerRadius: 10))
+                .accessibilityIdentifier("task-remix-banner")
+            }
+
             Text("What should the agent do?")
                 .font(.headline)
 
@@ -306,6 +329,17 @@ struct TaskPilotMainView: View {
             .overlay {
                 RoundedRectangle(cornerRadius: 13)
                     .stroke(theme.borderColor, lineWidth: 1)
+            }
+
+            if let review = model.remixReview {
+                TaskRemixReviewView(review: review, surface: theme.surfaceColor, border: theme.borderColor)
+            }
+            if let error = model.requestSubmissionError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("request-submission-error")
             }
         }
     }

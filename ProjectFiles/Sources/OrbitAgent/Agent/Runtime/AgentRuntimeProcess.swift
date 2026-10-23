@@ -251,7 +251,7 @@ final class AgentRuntimeProcess {
                 "action_contract_version": ActionContract.version,
                 "task_generation_id": lease.id,
                 "task_protocol_version": ActionContract.taskProtocolVersion,
-                "exact_input_reference_version": 1,
+                "exact_input_reference_version": AgentTaskInputReferenceProtocol.version,
                 "exact_input_references": exactInputReferences.map(\.wireValue),
                 "coordinate_mapping_version": ScreenCoordinateMapping.version,
                 "observation_completeness_version": ObservationCollection<Int>.version,

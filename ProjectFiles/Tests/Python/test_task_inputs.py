@@ -39,6 +39,15 @@ def requirement(task, check):
 
 
 class TaskInputTests(unittest.TestCase):
+    def test_remix_literal_fixture_matches_task_input_binding(self):
+        fixture_path = Path(__file__).resolve().parents[1] / 'Fixtures' / 'remix-input-cases.json'
+        fixture = json.loads(fixture_path.read_text(encoding='utf-8'))
+        self.assertEqual(fixture['version'], 1)
+        for case in fixture['cases']:
+            with self.subTest(case=case['id']):
+                values = [entry.value for entry in TaskInputBindings(case['request']).entries]
+                self.assertEqual(values, case['values'])
+
     def test_explicit_utf8_ranges_bind_exact_chip_values_and_keep_occurrences(self):
         path = "/fixture/café budget.xlsx"
         url = "https://example.invalid/a%20b?q=one&x=%24HOME"
@@ -66,6 +75,27 @@ class TaskInputTests(unittest.TestCase):
                 self.assertEqual(task[start:end], entry.value)
         self.assertIn("%20", inputs.entries[1].value)
         self.assertIn("%24HOME", inputs.entries[1].value)
+
+    def test_version_two_text_references_bind_as_exact_literals(self):
+        value = "Résumé — exact text: $HOME\nsecond line"
+        task = "Type " + value + " into the selected field"
+        start = len("Type ".encode("utf-8"))
+        reference = {"version": EXACT_INPUT_REFERENCE_VERSION, "kind": "text",
+                     "utf8_start": start, "utf8_length": len(value.encode("utf-8")), "value": value}
+        inputs = TaskInputBindings(task, scope=SCOPE, exact_input_references=[reference])
+        self.assertEqual(inputs.entries[0].value, value)
+        self.assertEqual(inputs.entries[0].kind, "text")
+        self.assertEqual(inputs.entries[0].sources, ((start, start + len(value)),))
+        self.assertEqual(inputs.exact_references, (("text", start, len(value.encode("utf-8")), value),))
+
+    def test_version_one_file_references_remain_compatible_but_text_requires_version_two(self):
+        value = "/fixture/report.pdf"
+        task = "Open " + value
+        reference = {"version": 1, "kind": "file", "utf8_start": 5,
+                     "utf8_length": len(value.encode()), "value": value}
+        self.assertEqual(TaskInputBindings(task, exact_input_references=[reference]).entries[0].value, value)
+        with self.assertRaisesRegex(InputReferenceError, "must be file, folder, url, or text"):
+            TaskInputBindings(task, exact_input_references=[dict(reference, kind="text")])
 
     def test_explicit_ranges_reject_mismatch_utf8_splits_overlap_and_bad_urls(self):
         task = "Open /fixture/café.txt"

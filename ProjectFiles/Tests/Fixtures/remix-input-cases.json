@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "quoted-filename-path-and-url",
+      "request": "Summarize “Budget.xlsx” beside /tmp/Reports, then open <https://example.test/a%20b?q=%24HOME>.",
+      "values": ["Budget.xlsx", "/tmp/Reports", "https://example.test/a%20b?q=%24HOME"]
+    },
+    {
+      "id": "multiline-text-and-sentence-filename",
+      "request": "Type ``  First line\nRésumé 🙂  `` exactly then save as final.v2.txt!",
+      "values": ["  First line\nRésumé 🙂  ", "final.v2.txt"]
+    },
+    {
+      "id": "relative-paths",
+      "request": "Copy ./exports/final.csv into ../archive/results.json",
+      "values": ["./exports/final.csv", "../archive/results.json"]
+    },
+    {
+      "id": "apostrophe-path-fragment-is-ambiguous",
+      "request": "Don't replace /tmp/O'Brien-draft.pdf; use /tmp/final.pdf",
+      "values": ["/tmp/final.pdf"]
+    },
+    {
+      "id": "ambiguous-button-description-stays-prose",
+      "request": "Click the first Save button rather than the other Save button",
+      "values": []
+    }
+  ]
+}

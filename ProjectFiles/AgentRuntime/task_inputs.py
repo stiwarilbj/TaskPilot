@@ -17,13 +17,14 @@ import uuid
 from action_contract_generated import CONTRACT
 
 TASK_INPUT_VERSION = 3
-EXACT_INPUT_REFERENCE_VERSION = 1
+EXACT_INPUT_REFERENCE_VERSION = 2
+LEGACY_EXACT_INPUT_REFERENCE_VERSION = 1
 MAX_INPUTS = 128
 PREVIEW_LENGTH = 160
 REFERENCE_PATTERN = re.compile(r"\binput_[0-9a-f]{16}_[1-9][0-9]*\b")
 FENCE_START = re.compile(r"(?m)^[ \t]*(`{3,}|~{3,})[^\r\n]*\r?\n")
 BARE_RESOURCE = re.compile(r'''(?<![\w/])(?:https?://|~/|/|\.\./|\./)[^\s"'`<>]+''')
-BARE_FILENAME = re.compile(r'''(?<!\S)(?:\.?[\w-]+\.)+[\w-]+(?=\s|$)''')
+BARE_FILENAME = re.compile(r'''(?<!\S)(?:\.?[\w-]+\.)+[\w-]+(?=\s|$|[.,;:!?])''')
 EXPLICIT_TEXT = (
     re.compile(r"\s*(?:type|enter|paste|print literal text)[ \t](?P<text>[^\r\n]+)", re.I),
     re.compile(r"\s*(?:create|write|append)\b[^\r\n]*?\b(?:saying|containing|with (?:the )?text)[ \t](?P<text>[^\r\n]+)", re.I),
@@ -105,10 +106,13 @@ def literal_spans(task: str) -> list[tuple[int, int]]:
         for match in pattern.finditer(task):
             if any(match.start() < end and match.end() > start for start, end in covered + spans): continue
             value = match[0]
+            if pattern is BARE_RESOURCE and not value.startswith(("http://", "https://")):
+                value = value.rstrip(",")
+                if not value: continue
             if match.end() < len(task) and task[match.end()] in "\"'`“”‘’": continue
             if value.endswith((".", ",", ";", ":", "!", "?")) or any(c in value for c in "()[]{}|;"):
                 continue
-            spans.append(match.span())
+            spans.append((match.start(), match.start() + len(value)))
     return sorted(spans)
 
 
@@ -146,12 +150,17 @@ class TaskInputBindings:
                 field = f"exact_input_references[{index}]"
                 if type(reference) is not dict or set(reference) != {"version", "kind", "utf8_start", "utf8_length", "value"}:
                     fail(field, "must contain version, kind, utf8_start, utf8_length, and value")
-                if type(reference["version"]) is not int or reference["version"] != EXACT_INPUT_REFERENCE_VERSION:
+                if type(reference["version"]) is not int or reference["version"] not in {
+                    LEGACY_EXACT_INPUT_REFERENCE_VERSION, EXACT_INPUT_REFERENCE_VERSION
+                }:
                     fail(field + ".version", "does not match the exact-input reference protocol")
                 kind = reference["kind"]
                 start, length, value = reference["utf8_start"], reference["utf8_length"], reference["value"]
-                if not isinstance(kind, str) or kind not in {"file", "folder", "url"}:
-                    fail(field + ".kind", "must be file, folder, or url")
+                allowed_kinds = {"file", "folder", "url"}
+                if reference["version"] == EXACT_INPUT_REFERENCE_VERSION:
+                    allowed_kinds.add("text")
+                if not isinstance(kind, str) or kind not in allowed_kinds:
+                    fail(field + ".kind", "must be file, folder, url, or text for version 2")
                 if type(start) is not int or start < 0:
                     fail(field + ".utf8_start", "must be a nonnegative integer")
                 if type(length) is not int or length <= 0:
@@ -176,7 +185,7 @@ class TaskInputBindings:
                     parsed = urlsplit(value)
                     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
                         fail(field + ".value", "must be an absolute HTTP(S) URL")
-                elif not value.startswith("/"):
+                elif kind in {"file", "folder"} and not value.startswith("/"):
                     fail(field + ".value", "must be an absolute local path")
                 explicit_spans.append((codepoint_start, codepoint_end))
                 exact_occurrences.append((kind, start, length, value))

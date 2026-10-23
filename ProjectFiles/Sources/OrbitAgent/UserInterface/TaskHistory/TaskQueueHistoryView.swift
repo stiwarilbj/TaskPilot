@@ -3,6 +3,7 @@ import SwiftUI
 struct TaskQueueHistoryView: View {
     @ObservedObject var model: TaskPilotCoordinator
     @Environment(\.dismissWindow) private var dismissWindow
+    @Environment(\.openWindow) private var openWindow
     @State private var confirmingClearQueue = false
     @State private var confirmingClearHistory = false
 
@@ -75,6 +76,27 @@ struct TaskQueueHistoryView: View {
             Button("Cancel", role: .cancel) { }
         } message: {
             Text("This permanently removes all saved requests and responses.")
+        }
+        .confirmationDialog(
+            "A Remix is already in progress",
+            isPresented: Binding(
+                get: { model.pendingRemixHistoryEntryID != nil },
+                set: { if !$0 { model.continueCurrentRemix() } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Continue Editing") {
+                model.continueCurrentRemix()
+                openWindow(id: "controller")
+            }
+            Button("Discard Remix and Load Selected", role: .destructive) {
+                if model.discardRemixAndLoadPendingHistoryEntry() {
+                    openWindow(id: "controller")
+                }
+            }
+            Button("Cancel", role: .cancel) { model.continueCurrentRemix() }
+        } message: {
+            Text("You can keep editing the current request, or replace it with this history request. Your original composer draft will be restored when Remix ends.")
         }
     }
 
@@ -361,6 +383,15 @@ struct TaskQueueHistoryView: View {
                     )
                 }
                 .buttonStyle(.borderedProminent)
+
+                Button {
+                    if model.beginHistoryRemix(id: entry.id) {
+                        openWindow(id: "controller")
+                    }
+                } label: {
+                    Label("Remix", systemImage: "slider.horizontal.3")
+                }
+                .help("Open this request in the task composer with editable exact inputs")
 
                 Spacer()
 
