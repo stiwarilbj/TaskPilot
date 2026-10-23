@@ -313,10 +313,12 @@ def validate_metadata(value: dict, purpose: str, ledger: TaskEvidenceLedger | No
 
 
 class TaskEvidenceLedger:
-    def __init__(self, task: str, generation: str | None = None, *, input_scope: str | None = None) -> None:
+    def __init__(self, task: str, generation: str | None = None, *, input_scope: str | None = None,
+                 exact_input_references: list[dict] | None = None) -> None:
         self._state = RevisionedJSONState()
         self.task, self.generation = task, generation
-        self.inputs = TaskInputBindings(task, scope=input_scope)
+        self.inputs = TaskInputBindings(task, scope=input_scope,
+                                        exact_input_references=exact_input_references)
         self.requirements: dict[str, dict] = {}
         self.evidence: dict[str, dict] = {}
         self.coverage_complete = False

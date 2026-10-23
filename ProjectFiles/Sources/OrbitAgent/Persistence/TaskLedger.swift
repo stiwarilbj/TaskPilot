@@ -45,15 +45,18 @@ struct AgentRequestMetrics: Codable, Equatable {
 struct QueuedAgentTask: Codable, Equatable, Identifiable {
     let id: UUID
     let request: String
+    let exactInputReferences: [AgentTaskInputReference]?
     let queuedAt: Date
 
     init(
         id: UUID = UUID(),
         request: String,
+        exactInputReferences: [AgentTaskInputReference] = [],
         queuedAt: Date = Date()
     ) {
         self.id = id
         self.request = request
+        self.exactInputReferences = exactInputReferences.isEmpty ? nil : exactInputReferences
         self.queuedAt = queuedAt
     }
 }
@@ -75,6 +78,7 @@ enum AgentTaskHistoryOutcome: String, Codable, Equatable {
 struct AgentTaskHistoryEntry: Codable, Equatable, Identifiable {
     let id: UUID
     let request: String
+    let exactInputReferences: [AgentTaskInputReference]?
     let responseTitle: String
     let response: String
     let outcome: AgentTaskHistoryOutcome
@@ -86,6 +90,7 @@ struct AgentTaskHistoryEntry: Codable, Equatable, Identifiable {
     init(
         id: UUID = UUID(),
         request: String,
+        exactInputReferences: [AgentTaskInputReference] = [],
         responseTitle: String,
         response: String,
         outcome: AgentTaskHistoryOutcome,
@@ -96,6 +101,7 @@ struct AgentTaskHistoryEntry: Codable, Equatable, Identifiable {
     ) {
         self.id = id
         self.request = request
+        self.exactInputReferences = exactInputReferences.isEmpty ? nil : exactInputReferences
         self.responseTitle = responseTitle
         self.response = response
         self.outcome = outcome
@@ -111,6 +117,7 @@ struct AgentTaskHistoryEntry: Codable, Equatable, Identifiable {
 struct AgentTaskAuthorization: Codable, Equatable {
     var id = UUID()
     let request: String
+    var exactInputReferences: [AgentTaskInputReference]? = nil
     var startedAt = Date()
     let wasQueued: Bool
     var queuedTaskID: UUID? = nil
@@ -132,6 +139,7 @@ struct AgentTaskLedgerSnapshot: Codable, Equatable {
             : "TaskPilot restarted before this task finished. Saved receipt states do not prove task completion. Nothing was automatically replayed."
         if !history.contains(where: { $0.id == activeTask.id }) {
             history.append(AgentTaskHistoryEntry(id: activeTask.id, request: activeTask.request,
+                exactInputReferences: activeTask.exactInputReferences ?? [],
                 responseTitle: "Task interrupted", response: message, outcome: .stopped,
                 startedAt: activeTask.startedAt, wasQueued: activeTask.wasQueued))
         }

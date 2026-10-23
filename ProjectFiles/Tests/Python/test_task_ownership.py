@@ -66,13 +66,14 @@ class TaskOwnershipTests(unittest.TestCase):
             self.assertEqual(runtime.wait_for_user_input('same'), 'current')
 
     def test_startup_requires_valid_generation_only_for_tasks_and_clears_old_state(self):
-        config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=CONTRACT_HASH, action_contract_version=CONTRACT_VERSION, task_protocol_version=TASK_PROTOCOL_VERSION, coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION, observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION, text_recognition_version=runtime.TEXT_RECOGNITION_VERSION, evidence_consistency_version=runtime.EVIDENCE_CONSISTENCY_VERSION, command_capability_version=runtime.COMMAND_CAPABILITY_VERSION)
+        config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=CONTRACT_HASH, action_contract_version=CONTRACT_VERSION, task_protocol_version=TASK_PROTOCOL_VERSION, coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION, observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION, text_recognition_version=runtime.TEXT_RECOGNITION_VERSION, evidence_consistency_version=runtime.EVIDENCE_CONSISTENCY_VERSION, command_capability_version=runtime.COMMAND_CAPABILITY_VERSION, exact_input_reference_version=runtime.EXACT_INPUT_REFERENCE_VERSION, exact_input_references=[])
         for invalid in [None, '', 'old', True, 7]:
             with self.subTest(invalid=invalid), mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(dict(config, task_generation_id=invalid)))):
                 with self.assertRaisesRegex(RuntimeError, 'generation ID'): runtime.read_runtime_configuration(require_generation=True)
         with mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(dict(config, task_generation_id=self.generation)))):
             runtime.read_runtime_configuration(require_generation=True)
         self.assertEqual(runtime._task_generation_id, self.generation)
+        self.assertEqual(runtime._exact_input_references, [])
         for invalid in [None, True, '1', 0]:
             with self.subTest(protocol=invalid), mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(dict(config, task_generation_id=self.generation, task_protocol_version=invalid)))):
                 with self.assertRaisesRegex(RuntimeError, 'protocol does not match'): runtime.read_runtime_configuration(require_generation=True)
@@ -80,3 +81,24 @@ class TaskOwnershipTests(unittest.TestCase):
         with mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(config))): runtime.read_runtime_configuration()
         self.assertIsNone(runtime._task_generation_id)
         self.assertIsNone(runtime._bridge_observation_revision)
+        self.assertEqual(runtime._exact_input_references, [])
+
+    def test_startup_requires_versioned_bounded_reference_metadata(self):
+        config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=CONTRACT_HASH,
+            action_contract_version=CONTRACT_VERSION, task_protocol_version=TASK_PROTOCOL_VERSION,
+            task_generation_id=self.generation, coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION,
+            observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION,
+            text_recognition_version=runtime.TEXT_RECOGNITION_VERSION,
+            evidence_consistency_version=runtime.EVIDENCE_CONSISTENCY_VERSION,
+            command_capability_version=runtime.COMMAND_CAPABILITY_VERSION,
+            exact_input_reference_version=runtime.EXACT_INPUT_REFERENCE_VERSION, exact_input_references=[])
+        for version in [None, True, 0, runtime.EXACT_INPUT_REFERENCE_VERSION + 1]:
+            with self.subTest(version=version), mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(
+                    dict(config, exact_input_reference_version=version)))):
+                with self.assertRaisesRegex(RuntimeError, 'exact-input reference versions'):
+                    runtime.read_runtime_configuration(require_generation=True)
+        for references in [None, {}, [None] * 129]:
+            with self.subTest(references=type(references).__name__), mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(
+                    dict(config, exact_input_references=references)))):
+                with self.assertRaisesRegex(RuntimeError, 'invalid exact-input reference metadata'):
+                    runtime.read_runtime_configuration(require_generation=True)

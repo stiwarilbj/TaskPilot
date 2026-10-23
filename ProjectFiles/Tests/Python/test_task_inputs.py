@@ -12,7 +12,8 @@ from evidence_fixtures import native_result
 import openclaw_runtime as runtime
 from evidence_fixtures import VerificationSessions
 import prompt_compiler
-from task_inputs import TaskInputBindings, InputReferenceError, MAX_INPUTS, TASK_INPUT_VERSION
+from task_inputs import (TaskInputBindings, InputReferenceError, MAX_INPUTS, TASK_INPUT_VERSION,
+                         EXACT_INPUT_REFERENCE_VERSION)
 from task_evidence import TaskEvidenceLedger
 from response_validation import ResponseValidationError, validate_response
 
@@ -38,6 +39,72 @@ def requirement(task, check):
 
 
 class TaskInputTests(unittest.TestCase):
+    def test_explicit_utf8_ranges_bind_exact_chip_values_and_keep_occurrences(self):
+        path = "/fixture/café budget.xlsx"
+        url = "https://example.invalid/a%20b?q=one&x=%24HOME"
+        task = "Summarize " + path + " beside " + path + " then visit " + url
+        encoded = task.encode("utf-8")
+        path_ranges = []
+        cursor = 0
+        while (start := encoded.find(path.encode("utf-8"), cursor)) >= 0:
+            path_ranges.append(start); cursor = start + 1
+        url_start = encoded.index(url.encode("utf-8"))
+        references = [
+            {"version": EXACT_INPUT_REFERENCE_VERSION, "kind": "file", "utf8_start": path_ranges[0],
+             "utf8_length": len(path.encode("utf-8")), "value": path},
+            {"version": EXACT_INPUT_REFERENCE_VERSION, "kind": "file", "utf8_start": path_ranges[1],
+             "utf8_length": len(path.encode("utf-8")), "value": path},
+            {"version": EXACT_INPUT_REFERENCE_VERSION, "kind": "url", "utf8_start": url_start,
+             "utf8_length": len(url.encode("utf-8")), "value": url},
+        ]
+        inputs = TaskInputBindings(task, scope=SCOPE, exact_input_references=references)
+        self.assertEqual([entry.value for entry in inputs.entries], [path, url])
+        self.assertEqual(len(inputs.entries[0].sources), 2)
+        self.assertEqual(len(inputs.entries[1].sources), 1)
+        for entry in inputs.entries:
+            for start, end in entry.sources:
+                self.assertEqual(task[start:end], entry.value)
+        self.assertIn("%20", inputs.entries[1].value)
+        self.assertIn("%24HOME", inputs.entries[1].value)
+
+    def test_explicit_ranges_reject_mismatch_utf8_splits_overlap_and_bad_urls(self):
+        task = "Open /fixture/café.txt"
+        byte_start = len("Open ".encode())
+        value = "/fixture/café.txt"
+        valid = {"version": 1, "kind": "file", "utf8_start": byte_start,
+                 "utf8_length": len(value.encode()), "value": value}
+        cases = [
+            (dict(valid, value="other.txt"), "exactly match"),
+            (dict(valid, utf8_start=task.encode().index("é".encode()) + 1, utf8_length=1,
+                  value="x"), "UTF-8 character boundaries"),
+            (dict(valid, utf8_start=byte_start + len("/fixture/".encode()),
+                  utf8_length=len("café.txt".encode()), value="café.txt"), "absolute local path"),
+            (dict(valid, version=True), "reference protocol"),
+            (dict(valid, utf8_length=True), "positive integer"),
+            ({"version": 1, "kind": "url", "utf8_start": 0, "utf8_length": 4, "value": "Open"}, r"HTTP\(S\)"),
+        ]
+        for reference, error in cases:
+            with self.subTest(reference=reference), self.assertRaisesRegex(InputReferenceError, error):
+                TaskInputBindings(task, exact_input_references=[reference])
+        path = "/tmp/one"
+        request = path + " and " + path
+        start = request.index(path)
+        refs = [dict(version=1, kind="file", utf8_start=start, utf8_length=len(path), value=path),
+                dict(version=1, kind="file", utf8_start=start + 1, utf8_length=len(path), value=path)]
+        with self.assertRaisesRegex(InputReferenceError, "non-overlapping"):
+            TaskInputBindings(request, exact_input_references=refs)
+
+    def test_explicit_references_are_prioritized_before_automatically_found_literals(self):
+        values = [f"/fixture/{index}.txt" for index in range(MAX_INPUTS + 3)]
+        task = " ".join(values)
+        selected = values[-1]
+        start = len(" ".join(values[:-1]).encode()) + 1
+        refs = [{"version": 1, "kind": "file", "utf8_start": start,
+                 "utf8_length": len(selected), "value": selected}]
+        inputs = TaskInputBindings(task, exact_input_references=refs, scope=SCOPE)
+        self.assertEqual(len(inputs.entries), MAX_INPUTS)
+        self.assertEqual(inputs.entries[0].value, selected)
+
     def test_literal_bytes_sources_and_kinds_are_preserved(self):
         inputs = TaskInputBindings(TASK, scope=SCOPE)
         self.assertEqual([e.value for e in inputs.entries], [PATH, TEXT, URL])

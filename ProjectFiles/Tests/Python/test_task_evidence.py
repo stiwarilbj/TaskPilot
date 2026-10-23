@@ -264,8 +264,8 @@ class EvidenceTaskLoopTests(unittest.TestCase):
         files = dict(initial_files or {}); self.actions = []; self.events = []; self.ledgers = []
         temporary = tempfile.TemporaryDirectory(); self.addCleanup(temporary.cleanup)
         revision = 0
-        def create(*args):
-            ledger = TaskEvidenceLedger(*args); self.ledgers.append(ledger); return ledger
+        def create(*args, **kwargs):
+            ledger = TaskEvidenceLedger(*args, **kwargs); self.ledgers.append(ledger); return ledger
         def bridge(method, _display, **params):
             nonlocal revision
             if method == 'observe':

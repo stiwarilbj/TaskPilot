@@ -68,7 +68,7 @@ from local_text_recognition import (TEXT_RECOGNITION_VERSION, TextRecognitionErr
 from task_evidence import (TaskEvidenceLedger, RevisionedJSONState, CHECKLIST_VERSION,
                            LARGEST_PATTERN, digest as evidence_digest)
 from expected_effects import ExpectedEffect, EXPECTED_EFFECT_VERSION, FILE_EFFECTS, path_key
-from task_inputs import TASK_INPUT_VERSION, input_reference_rules
+from task_inputs import EXACT_INPUT_REFERENCE_VERSION, TASK_INPUT_VERSION, input_reference_rules
 from command_intents import explicit_operation
 from evidence_consistency import EvidenceConsistency, EVIDENCE_CONSISTENCY_VERSION
 from recovery_cycles import RecoveryCycles, RECOVERY_CYCLE_VERSION
@@ -104,6 +104,7 @@ _active_acp_process: subprocess.Popen[str] | None = None
 _bridge_observation_revision: str | None = None
 _task_generation_id: str | None = None
 _observation_keywords: list[str] = []
+_exact_input_references: list[dict[str, Any]] = []
 _runtime_inbox: RuntimeInbox | None = None
 _receipt_metrics = {"receipt_queries": 0, "receipt_recoveries": 0, "receipt_unresolved": 0}
 _local_change_metrics = {"local_notifications": 0, "local_targeted_checks": 0, "local_poll_wakeups": 0}
@@ -3039,7 +3040,8 @@ def routed_json_prompt(
 def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str) -> None:
     if current_task.get() is not None:
         raise ExecutionStateError("A task already owns this execution context")
-    context = TaskContext(task, display_id, _task_value('generation'))
+    context = TaskContext(task, display_id, _task_value('generation'),
+                          exact_input_references=list(_exact_input_references))
     token = current_task.set(context)
     try:
         with screenshot_buffer_scope():
@@ -3069,7 +3071,8 @@ class TaskExecution:
     def run(self, openclaw_path: str | None, api_key: str) -> None:
         c = self.c
         try:
-            c.ledger = TaskEvidenceLedger(c.task, c.generation)
+            c.ledger = TaskEvidenceLedger(c.task, c.generation,
+                                          exact_input_references=c.exact_input_references)
             publish_task_progress(c.ledger, force=True)
             c.recovery = ActionRecovery()
             c.recovery_cycles = RecoveryCycles(rejection_limit=MAX_IDENTICAL_ACTIONS)
@@ -3515,10 +3518,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_runtime_configuration(require_generation: bool = False) -> str:
-    global _task_generation_id, _bridge_observation_revision, _observation_keywords
+    global _task_generation_id, _bridge_observation_revision, _observation_keywords, _exact_input_references
     _task_generation_id = None
     _bridge_observation_revision = None
     _observation_keywords = []
+    _exact_input_references = []
     raw_line = runtime_line()
     try:
         configuration = json.loads(raw_line)
@@ -3548,6 +3552,12 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
             raise RuntimeError("TaskPilot evidence inspection versions do not match; rebuild the bundled components together")
         if type(configuration.get('command_capability_version')) is not int or configuration['command_capability_version'] != COMMAND_CAPABILITY_VERSION:
             raise RuntimeError('TaskPilot command inspection versions do not match; rebuild the bundled components together')
+        if type(configuration.get("exact_input_reference_version")) is not int or configuration["exact_input_reference_version"] != EXACT_INPUT_REFERENCE_VERSION:
+            raise RuntimeError("TaskPilot exact-input reference versions do not match; rebuild the bundled components together")
+        references = configuration.get("exact_input_references")
+        if type(references) is not list or len(references) > 128:
+            raise RuntimeError("TaskPilot provided invalid exact-input reference metadata")
+        _exact_input_references = references
     api_key = configuration.get("gemini_api_key")
     if not isinstance(api_key, str):
         raise RuntimeError(f"{PRODUCT_NAME} did not provide the secure runtime configuration")

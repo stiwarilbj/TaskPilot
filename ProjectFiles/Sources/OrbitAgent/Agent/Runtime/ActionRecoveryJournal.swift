@@ -118,7 +118,7 @@ final class ActionRecoveryJournal: @unchecked Sendable {
     func register(_ authorization: AgentTaskAuthorization) throws {
         lock.lock(); defer { lock.unlock() }
         guard !failed else { throw Self.unavailable }
-        let fingerprint = digest(Data(authorization.request.utf8), domain: "authorization:\(authorization.id)")
+        let fingerprint = authorizationFingerprint(authorization)
         if let old = snapshot.authorizations.first(where: { $0.task == authorization.id }) {
             guard old.fingerprint == fingerprint, !old.closed else { throw Self.unavailable }
             return
@@ -133,8 +133,22 @@ final class ActionRecoveryJournal: @unchecked Sendable {
     func matches(_ authorization: AgentTaskAuthorization) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return !failed && snapshot.authorizations.contains {
-            $0.task == authorization.id && $0.fingerprint == digest(Data(authorization.request.utf8), domain: "authorization:\(authorization.id)")
+            $0.task == authorization.id && $0.fingerprint == authorizationFingerprint(authorization)
         }
+    }
+
+    private func authorizationFingerprint(_ authorization: AgentTaskAuthorization) -> String {
+        let references = authorization.exactInputReferences ?? []
+        guard !references.isEmpty else {
+            // Keep recovery authorization for pre-chip tasks compatible with
+            // their existing private journal entries.
+            return digest(Data(authorization.request.utf8), domain: "authorization:\(authorization.id)")
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let payload = (try? encoder.encode(AgentTaskSubmission(request: authorization.request,
+            exactInputReferences: references))) ?? Data()
+        return digest(payload, domain: "authorization-v2:\(authorization.id)")
     }
 
     func prepare(task: UUID, action: String, payload: Data) throws {

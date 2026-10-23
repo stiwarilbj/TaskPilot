@@ -12,7 +12,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "AgentRuntime"))
 import openclaw_runtime as runtime
 import task_evidence as evidence
-from task_inputs import TASK_INPUT_VERSION, TaskInputBindings
+from task_inputs import EXACT_INPUT_REFERENCE_VERSION, TASK_INPUT_VERSION, TaskInputBindings
 from test_verification_sessions import ACPFixture
 
 
@@ -100,7 +100,7 @@ class CanonicalStateTests(unittest.TestCase):
 
     def test_immutable_task_inputs_keep_the_existing_identity_and_encode_once(self):
         inputs = TaskInputBindings('Read file "/fixture/a.txt"', scope="0123456789abcdef")
-        expected = hashlib.sha256(json.dumps([TASK_INPUT_VERSION,
+        expected = hashlib.sha256(json.dumps([TASK_INPUT_VERSION, EXACT_INPUT_REFERENCE_VERSION, inputs.exact_references,
             [(e.identifier, e.value, e.sources) for e in inputs.entries], inputs.omitted], ensure_ascii=True).encode()).hexdigest()
         with mock.patch.object(evidence.json, "dumps", wraps=json.dumps) as encode, \
              mock.patch.object(evidence.hashlib, "sha256", wraps=hashlib.sha256) as digest:

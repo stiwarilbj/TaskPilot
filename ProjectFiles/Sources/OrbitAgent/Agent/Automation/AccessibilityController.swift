@@ -661,9 +661,10 @@ final class AccessibilityController {
             return result
         }
         let controls = try ObservationConsistency.controlSignature(elements: signatureRows, applications: signatureApps)
+        let destinationSignature = try ObservationConsistency.resultDestinationSignature(resultDestinations)
         let signature = String(decoding: try JSONSerialization.data(withJSONObject:
             ["controls": controls, "collection_gaps": collection.reasonCounts,
-             "result_destinations": resultDestinations], options: [.sortedKeys]), as: UTF8.self)
+             "result_destinations": destinationSignature], options: [.sortedKeys]), as: UTF8.self)
         let lease = TaskOwnership.current
         return StagedAccessibilitySnapshot(snapshot: snapshot, consistencySignature: signature, publish: { [self] in
             try TaskOwnership.$current.withValue(lease) {

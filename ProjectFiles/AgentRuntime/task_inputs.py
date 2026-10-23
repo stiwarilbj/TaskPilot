@@ -16,7 +16,8 @@ import uuid
 
 from action_contract_generated import CONTRACT
 
-TASK_INPUT_VERSION = 2
+TASK_INPUT_VERSION = 3
+EXACT_INPUT_REFERENCE_VERSION = 1
 MAX_INPUTS = 128
 PREVIEW_LENGTH = 160
 REFERENCE_PATTERN = re.compile(r"\binput_[0-9a-f]{16}_[1-9][0-9]*\b")
@@ -122,17 +123,68 @@ class TaskInput:
 @dataclass(frozen=True, init=False)
 class TaskInputBindings:
     entries: tuple[TaskInput, ...]
+    exact_references: tuple[tuple[str, int, int, str], ...]
     _by_id: MappingProxyType
     omitted: int
 
-    def __init__(self, task: str, *, scope: str | None = None):
+    def __init__(self, task: str, *, scope: str | None = None,
+                 exact_input_references: list[dict] | None = None):
         # The scope is an opaque binding namespace, not the native generation ID.
         # Offline fixtures inject a repeatable scope so recorded hashes replay.
         scope = scope if scope is not None else uuid.uuid4().hex[:16]
         if not re.fullmatch(r"[0-9a-f]{16}", scope): raise ValueError("Invalid task input namespace")
         unique: dict[str, list[tuple[int, int]]] = {}
+        exact_occurrences: list[tuple[str, int, int, str]] = []
         omitted = 0
+        explicit_spans: list[tuple[int, int]] = []
+        encoded_task = task.encode("utf-8")
+        if exact_input_references is not None:
+            if type(exact_input_references) is not list or len(exact_input_references) > MAX_INPUTS:
+                raise InputReferenceError("exact_input_references must be a list of at most 128 references")
+            previous_end = 0
+            for index, reference in enumerate(exact_input_references):
+                field = f"exact_input_references[{index}]"
+                if type(reference) is not dict or set(reference) != {"version", "kind", "utf8_start", "utf8_length", "value"}:
+                    fail(field, "must contain version, kind, utf8_start, utf8_length, and value")
+                if type(reference["version"]) is not int or reference["version"] != EXACT_INPUT_REFERENCE_VERSION:
+                    fail(field + ".version", "does not match the exact-input reference protocol")
+                kind = reference["kind"]
+                start, length, value = reference["utf8_start"], reference["utf8_length"], reference["value"]
+                if not isinstance(kind, str) or kind not in {"file", "folder", "url"}:
+                    fail(field + ".kind", "must be file, folder, or url")
+                if type(start) is not int or start < 0:
+                    fail(field + ".utf8_start", "must be a nonnegative integer")
+                if type(length) is not int or length <= 0:
+                    fail(field + ".utf8_length", "must be a positive integer")
+                if not isinstance(value, str) or not value:
+                    fail(field + ".value", "must be a nonempty string")
+                end = start + length
+                if start < previous_end or end > len(encoded_task):
+                    fail(field, "must be an in-bounds, non-overlapping UTF-8 range")
+                try:
+                    exact = encoded_task[start:end].decode("utf-8")
+                    # Both endpoints must be code point boundaries; decoding
+                    # the selected bytes alone rejects a split multibyte value.
+                    codepoint_start = len(encoded_task[:start].decode("utf-8"))
+                    codepoint_end = len(encoded_task[:end].decode("utf-8"))
+                except UnicodeDecodeError as error:
+                    raise InputReferenceError(f"{field} must use UTF-8 character boundaries") from error
+                if exact != value:
+                    fail(field + ".value", "must exactly match the submitted request range")
+                if kind == "url":
+                    from urllib.parse import urlsplit
+                    parsed = urlsplit(value)
+                    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+                        fail(field + ".value", "must be an absolute HTTP(S) URL")
+                elif not value.startswith("/"):
+                    fail(field + ".value", "must be an absolute local path")
+                explicit_spans.append((codepoint_start, codepoint_end))
+                exact_occurrences.append((kind, start, length, value))
+                unique.setdefault(value, []).append((codepoint_start, codepoint_end))
+                previous_end = end
         for start, end in literal_spans(task):
+            if any(start < right and end > left for left, right in explicit_spans):
+                continue
             value = task[start:end]
             if value not in unique and len(unique) >= MAX_INPUTS:
                 omitted += 1
@@ -141,6 +193,7 @@ class TaskInputBindings:
         entries = tuple(TaskInput(f"input_{scope}_{index}", value, literal_kind(value), tuple(sources))
                         for index, (value, sources) in enumerate(unique.items(), 1))
         object.__setattr__(self, "entries", entries)
+        object.__setattr__(self, "exact_references", tuple(exact_occurrences))
         object.__setattr__(self, "_by_id", MappingProxyType({entry.identifier: entry for entry in entries}))
         object.__setattr__(self, "omitted", omitted)
 
@@ -156,7 +209,8 @@ class TaskInputBindings:
 
     @cached_property
     def _canonical(self) -> str:
-        return json.dumps([TASK_INPUT_VERSION, [(e.identifier, e.value, e.sources) for e in self.entries],
+        return json.dumps([TASK_INPUT_VERSION, EXACT_INPUT_REFERENCE_VERSION, self.exact_references,
+                           [(e.identifier, e.value, e.sources) for e in self.entries],
                            self.omitted], ensure_ascii=True)
 
     @cached_property

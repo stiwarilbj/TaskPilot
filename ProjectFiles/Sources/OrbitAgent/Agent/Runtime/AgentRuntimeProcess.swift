@@ -162,6 +162,7 @@ final class AgentRuntimeProcess {
         runtimeURL: URL,
         openClawURL: URL,
         geminiAPIKey: String,
+        exactInputReferences: [AgentTaskInputReference] = [],
         lease: TaskLease = TaskLease()
     ) throws {
         guard ioQueue.sync(execute: { invocation == nil || invocation?.lease.state == .retired }) else { throw RuntimeProcessError.alreadyRunning }
@@ -250,6 +251,8 @@ final class AgentRuntimeProcess {
                 "action_contract_version": ActionContract.version,
                 "task_generation_id": lease.id,
                 "task_protocol_version": ActionContract.taskProtocolVersion,
+                "exact_input_reference_version": 1,
+                "exact_input_references": exactInputReferences.map(\.wireValue),
                 "coordinate_mapping_version": ScreenCoordinateMapping.version,
                 "observation_completeness_version": ObservationCollection<Int>.version,
                 "text_recognition_version": LocalTextRecognition.version,

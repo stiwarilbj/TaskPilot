@@ -537,7 +537,9 @@ def replay_case(case, pack, requests=None, script=None):
                        "record_action_diagnostic": lambda *_: None,
                        "request_and_enter_user_input": forbidden, "largest_top_level_file": forbidden,
                        "task_capability_context": fixture_context,
-                       "TaskEvidenceLedger": lambda task, generation=None: original_ledger(task, generation, input_scope=input_scope),
+                       "TaskEvidenceLedger": lambda task, generation=None, **kwargs: original_ledger(
+                           task, generation, input_scope=input_scope,
+                           exact_input_references=kwargs.get("exact_input_references")),
                        "compact_history": lambda history: json.loads(json.dumps(compact_history(history), sort_keys=True)),
                        "desktop_instruction": lambda *args: apply_rules(planning(*args), pack, "planning"),
                        "verification_instruction": lambda *args: apply_rules(verification(*args), pack, "verification")}

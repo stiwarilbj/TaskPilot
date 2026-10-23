@@ -327,4 +327,23 @@ final class ObservationConsistencyTests: XCTestCase {
         same["windows"] = [["frame": ["x": 99, "y": 20], "source": "core_graphics"]]
         XCTAssertNotEqual(baseline, try ObservationConsistency.controlSignature(elements: [], applications: [same]))
     }
+
+    func testResultDestinationSignatureIgnoresObservationRevisionAndEnumerationOrder() throws {
+        let first: [[String: Any]] = [
+            ["pid": 42, "bundle_id": "com.example.browser", "app": "Browser", "window_title": "Report",
+             "title": "Report", "url": "https://example.test/report", "observation_revision": "revision-a"],
+            ["pid": 42, "bundle_id": "com.example.browser", "app": "Browser", "window_title": "Home",
+             "title": "Home", "url": "https://example.test/", "observation_revision": "revision-a"]
+        ]
+        let second = first.reversed().map { row -> [String: Any] in
+            var changed = row
+            changed["observation_revision"] = "revision-b"
+            return changed
+        }
+        let baseline = try ObservationConsistency.resultDestinationSignature(first)
+        XCTAssertEqual(baseline, try ObservationConsistency.resultDestinationSignature(second))
+        var changed = first
+        changed[0]["url"] = "https://example.test/other"
+        XCTAssertNotEqual(baseline, try ObservationConsistency.resultDestinationSignature(changed))
+    }
 }

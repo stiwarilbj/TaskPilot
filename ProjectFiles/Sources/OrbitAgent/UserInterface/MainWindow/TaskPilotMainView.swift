@@ -280,7 +280,7 @@ struct TaskPilotMainView: View {
                 .font(.headline)
 
             ZStack(alignment: .topLeading) {
-                if model.prompt.isEmpty {
+                if model.taskDraft.isEmpty {
                     Text("Example: Open Safari on the agent screen, compare three flight options, and leave the best one open")
                         .font(.system(size: TaskPilotAppearancePreferences.clampedInputFontSize(inputFontSize)))
                         .foregroundStyle(.tertiary)
@@ -288,13 +288,15 @@ struct TaskPilotMainView: View {
                         .padding(.vertical, 11)
                         .allowsHitTesting(false)
                 }
-                TextEditor(text: $model.prompt)
-                    .font(.system(size: TaskPilotAppearancePreferences.clampedInputFontSize(inputFontSize)))
-                    .scrollContentBackground(.hidden)
-                    .padding(.horizontal, 7)
-                    .padding(.top, 12)
-                    .padding(.bottom, 7)
-                    .focused($promptFocused)
+                TaskRequestComposer(
+                    draft: $model.taskDraft,
+                    fontSize: TaskPilotAppearancePreferences.clampedInputFontSize(inputFontSize),
+                    focusRequested: promptFocused,
+                    onFocusChanged: { promptFocused = $0 },
+                    accessibilityLabel: "What should the agent do?"
+                )
+                .padding(.horizontal, 7)
+                .padding(.vertical, 5)
             }
             .frame(height: 116)
             .background(theme.surfaceColor, in: RoundedRectangle(cornerRadius: 13))

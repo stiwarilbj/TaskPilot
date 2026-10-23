@@ -152,4 +152,16 @@ enum ObservationConsistency {
         }.sorted()
         return try encode(["controls": controls, "applications": apps])
     }
+
+    /// Destination evidence is revision-scoped for publication, but generated
+    /// revisions and Accessibility enumeration order do not describe a screen
+    /// change and must not destabilize the capture/control pair.
+    static func resultDestinationSignature(_ rows: [[String: Any]]) throws -> String {
+        let fields: Set<String> = ["pid", "bundle_id", "app", "window_title", "title", "url"]
+        let stableRows = try rows.map { row in
+            let stable = row.filter { fields.contains($0.key) }
+            return String(decoding: try JSONSerialization.data(withJSONObject: stable, options: [.sortedKeys]), as: UTF8.self)
+        }.sorted()
+        return String(decoding: try JSONSerialization.data(withJSONObject: stableRows, options: [.sortedKeys]), as: UTF8.self)
+    }
 }

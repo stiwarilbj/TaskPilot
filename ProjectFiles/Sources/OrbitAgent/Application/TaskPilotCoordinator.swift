@@ -43,7 +43,11 @@ final class TaskPilotCoordinator: ObservableObject {
 
     // MARK: - Observable app state
 
-    @Published var prompt = ""
+    @Published var taskDraft = TaskComposerDraft()
+    var prompt: String {
+        get { taskDraft.expandedText }
+        set { taskDraft = TaskComposerDraft(plainText: newValue) }
+    }
     @Published private(set) var runState: RunState = .idle
     @Published private(set) var status = "Checking your agent screen…"
     @Published private(set) var agentDisplay: DisplayDescriptor?
@@ -1026,11 +1030,11 @@ final class TaskPilotCoordinator: ObservableObject {
     }
 
     func submitCurrentPrompt() {
-        let request = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !request.isEmpty else { return }
+        let submission = taskDraft.submission().trimmedForSubmission()
+        guard !submission.request.isEmpty else { return }
         if isActive || !queuedTasks.isEmpty {
-            enqueueRequest(request)
-            prompt = ""
+            enqueueRequest(submission)
+            taskDraft = TaskComposerDraft()
             startNextQueuedTaskIfPossible()
             return
         }
@@ -1038,15 +1042,15 @@ final class TaskPilotCoordinator: ObservableObject {
             showingSetup = true
             return
         }
-        prompt = ""
-        startTask(request: request, queuedTask: nil)
+        taskDraft = TaskComposerDraft()
+        startTask(submission: submission, queuedTask: nil)
     }
 
     func enqueueCurrentPrompt() {
-        let request = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard isActive, !request.isEmpty else { return }
-        enqueueRequest(request)
-        prompt = ""
+        let submission = taskDraft.submission().trimmedForSubmission()
+        guard isActive, !submission.request.isEmpty else { return }
+        enqueueRequest(submission)
+        taskDraft = TaskComposerDraft()
     }
 
     func rerunHistoryEntry(id: UUID) {
@@ -1054,11 +1058,14 @@ final class TaskPilotCoordinator: ObservableObject {
         // Every rerun is a new execution. Duplicate wording is intentionally
         // preserved and never deduplicated against prior history.
         if isActive {
-            enqueueRequest(entry.request)
+            enqueueRequest(AgentTaskSubmission(request: entry.request,
+                exactInputReferences: entry.exactInputReferences ?? []))
         } else if isReady && !windowsPresentedOnMain {
-            startTask(request: entry.request, queuedTask: nil)
+            startTask(submission: AgentTaskSubmission(request: entry.request,
+                exactInputReferences: entry.exactInputReferences ?? []), queuedTask: nil)
         } else {
-            prompt = entry.request
+            taskDraft = TaskComposerDraft(submission: AgentTaskSubmission(request: entry.request,
+                exactInputReferences: entry.exactInputReferences ?? []))
             showingSetup = true
         }
     }
@@ -1092,8 +1099,9 @@ final class TaskPilotCoordinator: ObservableObject {
         persistTaskLedger()
     }
 
-    private func enqueueRequest(_ request: String) {
-        queuedTasks.append(QueuedAgentTask(request: request))
+    private func enqueueRequest(_ submission: AgentTaskSubmission) {
+        queuedTasks.append(QueuedAgentTask(request: submission.request,
+                                         exactInputReferences: submission.exactInputReferences))
         persistTaskLedger()
     }
 
@@ -1102,11 +1110,12 @@ final class TaskPilotCoordinator: ObservableObject {
               !queuedTasks.isEmpty else { return }
         let next = queuedTasks.removeFirst()
         // Removal is saved atomically with the task authorization below.
-        startTask(request: next.request, queuedTask: next)
+        startTask(submission: AgentTaskSubmission(request: next.request,
+            exactInputReferences: next.exactInputReferences ?? []), queuedTask: next)
     }
 
     private func startTask(
-        request: String,
+        submission: AgentTaskSubmission,
         queuedTask: QueuedAgentTask?
     ) {
         guard recoveryFailure == nil, let recoveryJournal else {
@@ -1126,7 +1135,10 @@ final class TaskPilotCoordinator: ObservableObject {
             showingSetup = true
             return
         }
-        let authorization = AgentTaskAuthorization(request: request, wasQueued: queuedTask != nil,
+        let request = submission.request
+        let authorization = AgentTaskAuthorization(request: request,
+            exactInputReferences: submission.exactInputReferences.isEmpty ? nil : submission.exactInputReferences,
+            wasQueued: queuedTask != nil,
             queuedTaskID: queuedTask?.id)
         do {
             try recoveryJournal.register(authorization)
@@ -1169,6 +1181,7 @@ final class TaskPilotCoordinator: ObservableObject {
             runtimeURL: bundledRuntime.executableURL,
                 openClawURL: openClawExecutableURL,
                 geminiAPIKey: savedGeminiAPIKey,
+                exactInputReferences: submission.exactInputReferences,
                 lease: lease
             )
         } catch {
@@ -1510,6 +1523,7 @@ final class TaskPilotCoordinator: ObservableObject {
         let entry = AgentTaskHistoryEntry(
             id: currentTaskAuthorization?.id ?? UUID(),
             request: request,
+            exactInputReferences: currentTaskAuthorization?.exactInputReferences ?? [],
             responseTitle: responseTitle,
             response: response,
             outcome: outcome,

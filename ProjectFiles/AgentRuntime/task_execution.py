@@ -132,6 +132,7 @@ class TaskContext:
     task: str
     display_id: int
     generation: str | None
+    exact_input_references: list[dict] = field(default_factory=list)
     machine: ExecutionMachine = field(default_factory=ExecutionMachine)
     ledger: Any = None
     runtime_state: Any = None
