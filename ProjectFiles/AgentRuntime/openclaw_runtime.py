@@ -52,6 +52,7 @@ from provider_errors import ProviderRequestError, facts as provider_error_facts,
 from action_receipts import BridgeReplyLost, RuntimeInbox, reconcile_receipt
 from local_budget import LocalBudget, LocalBudgetExpired, current_budget, local_scope, local_operation
 from task_execution import TaskContext, Phase, ExecutionStateError, current_task
+from task_wait import TaskWaitPublisher, WAIT_PRESENTATION_VERSION
 from bounded_transport import ACPTransport, TransportFailure, FRAME_BYTES, read_frames, write_frame
 from prompt_compiler import (
     PROMPT_COMPILER_VERSION, COMPLETION_RULES, json_data, recovery_condition,
@@ -77,6 +78,30 @@ from response_validation import (
     VALIDATION_VERSION, ResponseValidationError, extract_json_object, bind_command_outcomes,
     normalize_action, validate_response,
 )
+
+
+def expected_wait_description(decision: dict[str, Any] | None) -> str:
+    decision = decision if isinstance(decision, dict) else {}
+    expectation = decision.get("expected_result")
+    if isinstance(expectation, dict):
+        kind = expectation.get("type")
+        if kind == "dialog_appeared":
+            title = expectation.get("title")
+            return title if isinstance(title, str) and title.strip() else "The expected dialog"
+        if kind == "field_value":
+            return "The expected field update"
+        if kind in FILE_EFFECTS:
+            return "The requested file result"
+        return "The expected screen change"
+    action = decision.get("action")
+    if isinstance(action, dict):
+        if action.get("type") == "run_command":
+            return "The requested command result"
+        if action.get("type") in {"write_file", "read_file"}:
+            return "The requested file result"
+        if action.get("type") == "wait":
+            return "The app to finish waiting"
+    return "The expected result"
 
 MAX_COMPACT_ELEMENTS = 360
 MAX_RECENT_ACTIONS = 8
@@ -197,9 +222,45 @@ class TaskModelRouter(AdaptiveModelRouter):
 
 
 def emit(kind: str, **payload: Any) -> None:
+    if kind == "wait_phase":
+        context = current_task.get()
+        if context is not None:
+            context.wait_request_sequence += 1
+            publish_task_wait(
+                str(payload.get("phase") or "model_response"),
+                str(payload.get("waiting_for") or "The model’s response"),
+                operation_key=f"request:{context.wait_request_sequence}",
+                ledger=context.ledger,
+            )
+        return
     envelope = {"kind": kind, **payload}
     if _task_value('generation') is not None: envelope["task_generation_id"] = _task_value('generation')
     print(json.dumps(envelope, separators=(",", ":")), flush=True)
+
+
+def publish_task_wait(phase: str, waiting_for: str, *, attention: str = "none",
+                      operation_key: str | None = None, ledger: TaskEvidenceLedger | None = None) -> None:
+    context = current_task.get()
+    if context is None or context.generation is None:
+        return
+    if context.wait_publisher is None:
+        context.wait_publisher = TaskWaitPublisher(context.generation)
+    try:
+        snapshot = context.wait_publisher.update(
+            phase, latest_confirmed_status(ledger or context.ledger), waiting_for, attention,
+            operation_key=operation_key,
+        )
+        if snapshot is not None:
+            emit(**snapshot)
+    except Exception:
+        # This optional presentation must never affect task execution.
+        return
+
+
+def latest_confirmed_status(ledger: TaskEvidenceLedger | None) -> str:
+    if ledger is None:
+        return "No confirmed result yet."
+    return ledger.latest_confirmed_status()
 
 
 def publish_task_progress(ledger: TaskEvidenceLedger | None, *, lifecycle: str | None = None,
@@ -221,6 +282,10 @@ def publish_task_progress(ledger: TaskEvidenceLedger | None, *, lifecycle: str |
         context.progress_fingerprint = fingerprint
         context.progress_revision += 1
         emit("task_progress", revision=context.progress_revision, **snapshot)
+        if context.wait_publisher is not None:
+            publish_task_wait(context.wait_publisher.phase, context.wait_publisher.waiting_for,
+                              attention=context.wait_publisher.attention,
+                              operation_key=context.wait_publisher.operation_key, ledger=ledger)
     except Exception:
         # The progress projection is optional UI state. Its failure must not
         # change planning, execution, evidence, or completion behavior.
@@ -1590,6 +1655,8 @@ def complete_from_decision(decision: dict[str, Any], fallback: str, ledger: Task
         raise RuntimeError("TaskPilot cannot complete without evidence for every requested requirement")
     context = current_task.get()
     if context is not None:
+        publish_task_wait("draining", "Finishing the task safely",
+                          operation_key="task-draining", ledger=ledger)
         context.machine.complete()
         publish_task_progress(ledger, lifecycle="completed", active_requirement_ids=[])
     title = str(decision.get("output_title") or "OpenClaw result").strip()
@@ -3073,6 +3140,8 @@ class TaskExecution:
         try:
             c.ledger = TaskEvidenceLedger(c.task, c.generation,
                                           exact_input_references=c.exact_input_references)
+            publish_task_wait("starting", "Connecting to the app",
+                              operation_key="task-startup", ledger=c.ledger)
             publish_task_progress(c.ledger, force=True)
             c.recovery = ActionRecovery()
             c.recovery_cycles = RecoveryCycles(rejection_limit=MAX_IDENTICAL_ACTIONS)
@@ -3107,6 +3176,8 @@ class TaskExecution:
         except BaseException as error:
             c.machine.drain()  # Includes Stop/SystemExit, not just provider errors.
             stopped = isinstance(error, KeyboardInterrupt) or (isinstance(error, SystemExit) and error.code in {130, 143})
+            publish_task_wait("draining", "Finishing the task safely",
+                              operation_key="task-draining", ledger=c.ledger)
             publish_task_progress(c.ledger, lifecycle="stopped" if stopped else "failed", active_requirement_ids=[])
             if c.runtime_state is not None:
                 c.runtime_state.invalidate()
@@ -3131,6 +3202,8 @@ class TaskExecution:
         c = self.c
         if is_largest_downloads_file_task(c.task):
             c.machine.transition(Phase.OBSERVING)
+            publish_task_wait("observing", "Checking file details",
+                              operation_key="local-downloads-check", ledger=c.ledger)
             emit("status", message=f"{PRODUCT_NAME} is checking exact file sizes in Downloads…")
             largest = largest_top_level_file(Path.home() / "Downloads")
             message = (f"The largest file in your Downloads folder is '{largest['name']}', "
@@ -3144,6 +3217,8 @@ class TaskExecution:
         if not c.ledger.local_complete_grammar:
             return False
         c.machine.transition(Phase.OBSERVING)
+        publish_task_wait("observing", "Checking the requested file",
+                          operation_key="local-file-read", ledger=c.ledger)
         c.machine.transition(Phase.EXECUTING, local_request=True)
         check = next(iter(c.ledger.requirements.values()))["check"]
         action = {"type": "read_file", "path": check["path"], "max_bytes": action_default("read_file", "max_bytes")}
@@ -3173,6 +3248,8 @@ class TaskExecution:
         if c.step > MAX_STEPS:
             raise RuntimeError(f"{PRODUCT_NAME} reached its {MAX_STEPS}-step safety limit")
         c.decision = c.action = c.result = c.recovered_result = c.input_target = c.failure = None
+        publish_task_wait("observing", "Checking the current screen",
+                          operation_key=f"observation:{c.step}", ledger=c.ledger)
         discard_observation_image(c.observation)
         c.observation = c.pending_observation if c.pending_observation is not None else bridge_call("observe", c.display_id)
         c.pending_observation = None
@@ -3192,6 +3269,8 @@ class TaskExecution:
             return
         if c.loading_pid is not None:
             if observation_is_loading(c.observation, c.loading_pid):
+                publish_task_wait("reconciling", "The page to finish loading",
+                                  operation_key=f"loading:{c.step}:{c.loading_pid}", ledger=c.ledger)
                 c.reconcile_reason = "loading"
                 c.machine.transition(Phase.RECONCILING, observation=True)
                 return
@@ -3201,6 +3280,8 @@ class TaskExecution:
     def plan(self) -> None:
         c = self.c
         try:
+            publish_task_wait("planning", "Choosing the next step",
+                              operation_key=f"planning:{c.step}", ledger=c.ledger)
             c.screenshot_digest = observation_image_digest(c.observation)
             if not c.command_hints_inspected:
                 inspect_task_command_hints(c.task, c.display_id, c.observation)
@@ -3214,6 +3295,8 @@ class TaskExecution:
         c.ledger.accept_plan(c.decision, c.observation)
         active_ids = c.ledger.action_requirements(c.decision) if effective_decision_status(c.decision) == "act" else []
         publish_task_progress(c.ledger, lifecycle="running", active_requirement_ids=active_ids)
+        publish_task_wait("reconciling", "Preparing the next step",
+                          operation_key=f"decision:{c.step}", ledger=c.ledger)
         emit("status", message=str(c.decision.get("summary") or "OpenClaw inspected the screen"))
         c.reconcile_reason = "decision"
         c.machine.transition(Phase.RECONCILING, decision=True)
@@ -3222,6 +3305,8 @@ class TaskExecution:
         c = self.c
         conflicts = c.evidence_guard.conflicts(c.decision, c.observation, c.ledger)
         if not conflicts: return False
+        publish_task_wait("reconciling", "Checking the intended target",
+                          operation_key=f"evidence:{c.step}", ledger=c.ledger)
         c.pending_observation, report = inspect_evidence(c.evidence_guard, conflicts, c.observation,
                                                        c.display_id, c.ledger, c.router.metrics)
         c.history.append({"step": c.step, "action": "evidence_inspection", "result": report})
@@ -3233,6 +3318,8 @@ class TaskExecution:
 
     def defer_for_dependencies(self) -> bool:
         c = self.c
+        publish_task_wait("reconciling", "Checking required prerequisites",
+                          operation_key=f"dependencies:{c.step}", ledger=c.ledger)
         blocked = prepare_dependency_action(c.decision, c.display_id, c.ledger, c.router.metrics, c.evidence_guard)
         if self.defer_for_evidence(): return True
         if blocked is None:
@@ -3252,6 +3339,8 @@ class TaskExecution:
     def reconcile(self) -> None:
         c = self.c
         if c.reconcile_reason == "loading":
+            publish_task_wait("reconciling", "The page to finish loading",
+                              operation_key=f"loading:{c.step}:{c.loading_pid}", ledger=c.ledger)
             if c.loading_waits >= 2:
                 raise RuntimeError("The target app is still loading after bounded local recovery; no action was repeated while it was busy.")
             c.loading_waits += 1
@@ -3269,6 +3358,8 @@ class TaskExecution:
         elif c.reconcile_reason == "failure":
             self.reconcile_failure()
         elif c.reconcile_reason == "effect":
+            publish_task_wait("reconciling", f"Checking for {expected_wait_description(c.decision)}",
+                              operation_key=f"effect:{c.step}", ledger=c.ledger)
             with local_scope(5.0, 'effect_verification', budget=c.local_budget):
                 c.pending_observation, c.result = verify_expected_effect(c.display_id, c.observation, c.action,
                     c.result, c.decision.get("expected_result"), c.screenshot_digest, c.router.metrics)
@@ -3321,6 +3412,8 @@ class TaskExecution:
                 return
             else: raise RuntimeError(reason)
         if status == "done":
+            publish_task_wait("verifying", "Checking the requested results",
+                              operation_key=f"completion:{c.step}", ledger=c.ledger)
             c.machine.transition(Phase.VERIFYING, decision=True)
             return
         if status != "act":
@@ -3362,10 +3455,14 @@ class TaskExecution:
                 emit("status", message="Reconsidering the recovery strategy after repeated states…")
                 c.machine.transition(Phase.OBSERVING)
                 return
+        publish_task_wait("executing", expected_wait_description(c.decision),
+                          operation_key=f"action:{c.step}:{action_type}", ledger=c.ledger)
         c.machine.transition(Phase.EXECUTING, decision=True, preflight=True)
 
     def secure_input(self) -> None:
         c = self.c
+        publish_task_wait("secure_input", "Secure input in TaskPilot", attention="secure_input",
+                          operation_key=f"secure-input:{c.step}", ledger=c.ledger)
         emit("status", message=f"{PRODUCT_NAME} paused because the waiting app needs secure input…")
         c.ledger.before_action({"type": "type_text"})
         result = request_and_enter_user_input(c.input_target, c.display_id)
@@ -3488,6 +3585,8 @@ class TaskExecution:
 
     def verify(self) -> None:
         c = self.c
+        publish_task_wait("verifying", "Checking the requested results",
+                          operation_key=f"completion:{c.step}", ledger=c.ledger)
         if verify_task_completion(c.task, c.decision, c.display_id, c.history, c.router, c.client, c.ledger, c.evidence_guard):
             c.machine.drain()
             return
@@ -3550,6 +3649,8 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
             raise RuntimeError("TaskPilot text recognition versions do not match; rebuild the bundled components together")
         if type(configuration.get("evidence_consistency_version")) is not int or configuration["evidence_consistency_version"] != EVIDENCE_CONSISTENCY_VERSION:
             raise RuntimeError("TaskPilot evidence inspection versions do not match; rebuild the bundled components together")
+        if type(configuration.get("wait_presentation_version")) is not int or configuration["wait_presentation_version"] != WAIT_PRESENTATION_VERSION:
+            raise RuntimeError("TaskPilot wait presentation versions do not match; rebuild the bundled components together")
         if type(configuration.get('command_capability_version')) is not int or configuration['command_capability_version'] != COMMAND_CAPABILITY_VERSION:
             raise RuntimeError('TaskPilot command inspection versions do not match; rebuild the bundled components together')
         if type(configuration.get("exact_input_reference_version")) is not int or configuration["exact_input_reference_version"] != EXACT_INPUT_REFERENCE_VERSION:

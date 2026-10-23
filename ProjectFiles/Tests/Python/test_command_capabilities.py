@@ -116,7 +116,8 @@ class CommandCapabilityTests(unittest.TestCase):
         config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=runtime.CONTRACT_HASH,
             action_contract_version=runtime.CONTRACT_VERSION, task_generation_id=str(uuid.uuid4()), task_protocol_version=runtime.TASK_PROTOCOL_VERSION,
             coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION, observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION,
-            text_recognition_version=runtime.TEXT_RECOGNITION_VERSION, evidence_consistency_version=runtime.EVIDENCE_CONSISTENCY_VERSION)
+            text_recognition_version=runtime.TEXT_RECOGNITION_VERSION, evidence_consistency_version=runtime.EVIDENCE_CONSISTENCY_VERSION,
+            wait_presentation_version=runtime.WAIT_PRESENTATION_VERSION)
         for version in (None, True, 99):
             with mock.patch.object(runtime, 'runtime_line', return_value=json.dumps(dict(config, command_capability_version=version))):
                 with self.assertRaisesRegex(RuntimeError, 'command inspection versions'): runtime.read_runtime_configuration(require_generation=True)

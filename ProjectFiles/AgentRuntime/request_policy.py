@@ -254,6 +254,7 @@ class AdaptiveModelRouter:
             self.metrics[purpose] += 1
             if retry:
                 self.metrics["retries"] += 1
+            self.emit("wait_phase", phase="model_response", waiting_for="The model’s response")
             self.emit("status", message=f"Waiting for {model.split('/', 1)[-1]} to finish…")
             return operation(model)
 
@@ -351,6 +352,14 @@ class AdaptiveModelRouter:
             if not math.isfinite(deadline): continue
             delay = max(0, deadline - self.clock())
             if delay:
+                if failure.kind == "quota":
+                    waiting_for = ("The provider account’s quota reset" if failure.scope == "credential"
+                                   else "The selected model’s quota reset")
+                else:
+                    waiting_for = ("The provider account’s capacity cooldown" if failure.scope == "credential"
+                                   else "The selected model’s capacity cooldown")
+                self.emit("wait_phase", phase="provider_cooldown",
+                          waiting_for=waiting_for)
                 self.emit("status", message=f"Waiting {delay:g}s for the reported provider cooldown…")
                 self.sleep(delay)
                 if self.clock() < deadline: break  # An interrupted wait must not bypass the cooldown.

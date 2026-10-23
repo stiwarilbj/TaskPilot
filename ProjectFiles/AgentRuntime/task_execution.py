@@ -150,6 +150,8 @@ class TaskContext:
     progress_active_requirement_ids: list[str] = field(default_factory=list)
     progress_revision: int = 0
     progress_fingerprint: str = ""
+    wait_publisher: Any = None
+    wait_request_sequence: int = 0
     observation_keywords: list = field(default_factory=list)
     receipt_metrics: dict = field(default_factory=lambda: dict(receipt_queries=0, receipt_recoveries=0, receipt_unresolved=0))
     local_change_metrics: dict = field(default_factory=lambda: dict(local_notifications=0, local_targeted_checks=0, local_poll_wakeups=0))

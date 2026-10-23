@@ -77,6 +77,29 @@ class RequestPolicyTests(unittest.TestCase):
         router.execute(lambda model: self.calls.append(model) or 'ok')
         self.assertEqual(self.calls, [policy.PRIMARY_MODELS[1]])
 
+    def test_wait_events_explain_model_responses_and_classified_cooldowns(self):
+        events = []
+        self.now = 1000.0
+
+        def sleep(seconds):
+            self.now += seconds
+
+        router = policy.AdaptiveModelRouter(lambda *args, **kwargs: events.append((args, kwargs)),
+            clock=lambda: self.now, sleep=sleep)
+        router.execute(lambda model: "ok")
+        model_waits = [payload for args, payload in events if args == ("wait_phase",)]
+        self.assertEqual(model_waits, [{"phase": "model_response", "waiting_for": "The model’s response"}])
+
+        events.clear()
+        def temporarily_unavailable(model):
+            raise RuntimeError("HTTP 503 Retry-After: 1")
+        router.active_model = None
+        with self.assertRaises(RuntimeError):
+            router.execute(temporarily_unavailable)
+        cooldowns = [payload for args, payload in events if args == ("wait_phase",)]
+        cooldown = next(payload for payload in cooldowns if payload["phase"] == "provider_cooldown")
+        self.assertEqual(cooldown["waiting_for"], "The selected model’s capacity cooldown")
+
     def test_unavailable_model_skipped_for_rest_of_task(self):
         router = self.router()
         def operation(model):

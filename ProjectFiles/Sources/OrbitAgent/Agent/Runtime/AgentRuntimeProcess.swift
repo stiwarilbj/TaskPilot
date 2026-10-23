@@ -53,6 +53,7 @@ enum RuntimeEvent {
     case output(AgentTaskOutput)
     case userInputRequired(AgentUserInputRequest)
     case taskProgress(AgentTaskProgressSnapshot)
+    case taskWait(AgentTaskWaitSnapshot)
     case actionPresentation(actionID: String, taskGenerationID: String, verificationScope: String)
     case completed(String)
     case failed(String)
@@ -115,6 +116,7 @@ final class AgentRuntimeProcess {
         var transportFailure: String?
         var receiptIDs: Set<String> = []
         var progressRevision: UInt64 = 0
+        var waitRevision: UInt64 = 0
         var queuedEventBytes = 0
         var queuedEventCount = 0
         var pendingBridgeBytes = 0
@@ -257,7 +259,8 @@ final class AgentRuntimeProcess {
                 "observation_completeness_version": ObservationCollection<Int>.version,
                 "text_recognition_version": LocalTextRecognition.version,
                 "evidence_consistency_version": ControlEvidencePolicy.version,
-                "command_capability_version": CommandCapabilities.version
+                "command_capability_version": CommandCapabilities.version,
+                "wait_presentation_version": AgentTaskWaitSnapshot.version
             ], recordSize: false) // Credential-bearing frames expose timing only.
             configuration.append(0x0A)
             let sendSpan = telemetry.begin(.ipcSend)
@@ -504,6 +507,11 @@ final class AgentRuntimeProcess {
                   progress.revision > run.progressRevision else { return }
             run.progressRevision = progress.revision
             emit(.taskProgress(progress), for: run)
+        case "task_wait":
+            guard let wait = AgentTaskWaitSnapshot.parse(message, generationID: run.lease.id),
+                  wait.revision > run.waitRevision else { return }
+            run.waitRevision = wait.revision
+            emit(.taskWait(wait), for: run)
         case "action_presentation":
             guard let presentation = AgentActionPresentationMessage.parse(
                 message, generationID: run.lease.id, knownActionIDs: run.receiptIDs
@@ -616,12 +624,15 @@ final class AgentRuntimeProcess {
         case .modelHealth(let model, let state, let detail): bytes = model.utf8.count + state.utf8.count + detail.utf8.count
         case .userInputRequired(let request): bytes = request.title.utf8.count + request.message.utf8.count
         case .taskProgress(let progress): bytes = progress.estimatedByteCount
+        case .taskWait(let wait):
+            bytes = wait.lastConfirmed.utf8.count + wait.waitingFor.utf8.count + 256
         default: bytes = 1024
         }
         guard terminal || (run.queuedEventCount < 4096 && run.queuedEventBytes + bytes <= 8 * 1024 * 1024) else {
             // Progress is a replaceable presentation projection. Dropping it
             // under pressure must never turn into a task transport failure.
             if case .taskProgress = event { return }
+            if case .taskWait = event { return }
             failTransport("transport_event_limit", for: run); return
         }
         run.queuedEventCount += 1; run.queuedEventBytes += bytes

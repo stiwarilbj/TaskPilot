@@ -78,4 +78,24 @@ final class RuntimeSnapshotFilterTests: XCTestCase {
         XCTAssertTrue(nextInvocation.shouldSchedule(.status("Working")))
         XCTAssertTrue(nextInvocation.shouldSchedule(.diagnostics(value)))
     }
+
+    func testTaskWaitSnapshotsCoalesceOnlyWithinTheSameOperationAndMeaning() throws {
+        var filter = RuntimeSnapshotFilter()
+        func wait(_ overrides: [String: Any] = [:]) throws -> AgentTaskWaitSnapshot {
+            var message: [String: Any] = [
+                "kind": "task_wait", "task_generation_id": "generation", "version": 1,
+                "revision": 1, "operation_id": 1, "phase": "observing",
+                "last_confirmed": "No confirmed result yet.", "waiting_for": "Checking the current screen",
+                "attention": "none"
+            ]
+            message.merge(overrides) { _, new in new }
+            return try XCTUnwrap(AgentTaskWaitSnapshot.parse(message, generationID: "generation"))
+        }
+
+        XCTAssertTrue(filter.shouldSchedule(.taskWait(try wait())))
+        XCTAssertFalse(filter.shouldSchedule(.taskWait(try wait(["revision": 2]))))
+        XCTAssertTrue(filter.shouldSchedule(.taskWait(try wait(["operation_id": 2, "revision": 3]))))
+        XCTAssertTrue(filter.shouldSchedule(.taskWait(try wait(["operation_id": 2, "revision": 4,
+                                                                 "waiting_for": "Waiting for the model’s response"]))))
+    }
 }

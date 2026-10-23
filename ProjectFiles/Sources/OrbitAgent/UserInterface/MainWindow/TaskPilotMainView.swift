@@ -9,6 +9,7 @@ struct TaskPilotMainView: View {
     @Environment(\.openWindow) private var openWindow
     @FocusState private var promptFocused: Bool
     @FocusState private var userInputFocused: Bool
+    @State private var expandedWaitIdentity: String?
     @AppStorage(TaskPilotAppearancePreferences.themeKey) private var themeRawValue = TaskPilotTheme.light.rawValue
     @AppStorage(TaskPilotAppearancePreferences.inputFontSizeKey) private var inputFontSize = TaskPilotAppearancePreferences.defaultInputFontSize
     @AppStorage(TaskPilotAppearancePreferences.outputFontSizeKey) private var outputFontSize = TaskPilotAppearancePreferences.defaultOutputFontSize
@@ -85,6 +86,11 @@ struct TaskPilotMainView: View {
         }
         .onChange(of: model.remixSession?.id) { _, remixID in
             if remixID != nil { promptFocused = true }
+        }
+        .onChange(of: model.taskWaitDetails?.disclosureIdentity) { _, identity in
+            if expandedWaitIdentity != identity {
+                expandedWaitIdentity = nil
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await model.refreshReadiness() }
@@ -357,13 +363,18 @@ struct TaskPilotMainView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            HStack(spacing: 12) {
-                statusSymbol
-                Text(model.status)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+            if let details = model.taskWaitDetails {
+                TaskWaitDisclosureView(status: model.status, snapshot: details,
+                    symbol: AnyView(statusSymbol), expandedIdentity: $expandedWaitIdentity)
+            } else {
+                HStack(spacing: 12) {
+                    statusSymbol
+                    Text(model.status)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
         }
         .padding(.horizontal, 14)

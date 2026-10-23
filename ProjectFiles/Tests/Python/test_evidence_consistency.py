@@ -332,7 +332,8 @@ class EvidenceConsistencyTests(unittest.TestCase):
         configuration = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=runtime.CONTRACT_HASH,
             action_contract_version=runtime.CONTRACT_VERSION, task_protocol_version=runtime.TASK_PROTOCOL_VERSION,
             task_generation_id='d0b9c0fc-01af-42f0-b749-1027c907a2cd', coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION,
-            observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION, text_recognition_version=runtime.TEXT_RECOGNITION_VERSION)
+            observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION, text_recognition_version=runtime.TEXT_RECOGNITION_VERSION,
+            wait_presentation_version=runtime.WAIT_PRESENTATION_VERSION)
         for version in (None, True, '1', 2):
             with mock.patch.object(runtime, 'runtime_line', return_value=json.dumps(dict(configuration, evidence_consistency_version=version))), \
                  mock.patch.object(runtime, '_task_generation_id'), \

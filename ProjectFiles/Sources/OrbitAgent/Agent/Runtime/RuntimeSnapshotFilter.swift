@@ -6,6 +6,7 @@ import Foundation
 struct RuntimeSnapshotFilter {
     private var status: String?
     private var diagnostics: AgentRequestMetrics?
+    private var taskWait: AgentTaskWaitSnapshot?
 
     mutating func shouldSchedule(_ event: RuntimeEvent) -> Bool {
         switch event {
@@ -15,6 +16,16 @@ struct RuntimeSnapshotFilter {
         case .diagnostics(let value):
             guard diagnostics != value else { return false }
             diagnostics = value
+        case .taskWait(let value):
+            if let current = taskWait,
+               current.disclosureIdentity == value.disclosureIdentity,
+               current.phase == value.phase,
+               current.lastConfirmed == value.lastConfirmed,
+               current.waitingFor == value.waitingFor,
+               current.attention == value.attention {
+                return false
+            }
+            taskWait = value
         case .userInputRequired:
             // The input handoff changes status outside the runtime channel.
             invalidateStatus()

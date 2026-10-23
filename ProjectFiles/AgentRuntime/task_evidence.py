@@ -844,6 +844,38 @@ class TaskEvidenceLedger:
             "result_objects": self._presentation_result_objects(),
         }
 
+    def latest_confirmed_status(self) -> str:
+        """Describe the newest currently valid proof for a proven outcome."""
+        self.refresh()
+        for evidence_id, evidence in reversed(list(self.evidence.items())):
+            if not evidence.get("valid") or evidence.get("verified") is not True:
+                continue
+            if evidence.get("generation") != self.generation:
+                continue
+            for identifier, requirement in reversed(list(self.requirements.items())):
+                if requirement.get("scope", "outcome") == "prerequisite":
+                    continue
+                if requirement.get("state") != "proven" or evidence_id not in requirement.get("evidence_ids", []):
+                    continue
+                if not self.requirement_matches(identifier, evidence, semantic=True):
+                    continue
+                summary = self._presentation_evidence(requirement["check"], evidence["fact"])
+                if not summary:
+                    continue
+                label = summary.get("label", "Verified result")
+                detail = summary.get("detail", "")
+                check_type = requirement["check"].get("type")
+                if check_type in FILE_CHECKS | {"file_read", "file_written", "file_append"} and isinstance(detail, str):
+                    detail = os.path.basename(detail.rstrip("/")) or "the requested location"
+                elif check_type in {"window_active", "dialog_present"}:
+                    detail = "the expected window"
+                if label == "Command completed":
+                    return "Command finished; its requested result is not confirmed"
+                if detail:
+                    return f"{label}: {detail}"
+                return str(label)
+        return "No confirmed result yet."
+
     @staticmethod
     def _result_object_id(kind: str, target: str) -> str:
         prefix = {"file": "f", "folder": "d", "web": "w"}[kind]
