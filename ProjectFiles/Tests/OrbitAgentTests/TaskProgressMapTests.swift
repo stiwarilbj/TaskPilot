@@ -1,4 +1,6 @@
 import Foundation
+import AppKit
+import SwiftUI
 import XCTest
 @testable import OrbitAgent
 
@@ -166,5 +168,38 @@ final class TaskProgressMapTests: XCTestCase {
         malformed["requirements"] = [["id": "r1", "source_ranges": [[1, 2]], "state": "pending", "active": false, "evidence": []]]
         let snapshot = try XCTUnwrap(AgentTaskProgressSnapshot.parse(malformed, generationID: "generation"))
         XCTAssertFalse(TaskProgressSourceMapper.sourceRangesAreValid(snapshot.requirements[0].sourceRanges, in: "é"))
+    }
+
+    @MainActor
+    func testRendersCollapsedAndExpandedNarrowWindowFixtures() throws {
+        let request = "Create the report, save it in Downloads, and leave it open."
+        let requirements = [
+            requirement("r1", "Create the report", in: request, state: .proven,
+                        evidence: [AgentTaskProgressEvidence(label: "File contents matched",
+                                                            detail: "/tmp/taskpilot-synthetic-report.txt",
+                                                            revealPath: "/tmp/taskpilot-synthetic-report.txt")]),
+            requirement("r2", "save it in Downloads", in: request, active: true),
+            requirement("r3", "leave it open", in: request)
+        ]
+        let progress = map(request, requirements)
+        let fixtures: [(String, Bool)] = [("collapsed", false), ("expanded", true)]
+
+        for (name, initiallyExpanded) in fixtures {
+            let view = TaskProgressMapView(map: progress,
+                                           surface: Color(nsColor: .windowBackgroundColor),
+                                           border: Color(nsColor: .separatorColor),
+                                           accent: .blue,
+                                           initiallyExpanded: initiallyExpanded)
+                .frame(width: 320, height: 560, alignment: .topLeading)
+            let hostingView = NSHostingView(rootView: view)
+            hostingView.frame = NSRect(x: 0, y: 0, width: 320, height: 560)
+            hostingView.layoutSubtreeIfNeeded()
+
+            let bitmap = try XCTUnwrap(hostingView.bitmapImageRepForCachingDisplay(in: hostingView.bounds))
+            hostingView.cacheDisplay(in: hostingView.bounds, to: bitmap)
+            let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+            XCTAssertGreaterThan(png.count, 2_000, "\(name) fixture should render visible SwiftUI content")
+            try png.write(to: URL(fileURLWithPath: "/tmp/taskpilot-progress-map-\(name).png"))
+        }
     }
 }

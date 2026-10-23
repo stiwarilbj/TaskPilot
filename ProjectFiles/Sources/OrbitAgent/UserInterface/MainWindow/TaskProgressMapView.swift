@@ -103,9 +103,18 @@ struct TaskProgressMapView: View {
     let accent: Color
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var expanded = false
+    @State private var expanded: Bool
     @State private var selectedRequirementIDs: [String] = []
     @State private var revealMessage: String?
+
+    init(map: TaskProgressMap, surface: Color, border: Color, accent: Color,
+         initiallyExpanded: Bool = false) {
+        self.map = map
+        self.surface = surface
+        self.border = border
+        self.accent = accent
+        _expanded = State(initialValue: initiallyExpanded)
+    }
 
     private var clauses: [TaskProgressClause] { TaskProgressSourceMapper.clauses(for: map) }
     private var selectedRequirements: [AgentTaskProgressRequirement] {
