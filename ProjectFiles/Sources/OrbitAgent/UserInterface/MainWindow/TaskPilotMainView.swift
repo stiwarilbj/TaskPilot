@@ -52,6 +52,9 @@ struct TaskPilotMainView: View {
                 ScrollView {
                     VStack(spacing: 18) {
                         statusCard
+                        if let nextRequest = model.queuedTasks.first {
+                            nextUpCard(nextRequest)
+                        }
                         if let progressMap = model.taskProgressMap {
                             TaskProgressMapView(map: progressMap, surface: theme.surfaceColor,
                                                 border: theme.borderColor, accent: accent)
@@ -308,13 +311,26 @@ struct TaskPilotMainView: View {
     }
 
     private var statusCard: some View {
-        HStack(spacing: 12) {
-            statusSymbol
-            Text(model.status)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-                .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(alignment: .leading, spacing: 8) {
+            if let request = model.currentTaskRequest {
+                Label("Current task", systemImage: "play.circle.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.indigo)
+                Text(request)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            HStack(spacing: 12) {
+                statusSymbol
+                Text(model.status)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
@@ -323,6 +339,115 @@ struct TaskPilotMainView: View {
             RoundedRectangle(cornerRadius: 12)
                 .stroke(theme.borderColor, lineWidth: 1)
         }
+    }
+
+    private func nextUpCard(_ task: QueuedAgentTask) -> some View {
+        let session = model.queuedTaskEditSession
+        let isEditingThisRequest = session?.taskID == task.id
+        let editingAnotherRequest = session != nil && !isEditingThisRequest
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Label("Next up", systemImage: "hourglass")
+                        .font(.headline)
+                        .foregroundStyle(accent)
+                    Text("Waiting request")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 8)
+
+                Button("Queue & History") {
+                    model.revealQueuedTask(id: task.id)
+                    openWindow(id: "task-center")
+                }
+                .buttonStyle(.link)
+                .accessibilityLabel("Show this request in Queue and History")
+            }
+
+            if isEditingThisRequest {
+                if !model.isActive {
+                    Label("Waiting for Save or Cancel", systemImage: "pause.circle")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.orange)
+                }
+                QueuedTaskEditForm(model: model, taskID: task.id, surface: .mainWindow)
+            } else {
+                Text(task.request)
+                    .font(.body.weight(.medium))
+                    .lineLimit(3)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                if editingAnotherRequest {
+                    Text("Another waiting request is being edited. Continue editing it below.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityHint("Continue editing opens the active edit in Queue and History.")
+                }
+
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        editButton(for: task, editingAnotherRequest: editingAnotherRequest)
+                        moveLaterButton(for: task)
+                        removeQueuedButton(for: task)
+                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        editButton(for: task, editingAnotherRequest: editingAnotherRequest)
+                        HStack(spacing: 8) {
+                            moveLaterButton(for: task)
+                            removeQueuedButton(for: task)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(theme.surfaceColor, in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(theme.borderColor, lineWidth: 1)
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    @ViewBuilder
+    private func editButton(
+        for task: QueuedAgentTask,
+        editingAnotherRequest: Bool
+    ) -> some View {
+        if editingAnotherRequest, let editID = model.queuedTaskEditSession?.taskID {
+            Button("Continue editing") {
+                model.revealQueuedTask(id: editID, continueEditing: true)
+                openWindow(id: "task-center")
+            }
+            .buttonStyle(.borderedProminent)
+        } else {
+            Button("Edit") {
+                model.beginQueuedTaskEdit(id: task.id, surface: .mainWindow)
+            }
+            .buttonStyle(.borderedProminent)
+            .accessibilityLabel("Edit next waiting request")
+        }
+    }
+
+    private func moveLaterButton(for task: QueuedAgentTask) -> some View {
+        Button("Move later") {
+            model.moveQueuedTask(id: task.id, offset: 1)
+        }
+        .buttonStyle(.bordered)
+        .disabled(model.queuedTasks.last?.id == task.id)
+        .accessibilityLabel("Move request one place later")
+    }
+
+    private func removeQueuedButton(for task: QueuedAgentTask) -> some View {
+        Button("Remove", role: .destructive) {
+            model.removeQueuedTask(id: task.id)
+        }
+        .buttonStyle(.bordered)
+        .accessibilityLabel("Remove waiting request")
     }
 
     private var outputCard: some View {

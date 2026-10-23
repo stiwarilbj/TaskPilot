@@ -111,6 +111,8 @@ final class TaskPilotCoordinator: ObservableObject {
     @Published private(set) var userInputRequest: AgentUserInputRequest?
     @Published var userInputDraft = ""
     @Published private(set) var queuedTasks: [QueuedAgentTask] = []
+    @Published private(set) var queuedTaskEditSession: QueuedTaskEditSession?
+    @Published private(set) var requestedQueueTaskID: UUID?
     @Published private(set) var taskHistory: [AgentTaskHistoryEntry] = []
     @Published private(set) var requestMetrics: AgentRequestMetrics?
     @Published private(set) var currentTaskRequest: String?
@@ -1071,12 +1073,22 @@ final class TaskPilotCoordinator: ObservableObject {
     }
 
     func removeQueuedTask(id: UUID) {
+        guard queuedTasks.contains(where: { $0.id == id }) else { return }
         queuedTasks.removeAll { $0.id == id }
+        if queuedTaskEditSession?.taskID == id {
+            queuedTaskEditSession = nil
+        }
+        if requestedQueueTaskID == id {
+            requestedQueueTaskID = nil
+        }
         persistTaskLedger()
+        startNextQueuedTaskIfPossible()
     }
 
     func clearQueue() {
         queuedTasks.removeAll()
+        queuedTaskEditSession = nil
+        requestedQueueTaskID = nil
         persistTaskLedger()
     }
 
@@ -1087,6 +1099,98 @@ final class TaskPilotCoordinator: ObservableObject {
             offset: offset
         )
         persistTaskLedger()
+        startNextQueuedTaskIfPossible()
+    }
+
+    @discardableResult
+    func beginQueuedTaskEdit(id: UUID, surface: QueuedTaskEditSurface) -> Bool {
+        guard let task = queuedTasks.first(where: { $0.id == id }) else { return false }
+        if var session = queuedTaskEditSession {
+            guard session.taskID == id else { return false }
+            session.focusSurface = surface
+            session.errorMessage = nil
+            queuedTaskEditSession = session
+            return true
+        }
+        queuedTaskEditSession = QueuedTaskEditSession(task: task, surface: surface)
+        return true
+    }
+
+    func updateQueuedTaskEditDraft(_ draft: TaskComposerDraft, taskID: UUID) {
+        guard var session = queuedTaskEditSession, session.taskID == taskID else { return }
+        session.draft = draft
+        session.errorMessage = nil
+        queuedTaskEditSession = session
+    }
+
+    func queuedTaskEditDraft(for taskID: UUID) -> TaskComposerDraft {
+        guard let session = queuedTaskEditSession, session.taskID == taskID else {
+            return TaskComposerDraft()
+        }
+        return session.draft
+    }
+
+    func queuedTaskEditorDidFocus(taskID: UUID, surface: QueuedTaskEditSurface) {
+        guard var session = queuedTaskEditSession,
+              session.taskID == taskID,
+              session.focusSurface == surface else { return }
+        session.focusSurface = nil
+        queuedTaskEditSession = session
+    }
+
+    func cancelQueuedTaskEdit(taskID: UUID) {
+        guard queuedTaskEditSession?.taskID == taskID else { return }
+        queuedTaskEditSession = nil
+        startNextQueuedTaskIfPossible()
+    }
+
+    func saveQueuedTaskEdit(taskID: UUID) {
+        guard var session = queuedTaskEditSession, session.taskID == taskID else { return }
+        guard session.isEligible(in: queuedTasks) else {
+            queuedTaskEditSession = nil
+            if requestedQueueTaskID == taskID {
+                requestedQueueTaskID = nil
+            }
+            startNextQueuedTaskIfPossible()
+            return
+        }
+        guard !session.draft.isEmpty else { return }
+
+        let replacementQueue: [QueuedAgentTask]
+        do {
+            // Commit the replacement first. A failed write leaves the saved
+            // queue untouched and keeps the editable draft available.
+            guard let committed = try session.commitReplacement(from: queuedTasks, persist: { queue in
+                try taskLedgerStore.save(
+                    queue: queue,
+                    history: taskHistory,
+                    activeTask: currentTaskAuthorization
+                )
+            }) else { return }
+            replacementQueue = committed
+        } catch {
+            session.errorMessage = "Couldn’t save this request. The saved version is unchanged. \(error.localizedDescription)"
+            session.focusSurface = nil
+            queuedTaskEditSession = session
+            return
+        }
+
+        queuedTasks = replacementQueue
+        queuedTaskEditSession = nil
+        startNextQueuedTaskIfPossible()
+    }
+
+    func revealQueuedTask(id: UUID, continueEditing: Bool = false) {
+        guard queuedTasks.contains(where: { $0.id == id }) else { return }
+        requestedQueueTaskID = id
+        if continueEditing, var session = queuedTaskEditSession {
+            requestedQueueTaskID = session.taskID
+            session.focusSurface = .queueHistory
+            queuedTaskEditSession = session
+        } else if var session = queuedTaskEditSession, session.taskID == id {
+            session.focusSurface = .queueHistory
+            queuedTaskEditSession = session
+        }
     }
 
     func deleteHistoryEntry(id: UUID) {
@@ -1107,7 +1211,8 @@ final class TaskPilotCoordinator: ObservableObject {
 
     private func startNextQueuedTaskIfPossible() {
         guard recoveryFailure == nil, !isActive, isReady, !windowsPresentedOnMain,
-              !queuedTasks.isEmpty else { return }
+              !queuedTasks.isEmpty,
+              queuedTaskEditSession?.blocksAutomaticHandoff(in: queuedTasks) != true else { return }
         let next = queuedTasks.removeFirst()
         // Removal is saved atomically with the task authorization below.
         startTask(submission: AgentTaskSubmission(request: next.request,

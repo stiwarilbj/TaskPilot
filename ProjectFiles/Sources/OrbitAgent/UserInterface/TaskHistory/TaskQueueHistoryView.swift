@@ -30,22 +30,30 @@ struct TaskQueueHistoryView: View {
 
             Divider()
 
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 18) {
-                    if let currentRequest = model.currentTaskRequest {
-                        currentTaskCard(currentRequest)
-                    }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 18) {
+                        if let currentRequest = model.currentTaskRequest {
+                            currentTaskCard(currentRequest)
+                        }
 
-                    if !model.queuedTasks.isEmpty {
-                        queueSection
-                    }
+                        if !model.queuedTasks.isEmpty {
+                            queueSection
+                        }
 
-                    historySection
+                        historySection
+                    }
+                    .padding(20)
                 }
-                .padding(20)
+                .onAppear {
+                    scrollToRequestedTask(using: proxy)
+                }
+                .onChange(of: model.requestedQueueTaskID) { _, _ in
+                    scrollToRequestedTask(using: proxy)
+                }
             }
         }
-        .frame(minWidth: 680, minHeight: 560)
+        .frame(minWidth: 540, minHeight: 560)
         .confirmationDialog(
             "Remove every waiting request?",
             isPresented: $confirmingClearQueue
@@ -72,7 +80,7 @@ struct TaskQueueHistoryView: View {
 
     private func currentTaskCard(_ request: String) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("Running now", systemImage: "play.circle.fill")
+            Label("Current task", systemImage: "play.circle.fill")
                 .font(.headline)
                 .foregroundStyle(.indigo)
             Text(request)
@@ -112,51 +120,137 @@ struct TaskQueueHistoryView: View {
         _ task: QueuedAgentTask,
         index: Int
     ) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            Text("\(index + 1)")
-                .font(.caption.bold())
-                .foregroundStyle(.secondary)
-                .frame(width: 24, height: 24)
-                .background(.secondary.opacity(0.1), in: Circle())
+        let editSession = model.queuedTaskEditSession
+        let isEditingThis = editSession?.taskID == task.id
 
-            VStack(alignment: .leading, spacing: 5) {
-                Text(task.request)
-                    .font(.body.weight(.medium))
-                    .textSelection(.enabled)
-                Text("Queued \(task.queuedAt.formatted(date: .abbreviated, time: .shortened))")
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                Text("\(index + 1)")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24, height: 24)
+                    .background(.secondary.opacity(0.1), in: Circle())
+
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(task.request)
+                        .font(.body.weight(.medium))
+                        .textSelection(.enabled)
+                    Text("Queued \(task.queuedAt.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 6) {
+                        queueEditButton(task, index: index, editSession: editSession, isEditingThis: isEditingThis)
+                        moveEarlierButton(task, index: index)
+                        moveLaterButton(task, index: index)
+                        removeQueuedButton(task)
+                    }
+                    VStack(alignment: .trailing, spacing: 6) {
+                        queueEditButton(task, index: index, editSession: editSession, isEditingThis: isEditingThis)
+                        HStack(spacing: 6) {
+                            moveEarlierButton(task, index: index)
+                            moveLaterButton(task, index: index)
+                            removeQueuedButton(task)
+                        }
+                    }
+                }
+            }
+
+            if isEditingThis {
+                if !model.isActive, model.queuedTasks.first?.id == task.id {
+                    Label("Waiting for Save or Cancel", systemImage: "pause.circle")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.orange)
+                }
+                QueuedTaskEditForm(model: model, taskID: task.id, surface: .queueHistory)
+            } else if let editSession, model.queuedTasks.contains(where: { $0.id == editSession.taskID }) {
+                Text("Finish or cancel the other request’s edit before editing this one.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            HStack(spacing: 4) {
-                Button {
-                    model.moveQueuedTask(id: task.id, offset: -1)
-                } label: {
-                    Image(systemName: "arrow.up")
-                }
-                .disabled(index == 0)
-                .help("Move earlier")
-
-                Button {
-                    model.moveQueuedTask(id: task.id, offset: 1)
-                } label: {
-                    Image(systemName: "arrow.down")
-                }
-                .disabled(index == model.queuedTasks.count - 1)
-                .help("Move later")
-
-                Button(role: .destructive) {
-                    model.removeQueuedTask(id: task.id)
-                } label: {
-                    Image(systemName: "trash")
-                }
-                .help("Remove from queue")
-            }
-            .buttonStyle(.borderless)
         }
         .padding(12)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 11))
+        .overlay {
+            RoundedRectangle(cornerRadius: 11)
+                .stroke(
+                    model.requestedQueueTaskID == task.id ? Color.accentColor.opacity(0.65) : .clear,
+                    lineWidth: 2
+                )
+        }
+        .id(task.id)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Waiting request \(index + 1)")
+    }
+
+    @ViewBuilder
+    private func queueEditButton(
+        _ task: QueuedAgentTask,
+        index: Int,
+        editSession: QueuedTaskEditSession?,
+        isEditingThis: Bool
+    ) -> some View {
+        if !isEditingThis {
+            if let editSession,
+               model.queuedTasks.contains(where: { $0.id == editSession.taskID }) {
+                Button("Continue editing") {
+                    model.revealQueuedTask(id: editSession.taskID, continueEditing: true)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Reveal the request currently being edited")
+            } else {
+                Button("Edit") {
+                    model.beginQueuedTaskEdit(id: task.id, surface: .queueHistory)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Edit waiting request \(index + 1)")
+            }
+        } else {
+            Label("Editing", systemImage: "pencil")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func moveEarlierButton(_ task: QueuedAgentTask, index: Int) -> some View {
+        Button {
+            model.moveQueuedTask(id: task.id, offset: -1)
+        } label: {
+            Image(systemName: "arrow.up")
+        }
+        .disabled(index == 0)
+        .help("Move earlier")
+        .accessibilityLabel("Move waiting request earlier")
+    }
+
+    private func moveLaterButton(_ task: QueuedAgentTask, index: Int) -> some View {
+        Button {
+            model.moveQueuedTask(id: task.id, offset: 1)
+        } label: {
+            Image(systemName: "arrow.down")
+        }
+        .disabled(index == model.queuedTasks.count - 1)
+        .help("Move later")
+        .accessibilityLabel("Move waiting request later")
+    }
+
+    private func removeQueuedButton(_ task: QueuedAgentTask) -> some View {
+        Button(role: .destructive) {
+            model.removeQueuedTask(id: task.id)
+        } label: {
+            Image(systemName: "trash")
+        }
+        .help("Remove from queue")
+        .accessibilityLabel("Remove waiting request")
+    }
+
+    private func scrollToRequestedTask(using proxy: ScrollViewProxy) {
+        guard let id = model.requestedQueueTaskID,
+              model.queuedTasks.contains(where: { $0.id == id }) else { return }
+        proxy.scrollTo(id, anchor: .center)
     }
 
     private var historySection: some View {
