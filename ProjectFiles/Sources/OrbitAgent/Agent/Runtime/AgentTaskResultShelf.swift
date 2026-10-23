@@ -156,6 +156,67 @@ enum TaskResultShelfActionOutcome: Equatable {
     case unavailable(String)
 }
 
+enum TaskResultShelfEntry: Equatable, Identifiable {
+    case result(AgentTaskResultObject)
+    case folderStack(id: String, path: String, results: [AgentTaskResultObject])
+
+    var id: String {
+        switch self {
+        case .result(let result): result.id
+        case .folderStack(let id, _, _): id
+        }
+    }
+
+    var isFolderStack: Bool {
+        if case .folderStack = self { return true }
+        return false
+    }
+
+    var results: [AgentTaskResultObject] {
+        switch self {
+        case .result(let result): [result]
+        case .folderStack(_, _, let results): results
+        }
+    }
+
+    static func grouped(_ results: [AgentTaskResultObject]) -> [Self] {
+        enum PendingEntry {
+            case result(AgentTaskResultObject)
+            case files(path: String, results: [AgentTaskResultObject])
+        }
+
+        var pending: [PendingEntry] = []
+        var stackPositions: [String: Int] = [:]
+
+        for result in results {
+            guard result.kind == .file, let path = result.path else {
+                pending.append(.result(result))
+                continue
+            }
+
+            let parentPath = URL(fileURLWithPath: path).deletingLastPathComponent().standardizedFileURL.path
+            if let position = stackPositions[parentPath], case .files(let storedPath, var files) = pending[position] {
+                files.append(result)
+                pending[position] = .files(path: storedPath, results: files)
+            } else {
+                stackPositions[parentPath] = pending.count
+                pending.append(.files(path: parentPath, results: [result]))
+            }
+        }
+
+        return pending.map { entry in
+            switch entry {
+            case .result(let result):
+                .result(result)
+            case .files(let path, let files) where files.count >= 2:
+                .folderStack(id: "stack:\(path)", path: path, results: files)
+            case .files(_, let files):
+                .result(files[0])
+            }
+        }
+    }
+}
+
 @MainActor
 struct TaskResultShelfDispatcher {
     let handler: (TaskResultShelfAction, AgentTaskResultObject) -> TaskResultShelfActionOutcome
@@ -247,7 +308,11 @@ struct TaskResultShelfView: View {
     let actionHandler: ActionHandler?
     @State private var previewURL: URL?
     @State private var previewTitle = ""
-    @State private var actionMessage: String?
+    @State private var presentedStack: TaskResultShelfEntry?
+    @State private var pendingPreview: (url: URL, title: String)?
+    @State private var actionMessages: [String: String] = [:]
+
+    private var entries: [TaskResultShelfEntry] { TaskResultShelfEntry.grouped(results) }
 
     init(results: [AgentTaskResultObject], surface: Color, border: Color, accent: Color,
          actionHandler: ActionHandler? = nil) {
@@ -265,30 +330,33 @@ struct TaskResultShelfView: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text("Verified during this task")
+                Text("Results from this task")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
             ScrollView(.horizontal) {
                 HStack(alignment: .top, spacing: 9) {
-                    ForEach(results) { result in
-                        resultCard(result)
+                    ForEach(entries) { entry in
+                        resultCard(entry)
                     }
                 }
                 .padding(.vertical, 2)
             }
             .scrollIndicators(.automatic)
             .accessibilityLabel("Task result cards; scroll horizontally for more results")
-            if let actionMessage {
-                Text(actionMessage)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .accessibilityElement(children: .combine)
-                    .accessibilityLabel(actionMessage)
+        }
+        .onChange(of: entries) { _, updatedEntries in
+            let currentResultIDs = Set(updatedEntries.flatMap(\.results).map(\.id))
+            actionMessages = actionMessages.filter { currentResultIDs.contains($0.key) }
+            if let presentedStack {
+                self.presentedStack = updatedEntries.first { $0.id == presentedStack.id && $0.isFolderStack }
             }
         }
-        .onChange(of: results) { _, _ in
-            actionMessage = nil
+        .onChange(of: presentedStack) { oldValue, newValue in
+            guard oldValue != nil, newValue == nil, let pendingPreview else { return }
+            self.pendingPreview = nil
+            previewTitle = pendingPreview.title
+            previewURL = pendingPreview.url
         }
         .sheet(isPresented: Binding(get: { previewURL != nil }, set: { if !$0 { previewURL = nil } })) {
             if let previewURL {
@@ -298,10 +366,35 @@ struct TaskResultShelfView: View {
                     .accessibilityLabel("Quick Look preview of \(previewTitle)")
             }
         }
+        .popover(item: $presentedStack, arrowEdge: .top) { entry in
+            if case .folderStack(_, let path, let files) = entry {
+                TaskResultShelfStackPopoverView(
+                    path: path,
+                    files: files,
+                    surface: surface,
+                    accent: accent,
+                    actionMessages: actionMessages,
+                    actionHandler: actionHandler ?? TaskResultShelfActionService.perform,
+                    onAction: { action, result, outcome in
+                        handle(action, for: result, outcome: outcome, fromStack: true)
+                    },
+                    onDismiss: { presentedStack = nil }
+                )
+            }
+        }
     }
 
     @ViewBuilder
-    private func resultCard(_ result: AgentTaskResultObject) -> some View {
+    private func resultCard(_ entry: TaskResultShelfEntry) -> some View {
+        switch entry {
+        case .result(let result):
+            singleResultCard(result)
+        case .folderStack:
+            folderStackCard(entry)
+        }
+    }
+
+    private func singleResultCard(_ result: AgentTaskResultObject) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: icon(for: result))
@@ -344,6 +437,9 @@ struct TaskResultShelfView: View {
                         .accessibilityLabel("\(action.title) \(result.name)")
                 }
             }
+            if let message = actionMessages[result.id] {
+                actionFeedback(message)
+            }
         }
         .padding(10)
         .frame(width: 276, alignment: .leading)
@@ -356,6 +452,65 @@ struct TaskResultShelfView: View {
         .accessibilityLabel("\(result.kind == .web ? "Website" : result.kind == .folder ? "Folder" : "File"), \(result.name), \(result.location), \(result.state == .verified ? "verified during this task" : "needs recheck")")
     }
 
+    @ViewBuilder
+    private func folderStackCard(_ entry: TaskResultShelfEntry) -> some View {
+        if case .folderStack(_, let path, let files) = entry {
+            let name = URL(fileURLWithPath: path).lastPathComponent
+            let needingRecheck = files.filter { $0.state == .needsRecheck }.count
+            Button { presentedStack = entry } label: {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "doc.on.doc.fill")
+                            .font(.title3)
+                            .foregroundStyle(accent)
+                            .frame(width: 24)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("\(name) · \(files.count) files")
+                                .font(.callout.weight(.semibold))
+                                .lineLimit(1)
+                                .help("\(name) · \(files.count) files")
+                            Text(path)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .help(path)
+                        }
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.down")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
+                    }
+                    if needingRecheck > 0 {
+                        Label("\(needingRecheck) needs recheck", systemImage: "arrow.clockwise.circle")
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.orange)
+                    } else {
+                        Text("Verified during this run")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("Show files and actions")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(accent)
+                }
+                .padding(10)
+                .frame(width: 276, alignment: .leading)
+                .background(surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(border, lineWidth: 1)
+                }
+                .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .help("Show \(files.count) files in \(path)")
+            .accessibilityLabel("Folder \(name), \(files.count) files, \(path)\(needingRecheck > 0 ? ", \(needingRecheck) needs recheck" : ", verified during this task")")
+            .accessibilityHint("Opens the files and their available actions")
+        }
+    }
+
     private func icon(for result: AgentTaskResultObject) -> String {
         switch result.kind {
         case .file: "doc"
@@ -364,18 +519,135 @@ struct TaskResultShelfView: View {
         }
     }
 
-    private func perform(_ action: TaskResultShelfAction, for result: AgentTaskResultObject) {
+    private func actionFeedback(_ message: String) -> some View {
+        Text(message)
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(message)
+    }
+
+    private func perform(_ action: TaskResultShelfAction, for result: AgentTaskResultObject, fromStack: Bool = false) {
         let handler = actionHandler ?? TaskResultShelfActionService.perform
-        switch TaskResultShelfDispatcher(handler: handler).perform(action, for: result) {
+        let outcome = TaskResultShelfDispatcher(handler: handler).perform(action, for: result)
+        handle(action, for: result, outcome: outcome, fromStack: fromStack)
+    }
+
+    private func handle(_ action: TaskResultShelfAction, for result: AgentTaskResultObject,
+                        outcome: TaskResultShelfActionOutcome, fromStack: Bool) {
+        switch outcome {
         case .completed:
-            actionMessage = action == .copyPath ? "Path copied." : nil
+            actionMessages[result.id] = action == .copyPath ? "Path copied." : nil
         case .preview(let url):
-            previewURL = url
-            previewTitle = result.name
-            actionMessage = nil
+            actionMessages[result.id] = nil
+            if fromStack {
+                pendingPreview = (url, result.name)
+                presentedStack = nil
+            } else {
+                previewURL = url
+                previewTitle = result.name
+            }
         case .unavailable(let message):
-            actionMessage = message
+            actionMessages[result.id] = message
         }
+    }
+}
+
+struct TaskResultShelfStackPopoverView: View {
+    typealias ActionHandler = @MainActor (TaskResultShelfAction, AgentTaskResultObject) -> TaskResultShelfActionOutcome
+    typealias ActionUpdate = @MainActor (TaskResultShelfAction, AgentTaskResultObject, TaskResultShelfActionOutcome) -> Void
+
+    let path: String
+    let files: [AgentTaskResultObject]
+    let surface: Color
+    let accent: Color
+    let actionMessages: [String: String]
+    let actionHandler: ActionHandler
+    let onAction: ActionUpdate
+    let onDismiss: @MainActor () -> Void
+
+    private var folderName: String { URL(fileURLWithPath: path).lastPathComponent }
+    private var popoverHeight: CGFloat { min(max(CGFloat(files.count) * 105 + 58, 190), 440) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(folderName) · \(files.count) files")
+                    .font(.headline)
+                    .lineLimit(1)
+                Text(path)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .help(path)
+            }
+            Divider()
+            ScrollView {
+                VStack(spacing: 0) {
+                    ForEach(Array(files.enumerated()), id: \.element.id) { index, file in
+                        fileRow(file)
+                        if index < files.count - 1 { Divider().padding(.leading, 8) }
+                    }
+                }
+            }
+            .accessibilityLabel("Files in \(path); scroll vertically for more files")
+        }
+        .padding(12)
+        .frame(width: 390, height: popoverHeight)
+        .background(surface)
+        .onExitCommand(perform: onDismiss)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Files in folder \(path)")
+    }
+
+    private func fileRow(_ result: AgentTaskResultObject) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Image(systemName: "doc")
+                    .foregroundStyle(accent)
+                    .accessibilityHidden(true)
+                Text(result.name)
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+                    .help(result.name)
+                Spacer(minLength: 0)
+                if result.state == .needsRecheck {
+                    Label("Needs recheck", systemImage: "arrow.clockwise.circle")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.orange)
+                } else {
+                    Text("Verified")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            HStack(spacing: 12) {
+                ForEach(TaskResultShelfAction.available(for: result), id: \.rawValue) { action in
+                    Button(action.title) {
+                        let outcome = TaskResultShelfDispatcher(handler: actionHandler).perform(action, for: result)
+                        onAction(action, result, outcome)
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(accent)
+                    .help("\(action.title) \(result.name)")
+                    .accessibilityLabel("\(action.title) \(result.name)")
+                }
+            }
+            if let message = actionMessages[result.id] {
+                Text(message)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(message)
+            }
+        }
+        .padding(.vertical, 8)
+        .padding(.horizontal, 4)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("File \(result.name), \(result.state == .verified ? "verified" : "needs recheck")")
     }
 }
 
