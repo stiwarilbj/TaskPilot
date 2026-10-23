@@ -344,6 +344,14 @@ struct TaskPilotMainView: View {
                 }
             }
 
+            if let progressMap = model.taskProgressMap, !progressMap.resultObjects.isEmpty {
+                TaskResultShelfView(results: progressMap.resultObjects,
+                                    surface: theme.surfaceColor,
+                                    border: theme.borderColor,
+                                    accent: accent)
+                    .id(progressMap.generationID)
+            }
+
             Divider()
 
             if let output = model.taskOutput {

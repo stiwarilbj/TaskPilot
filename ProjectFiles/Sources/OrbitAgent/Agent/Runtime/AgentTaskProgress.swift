@@ -38,6 +38,7 @@ struct AgentTaskProgressSnapshot: Equatable {
     let wholeRequestCoverage: String
     let activeRequirementIDs: [String]
     let requirements: [AgentTaskProgressRequirement]
+    let resultObjects: [AgentTaskResultObject]
 
     var estimatedByteCount: Int {
         let textBytes = requirements.reduce(0) { total, requirement in
@@ -46,13 +47,15 @@ struct AgentTaskProgressSnapshot: Equatable {
                     $0 + $1.label.utf8.count + $1.detail.utf8.count + ($1.revealPath?.utf8.count ?? 0) + 48
                 }
         } + activeRequirementIDs.reduce(0) { $0 + $1.utf8.count + 4 }
+            + resultObjects.reduce(0) { $0 + $1.estimatedByteCount }
         // JSON escaping can expand control characters to six bytes each.
         return 1_024 + textBytes * 6
     }
 
     static func parse(_ message: [String: Any], generationID: String) -> Self? {
         let requiredKeys: Set<String> = ["kind", "task_generation_id", "revision", "version", "lifecycle",
-                                         "whole_request_coverage", "active_requirement_ids", "requirements"]
+                                         "whole_request_coverage", "active_requirement_ids", "requirements",
+                                         "result_objects"]
         guard Set(message.keys) == requiredKeys,
               message["kind"] as? String == "task_progress",
               message["task_generation_id"] as? String == generationID,
@@ -60,7 +63,7 @@ struct AgentTaskProgressSnapshot: Equatable {
               CFGetTypeID(revisionNumber) != CFBooleanGetTypeID(),
               let revision = UInt64(revisionNumber.stringValue), revision > 0,
               let version = message["version"] as? NSNumber,
-              CFGetTypeID(version) != CFBooleanGetTypeID(), version.intValue == 1, version.doubleValue == 1,
+              CFGetTypeID(version) != CFBooleanGetTypeID(), version.intValue == 2, version.doubleValue == 2,
               let lifecycleRaw = message["lifecycle"] as? String,
               let lifecycle = AgentTaskProgressLifecycle(rawValue: lifecycleRaw),
               lifecycle != .paused, lifecycle != .stopping,
@@ -69,7 +72,8 @@ struct AgentTaskProgressSnapshot: Equatable {
               let activeValues = message["active_requirement_ids"] as? [String], activeValues.count <= 512,
               Set(activeValues).count == activeValues.count,
               activeValues.allSatisfy(isRequirementID),
-              let rawRequirements = message["requirements"] as? [[String: Any]], rawRequirements.count <= 512 else {
+              let rawRequirements = message["requirements"] as? [[String: Any]], rawRequirements.count <= 512,
+              let resultObjects = AgentTaskResultObject.parseList(message["result_objects"]) else {
             return nil
         }
 
@@ -131,7 +135,8 @@ struct AgentTaskProgressSnapshot: Equatable {
         }
         guard Set(activeValues).isSubset(of: identifiers) else { return nil }
         return Self(generationID: generationID, revision: revision, lifecycle: lifecycle,
-                    wholeRequestCoverage: coverage, activeRequirementIDs: activeValues, requirements: requirements)
+                    wholeRequestCoverage: coverage, activeRequirementIDs: activeValues, requirements: requirements,
+                    resultObjects: resultObjects)
     }
 
     private static func isRequirementID(_ value: String) -> Bool {
@@ -154,6 +159,7 @@ struct TaskProgressMap: Equatable {
     var wholeRequestCoverage: String
     var activeRequirementIDs: [String]
     var requirements: [AgentTaskProgressRequirement]
+    var resultObjects: [AgentTaskResultObject]
 
     init(request: String, generationID: String) {
         originalRequest = request
@@ -163,6 +169,7 @@ struct TaskProgressMap: Equatable {
         wholeRequestCoverage = "pending"
         activeRequirementIDs = []
         requirements = []
+        resultObjects = []
     }
 
     init(request: String, snapshot: AgentTaskProgressSnapshot) {
@@ -173,5 +180,6 @@ struct TaskProgressMap: Equatable {
         wholeRequestCoverage = snapshot.wholeRequestCoverage
         activeRequirementIDs = snapshot.activeRequirementIDs
         requirements = snapshot.requirements
+        resultObjects = snapshot.resultObjects
     }
 }

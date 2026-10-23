@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import math
 import os
 import re
 import threading
+import unicodedata
 from copy import deepcopy
 from typing import Any
 
@@ -21,7 +23,14 @@ from task_inputs import TaskInputBindings
 from expected_effects import ExpectedEffect, ExpectedEffectError, validate_expectation
 from observation_context import coordinate_targets, observation_indexes
 
-CHECKLIST_VERSION = 7
+CHECKLIST_VERSION = 8
+RESULT_BROWSER_BUNDLE_IDS = frozenset({
+    "com.apple.Safari", "com.apple.SafariTechnologyPreview",
+    "com.google.Chrome", "com.google.Chrome.beta", "com.google.Chrome.canary", "com.google.Chrome.dev",
+    "org.chromium.Chromium", "org.mozilla.firefox", "org.mozilla.firefoxdeveloperedition",
+    "com.microsoft.edgemac", "com.brave.Browser", "company.thebrowser.Browser",
+    "com.operasoftware.Opera", "com.vivaldi.Vivaldi", "com.kagi.kagimacOS",
+})
 FILE_CHECKS = {"file_exists", "directory_exists", "path_absent", "file_contents"}
 OBSERVATION_CHECKS = {"window_active", "field_value", "dialog_present"}
 READ_PATTERN = r'\s*(?:read|show|print)\s+(?:the\s+)?(?:contents of\s+)?file\s+(["`\'])((?:/|~/)(?:(?!\1)[^\n])+)\1\s*[.!]?\s*'
@@ -319,6 +328,9 @@ class TaskEvidenceLedger:
         self.rejections = self.checks = 0
         self.action_sequence = 0
         self.readback = False
+        # Presentation-only objects remain task-scoped and never enter prompt
+        # history, completion evidence, or persistent task history.
+        self._result_object_cache: dict[str, dict] = {}
         read = re.fullmatch(READ_PATTERN, task, re.I)
         if read:
             self.local_complete_grammar = True
@@ -822,12 +834,230 @@ class TaskEvidenceLedger:
             if identifier in active and lifecycle == "running" and projected_state != "proven":
                 projected_active.append(identifier)
         return {
-            "version": 1,
+            "version": 2,
             "lifecycle": lifecycle,
             "whole_request_coverage": "audited" if self.coverage_complete else "pending",
             "active_requirement_ids": projected_active,
             "requirements": summaries,
+            "result_objects": self._presentation_result_objects(),
         }
+
+    @staticmethod
+    def _result_object_id(kind: str, target: str) -> str:
+        prefix = {"file": "f", "folder": "d", "web": "w"}[kind]
+        fingerprint = hashlib.sha256((kind + "\0" + target).encode("utf-8")).hexdigest()
+        return f"{prefix}:{fingerprint}"
+
+    @staticmethod
+    def _safe_web_destination(value: Any) -> tuple[str, str] | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            if len(value.encode("utf-8")) > 4096:
+                return None
+        except UnicodeEncodeError:
+            return None
+        if any(unicodedata.category(char) == "Cc" for char in value):
+            return None
+        if any(char.isspace() or char == "\\" for char in value):
+            return None
+        try:
+            from urllib.parse import urlsplit
+            parsed = urlsplit(value)
+            hostname = parsed.hostname
+            # A browser's observed document location is useful as an openable
+            # result only when it is an ordinary public web URL, without user
+            # credentials or malformed ports.
+            if (parsed.scheme.lower() not in {"http", "https"} or not hostname or
+                    parsed.username is not None or parsed.password is not None):
+                return None
+            try:
+                ipaddress.ip_address(hostname)
+            except ValueError:
+                ascii_host = hostname.encode("idna").decode("ascii")
+                labels = ascii_host.rstrip(".").split(".")
+                if (not labels or len(ascii_host) > 253 or
+                        any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                            for label in labels)):
+                    return None
+            if len(hostname) > 253:
+                return None
+            port = parsed.port
+            if port is not None and not 1 <= port <= 65535:
+                return None
+            return value, hostname.lower()
+        except (ValueError, UnicodeError):
+            return None
+
+    def _presentation_result_objects(self) -> list[dict]:
+        """Project only requested, natively evidenced output targets.
+
+        The output is a user-interface convenience, never a source of proof.
+        Historical targets remain visible as needing recheck after mutable
+        evidence is invalidated, while only currently matching evidence is
+        labelled verified.
+        """
+        self.refresh()
+        current: dict[str, dict] = {}
+        associated_requirements: set[str] = set()
+
+        def add(item: dict, requirement_id: str) -> None:
+            item["_requirement_id"] = requirement_id
+            previous = current.get(item["id"])
+            if previous is None or (previous["state"] != "verified" and item["state"] == "verified"):
+                current[item["id"]] = item
+
+        file_types = {"file_written", "file_append", "file_contents", "file_exists", "directory_exists"}
+        for requirement_id, requirement in self.requirements.items():
+            if requirement.get("scope", "outcome") == "prerequisite":
+                continue
+            check = requirement.get("check", {})
+            kind = check.get("type")
+            if kind in file_types and isinstance(check.get("path"), str):
+                associated_requirements.add(requirement_id)
+                matching = []
+                for evidence_id, evidence in self.evidence.items():
+                    if self.requirement_matches(requirement_id, evidence):
+                        matching.append((evidence_id, evidence))
+                path_key_value = path_key(check["path"])
+                has_current_requirement_proof = requirement.get("state") == "proven" and bool(matching)
+                if has_current_requirement_proof:
+                    chosen = next(((evidence_id, evidence) for evidence_id, evidence in reversed(matching)
+                                   if evidence_id in requirement.get("evidence_ids", [])), matching[-1])
+                else:
+                    historical = []
+                    for evidence_id, evidence in self.evidence.items():
+                        if evidence.get("generation") != self.generation:
+                            continue
+                        if self.matches(check, {**evidence, "valid": True}):
+                            historical.append((evidence_id, evidence))
+                    cached = [item for item in self._result_object_cache.values()
+                              if item.get("_requirement_id") == requirement_id and
+                              item.get("kind") in {"file", "folder"} and
+                              path_key(item.get("path", "")) == path_key(check["path"])]
+                    chosen = historical[-1] if historical else None
+                    if chosen is None and cached:
+                        # Reuse the last verified object description without
+                        # treating it as fresh proof.
+                        stale = dict(cached[-1])
+                        stale["state"] = "needs_recheck"
+                        add(stale, requirement_id)
+                        continue
+                if chosen is None:
+                    continue
+                evidence_id, evidence = chosen
+                fact = evidence.get("fact", {})
+                path = fact.get("path")
+                if not isinstance(path, str) or path_key(path) != path_key(check["path"]):
+                    continue
+                identity_fields = ("file_identity", "file_version", "parent_identity")
+                selected_identity = {field: fact[field] for field in identity_fields if field in fact}
+                fresh_object_support = any(
+                    candidate.get("valid") is True and candidate.get("generation") == self.generation and
+                    candidate.get("fact", {}).get("path") == path_key_value and
+                    candidate.get("fact", {}).get("type") in {
+                        "file_read", "file_contents", "file_append", "file_exists", "directory_exists",
+                    } and
+                    all(candidate.get("fact", {}).get(field) == value
+                        for field, value in selected_identity.items())
+                    for candidate in self.evidence.values()
+                )
+                status = ("verified" if has_current_requirement_proof and fresh_object_support
+                          else "needs_recheck")
+                object_kind = "folder" if kind == "directory_exists" or fact.get("type") == "directory_exists" else "file"
+                if object_kind == "folder" and fact.get("type") != "directory_exists":
+                    continue
+                if object_kind == "file" and fact.get("type") == "directory_exists":
+                    continue
+                if len(path.encode("utf-8")) > 4096 or not path.startswith("/"):
+                    continue
+                item = {
+                    "id": self._result_object_id(object_kind, path),
+                    "kind": object_kind,
+                    "state": status,
+                    "name": path.rsplit("/", 1)[-1] or path,
+                    "location": path.rsplit("/", 1)[0] or "/",
+                    "path": path,
+                }
+                for field in ("file_identity", "file_version", "parent_identity"):
+                    value = fact.get(field)
+                    if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value):
+                        item[field] = value
+                add(item, requirement_id)
+                continue
+
+            if kind != "window_active":
+                continue
+            associated_requirements.add(requirement_id)
+            check_fingerprint = digest(check)
+            current_observation = self.current_observation or {}
+            revision = current_observation.get("observation_revision")
+            app = observation_indexes(current_observation).application(check.get("pid"))
+            has_current_proof = any(
+                evidence_id in requirement.get("evidence_ids", []) and
+                (evidence := self.evidence.get(evidence_id)) is not None and
+                evidence.get("valid") is True and evidence.get("fact", {}).get("type") == "requirement_observed" and
+                evidence["fact"].get("check_fingerprint") == check_fingerprint and
+                evidence["fact"].get("revision") == revision
+                for evidence_id in requirement.get("evidence_ids", [])
+            )
+            destinations = current_observation.get("result_destinations", [])
+            if (requirement.get("state") == "proven" and has_current_proof and isinstance(app, dict)
+                    and isinstance(destinations, list)):
+                matches = [destination for destination in destinations
+                           if isinstance(destination, dict) and destination.get("pid") == check.get("pid")
+                           and destination.get("window_title") == check.get("title")
+                           and destination.get("bundle_id") == app.get("bundle_id")
+                           and destination.get("bundle_id") in RESULT_BROWSER_BUNDLE_IDS
+                           and destination.get("observation_revision") == revision]
+                for destination in matches:
+                    safe_url = self._safe_web_destination(destination.get("url"))
+                    if safe_url is None:
+                        continue
+                    url, hostname = safe_url
+                    title = destination.get("title")
+                    title = title if isinstance(title, str) and title.strip() and len(title.encode("utf-8")) <= 512 else hostname
+                    item = {"id": self._result_object_id("web", url), "kind": "web", "state": "verified",
+                            "name": title, "location": hostname, "url": url, "hostname": hostname}
+                    add(item, requirement_id)
+
+        # Retain just the objects still associated with an outcome requirement.
+        for identifier, item in list(self._result_object_cache.items()):
+            requirement_id = item.get("_requirement_id")
+            if requirement_id not in associated_requirements:
+                continue
+            requirement = self.requirements.get(requirement_id, {})
+            check = requirement.get("check", {})
+            if item.get("kind") in {"file", "folder"} and path_key(item.get("path", "")) != path_key(check.get("path", "")):
+                continue
+            if identifier not in current:
+                stale = dict(item)
+                stale["state"] = "needs_recheck"
+                current[identifier] = stale
+
+        # Carry forward the original display order for already-seen exact
+        # destinations, then append newly verified objects in ledger order.
+        ordered: dict[str, dict] = {}
+        for identifier in self._result_object_cache:
+            if identifier in current:
+                ordered[identifier] = current.pop(identifier)
+        ordered.update(current)
+        self._result_object_cache = ordered
+        output = []
+        byte_count = 0
+        for item in ordered.values():
+            projected = {key: value for key, value in item.items() if key != "_requirement_id"}
+            try:
+                size = sum(len(projected.get(field, "").encode("utf-8")) for field in (
+                    "id", "name", "location", "path", "url", "file_identity", "file_version", "parent_identity",
+                )) + 96
+            except (AttributeError, UnicodeEncodeError):
+                continue
+            if len(output) >= 128 or byte_count + size > 512 * 1024:
+                break
+            output.append(projected)
+            byte_count += size
+        return output
 
     @staticmethod
     def _presentation_evidence(check: dict, fact: dict) -> dict | None:

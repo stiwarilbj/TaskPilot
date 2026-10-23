@@ -83,9 +83,10 @@ final class TaskProgressMapTests: XCTestCase {
     func testSnapshotRequiresExactGenerationAndStrictSafeEvidenceFields() throws {
         let base: [String: Any] = [
             "kind": "task_progress", "task_generation_id": "generation", "revision": 2,
-            "version": 1, "lifecycle": "running", "whole_request_coverage": "pending",
+            "version": 2, "lifecycle": "running", "whole_request_coverage": "pending",
             "active_requirement_ids": ["r1"],
-            "requirements": [["id": "r1", "source_ranges": [[0, 15]], "state": "pending", "active": true, "evidence": []]]
+            "requirements": [["id": "r1", "source_ranges": [[0, 15]], "state": "pending", "active": true, "evidence": []]],
+            "result_objects": []
         ]
         let parsed = try XCTUnwrap(AgentTaskProgressSnapshot.parse(base, generationID: "generation"))
         XCTAssertEqual(parsed.revision, 2)
@@ -109,11 +110,12 @@ final class TaskProgressMapTests: XCTestCase {
     func testOnlyConfirmedFileEvidenceCanOfferFinderReveal() throws {
         let base: [String: Any] = [
             "kind": "task_progress", "task_generation_id": "generation", "revision": 3,
-            "version": 1, "lifecycle": "completed", "whole_request_coverage": "audited",
+            "version": 2, "lifecycle": "completed", "whole_request_coverage": "audited",
             "active_requirement_ids": [],
             "requirements": [["id": "r1", "source_ranges": [[0, 15]], "state": "proven", "active": false,
                               "evidence": [["label": "File contents matched", "detail": "/tmp/report.txt",
-                                            "reveal_path": "/tmp/report.txt"]]]]
+                                            "reveal_path": "/tmp/report.txt"]]]],
+            "result_objects": []
         ]
         let parsed = try XCTUnwrap(AgentTaskProgressSnapshot.parse(base, generationID: "generation"))
         XCTAssertEqual(parsed.requirements[0].evidence[0].revealPath, "/tmp/report.txt")
@@ -159,9 +161,10 @@ final class TaskProgressMapTests: XCTestCase {
     func testByteRangesMustRespectUTF8BoundariesAndTaskLength() throws {
         let base: [String: Any] = [
             "kind": "task_progress", "task_generation_id": "generation", "revision": 4,
-            "version": 1, "lifecycle": "running", "whole_request_coverage": "pending",
+            "version": 2, "lifecycle": "running", "whole_request_coverage": "pending",
             "active_requirement_ids": [],
-            "requirements": [["id": "r1", "source_ranges": [[0, 1]], "state": "pending", "active": false, "evidence": []]]
+            "requirements": [["id": "r1", "source_ranges": [[0, 1]], "state": "pending", "active": false, "evidence": []]],
+            "result_objects": []
         ]
         XCTAssertNotNil(AgentTaskProgressSnapshot.parse(base, generationID: "generation"))
         var malformed = base

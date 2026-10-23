@@ -5,6 +5,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "AgentRuntime"))
 from evidence_fixtures import native_result
+from evidence_fixtures import filesystem_identity
 from task_evidence import TaskEvidenceLedger
 
 
@@ -34,6 +35,9 @@ class TaskProgressProjectionTests(unittest.TestCase):
         self.assertEqual(requirement["source_ranges"], [[0, len("Create the report".encode("utf-8"))]])
         self.assertEqual(confirmed["active_requirement_ids"], [])
         self.assertTrue(requirement["evidence"])
+        self.assertEqual(len(confirmed["result_objects"]), 1)
+        self.assertEqual(confirmed["result_objects"][0]["kind"], "file")
+        self.assertEqual(confirmed["result_objects"][0]["state"], "verified")
         self.assertIn("/fixture/report.txt", requirement["evidence"][0]["detail"])
         serialized = str(confirmed)
         self.assertNotIn("PRIVATE-CONTENT", serialized)
@@ -45,6 +49,162 @@ class TaskProgressProjectionTests(unittest.TestCase):
         invalidated = ledger.presentation_state()
         self.assertEqual(invalidated["requirements"][0]["state"], "invalidated")
         self.assertEqual(invalidated["requirements"][0]["evidence"], [])
+        self.assertEqual(invalidated["result_objects"][0]["state"], "needs_recheck")
+
+    def test_shelf_includes_requested_files_and_folders_but_not_inputs_or_prerequisites(self):
+        task = "Create /fixture/report.txt, verify /fixture/results, and read /fixture/source.txt."
+        ledger = TaskEvidenceLedger(task, "generation-objects")
+        ledger.add_requirements([
+            {"source": task, "description": "Create the requested file",
+             "check": {"type": "file_written", "path": "/fixture/report.txt", "content": "report"}},
+            {"source": task, "description": "Verify the requested output folder",
+             "check": {"type": "directory_exists", "path": "/fixture/results"}},
+            {"source": task, "description": "Read the source file",
+             "check": {"type": "file_read", "path": "/fixture/source.txt"}},
+            {"source": task, "description": "Confirm the input folder first",
+             "scope": "prerequisite", "check": {"type": "directory_exists", "path": "/fixture/input"}},
+        ])
+        action = {"type": "write_file", "path": "/fixture/report.txt", "content": "report"}
+        ledger.record_action(action, native_result(action))
+        ledger.add_evidence({"type": "directory_exists", "path": "/fixture/results",
+                             **filesystem_identity("/fixture/results")}, mutable=True)
+        ledger.add_evidence({"type": "directory_exists", "path": "/fixture/input",
+                             **filesystem_identity("/fixture/input")}, mutable=True)
+        ledger.record_action({"type": "read_file", "path": "/fixture/source.txt"},
+                             native_result({"type": "read_file", "path": "/fixture/source.txt"}, content="source"))
+
+        objects = ledger.presentation_state()["result_objects"]
+        self.assertEqual([(item["kind"], item["path"], item["state"]) for item in objects], [
+            ("file", "/fixture/report.txt", "verified"),
+            ("folder", "/fixture/results", "verified"),
+        ])
+        self.assertNotIn("/fixture/source.txt", str(objects))
+        self.assertNotIn("/fixture/input", str(objects))
+        self.assertNotIn("content", str(objects))
+
+    def test_same_destination_is_deduplicated_and_proven_copy_wins(self):
+        task = "Create the report and verify that it exists."
+        ledger = TaskEvidenceLedger(task, "generation-dedup")
+        ledger.add_requirements([
+            {"source": task, "description": "Write the report",
+             "check": {"type": "file_written", "path": "/fixture/report.txt", "content": "report"}},
+            {"source": task, "description": "Verify the report contents",
+             "check": {"type": "file_contents", "path": "/fixture/report.txt", "content": "report"}},
+        ])
+        action = {"type": "write_file", "path": "/fixture/report.txt", "content": "report"}
+        ledger.record_action(action, native_result(action))
+        objects = ledger.presentation_state()["result_objects"]
+        self.assertEqual(len(objects), 1)
+        self.assertEqual(objects[0]["state"], "verified")
+
+    def test_overwriting_a_verified_output_marks_the_original_result_for_recheck(self):
+        task = "Create /fixture/report.txt containing report."
+        ledger = TaskEvidenceLedger(task, "generation-replaced-output")
+        ledger.add_requirements([{
+            "source": task, "description": "Create the requested report",
+            "check": {"type": "file_written", "path": "/fixture/report.txt", "content": "report"},
+        }])
+        first = {"type": "write_file", "path": "/fixture/report.txt", "content": "report"}
+        ledger.record_action(first, native_result(first))
+        self.assertEqual(ledger.presentation_state()["result_objects"][0]["state"], "verified")
+
+        replacement = {"type": "write_file", "path": "/fixture/report.txt", "content": "different"}
+        ledger.before_action(replacement)
+        ledger.record_action(replacement, native_result(replacement, file_version="f" * 64))
+        self.assertEqual(ledger.presentation_state()["result_objects"][0]["state"], "needs_recheck")
+
+    def test_web_cards_require_a_matching_current_window_proof_and_safe_observed_url(self):
+        task = "Open the example page and leave it visible."
+        ledger = TaskEvidenceLedger(task, "generation-web")
+        ledger.add_requirements([{
+            "source": task, "description": "Leave the example page visible",
+            "check": {"type": "window_active", "pid": 42, "title": "Example Domain"},
+        }])
+        observation = {
+            "task_generation_id": "generation-web", "observation_revision": "rev-1",
+            "applications": [{"pid": 42, "name": "Safari", "bundle_id": "com.apple.Safari",
+                               "active": True, "topmost_on_agent_screen": True,
+                               "windows": [{"title": "Example Domain", "topmost_on_agent_screen": True}]}],
+            "result_destinations": [{"pid": 42, "window_title": "Example Domain",
+                                      "bundle_id": "com.apple.Safari",
+                                      "title": "Example Domain", "url": "https://example.com/",
+                                      "observation_revision": "rev-1"}],
+        }
+        ledger.observe(observation)
+        objects = ledger.presentation_state()["result_objects"]
+        self.assertEqual(len(objects), 1)
+        self.assertEqual(objects[0]["kind"], "web")
+        self.assertEqual(objects[0]["url"], "https://example.com/")
+        self.assertEqual(objects[0]["state"], "verified")
+
+        changed = {**observation, "observation_revision": "rev-2", "result_destinations": []}
+        changed["applications"] = [{**observation["applications"][0], "windows": [
+            {"title": "Example Domain", "topmost_on_agent_screen": True}]}]
+        ledger.observe(changed)
+        stale = ledger.presentation_state()["result_objects"]
+        self.assertEqual(stale[0]["state"], "needs_recheck")
+
+        non_browser = {**observation, "result_destinations": [{
+            "pid": 42, "bundle_id": "com.example.notes", "window_title": "Example Domain",
+            "title": "Example Domain", "url": "https://example.com/", "observation_revision": "rev-1",
+        }]}
+        ledger = TaskEvidenceLedger(task, "generation-web-nonbrowser")
+        ledger.add_requirements([{
+            "source": task, "description": "Leave the example page visible",
+            "check": {"type": "window_active", "pid": 42, "title": "Example Domain"},
+        }])
+        non_browser["task_generation_id"] = "generation-web-nonbrowser"
+        non_browser["applications"] = [{**observation["applications"][0], "bundle_id": "com.example.notes"}]
+        ledger.observe(non_browser)
+        self.assertEqual(ledger.presentation_state()["result_objects"], [])
+
+    def test_web_projection_rejects_credentials_unsupported_schemes_and_stale_revisions(self):
+        for url in ("file:///tmp/report.pdf", "javascript:alert(1)", "https://user:secret@example.com/"):
+            self.assertIsNone(TaskEvidenceLedger._safe_web_destination(url), url)
+        self.assertIsNone(TaskEvidenceLedger._safe_web_destination("https://example.com:99999/"))
+        self.assertIsNone(TaskEvidenceLedger._safe_web_destination("https://example.\u0085com/"))
+
+        task = "Open the example page and leave it visible."
+        ledger = TaskEvidenceLedger(task, "generation-web-stale")
+        ledger.add_requirements([{"source": task, "description": "Keep example visible",
+                                  "check": {"type": "window_active", "pid": 42, "title": "Example Domain"}}])
+        ledger.observe({"task_generation_id": "generation-web-stale", "observation_revision": "rev-3",
+                        "applications": [{"pid": 42, "name": "Safari", "bundle_id": "com.apple.Safari",
+                                          "active": True, "topmost_on_agent_screen": True,
+                                          "windows": [{"title": "Example Domain", "topmost_on_agent_screen": True}]}],
+                        "result_destinations": [{"pid": 42, "window_title": "Example Domain", "title": "Example",
+                                                 "bundle_id": "com.apple.Safari",
+                                                 "url": "https://example.com/", "observation_revision": "old"}]})
+        self.assertEqual(ledger.presentation_state()["result_objects"], [])
+
+    def test_result_shelf_preserves_first_appearance_when_a_window_navigates(self):
+        task = "Open the example page and leave it visible."
+        ledger = TaskEvidenceLedger(task, "generation-web-order")
+        ledger.add_requirements([{
+            "source": task, "description": "Leave the example page visible",
+            "check": {"type": "window_active", "pid": 42, "title": "Example Domain"},
+        }])
+        base = {
+            "task_generation_id": "generation-web-order",
+            "applications": [{"pid": 42, "name": "Safari", "bundle_id": "com.apple.Safari",
+                              "active": True, "topmost_on_agent_screen": True,
+                              "windows": [{"title": "Example Domain", "topmost_on_agent_screen": True}]}],
+        }
+        first_url = "https://example.com/first"
+        ledger.observe({**base, "observation_revision": "rev-1", "result_destinations": [{
+            "pid": 42, "bundle_id": "com.apple.Safari", "window_title": "Example Domain", "title": "Example Domain",
+            "url": first_url, "observation_revision": "rev-1",
+        }]})
+        self.assertEqual([item["url"] for item in ledger.presentation_state()["result_objects"]], [first_url])
+        second_url = "https://example.com/second"
+        ledger.observe({**base, "observation_revision": "rev-2", "result_destinations": [{
+            "pid": 42, "bundle_id": "com.apple.Safari", "window_title": "Example Domain", "title": "Example Domain",
+            "url": second_url, "observation_revision": "rev-2",
+        }]})
+
+        results = ledger.presentation_state()["result_objects"]
+        self.assertEqual([item["url"] for item in results], [first_url, second_url])
+        self.assertEqual([item["state"] for item in results], ["needs_recheck", "verified"])
 
     def test_repeated_sources_are_retained_without_claiming_whole_request_coverage(self):
         task = "Create a report, then Create a report."

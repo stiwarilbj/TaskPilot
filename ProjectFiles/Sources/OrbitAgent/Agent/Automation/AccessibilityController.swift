@@ -13,6 +13,7 @@ struct AccessibilitySnapshot {
     let revision: String
     let elements: [[String: Any]]
     let applications: [[String: Any]]
+    let resultDestinations: [[String: Any]]
     let installedApplications: [[String: Any]]
     let systemContext: [String: Any]
     let completeness: [String: Any]
@@ -395,7 +396,8 @@ final class AccessibilityController {
     // observations use stageSnapshot and explicitly commit the accepted pair.
     func snapshot(on display: DisplayDescriptor) -> AccessibilitySnapshot {
         guard let staged = try? stageSnapshot(on: display) else {
-            return AccessibilitySnapshot(revision: "", elements: [], applications: [], installedApplications: [], systemContext: [:],
+            return AccessibilitySnapshot(revision: "", elements: [], applications: [], resultDestinations: [],
+                installedApplications: [], systemContext: [:],
                 completeness: ["version": 1, "state": "partial", "reason_counts": ["collection_failed": 1]])
         }
         try? staged.publish()
@@ -480,6 +482,7 @@ final class AccessibilityController {
         var structureCache: [UInt: AutomationStructureNode] = [:]
         var elementRows: [[String: Any]] = []
         var applicationRows: [[String: Any]] = []
+        var resultDestinations: [[String: Any]] = []
         var roots: [ObservationCollection<ObservationNode>.Entry] = []
         let revision = UUID().uuidString
         var observedGraphics: [pid_t: [AutomationGraphicsWindow]] = [:]
@@ -542,6 +545,21 @@ final class AccessibilityController {
             observedApps[pid] = appIdentity
             graph?.prepare(appIdentity, windows: visibleWindows)
 
+            for windowRecord in windowRecords {
+                guard resultDestinations.count < 128 else { break }
+                guard let documentURL = Self.taskResultWebURL(
+                    attribute(windowRecord.element, kAXDocumentAttribute)
+                        ?? attribute(windowRecord.element, kAXURLAttribute)
+                ) else { continue }
+                let title = stringAttribute(windowRecord.element, kAXTitleAttribute) ?? ""
+                resultDestinations.append([
+                    "pid": Int(pid), "bundle_id": appIdentity.bundleID ?? "",
+                    "app": app.localizedName ?? "Unknown app", "window_title": title,
+                    "title": title, "url": documentURL.absoluteString,
+                    "observation_revision": revision
+                ])
+            }
+
             applicationRows.append([
                 "name": app.localizedName ?? "Unknown app",
                 "bundle_id": app.bundleIdentifier ?? "",
@@ -603,6 +621,7 @@ final class AccessibilityController {
             revision: revision,
             elements: elementRows,
             applications: applicationRows,
+            resultDestinations: resultDestinations,
             installedApplications: installedApplicationEntries.map { entry in
                 var row: [String: Any] = [
                     "name": entry.name,
@@ -643,7 +662,8 @@ final class AccessibilityController {
         }
         let controls = try ObservationConsistency.controlSignature(elements: signatureRows, applications: signatureApps)
         let signature = String(decoding: try JSONSerialization.data(withJSONObject:
-            ["controls": controls, "collection_gaps": collection.reasonCounts], options: [.sortedKeys]), as: UTF8.self)
+            ["controls": controls, "collection_gaps": collection.reasonCounts,
+             "result_destinations": resultDestinations], options: [.sortedKeys]), as: UTF8.self)
         let lease = TaskOwnership.current
         return StagedAccessibilitySnapshot(snapshot: snapshot, consistencySignature: signature, publish: { [self] in
             try TaskOwnership.$current.withValue(lease) {
@@ -3666,6 +3686,28 @@ final class AccessibilityController {
 
     private func stringAttribute(_ element: AXUIElement, _ name: String) -> String? {
         attribute(element, name) as? String
+    }
+
+    private static func taskResultWebURL(_ value: Any?) -> URL? {
+        let raw: String?
+        if let value = value as? String {
+            raw = value
+        } else if let value = value as? URL {
+            raw = value.absoluteString
+        } else if let value = value as? NSURL {
+            raw = value.absoluteString
+        } else {
+            raw = nil
+        }
+        guard let raw, !raw.isEmpty, raw.utf8.count <= 4096,
+              !raw.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+              let components = URLComponents(string: raw),
+              let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = components.host, !host.isEmpty,
+              components.user == nil, components.password == nil,
+              let url = components.url else { return nil }
+        if let port = components.port, !(1...65535).contains(port) { return nil }
+        return url
     }
 
     private func boolAttribute(_ element: AXUIElement, _ name: String) -> Bool? {

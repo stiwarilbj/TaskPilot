@@ -1605,7 +1605,8 @@ def complete_from_decision(decision: dict[str, Any], fallback: str, ledger: Task
 def compact_observation(observation: dict[str, Any], task: str = "") -> dict[str, Any]:
     compact = {
         key: value for key, value in observation.items()
-        if key not in {"screenshot_path", "agent_cursor", "installed_applications", "elements", "text_recognition"}
+        if key not in {"screenshot_path", "agent_cursor", "installed_applications", "elements", "text_recognition",
+                       "result_destinations"}
     }
     text = prompt_text_recognition(observation)
     if text is not None: compact['text_recognition'] = text

@@ -86,7 +86,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
 
             class Ledger:
                 def presentation_state(self, *_args):
-                    return {"version": 1, "requirements": []}
+                    return {"version": 2, "requirements": [], "result_objects": []}
 
             with mock.patch.object(runtime, "emit", side_effect=RuntimeError("event unavailable")):
                 runtime.publish_task_progress(Ledger())
@@ -192,6 +192,17 @@ class OpenClawRuntimeTests(unittest.TestCase):
         )
         self.assertNotIn("screenshot_path", result)
         self.assertEqual(result["display"]["id"], 1)
+
+    def test_observed_web_destinations_are_kept_out_of_model_observations(self):
+        observation = {
+            "observation_revision": "rev-1",
+            "result_destinations": [{"url": "https://private.example/path?token=secret",
+                                     "title": "Private page"}],
+            "applications": [{"pid": 42, "name": "Browser"}],
+        }
+        compact = runtime.prompt_observation(observation)
+        self.assertNotIn("result_destinations", compact)
+        self.assertNotIn("token=secret", str(compact))
 
     def test_compact_observation_bounds_repeated_inventory(self):
         result = runtime.compact_observation({

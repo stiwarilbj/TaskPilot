@@ -20,7 +20,8 @@ final class LocalTextRecognitionTests: XCTestCase {
     }
     private func snapshot(elements: [[String: Any]] = [], available: Bool = false, partial: Bool = true) -> AccessibilitySnapshot {
         AccessibilitySnapshot(revision: "staged", elements: elements,
-            applications: [["pid": 42, "accessibility_available": available]], installedApplications: [], systemContext: [:],
+            applications: [["pid": 42, "accessibility_available": available]], resultDestinations: [],
+            installedApplications: [], systemContext: [:],
             completeness: ["state": partial ? "partial" : "complete", "limitations": partial ? [["pid": 42]] : []])
     }
     private func scene(_ windows: [ScreenTextWindow] = [.init(pid: 42, id: 7, frame: CGRect(x: 0, y: 0, width: 1000, height: 600))]) throws -> String {
