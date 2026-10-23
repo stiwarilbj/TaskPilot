@@ -182,14 +182,19 @@ final class TaskProgressMapTests: XCTestCase {
             requirement("r3", "leave it open", in: request)
         ]
         let progress = map(request, requirements)
-        let fixtures: [(String, Bool)] = [("collapsed", false), ("expanded", true)]
+        let fixtures: [(String, Bool, [String])] = [
+            ("collapsed", false, []),
+            ("expanded", true, []),
+            ("evidence", true, ["r1"])
+        ]
 
-        for (name, initiallyExpanded) in fixtures {
+        for (name, initiallyExpanded, selectedRequirementIDs) in fixtures {
             let view = TaskProgressMapView(map: progress,
                                            surface: Color(nsColor: .windowBackgroundColor),
                                            border: Color(nsColor: .separatorColor),
                                            accent: .blue,
-                                           initiallyExpanded: initiallyExpanded)
+                                           initiallyExpanded: initiallyExpanded,
+                                           initiallySelectedRequirementIDs: selectedRequirementIDs)
                 .frame(width: 320, height: 560, alignment: .topLeading)
             let hostingView = NSHostingView(rootView: view)
             hostingView.frame = NSRect(x: 0, y: 0, width: 320, height: 560)

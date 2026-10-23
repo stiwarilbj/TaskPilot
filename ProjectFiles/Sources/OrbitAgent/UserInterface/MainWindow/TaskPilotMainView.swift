@@ -55,6 +55,7 @@ struct TaskPilotMainView: View {
                         if let progressMap = model.taskProgressMap {
                             TaskProgressMapView(map: progressMap, surface: theme.surfaceColor,
                                                 border: theme.borderColor, accent: accent)
+                                .id(progressMap.generationID)
                         }
                         if model.userInputRequest != nil {
                             userInputCard

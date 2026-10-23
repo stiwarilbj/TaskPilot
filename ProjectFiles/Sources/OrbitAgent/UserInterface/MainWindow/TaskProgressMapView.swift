@@ -108,12 +108,15 @@ struct TaskProgressMapView: View {
     @State private var revealMessage: String?
 
     init(map: TaskProgressMap, surface: Color, border: Color, accent: Color,
-         initiallyExpanded: Bool = false) {
+         initiallyExpanded: Bool = false, initiallySelectedRequirementIDs: [String] = []) {
         self.map = map
         self.surface = surface
         self.border = border
         self.accent = accent
         _expanded = State(initialValue: initiallyExpanded)
+        _selectedRequirementIDs = State(initialValue: initiallySelectedRequirementIDs.filter { id in
+            map.requirements.contains(where: { $0.id == id })
+        })
     }
 
     private var clauses: [TaskProgressClause] { TaskProgressSourceMapper.clauses(for: map) }
