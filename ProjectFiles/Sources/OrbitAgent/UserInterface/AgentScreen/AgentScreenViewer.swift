@@ -17,21 +17,30 @@ final class AgentScreenViewerModel: ObservableObject {
     @Published private(set) var status = "Connecting to the agent screen…"
     @Published private(set) var interactionStatus = "Click the screen to control it; type after selecting an app"
     @Published private(set) var agentCursor: AgentCursorPresentation?
+    let actionMagnifier = AgentActionMagnifierModel()
 
     var interactionHandler: ((AgentScreenInteraction, DisplayDescriptor) throws -> String)?
 
     private let capture: ScreenCaptureService
     private var captureTask: Task<Void, Never>?
     private var cursorVisibilityTask: Task<Void, Never>?
+    private var currentDisplayID: CGDirectDisplayID?
+    private var isViewerVisible = false
 
     init(capture: ScreenCaptureService) {
         self.capture = capture
     }
 
     func start(display: DisplayDescriptor?) {
+        isViewerVisible = display != nil
+        if let newID = display?.id, let currentDisplayID, currentDisplayID != newID {
+            actionMagnifier.clear(keepGeneration: true)
+        }
+        currentDisplayID = display?.id
         captureTask?.cancel()
         captureTask = nil
         guard let display else {
+            actionMagnifier.clear(keepGeneration: true)
             image = nil
             status = "The agent screen is not connected"
             return
@@ -64,7 +73,27 @@ final class AgentScreenViewerModel: ObservableObject {
         cursorVisibilityTask?.cancel()
         cursorVisibilityTask = nil
         agentCursor = nil
+        currentDisplayID = nil
+        isViewerVisible = false
+        actionMagnifier.clear(keepGeneration: true)
     }
+
+    func beginTask(_ generationID: String) { actionMagnifier.beginTask(generationID) }
+
+    func handleActionMagnifier(_ event: AgentActionMagnifierEvent) {
+        switch event.kind {
+        case .targeted(let request):
+            guard isViewerVisible, currentDisplayID == request.displayID else { return }
+            actionMagnifier.show(request)
+        case .state(let actionID, let generationID, let sequence, let state):
+            actionMagnifier.update(actionID: actionID, generationID: generationID,
+                                   sequence: sequence, state: state)
+        case .clear(let generationID, let sequence):
+            actionMagnifier.clear(generationID: generationID, sequence: sequence)
+        }
+    }
+
+    func clearActionMagnifier() { actionMagnifier.clear(keepGeneration: true) }
 
     func showAgentCursor(_ presentation: AgentCursorPresentation) {
         cursorVisibilityTask?.cancel()
@@ -115,6 +144,11 @@ struct AgentScreenViewer: View {
                             .allowsHitTesting(false)
                             .transition(.opacity)
                         }
+
+                        AgentActionMagnifierOverlay(
+                            model: model.actionMagnifier,
+                            displaySize: display.frame.size
+                        )
                     }
                 }
             } else {

@@ -192,6 +192,10 @@ final class AccessibilityController {
     private var elementMap: [String: ElementRecord] = [:]
     private var observationRevision = ""
     private var observationCoordinates: ScreenCoordinateMapping?
+    private var observationMagnifierSource: (revision: String, displayID: CGDirectDisplayID, source: AgentMagnifierImageSource)?
+    private var actionMagnifierSequence: UInt64 = 0
+    private var activeMagnifierAction: (actionID: String, generationID: String, sequence: UInt64)?
+    var onActionMagnifierEvent: ((AgentActionMagnifierEvent) -> Void)?
     private var observationTaskGenerationID: String?
     private var observedGraphicsWindows: [pid_t: [AutomationGraphicsWindow]] = [:]
     private var observedApplications: [pid_t: AutomationApplicationIdentity] = [:]
@@ -244,6 +248,8 @@ final class AccessibilityController {
         taskLease = lease
         taskGenerationID = lease?.id
         elementMap.removeAll(); observationRevision = ""; observationCoordinates = nil
+        observationMagnifierSource = nil
+        actionMagnifierSequence = 0; activeMagnifierAction = nil
         manualTargetPID = nil
         taskDisplayOverrideID = nil
         taskApplicationBaseline = TaskApplicationBaseline(
@@ -274,6 +280,8 @@ final class AccessibilityController {
         taskApplicationBaseline = nil
         taskGenerationID = nil
         elementMap.removeAll(); observationRevision = ""; observationCoordinates = nil
+        observationMagnifierSource = nil
+        activeMagnifierAction = nil
         manualTargetPID = nil
         taskDisplayOverrideID = nil
         lock.unlock()
@@ -906,15 +914,113 @@ final class AccessibilityController {
         })
     }
 
-    func bindCoordinates(_ coordinates: ScreenCoordinateMapping, revision: String, on display: DisplayDescriptor) throws {
+    func bindCoordinates(_ coordinates: ScreenCoordinateMapping, revision: String, on display: DisplayDescriptor,
+                         screenshotURL: URL? = nil) throws {
         try coordinates.validate(display: display)
         try validateObservation(revision)
+        let protectedTargets = lock.withLock {
+            elementMap.values.filter {
+                AutomationTextEntryPolicy.isSecure(role: $0.role, subrole: $0.identity.subrole)
+            }.compactMap(\.observedBounds)
+        }
+        let source = screenshotURL.flatMap { try? AgentMagnifierImageSource(
+            url: $0, mapping: coordinates, protectedTargets: protectedTargets
+        ) }
         try TaskOwnership.commit {
             try lock.withLock {
                 guard revision == observationRevision else { throw AccessibilityActionError.staleObservation }
                 observationCoordinates = coordinates
+                observationMagnifierSource = source.map { (revision, display.id, $0) }
             }
         }
+    }
+
+    func finishActionMagnifier(actionID: String, generationID: String, state: AgentActionMagnifierState) {
+        guard let lease = TaskOwnership.current, lease.id == generationID, lease.accepts(generationID) else { return }
+        guard let sequence = lock.withLock({ () -> UInt64? in
+            guard activeMagnifierAction?.actionID == actionID,
+                  activeMagnifierAction?.generationID == generationID else { return nil }
+            return activeMagnifierAction?.sequence
+        }) else { return }
+        onActionMagnifierEvent?(.init(kind: .state(
+            actionID: actionID, generationID: generationID, sequence: sequence, state: state
+        )))
+    }
+
+    func clearActionMagnifier() {
+        guard let lease = TaskOwnership.current, lease.accepts(lease.id) else { return }
+        let sequence = lock.withLock { () -> UInt64 in
+            actionMagnifierSequence &+= 1
+            activeMagnifierAction = nil
+            return actionMagnifierSequence
+        }
+        onActionMagnifierEvent?(.init(kind: .clear(generationID: lease.id, sequence: sequence)))
+    }
+
+    private func publishActionMagnifier(
+        type: String,
+        record: ElementRecord?,
+        pid: pid_t,
+        point: CGPoint,
+        display: DisplayDescriptor
+    ) {
+        guard let lease = TaskOwnership.current, lease.accepts(lease.id),
+              let receipt = TaskOwnership.actionReceipt, receipt.generation == lease.id else { return }
+        let state = lock.withLock {
+            (observationRevision, observationCoordinates, observationMagnifierSource)
+        }
+        guard !state.0.isEmpty,
+              let coordinates = state.1,
+              coordinates.displayID == display.id else { return }
+        if let acceptedSource = state.2,
+           acceptedSource.revision != state.0 || acceptedSource.displayID != display.id {
+            return
+        }
+        let source = state.2?.source
+        do { try coordinates.validate(display: display) }
+        catch { return }
+        if let record, record.revision != state.0 { return }
+        guard display.frame.contains(point) else { return }
+
+        let secureTarget = record.map {
+            AutomationTextEntryPolicy.isSecure(role: $0.role, subrole: $0.identity.subrole)
+        } ?? false
+        let appName = record?.identity.application.name
+            ?? NSRunningApplication(processIdentifier: pid)?.localizedName
+            ?? "Application"
+        var containers: [String] = []
+        if let structure = record?.identity.structure {
+            let contextualRoles: Set<String> = ["AXWindow", "AXSheet", "AXDialog", "AXPopover", "AXMenu",
+                "AXGroup", "AXTabGroup", "AXToolbar", "AXScrollArea", "AXList", "AXTable", "AXOutline"]
+            for node in structure.reversed() where contextualRoles.contains(node.role) {
+                if !node.label.isEmpty { containers.append(node.label) }
+            }
+        }
+        guard let actionTitle = AgentActionMagnifierCaption.actionTitle(for: type) else { return }
+        let breadcrumb = AgentActionMagnifierCaption.breadcrumb(
+            target: record?.identity.label, containers: containers, application: appName
+        )
+        let sequence = lock.withLock { () -> UInt64 in
+            actionMagnifierSequence &+= 1
+            activeMagnifierAction = (receipt.id, lease.id, actionMagnifierSequence)
+            return actionMagnifierSequence
+        }
+        let reader = secureTarget ? nil : source?.makeReader()
+        let request = AgentActionMagnifierRequest(
+            actionID: receipt.id,
+            generationID: lease.id,
+            sequence: sequence,
+            observationRevision: state.0,
+            displayID: display.id,
+            displayFrame: display.frame,
+            mapping: coordinates,
+            actionTitle: actionTitle,
+            breadcrumb: breadcrumb,
+            pointer: point,
+            target: secureTarget ? nil : record?.observedBounds,
+            reader: reader
+        )
+        onActionMagnifierEvent?(.init(kind: .targeted(request)))
     }
 
     func validateCoordinates(on display: DisplayDescriptor) throws {
@@ -1200,6 +1306,13 @@ final class AccessibilityController {
             let unsupported = try profileKey.map { key in
                 try ControlCompatibilityProfiles.owned { compatibilityProfiles.evidence(for: key, method: .accessibility) == .unsupported }
             } ?? false
+            var magnifierPublished = false
+            func publishMagnifier(at point: CGPoint) {
+                guard !magnifierPublished else { return }
+                magnifierPublished = true
+                self.publishActionMagnifier(type: type, record: record, pid: record.pid,
+                                            point: point, display: display)
+            }
             let method = try AutomationPressPolicy.deliver(
                 preferVerifiedCoordinate: preferred == coordinateMethod && unsupported,
                 pressAdvertised: profileKey?.pressAdvertised ?? true,
@@ -1216,6 +1329,9 @@ final class AccessibilityController {
                                                  record: record, action: action, on: display)
                 }, preflight: {
                 try self.validateRecord(record, action: action, on: display)
+                if let bounds = self.frame(of: record.element) {
+                    publishMagnifier(at: CGPoint(x: bounds.midX, y: bounds.midY))
+                }
             }, press: {
                 ownedAXPress(record.element, kAXPressAction as CFString)
             }, fallback: {
@@ -1236,6 +1352,7 @@ final class AccessibilityController {
                     preflight: {
                         try self.validateRecord(record, action: action, on: display)
                         try self.validatePointerHit(record, at: CGPoint(x: elementFrame.midX, y: elementFrame.midY))
+                        publishMagnifier(at: CGPoint(x: elementFrame.midX, y: elementFrame.midY))
                     }
                 )
                 if let profileKey {
@@ -1277,6 +1394,7 @@ final class AccessibilityController {
             // Bind coordinates to the control in the planning observation,
             // before activation or z-order recovery can change its position.
             let coordinateRecord = record == nil ? try observedControl(at: point, pid: pid) : nil
+            var magnifierPublished = false
             try postClick(
                 to: pid,
                 point: point,
@@ -1294,6 +1412,11 @@ final class AccessibilityController {
                             try self.validateRecord(coordinateRecord, action: action, on: display)
                             try self.validatePointerHit(coordinateRecord, at: point)
                         }
+                    }
+                    if !magnifierPublished {
+                        magnifierPublished = true
+                        self.publishActionMagnifier(type: type, record: record ?? coordinateRecord,
+                                                    pid: pid, point: point, display: display)
                     }
                 }
             )
@@ -1335,12 +1458,20 @@ final class AccessibilityController {
             rememberManualTarget(pid)
             let deltaX = intValue(action["delta_x"]) ?? 0
             let deltaY = intValue(action["delta_y"]) ?? 0
+            var magnifierPublished = false
             let retargeted = try postScroll(
                 to: pid,
                 point: point,
                 deltaX: deltaX,
                 deltaY: deltaY,
-                on: display
+                on: display,
+                onResolvedPoint: { resolvedPoint in
+                    guard !magnifierPublished else { return }
+                    magnifierPublished = true
+                    let resolvedRecord = record ?? (try? self.observedControl(at: resolvedPoint, pid: pid))
+                    self.publishActionMagnifier(type: type, record: resolvedRecord,
+                                                pid: pid, point: resolvedPoint, display: display)
+                }
             )
             return retargeted
                 ? "Scrolled the target app after safely retargeting inside its visible window"
@@ -3311,7 +3442,8 @@ final class AccessibilityController {
         point: CGPoint,
         deltaX: Int,
         deltaY: Int,
-        on display: DisplayDescriptor
+        on display: DisplayDescriptor,
+        onResolvedPoint: ((CGPoint) -> Void)? = nil
     ) throws -> Bool {
         let previouslyActiveApp = activateForTargetedInput(pid)
         defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.05, targetPID: pid) }
@@ -3336,6 +3468,7 @@ final class AccessibilityController {
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
             throw AccessibilityActionError.activationFailed
         }
+        onResolvedPoint?(resolvedPoint)
         let move = CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
                            mouseCursorPosition: resolvedPoint, mouseButton: .left)
         try TaskOwnership.commit {

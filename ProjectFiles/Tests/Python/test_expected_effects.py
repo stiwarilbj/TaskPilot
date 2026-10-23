@@ -61,6 +61,17 @@ class ExpectedEffectTests(unittest.TestCase):
                 validate_response({'status': 'act', 'action': {'type': 'focus', 'element_id': 'before:field'},
                                    'expected_result': spec}, 'planning', self.before)
 
+    def test_live_presentation_scope_requires_a_named_supported_verified_check(self):
+        for result in [None, {}, {'expected_effect': None},
+                       {'expected_effect': {'outcome': 'unconfirmed', 'check': 'dialog_appeared'}},
+                       {'expected_effect': {'outcome': 'verified', 'check': {'unexpected': 'object'}}},
+                       {'expected_effect': {'outcome': 'verified', 'check': 'screen_changed'}},
+                       {'expected_effect': {'outcome': 'verified', 'check': 'delivery_only'}}]:
+            self.assertIsNone(runtime.expected_effect_presentation_scope(result))
+        for scope in ['dialog_appeared', 'field_value', 'file_contents', 'file_exists', 'directory_exists', 'path_absent']:
+            self.assertEqual(runtime.expected_effect_presentation_scope(
+                {'expected_effect': {'outcome': 'verified', 'check': scope}}), scope)
+
     def test_secure_values_cannot_be_expected_or_read_back(self):
         for changes in [{'role': 'AXSecureTextField'}, {'subrole': 'AXSecureTextField'}]:
             with self.assertRaisesRegex(ResponseValidationError, 'nonsecure observed text field'):

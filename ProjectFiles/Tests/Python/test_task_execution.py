@@ -194,6 +194,29 @@ class ExecutionBoundaryTests(unittest.TestCase):
         self.assertEqual(self.context.machine.pending_action, self.action_id)
         with self.assertRaises(ExecutionStateError): self.context.machine.require('execute')
 
+    def test_pointer_presentation_uses_the_native_action_receipt_id(self):
+        self.context.machine.phase = Phase.EXECUTING
+        action = {'type': 'click', 'pid': 42, 'x': 500, 'y': 500}
+        action_id = str(uuid.uuid4())
+        result = native_result(action)
+        response = {'ok': True, 'result': result, 'action_receipt': {
+            'action_id': action_id, 'state': 'unconfirmed', 'terminal': True}}
+        with mock.patch.object(runtime, 'bridge_exchange', return_value=response):
+            runtime.bridge_call('act', 1, action=action, action_id=action_id)
+        self.assertEqual(self.context.presentation_action_id, action_id)
+        self.assertIsNone(self.context.machine.pending_action)
+
+    def test_non_pointer_action_does_not_claim_a_live_view_presentation(self):
+        self.context.machine.phase = Phase.EXECUTING
+        action = {'type': 'write_file', 'path': '/fixture/file', 'content': 'value'}
+        action_id = str(uuid.uuid4())
+        result = native_result(action)
+        response = {'ok': True, 'result': result, 'action_receipt': {
+            'action_id': action_id, 'state': 'confirmed', 'terminal': True}}
+        with mock.patch.object(runtime, 'bridge_exchange', return_value=response):
+            runtime.bridge_call('act', 1, action=action, action_id=action_id)
+        self.assertIsNone(self.context.presentation_action_id)
+
 
 class TaskDispatcherTests(unittest.TestCase):
     def exercise(self, *, lost=False, disconnected=False, stop_after_rejection=False, startup_failure=False):

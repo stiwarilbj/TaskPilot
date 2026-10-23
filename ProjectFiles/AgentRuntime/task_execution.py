@@ -144,6 +144,7 @@ class TaskContext:
     images: Any = None
     active_acp_process: Any = None
     bridge_observation_revision: str | None = None
+    presentation_action_id: str | None = None
     observation_keywords: list = field(default_factory=list)
     receipt_metrics: dict = field(default_factory=lambda: dict(receipt_queries=0, receipt_recoveries=0, receipt_unresolved=0))
     local_change_metrics: dict = field(default_factory=lambda: dict(local_notifications=0, local_targeted_checks=0, local_poll_wakeups=0))

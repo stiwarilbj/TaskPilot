@@ -433,6 +433,9 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
             params["action_id"] = str(uuid.uuid4()).lower()
         elif isinstance(params["action_id"], str):
             params["action_id"] = params["action_id"].lower()
+        if context is not None:
+            action_type = params.get("action", {}).get("type")
+            context.presentation_action_id = params["action_id"] if action_type in {"press", "click", "double_click", "scroll"} else None
         timeout = 30.0
         if params.get("action", {}).get("type") == "run_command":
             timeout += float(params["action"].get("timeout_seconds", action_default("run_command", "timeout_seconds")))
@@ -1383,6 +1386,16 @@ def verify_expected_effect(display_id: int, before: dict[str, Any], action: dict
     key = 'verified_effects' if outcome == 'verified' else 'unconfirmed_effects'
     metrics[key] = metrics.get(key, 0) + 1
     return observation, {**result, 'expected_effect': checked}
+
+
+def expected_effect_presentation_scope(result: Any) -> str | None:
+    """Return only the named, supported check that actually passed."""
+    if not isinstance(result, dict): return None
+    effect = result.get('expected_effect')
+    if not isinstance(effect, dict) or effect.get('outcome') != 'verified': return None
+    scope = effect.get('check')
+    return scope if isinstance(scope, str) and scope in {'dialog_appeared', 'field_value', 'file_contents', 'file_exists',
+                                                         'directory_exists', 'path_absent'} else None
 
 
 def trusted_native_history(
@@ -3215,6 +3228,10 @@ class TaskExecution:
             with local_scope(5.0, 'effect_verification', budget=c.local_budget):
                 c.pending_observation, c.result = verify_expected_effect(c.display_id, c.observation, c.action,
                     c.result, c.decision.get("expected_result"), c.screenshot_digest, c.router.metrics)
+            scope = expected_effect_presentation_scope(c.result)
+            if scope and c.presentation_action_id:
+                emit("action_presentation", action_id=c.presentation_action_id, state="confirmed",
+                     verification_scope=scope)
             if c.result.get("outcome") == "verified": c.recovery.succeeded(c.action, c.observation)
             if c.result.get("outcome") == "delivered_unconfirmed":
                 c.router.metrics["unconfirmed_actions"] += 1
@@ -3396,6 +3413,7 @@ class TaskExecution:
                 discard_observation_image(fresh)
             if observation_is_loading(c.pending_observation, target_pid):
                 c.loading_pid, c.loading_waits = target_pid, 1
+        c.presentation_action_id = None
         emit("status", message="Checking fresh evidence and the action failure before continuing…")
 
     def record_result(self) -> None:
@@ -3410,6 +3428,7 @@ class TaskExecution:
                 c.ledger.record_effect(c.decision["expected_result"], effect["evidence"], c.action)
             if not c.recovered_result:
                 c.recovery_cycles.record(c.action, c.observation, c.result, c.ledger, c.screenshot_digest)
+        c.presentation_action_id = None
         if (c.decision.get("finish_after_action") is True and c.action["type"] in {"write_file", "run_command"}
                 and isinstance(c.result, dict) and c.result.get("verification_scope") != "expected_effect_unconfirmed"):
             discard_observation_image(c.pending_observation)

@@ -60,6 +60,7 @@ final class AgentAutomationBridge {
         let requestID = request["request_id"] as? String ?? UUID().uuidString
         let lease = TaskOwnership.current
         var receiptToken: ActionReceiptStore.Token?
+        var magnifierActionTitle: String?
         do {
             guard let lease, owns(lease), lease.accepts(request["task_generation_id"] as? String) else { throw CancellationError() }
             try await lease.checkpoint()
@@ -128,6 +129,13 @@ final class AgentAutomationBridge {
                     throw BridgeError.invalidRequest("Missing action payload")
                 }
                 let action = try ActionContract.validate(input)
+                switch action["type"] as? String {
+                case "press": magnifierActionTitle = "Pressed"
+                case "click": magnifierActionTitle = "Clicked"
+                case "double_click": magnifierActionTitle = "Double-clicked"
+                case "scroll": magnifierActionTitle = "Scrolled"
+                default: magnifierActionTitle = nil
+                }
                 let id = try ActionReceiptStore.validateID(params["action_id"] as? String)
                 var identity = params
                 identity.removeValue(forKey: "action_id")
@@ -231,7 +239,8 @@ final class AgentAutomationBridge {
                         // authoritative together, under the same epoch check.
                         try lease.commit {
                             try candidate.publish()
-                            try self.accessibility.bindCoordinates(coordinates, revision: candidate.snapshot.revision, on: observationDisplay)
+                            try self.accessibility.bindCoordinates(coordinates, revision: candidate.snapshot.revision,
+                                on: observationDisplay, screenshotURL: encoded.url)
                             try lease.bindScreenText(screenText, revision: candidate.snapshot.revision)
                         }
                         textMetadata = metadata
@@ -293,6 +302,7 @@ final class AgentAutomationBridge {
             case "act":
                 let action = validatedAction!
                 let kind = ActionKind(rawValue: action["type"] as! String)!
+                if params["private_input"] as? Bool == true { accessibility.clearActionMagnifier() }
                 result = try await TaskOwnership.$actionReceipt.withValue(receiptToken) {
                     if kind.owner == .task_tool {
                         return try await taskTools.perform(action: action, commandBindingID: params["command_inspection_id"] as? String)
@@ -312,6 +322,10 @@ final class AgentAutomationBridge {
                 }
                 try LocalOperationBudget.check()
                 try receiptToken?.complete(result)
+                if let title = magnifierActionTitle, let receiptToken {
+                    accessibility.finishActionMagnifier(actionID: receiptToken.id, generationID: lease.id,
+                                                        state: .delivered(title))
+                }
 
             default:
                 throw BridgeError.invalidRequest("Unknown bridge method: \(method)")
@@ -331,6 +345,17 @@ final class AgentAutomationBridge {
             let code = error is LocalOperationBudget.Exhausted ? "local_budget_exhausted" : error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" :
                 (error as? ActionReceiptStore.ReceiptError)?.code ?? (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? (error is BoundFileOperation.Conflict ? "file_conflict" : "action_rejected")
             receiptToken?.fail(error, code: code)
+            if let title = magnifierActionTitle, let receiptToken {
+                let receiptState = receiptToken.receipt["state"] as? String
+                let presentation: AgentActionMagnifierState
+                switch receiptState {
+                case "unconfirmed", "dispatched": presentation = .uncertain
+                case "confirmed": presentation = .delivered(title)
+                default: presentation = .rejected
+                }
+                accessibility.finishActionMagnifier(actionID: receiptToken.id, generationID: lease?.id ?? "",
+                                                    state: presentation)
+            }
             // Cancellation must remain a stop even if an acknowledged result
             // raced with revocation. The receipt still retains that result.
             if let receiptToken, code != "cancelled" {

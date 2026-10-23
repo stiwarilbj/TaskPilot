@@ -52,9 +52,34 @@ enum RuntimeEvent {
     case diagnostics(AgentRequestMetrics)
     case output(AgentTaskOutput)
     case userInputRequired(AgentUserInputRequest)
+    case actionPresentation(actionID: String, taskGenerationID: String, verificationScope: String)
     case completed(String)
     case failed(String)
     case stopped
+}
+
+struct AgentActionPresentationMessage: Equatable {
+    let actionID: String
+    let generationID: String
+    let verificationScope: String
+
+    static let supportedScopes: Set<String> = [
+        "dialog_appeared", "field_value", "file_contents", "file_exists", "directory_exists", "path_absent"
+    ]
+
+    static func parse(_ message: [String: Any], generationID: String,
+                      knownActionIDs: Set<String>) -> Self? {
+        guard Set(message.keys) == Set(["kind", "task_generation_id", "action_id", "state", "verification_scope"]),
+              message["kind"] as? String == "action_presentation",
+              message["task_generation_id"] as? String == generationID,
+              message["state"] as? String == "confirmed",
+              let actionID = message["action_id"] as? String,
+              let uuid = UUID(uuidString: actionID), uuid.uuidString.lowercased() == actionID,
+              knownActionIDs.contains(actionID),
+              let scope = message["verification_scope"] as? String,
+              supportedScopes.contains(scope) else { return nil }
+        return Self(actionID: actionID, generationID: generationID, verificationScope: scope)
+    }
 }
 
 enum RuntimeProcessError: LocalizedError {
@@ -469,6 +494,16 @@ final class AgentRuntimeProcess {
                 ) ?? .password
             )
             emit(.userInputRequired(request), for: run)
+        case "action_presentation":
+            guard let presentation = AgentActionPresentationMessage.parse(
+                message, generationID: run.lease.id, knownActionIDs: run.receiptIDs
+            ) else {
+                failTransport("transport_malformed_frame", for: run)
+                return
+            }
+            emit(.actionPresentation(actionID: presentation.actionID,
+                                     taskGenerationID: presentation.generationID,
+                                     verificationScope: presentation.verificationScope), for: run)
         case "complete":
             run.receivedTerminalEvent = true
             run.pendingTerminalEvent = .completed(message["message"] as? String ?? "Task complete")

@@ -305,6 +305,12 @@ final class TaskPilotCoordinator: ObservableObject {
                 self?.viewer.showAgentCursor(presentation)
             }
         }
+        accessibility.onActionMagnifierEvent = { [weak self] event in
+            Task { @MainActor [weak self] in
+                guard let self, self.currentTaskLease?.id == event.generationID else { return }
+                self.viewer.handleActionMagnifier(event)
+            }
+        }
         viewer.interactionHandler = { [weak self] interaction, display in
             guard let self else { return "Live control disconnected" }
             return try self.accessibility.performViewerInteraction(interaction, on: display)
@@ -1143,6 +1149,7 @@ final class TaskPilotCoordinator: ObservableObject {
         let lease = TaskLease(taskRequest: request, closePersistentProcesses: closesTaskAppsAfterUse,
             recoveryJournal: recoveryJournal, recoveryTask: authorization.id)
         currentTaskLease = lease
+        viewer.beginTask(lease.id)
         accessibility.beginTaskResourceTracking(on: display, lease: lease)
         agentCursor.hide()
 
@@ -1163,6 +1170,7 @@ final class TaskPilotCoordinator: ObservableObject {
         } catch {
             lease.revoke()
             agentCursor.hide()
+            viewer.clearActionMagnifier()
             _ = accessibility.finishTaskResourceTracking(
                 closeOpenedResources: closesTaskAppsAfterUse
             )
@@ -1207,6 +1215,7 @@ final class TaskPilotCoordinator: ObservableObject {
     func stop() {
         guard isActive else { return }
         agentCursor.hide()
+        viewer.clearActionMagnifier()
         if runState == .takingOver {
             accessibility.restoreWindows(takeoverPlacements)
             takeoverPlacements = []
@@ -1311,6 +1320,7 @@ final class TaskPilotCoordinator: ObservableObject {
             taskOutput = output
         case .userInputRequired(let request):
             agentCursor.hide()
+            viewer.clearActionMagnifier()
             userInputDraft = ""
             userInputRequest = request
             runState = .waitingForUser
@@ -1414,6 +1424,7 @@ final class TaskPilotCoordinator: ObservableObject {
         case .stopped:
             taskNotification?.cancel(); taskNotification = nil
             agentCursor.hide()
+            viewer.clearActionMagnifier()
             userInputRequest = nil
             userInputDraft = ""
             let wasQueued = currentTaskWasQueued
@@ -1435,6 +1446,10 @@ final class TaskPilotCoordinator: ObservableObject {
                 )
             }
             advanceQueueAfterTerminalTask()
+        case let .actionPresentation(actionID, taskGenerationID, verificationScope):
+            guard currentTaskLease?.id == taskGenerationID else { return }
+            viewer.actionMagnifier.update(actionID: actionID, generationID: taskGenerationID,
+                                          state: .confirmed(verificationScope))
         }
     }
 
