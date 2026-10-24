@@ -13,7 +13,8 @@ from evidence_fixtures import native_result, native_check, native_batch
 import openclaw_runtime as runtime
 from evidence_fixtures import VerificationSessions
 from response_validation import ResponseValidationError, validate_response
-from task_evidence import TaskEvidenceLedger, content_hash, validate_metadata
+from task_evidence import (TaskEvidenceLedger, content_hash, validate_metadata,
+                           requests_per_input_work, validate_batch_declaration)
 
 
 TASK = 'Write /fixture/a.txt with A and /fixture/b.txt with B.'
@@ -257,6 +258,117 @@ class EvidenceLedgerTests(unittest.TestCase):
                 bridge.assert_not_called()
                 self.assertEqual(router.metrics['repairs'], count - 1)
                 if count == 2: self.assertIn('requirements must enumerate', client.prompt.call_args_list[1].args[0])
+
+
+class BatchEvidenceTests(unittest.TestCase):
+    task = 'Convert each of "/Inputs/January.pdf" and "/Inputs/February.pdf" separately into files in "/Output".'
+
+    def make_plan(self, *, multi_outcome=False):
+        ledger = TaskEvidenceLedger(self.task, 'task-batch', input_scope='0123456789abcdef')
+        resources = ledger.inputs.resource_inputs
+        jan_id, feb_id, output_id = [entry.identifier for entry in resources]
+        checks = [
+            {'type': 'file_contents', 'path': '/Output/January.pdf', 'content': 'January result'},
+            {'type': 'file_contents', 'path': '/Output/February.pdf', 'content': 'February result'},
+        ]
+        if multi_outcome:
+            checks[1] = {'type': 'file_exists', 'path': '/Output/January.preview.pdf'}
+            checks.append({'type': 'file_contents', 'path': '/Output/February.pdf', 'content': 'February result'})
+        requirements = [requirement(self.task, path=check['path'], content=check['content'])
+                        if check['type'] == 'file_contents' else
+                        requirement(self.task, 'file_exists', path=check['path']) for check in checks]
+        item_mappings = [
+            {'input_id': jan_id, 'requirement_ids': ['r1', 'r2'] if multi_outcome else ['r1']},
+            {'input_id': feb_id, 'requirement_ids': ['r3'] if multi_outcome else ['r2']},
+        ]
+        declaration = {'mode': 'per_input', 'items': item_mappings, 'source_input_ids': [jan_id, feb_id],
+                       'excluded_inputs': [{'input_id': output_id, 'reason': 'output_destination'}],
+                       'global_requirement_ids': []}
+        decision = {'status': 'act', 'action': {'type': 'none'}, 'requirements': requirements,
+                    'batch': declaration}
+        checked = validate_response(decision, 'planning', {}, ledger)
+        ledger.accept_plan(checked)
+        return ledger, declaration, checks
+
+    def test_separate_inputs_require_a_valid_complete_roster_and_never_mistake_destination_for_input(self):
+        ledger, declaration, _ = self.make_plan()
+        self.assertTrue(requests_per_input_work(self.task))
+        self.assertEqual([item['reference'] for item in ledger.batch_items],
+                         ['/Inputs/January.pdf', '/Inputs/February.pdf'])
+        self.assertFalse(ledger.batch_complete())
+
+        bad = deepcopy(declaration)
+        bad['items'] = bad['items'][:1]
+        with self.assertRaisesRegex(ResponseValidationError, 'match source_input_ids'):
+            validate_response({'status': 'act', 'action': {'type': 'none'}, 'batch': bad},
+                              'planning', {}, ledger)
+
+        bad_source = deepcopy(declaration)
+        bad_source['source_input_ids'].append(bad_source['excluded_inputs'][0]['input_id'])
+        bad_source['mode'] = 'combined'
+        bad_source['items'] = []
+        bad_source['excluded_inputs'] = []
+        bad_source['global_requirement_ids'] = ['r1', 'r2']
+        with self.assertRaisesRegex(ResponseValidationError, 'output destination'):
+            validate_response({'status': 'act', 'action': {'type': 'none'}, 'batch': bad_source},
+                              'planning', {}, ledger)
+
+    def test_each_item_needs_all_matching_current_evidence_before_handled_count_advances(self):
+        ledger, _, _ = self.make_plan(multi_outcome=True)
+        first = {'type': 'write_file', 'path': '/Output/January.pdf', 'content': 'January result'}
+        ledger.record_action(first, native_result(first))
+        projection = ledger.presentation_state(['r2'], 'running')['batch']
+        self.assertEqual(projection['handled_count'], 0)
+        self.assertEqual([item['state'] for item in projection['items']], ['working', 'waiting'])
+        self.assertFalse(ledger.batch_complete())
+
+        second = {'type': 'write_file', 'path': '/Output/January.preview.pdf', 'content': 'preview'}
+        ledger.record_action(second, native_result(second))
+        third = {'type': 'write_file', 'path': '/Output/February.pdf', 'content': 'February result'}
+        ledger.record_action(third, native_result(third))
+        projection = ledger.presentation_state([], 'running')['batch']
+        self.assertEqual(projection['handled_count'], 2)
+        self.assertEqual([item['state'] for item in projection['items']], ['verified', 'verified'])
+        self.assertTrue(ledger.batch_complete())
+
+        ledger.invalidate(lambda evidence: evidence['fact'].get('path') == '/Output/January.pdf')
+        projection = ledger.presentation_state([], 'running')['batch']
+        self.assertEqual(projection['handled_count'], 1)
+        self.assertEqual(projection['items'][0]['state'], 'needs_recheck')
+        self.assertFalse(ledger.batch_complete())
+
+    def test_repeated_source_is_one_item_and_combined_comparison_has_no_ribbon(self):
+        repeated = TaskEvidenceLedger(
+            'Convert each of "/Inputs/January.pdf", "/Inputs/January.pdf" and "/Inputs/February.pdf" separately.',
+            input_scope='0123456789abcdef')
+        self.assertEqual([item.value for item in repeated.inputs.resource_inputs],
+                         ['/Inputs/January.pdf', '/Inputs/February.pdf'])
+
+        combined_task = 'Compare each of "/Inputs/January.pdf" and "/Inputs/February.pdf" into one report at "/Output/report.pdf".'
+        combined = TaskEvidenceLedger(combined_task, input_scope='0123456789abcdef')
+        self.assertFalse(requests_per_input_work(combined_task))
+        self.assertFalse(combined.batch_declaration_required_for())
+        resources = combined.inputs.resource_inputs
+        declaration = {'mode': 'combined', 'items': [], 'source_input_ids': [resources[0].identifier, resources[1].identifier],
+                       'excluded_inputs': [{'input_id': resources[2].identifier, 'reason': 'output_destination'}],
+                       'global_requirement_ids': ['r1']}
+        combined.add_requirements([requirement(combined_task, 'visual', expected='One comparison report')])
+        validate_batch_declaration(declaration, combined, combined.requirements)
+        combined.accept_batch(declaration)
+        self.assertIsNone(combined.presentation_state()['batch'])
+
+    def test_instruction_revision_rebuilds_roster_without_carrying_old_proof(self):
+        ledger, declaration, _ = self.make_plan()
+        old_ids = {item['reference']: item['id'] for item in ledger.batch_items}
+        revised = 'Convert each of "/Inputs/January.pdf" and "/Inputs/March.pdf" separately into files in "/Output".'
+        ledger.apply_instruction_revision(revised, [])
+        self.assertTrue(ledger.batch_needs_declaration)
+        self.assertFalse(ledger.batch_complete())
+        resources = ledger.batch_source_candidates()
+        self.assertEqual(len(resources), 2)
+        self.assertEqual(ledger.batch_items[0]['id'], old_ids['/Inputs/January.pdf'])
+        self.assertNotIn('/Inputs/February.pdf', [item['reference'] for item in ledger.batch_items])
+        self.assertNotEqual(ledger.batch_items[1]['id'], old_ids['/Inputs/February.pdf'])
 
 
 class EvidenceTaskLoopTests(unittest.TestCase):

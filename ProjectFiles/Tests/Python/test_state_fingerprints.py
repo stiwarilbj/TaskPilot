@@ -101,7 +101,7 @@ class CanonicalStateTests(unittest.TestCase):
     def test_immutable_task_inputs_keep_the_existing_identity_and_encode_once(self):
         inputs = TaskInputBindings('Read file "/fixture/a.txt"', scope="0123456789abcdef")
         expected = hashlib.sha256(json.dumps([TASK_INPUT_VERSION, EXACT_INPUT_REFERENCE_VERSION, inputs.exact_references,
-            [(e.identifier, e.value, e.sources) for e in inputs.entries], inputs.omitted], ensure_ascii=True).encode()).hexdigest()
+            [(e.identifier, e.value, e.sources, e.resource_kind) for e in inputs.entries], inputs.omitted], ensure_ascii=True).encode()).hexdigest()
         with mock.patch.object(evidence.json, "dumps", wraps=json.dumps) as encode, \
              mock.patch.object(evidence.hashlib, "sha256", wraps=hashlib.sha256) as digest:
             self.assertEqual([inputs.fingerprint() for _ in range(5)], [expected] * 5)
@@ -120,9 +120,12 @@ class LedgerFingerprintTests(unittest.TestCase):
 
     def legacy_fingerprint(self):
         ledger = self.ledger
-        return evidence.digest([evidence.CHECKLIST_VERSION, ledger.task, ledger.generation, ledger.inputs.fingerprint(),
+        return evidence.digest([evidence.CHECKLIST_VERSION, evidence.BATCH_PROGRESS_VERSION,
+            ledger.task, ledger.generation, ledger.inputs.fingerprint(),
             ledger.requirements, {key: [e["fact_fingerprint"], e["action_fingerprint"], e["valid"], e["mutable"],
-            e["origin"], e.get("effect_check")] for key, e in ledger.evidence.items()}, ledger.coverage_complete])
+            e["origin"], e.get("effect_check")] for key, e in ledger.evidence.items()}, ledger.coverage_complete,
+            ledger.batch_mode, ledger.batch_items, ledger.batch_source_input_ids, ledger.batch_excluded_inputs,
+            ledger.batch_global_requirement_ids, ledger.batch_initialized, ledger.batch_needs_declaration])
 
     def test_same_ledger_revision_reuses_canonical_bytes_and_fingerprint(self):
         expected = self.legacy_fingerprint()

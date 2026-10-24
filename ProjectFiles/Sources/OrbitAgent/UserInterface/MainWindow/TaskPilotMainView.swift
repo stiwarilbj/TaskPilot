@@ -374,6 +374,15 @@ struct TaskPilotMainView: View {
                 }
             }
 
+            if let progressMap = model.taskProgressMap,
+               progressMap.generationID == model.currentTaskGenerationID,
+               let batch = progressMap.batch {
+                TaskBatchProgressRibbonView(map: progressMap, batch: batch,
+                                            surface: theme.surfaceColor, border: theme.borderColor,
+                                            accent: accent)
+                    .accessibilityIdentifier("task-batch-progress-ribbon")
+            }
+
             if let details = model.taskWaitDetails {
                 TaskWaitDisclosureView(status: model.status, snapshot: details,
                     symbol: AnyView(statusSymbol), expandedIdentity: $expandedWaitIdentity)

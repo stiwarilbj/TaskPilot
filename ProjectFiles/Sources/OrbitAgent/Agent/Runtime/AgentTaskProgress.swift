@@ -17,6 +17,36 @@ enum AgentTaskProgressRequirementState: String, Equatable {
     case invalidated
 }
 
+enum AgentTaskBatchItemState: String, Equatable {
+    case waiting
+    case working
+    case verified
+    case needsRecheck = "needs_recheck"
+    case unfinished
+}
+
+struct AgentTaskBatchOutcome: Equatable, Identifiable {
+    let id: String
+    let label: String
+}
+
+struct AgentTaskBatchItem: Equatable, Identifiable {
+    let id: String
+    let inputID: String
+    let reference: String
+    let kind: String
+    let state: AgentTaskBatchItemState
+    let active: Bool
+    let currentStep: String
+    let outcomes: [AgentTaskBatchOutcome]
+}
+
+struct AgentTaskBatchProgress: Equatable {
+    let needsDeclaration: Bool
+    let handledCount: Int
+    let items: [AgentTaskBatchItem]
+}
+
 struct AgentTaskProgressEvidence: Equatable {
     let label: String
     let detail: String
@@ -39,15 +69,31 @@ struct AgentTaskProgressSnapshot: Equatable {
     let activeRequirementIDs: [String]
     let requirements: [AgentTaskProgressRequirement]
     let resultObjects: [AgentTaskResultObject]
+    let batch: AgentTaskBatchProgress?
 
     var estimatedByteCount: Int {
-        let textBytes = requirements.reduce(0) { total, requirement in
-            total + requirement.id.utf8.count + requirement.sourceRanges.count * 40 + 64 +
-                requirement.evidence.reduce(0) {
-                    $0 + $1.label.utf8.count + $1.detail.utf8.count + ($1.revealPath?.utf8.count ?? 0) + 48
+        var textBytes = 0
+        for requirement in requirements {
+            var requirementBytes = requirement.id.utf8.count + requirement.sourceRanges.count * 40 + 64
+            for evidence in requirement.evidence {
+                requirementBytes += evidence.label.utf8.count + evidence.detail.utf8.count
+                    + (evidence.revealPath?.utf8.count ?? 0) + 48
+            }
+            textBytes += requirementBytes
+        }
+        for identifier in activeRequirementIDs { textBytes += identifier.utf8.count + 4 }
+        textBytes += resultObjects.reduce(0) { $0 + $1.estimatedByteCount }
+        if let batch {
+            textBytes += 64
+            for item in batch.items {
+                var itemBytes = item.id.utf8.count + item.inputID.utf8.count + item.reference.utf8.count
+                    + item.kind.utf8.count + item.currentStep.utf8.count + 96
+                for outcome in item.outcomes {
+                    itemBytes += outcome.id.utf8.count + outcome.label.utf8.count + 24
                 }
-        } + activeRequirementIDs.reduce(0) { $0 + $1.utf8.count + 4 }
-            + resultObjects.reduce(0) { $0 + $1.estimatedByteCount }
+                textBytes += itemBytes
+            }
+        }
         // JSON escaping can expand control characters to six bytes each.
         return 1_024 + textBytes * 6
     }
@@ -55,7 +101,7 @@ struct AgentTaskProgressSnapshot: Equatable {
     static func parse(_ message: [String: Any], generationID: String) -> Self? {
         let requiredKeys: Set<String> = ["kind", "task_generation_id", "revision", "version", "lifecycle",
                                          "whole_request_coverage", "active_requirement_ids", "requirements",
-                                         "result_objects"]
+                                         "result_objects", "batch"]
         guard Set(message.keys) == requiredKeys,
               message["kind"] as? String == "task_progress",
               message["task_generation_id"] as? String == generationID,
@@ -63,7 +109,7 @@ struct AgentTaskProgressSnapshot: Equatable {
               CFGetTypeID(revisionNumber) != CFBooleanGetTypeID(),
               let revision = UInt64(revisionNumber.stringValue), revision > 0,
               let version = message["version"] as? NSNumber,
-              CFGetTypeID(version) != CFBooleanGetTypeID(), version.intValue == 2, version.doubleValue == 2,
+              CFGetTypeID(version) != CFBooleanGetTypeID(), version.intValue == 3, version.doubleValue == 3,
               let lifecycleRaw = message["lifecycle"] as? String,
               let lifecycle = AgentTaskProgressLifecycle(rawValue: lifecycleRaw),
               lifecycle != .paused, lifecycle != .stopping,
@@ -134,9 +180,93 @@ struct AgentTaskProgressSnapshot: Equatable {
                                                               active: active, evidence: evidence))
         }
         guard Set(activeValues).isSubset(of: identifiers) else { return nil }
+        let batch: AgentTaskBatchProgress?
+        if message["batch"] is NSNull {
+            batch = nil
+        } else if let value = parseBatch(message["batch"], lifecycle: lifecycle, requirements: requirements) {
+            batch = value
+        } else {
+            return nil
+        }
         return Self(generationID: generationID, revision: revision, lifecycle: lifecycle,
                     wholeRequestCoverage: coverage, activeRequirementIDs: activeValues, requirements: requirements,
-                    resultObjects: resultObjects)
+                    resultObjects: resultObjects, batch: batch)
+    }
+
+    private static func parseBatch(_ value: Any?, lifecycle: AgentTaskProgressLifecycle,
+                                   requirements: [AgentTaskProgressRequirement]) -> AgentTaskBatchProgress? {
+        guard let raw = value as? [String: Any],
+              Set(raw.keys) == ["version", "needs_declaration", "handled_count", "items"],
+              let rawVersion = raw["version"], exactInteger(rawVersion) == 1,
+              let needsDeclarationNumber = raw["needs_declaration"] as? NSNumber,
+              CFGetTypeID(needsDeclarationNumber) == CFBooleanGetTypeID(),
+              let rawHandledCount = raw["handled_count"], let handledCount = exactInteger(rawHandledCount), handledCount <= 128,
+              let rawItems = raw["items"] as? [[String: Any]], rawItems.count >= 2, rawItems.count <= 128 else {
+            return nil
+        }
+        let requirementsByID = Dictionary(uniqueKeysWithValues: requirements.map { ($0.id, $0) })
+        var items: [AgentTaskBatchItem] = []
+        var itemIDs = Set<String>()
+        var inputIDs = Set<String>()
+        var references = Set<String>()
+        var associatedRequirements = Set<String>()
+        var provenCount = 0
+        for item in rawItems {
+            guard Set(item.keys) == ["id", "input_id", "reference", "kind", "state", "active", "current_step", "outcomes"],
+                  let id = item["id"] as? String, id.range(of: #"^b[1-9][0-9]*$"#, options: .regularExpression) != nil,
+                  itemIDs.insert(id).inserted,
+                  let inputID = item["input_id"] as? String,
+                  inputID.range(of: #"^input_[0-9a-f]{16}_[1-9][0-9]*$"#, options: .regularExpression) != nil,
+                  inputIDs.insert(inputID).inserted,
+                  let reference = item["reference"] as? String, safeReference(reference), references.insert(reference).inserted,
+                  let kind = item["kind"] as? String, ["file", "folder", "url", "path", "filename"].contains(kind),
+                  let rawState = item["state"] as? String, let state = AgentTaskBatchItemState(rawValue: rawState),
+                  let activeNumber = item["active"] as? NSNumber, CFGetTypeID(activeNumber) == CFBooleanGetTypeID(),
+                  let step = safeText(item["current_step"], maximumBytes: 200),
+                  let rawOutcomes = item["outcomes"] as? [[String: Any]], rawOutcomes.count <= 512 else {
+                return nil
+            }
+            var outcomes: [AgentTaskBatchOutcome] = []
+            for outcome in rawOutcomes {
+                guard Set(outcome.keys) == ["id", "label"],
+                      let requirementID = outcome["id"] as? String, isRequirementID(requirementID),
+                      associatedRequirements.insert(requirementID).inserted,
+                      requirementsByID[requirementID] != nil,
+                      let label = safeText(outcome["label"], maximumBytes: 160) else { return nil }
+                outcomes.append(AgentTaskBatchOutcome(id: requirementID, label: label))
+            }
+            let active = activeNumber.boolValue
+            let associated = outcomes.compactMap { requirementsByID[$0.id] }
+            let hasInvalidated = associated.contains(where: { $0.state == .invalidated })
+            let allProven = !associated.isEmpty && associated.allSatisfy({ $0.state == .proven })
+            let hasActivePending = associated.contains(where: { $0.active && $0.state != .proven })
+            let isTerminal = lifecycle == .completed || lifecycle == .failed || lifecycle == .stopped
+            let expectedState: AgentTaskBatchItemState
+            if hasInvalidated {
+                expectedState = .needsRecheck
+            } else if needsDeclarationNumber.boolValue {
+                expectedState = isTerminal ? .unfinished : .waiting
+            } else if allProven {
+                expectedState = .verified
+            } else if associated.isEmpty {
+                expectedState = .waiting
+            } else if lifecycle == .running && hasActivePending {
+                expectedState = .working
+            } else if isTerminal {
+                expectedState = .unfinished
+            } else {
+                expectedState = .waiting
+            }
+            guard state == expectedState, active == (state == .working),
+                  state != .working || (lifecycle == .running && hasActivePending) else { return nil }
+            if state == .verified { provenCount += 1 }
+            items.append(AgentTaskBatchItem(id: id, inputID: inputID, reference: reference, kind: kind,
+                                            state: state, active: active, currentStep: step, outcomes: outcomes))
+        }
+        guard provenCount == Int(handledCount) else { return nil }
+        if !needsDeclarationNumber.boolValue && items.contains(where: { $0.outcomes.isEmpty }) { return nil }
+        return AgentTaskBatchProgress(needsDeclaration: needsDeclarationNumber.boolValue,
+                                      handledCount: Int(handledCount), items: items)
     }
 
     private static func isRequirementID(_ value: String) -> Bool {
@@ -149,6 +279,17 @@ struct AgentTaskProgressSnapshot: Equatable {
               number.doubleValue.rounded(.towardZero) == number.doubleValue else { return nil }
         return Int(number.stringValue)
     }
+
+    private static func safeReference(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 8_192 && !value.unicodeScalars.contains(where: { $0.value == 0 })
+    }
+
+    private static func safeText(_ value: Any?, maximumBytes: Int) -> String? {
+        guard let text = value as? String, !text.isEmpty, text.utf8.count <= maximumBytes,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              text.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else { return nil }
+        return text
+    }
 }
 
 struct TaskProgressMap: Equatable {
@@ -160,6 +301,7 @@ struct TaskProgressMap: Equatable {
     var activeRequirementIDs: [String]
     var requirements: [AgentTaskProgressRequirement]
     var resultObjects: [AgentTaskResultObject]
+    var batch: AgentTaskBatchProgress?
 
     init(request: String, generationID: String) {
         originalRequest = request
@@ -170,6 +312,7 @@ struct TaskProgressMap: Equatable {
         activeRequirementIDs = []
         requirements = []
         resultObjects = []
+        batch = nil
     }
 
     init(request: String, snapshot: AgentTaskProgressSnapshot) {
@@ -181,5 +324,6 @@ struct TaskProgressMap: Equatable {
         activeRequirementIDs = snapshot.activeRequirementIDs
         requirements = snapshot.requirements
         resultObjects = snapshot.resultObjects
+        batch = snapshot.batch
     }
 }

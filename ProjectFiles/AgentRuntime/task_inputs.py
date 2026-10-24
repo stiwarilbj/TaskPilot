@@ -16,7 +16,7 @@ import uuid
 
 from action_contract_generated import CONTRACT
 
-TASK_INPUT_VERSION = 3
+TASK_INPUT_VERSION = 4
 EXACT_INPUT_REFERENCE_VERSION = 2
 LEGACY_EXACT_INPUT_REFERENCE_VERSION = 1
 MAX_INPUTS = 128
@@ -122,6 +122,7 @@ class TaskInput:
     value: str
     kind: str
     sources: tuple[tuple[int, int], ...]
+    resource_kind: str | None = None
 
 
 @dataclass(frozen=True, init=False)
@@ -138,6 +139,7 @@ class TaskInputBindings:
         scope = scope if scope is not None else uuid.uuid4().hex[:16]
         if not re.fullmatch(r"[0-9a-f]{16}", scope): raise ValueError("Invalid task input namespace")
         unique: dict[str, list[tuple[int, int]]] = {}
+        explicit_resource_kinds: dict[str, set[str]] = {}
         exact_occurrences: list[tuple[str, int, int, str]] = []
         omitted = 0
         explicit_spans: list[tuple[int, int]] = []
@@ -187,6 +189,8 @@ class TaskInputBindings:
                         fail(field + ".value", "must be an absolute HTTP(S) URL")
                 elif kind in {"file", "folder"} and not value.startswith("/"):
                     fail(field + ".value", "must be an absolute local path")
+                if kind in {"file", "folder", "url"}:
+                    explicit_resource_kinds.setdefault(value, set()).add(kind)
                 explicit_spans.append((codepoint_start, codepoint_end))
                 exact_occurrences.append((kind, start, length, value))
                 unique.setdefault(value, []).append((codepoint_start, codepoint_end))
@@ -199,19 +203,40 @@ class TaskInputBindings:
                 omitted += 1
                 continue
             unique.setdefault(value, []).append((start, end))
-        entries = tuple(TaskInput(f"input_{scope}_{index}", value, literal_kind(value), tuple(sources))
+        def resource_kind(value: str) -> str | None:
+            explicit = explicit_resource_kinds.get(value, set())
+            if len(explicit) == 1:
+                return next(iter(explicit))
+            if explicit:
+                return "path"
+            kind = literal_kind(value)
+            return kind if kind in {"path", "filename", "url"} else None
+
+        entries = tuple(TaskInput(f"input_{scope}_{index}", value, literal_kind(value), tuple(sources),
+                                  resource_kind(value))
                         for index, (value, sources) in enumerate(unique.items(), 1))
         object.__setattr__(self, "entries", entries)
         object.__setattr__(self, "exact_references", tuple(exact_occurrences))
         object.__setattr__(self, "_by_id", MappingProxyType({entry.identifier: entry for entry in entries}))
         object.__setattr__(self, "omitted", omitted)
 
-    def prompt_state(self) -> dict:
+    def prompt_state(self, *, include_resource_inputs: bool = True) -> dict:
         values = {}
+        resource_inputs = []
         for entry in self.entries:
             values[entry.identifier] = (entry.value if len(entry.value) <= PREVIEW_LENGTH else
                 {"excerpt": entry.value[:PREVIEW_LENGTH], "length": len(entry.value), "source_ranges": entry.sources})
-        return {"version": TASK_INPUT_VERSION, "values": values, **({"omitted": self.omitted} if self.omitted else {})}
+            if entry.resource_kind is not None:
+                resource_inputs.append({"input_id": entry.identifier, "kind": entry.resource_kind})
+        state = {"version": TASK_INPUT_VERSION, "values": values,
+                 **({"resource_inputs": resource_inputs} if include_resource_inputs and len(resource_inputs) >= 2 else {}),
+                 **({"omitted": self.omitted} if self.omitted else {})}
+        return state
+
+    @property
+    def resource_inputs(self) -> tuple[TaskInput, ...]:
+        """Inputs that can name a file, folder, or web resource without probing it."""
+        return tuple(entry for entry in self.entries if entry.resource_kind is not None)
 
     def fingerprint(self) -> str:
         return self._fingerprint
@@ -219,7 +244,7 @@ class TaskInputBindings:
     @cached_property
     def _canonical(self) -> str:
         return json.dumps([TASK_INPUT_VERSION, EXACT_INPUT_REFERENCE_VERSION, self.exact_references,
-                           [(e.identifier, e.value, e.sources) for e in self.entries],
+                           [(e.identifier, e.value, e.sources, e.resource_kind) for e in self.entries],
                            self.omitted], ensure_ascii=True)
 
     @cached_property

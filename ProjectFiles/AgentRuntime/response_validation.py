@@ -17,7 +17,7 @@ from action_contract_generated import (
     ActionContractError, validate_action,
 )
 
-VALIDATION_VERSION = 11
+VALIDATION_VERSION = 12
 
 
 class ResponseValidationError(RuntimeError):

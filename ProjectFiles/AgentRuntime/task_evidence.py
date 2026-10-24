@@ -23,7 +23,8 @@ from task_inputs import TaskInputBindings
 from expected_effects import ExpectedEffect, ExpectedEffectError, validate_expectation
 from observation_context import coordinate_targets, observation_indexes
 
-CHECKLIST_VERSION = 10
+CHECKLIST_VERSION = 11
+BATCH_PROGRESS_VERSION = 1
 RESULT_BROWSER_BUNDLE_IDS = frozenset({
     "com.apple.Safari", "com.apple.SafariTechnologyPreview",
     "com.google.Chrome", "com.google.Chrome.beta", "com.google.Chrome.canary", "com.google.Chrome.dev",
@@ -40,6 +41,168 @@ LARGEST_PATTERN = (r"\s*(?:(?:what(?:['’]s| is)|which is) (?:the |my )?|(?:fin
 
 class EvidenceValidationError(ValueError):
     pass
+
+
+_PER_INPUT_TERMS = re.compile(
+    r"\b(?:each|every|individually|separately|one\s+per|for\s+each|per[- ](?:file|document|input|item))\b",
+    re.I,
+)
+_COMBINED_TERMS = re.compile(
+    r"\b(?:merge|combine|compare|together|into\s+one|single\s+(?:report|summary|file|document|archive)|"
+    r"one\s+(?:report|summary|file|document|archive))\b",
+    re.I,
+)
+_ALL_RESOURCE_TERMS = re.compile(
+    r"\ball\s+(?:\d+\s+)?(?:files?|documents?|spreadsheets?|workbooks?|images?|pdfs?)\b",
+    re.I,
+)
+
+
+def requests_per_input_work(task: str) -> bool:
+    # A strong combined-result instruction wins over the ambiguous words
+    # "each" and "every" (for example, "compare each sheet in one report").
+    # Explicitly separate outputs still establish a batch.
+    if re.search(r"\b(?:separately|individually|one\s+per|for\s+each|per[- ](?:file|document|input|item)|separate\s+(?:files?|documents?|outputs?|reports?|summaries?)\s+for\s+each)\b", task, re.I):
+        return True
+    if _COMBINED_TERMS.search(task):
+        return False
+    return bool(_PER_INPUT_TERMS.search(task) or _ALL_RESOURCE_TERMS.search(task))
+
+
+def is_output_destination(task: str, entry: Any) -> bool:
+    """Recognize plainly phrased output locations without probing the filesystem."""
+    destination_prefix = re.compile(
+        r"\b(?:save|export|write|put|store|place|deliver|download|copy|move|create|output|convert|transform|process)\b"
+        r"[^!?\n]{0,180}\b(?:to|in|into|under|beside|at|as)\s*$",
+        re.I,
+    )
+    result_location = re.compile(
+        r"\b(?:report|summary|result|output|copy|converted\s+(?:file|document))\b"
+        r"[^!?\n]{0,80}\b(?:to|in|into|under|beside|at|as)\s*$", re.I)
+    direct_output = re.compile(
+        r"\b(?:save|export|write|store|create|generate|produce|make|download|output)"
+        r"\s+(?:(?:the|a|an|new|final|result|output|converted)\s+){0,3}"
+        r"(?:file|folder|document|spreadsheet|workbook|report|pdf|copy)?\s*$",
+        re.I,
+    )
+    for start, _ in entry.sources:
+        prefix = task[max(0, start - 180):start].rstrip("\"'`“‘")
+        if destination_prefix.search(prefix) or result_location.search(prefix) or direct_output.search(prefix):
+            return True
+    return False
+
+
+def validate_batch_declaration(value: Any, ledger: "TaskEvidenceLedger", proposed: dict,
+                               path: str = "batch") -> dict:
+    if not isinstance(value, dict) or set(value) != {
+        "mode", "items", "source_input_ids", "excluded_inputs", "global_requirement_ids"
+    }:
+        fail(path, "must contain mode, items, source_input_ids, excluded_inputs, and global_requirement_ids only")
+    mode = value.get("mode")
+    if not isinstance(mode, str) or mode not in {"per_input", "combined", "none"}:
+        fail(path + ".mode", "must be per_input, combined, or none")
+    resources = ledger.inputs.resource_inputs
+    by_id = {entry.identifier: entry for entry in resources}
+    if len(resources) < 2:
+        fail(path, "requires at least two explicit resource inputs")
+
+    source_ids = value.get("source_input_ids")
+    if (not isinstance(source_ids, list) or len(source_ids) > len(resources) or
+            any(not isinstance(identifier, str) for identifier in source_ids) or
+            len(set(source_ids)) != len(source_ids) or any(identifier not in by_id for identifier in source_ids)):
+        fail(path + ".source_input_ids", "must list unique resource input IDs from this task")
+    if any(is_output_destination(ledger.task, by_id[identifier]) for identifier in source_ids):
+        fail(path + ".source_input_ids", "cannot include a stated output destination as a source input")
+    excluded_values = value.get("excluded_inputs")
+    if not isinstance(excluded_values, list) or len(excluded_values) > len(resources):
+        fail(path + ".excluded_inputs", "must be a list of excluded resource inputs")
+    excluded: list[dict] = []
+    excluded_ids: list[str] = []
+    for index, item in enumerate(excluded_values):
+        field = f"{path}.excluded_inputs[{index}]"
+        if not isinstance(item, dict) or set(item) != {"input_id", "reason"}:
+            fail(field, "requires input_id and reason only")
+        identifier, reason = item.get("input_id"), item.get("reason")
+        if not isinstance(identifier, str) or identifier not in by_id:
+            fail(field + ".input_id", "must reference an explicit resource input from this task")
+        if identifier in excluded_ids:
+            fail(field + ".input_id", "must be unique")
+        if not isinstance(reason, str) or reason not in {"output_destination", "incidental"}:
+            fail(field + ".reason", "must be output_destination or incidental")
+        if reason == "output_destination" and not is_output_destination(ledger.task, by_id[identifier]):
+            fail(field + ".reason", "may identify only an output destination stated in the request")
+        if reason == "incidental" and requests_per_input_work(ledger.task):
+            fail(field + ".reason", "cannot omit a supplied input from explicitly per-input work")
+        excluded.append({"input_id": identifier, "reason": reason})
+        excluded_ids.append(identifier)
+    for identifier in excluded_ids:
+        if is_output_destination(ledger.task, by_id[identifier]) and next(
+                item["reason"] for item in excluded if item["input_id"] == identifier) != "output_destination":
+            fail(path + ".excluded_inputs", "a stated output destination must use reason output_destination")
+    if set(source_ids) & set(excluded_ids) or set(source_ids) | set(excluded_ids) != set(by_id):
+        fail(path, "must account for every explicit resource input exactly once")
+
+    item_values = value.get("items")
+    if not isinstance(item_values, list) or len(item_values) > len(resources):
+        fail(path + ".items", "must be a list of per-input outcome mappings")
+    items: list[dict] = []
+    item_ids: list[str] = []
+    mapped_requirement_ids: list[str] = []
+    if mode == "per_input":
+        if len(source_ids) < 2:
+            fail(path + ".source_input_ids", "must include at least two inputs for per_input work")
+        for index, item in enumerate(item_values):
+            field = f"{path}.items[{index}]"
+            if not isinstance(item, dict) or set(item) != {"input_id", "requirement_ids"}:
+                fail(field, "requires input_id and requirement_ids only")
+            identifier = item.get("input_id")
+            if not isinstance(identifier, str) or identifier not in by_id:
+                fail(field + ".input_id", "must reference an explicit resource input from this task")
+            if identifier in item_ids:
+                fail(field + ".input_id", "must be unique; repeated references to one input form one item")
+            requirement_ids = item.get("requirement_ids")
+            requirement_refs(requirement_ids, field + ".requirement_ids")
+            for requirement_id in requirement_ids:
+                requirement = proposed.get(requirement_id)
+                if (requirement is None or requirement.get("state") == "superseded" or
+                        requirement.get("scope", "outcome") == "prerequisite"):
+                    fail(field + ".requirement_ids", "must reference active outcome requirements from this task")
+                if requirement_id in mapped_requirement_ids:
+                    fail(field + ".requirement_ids", "cannot assign one requirement to multiple batch items")
+                mapped_requirement_ids.append(requirement_id)
+            items.append({"input_id": identifier, "requirement_ids": list(requirement_ids)})
+            item_ids.append(identifier)
+        if item_ids != source_ids:
+            fail(path + ".items", "must map source inputs in request order and match source_input_ids")
+    elif item_values:
+        fail(path + ".items", "must be empty unless mode is per_input")
+    elif mode == "combined" and len(source_ids) < 2:
+        fail(path + ".source_input_ids", "must include at least two inputs for a combined result")
+
+    if requests_per_input_work(ledger.task) and mode != "per_input":
+        fail(path + ".mode", "must be per_input because the request asks for separate work on each input")
+
+    global_ids = value.get("global_requirement_ids")
+    requirement_refs(global_ids, path + ".global_requirement_ids", empty=True)
+    active_outcomes = {identifier for identifier, requirement in proposed.items()
+                       if requirement.get("state") != "superseded" and
+                       requirement.get("scope", "outcome") != "prerequisite"}
+    if mode == "per_input":
+        if len(set(global_ids) & set(mapped_requirement_ids)):
+            fail(path + ".global_requirement_ids", "cannot repeat requirements already assigned to batch items")
+        if set(global_ids) | set(mapped_requirement_ids) != active_outcomes:
+            fail(path + ".global_requirement_ids", "must complete the requirement mapping for every active outcome")
+        for index, item in enumerate(items):
+            if not item["requirement_ids"]:
+                fail(f"{path}.items[{index}].requirement_ids", "must identify every requested outcome for this input")
+    elif set(global_ids) != active_outcomes:
+        fail(path + ".global_requirement_ids", "must list every active outcome requirement outside a per-input batch")
+
+    resource_order = [entry.identifier for entry in resources]
+    if [identifier for identifier in resource_order if identifier in set(source_ids)] != source_ids:
+        fail(path + ".source_input_ids", "must preserve the supplied input order")
+    return {"mode": mode, "items": items, "source_input_ids": list(source_ids),
+            "excluded_inputs": excluded, "global_requirement_ids": list(global_ids)}
 
 
 def fail(path: str, reason: str) -> None:
@@ -283,6 +446,13 @@ def validate_metadata(value: dict, purpose: str, ledger: TaskEvidenceLedger | No
             elif any(entry.get("depends_on") for entry in entries):
                 fail(key + ".depends_on", "requires a current task checklist")
     if ledger: ledger.validate_observation_checks(proposed, observation)
+    if "batch" in value:
+        if purpose != "planning": fail("batch", "may be declared only by a planning response")
+        if ledger is None: fail("batch", "requires the current task input and checklist")
+        normalized_batch = validate_batch_declaration(value["batch"], ledger, proposed)
+        if not ledger.batch_declaration_required_for(proposed) and ledger.batch_initialized:
+            if normalized_batch != ledger.batch_declaration():
+                fail("batch", "cannot change after planning unless inputs or checklist requirements changed")
     if "requirement_ids" in value:
         requirement_refs(value["requirement_ids"], "requirement_ids")
         if ledger is None or any(ref not in proposed or proposed[ref].get("state") == "superseded"
@@ -355,6 +525,11 @@ def validate_metadata(value: dict, purpose: str, ledger: TaskEvidenceLedger | No
                                             ledger.matches(check, ledger.evidence[ref]) for ref in proof["evidence_ids"])
                         if text is None or (text not in value["message"] and not native_output):
                             fail("message", "must contain the complete verified requested output")
+            if not ledger.batch_complete():
+                fail("batch", "every input must have current proof for all of its associated requested outcomes")
+    if (purpose == "planning" and ledger.batch_declaration_required_for(proposed) and
+            "batch" not in value):
+        fail("batch", "is required to classify separate work for each supplied input and associate its outcomes")
 
 
 class TaskEvidenceLedger:
@@ -379,6 +554,13 @@ class TaskEvidenceLedger:
         # Presentation-only objects remain task-scoped and never enter prompt
         # history, completion evidence, or persistent task history.
         self._result_object_cache: dict[str, dict] = {}
+        self.batch_mode: str | None = None
+        self.batch_items: list[dict] = []
+        self.batch_source_input_ids: list[str] = []
+        self.batch_excluded_inputs: list[dict] = []
+        self.batch_global_requirement_ids: list[str] = []
+        self.batch_initialized = False
+        self.batch_needs_declaration = False
         read = re.fullmatch(READ_PATTERN, task, re.I)
         if read:
             self.local_complete_grammar = True
@@ -390,10 +572,20 @@ class TaskEvidenceLedger:
                                     "check": {"type": "answer", "expected": task}}])
 
     def add_requirements(self, entries: list[dict], observation: dict | None = None, *, path="requirements") -> bool:
+        previous_outcomes = {identifier for identifier, requirement in self.requirements.items()
+                             if requirement.get("state") != "superseded" and
+                             requirement.get("scope", "outcome") != "prerequisite"}
         proposed = project_requirements(self.requirements, self.canonical_entries(entries, observation), self.task, path)
         self.validate_observation_checks(proposed, observation)
         changed = proposed != self.requirements
         self.requirements = proposed
+        current_outcomes = {identifier for identifier, requirement in self.requirements.items()
+                            if requirement.get("state") != "superseded" and
+                            requirement.get("scope", "outcome") != "prerequisite"}
+        if (self.batch_initialized and
+                current_outcomes - set(self.batch_global_requirement_ids) -
+                {ref for item in self.batch_items for ref in item.get("requirement_ids", [])}):
+            self.batch_needs_declaration = True
         self.bind_observation_checks(observation or self.current_observation)
         if changed: self.coverage_complete = False
         self.record_observation_checks()
@@ -402,12 +594,115 @@ class TaskEvidenceLedger:
 
     def accept_plan(self, decision: dict, observation: dict | None = None) -> None:
         self.add_requirements(decision.get("requirements", []), observation)
+        if "batch" in decision:
+            self.accept_batch(decision["batch"])
+
+    def batch_declaration_required_for(self, proposed: dict | None = None) -> bool:
+        if len(self.batch_source_candidates()) < 2 or not requests_per_input_work(self.task):
+            return False
+        if not self.batch_initialized or self.batch_needs_declaration:
+            return True
+        active = proposed if proposed is not None else self.requirements
+        outcome_ids = {identifier for identifier, requirement in active.items()
+                       if requirement.get("state") != "superseded" and
+                       requirement.get("scope", "outcome") != "prerequisite"}
+        assigned = set(self.batch_global_requirement_ids)
+        assigned.update(ref for item in self.batch_items for ref in item.get("requirement_ids", []))
+        return outcome_ids != assigned
+
+    def batch_source_candidates(self):
+        """Resource references not plainly described as output destinations."""
+        return tuple(entry for entry in self.inputs.resource_inputs
+                     if not is_output_destination(self.task, entry))
+
+    def batch_declaration(self) -> dict:
+        items = []
+        if self.batch_mode == "per_input":
+            items = [{"input_id": item["input_id"], "requirement_ids": list(item["requirement_ids"])}
+                     for item in self.batch_items]
+        return {"mode": self.batch_mode, "items": items,
+                "source_input_ids": list(self.batch_source_input_ids),
+                "excluded_inputs": deepcopy(self.batch_excluded_inputs),
+                "global_requirement_ids": list(self.batch_global_requirement_ids)}
+
+    def accept_batch(self, declaration: dict) -> None:
+        by_id = {entry.identifier: entry for entry in self.inputs.resource_inputs}
+        previous = {item["reference"]: item for item in self.batch_items}
+        self.batch_mode = declaration["mode"]
+        self.batch_source_input_ids = list(declaration["source_input_ids"])
+        self.batch_excluded_inputs = deepcopy(declaration["excluded_inputs"])
+        self.batch_global_requirement_ids = list(declaration["global_requirement_ids"])
+        self.batch_items = []
+        next_batch_number = max((int(item["id"][1:]) for item in previous.values()
+                                 if re.fullmatch(r"b[1-9][0-9]*", item.get("id", ""))), default=0) + 1
+        if self.batch_mode == "per_input":
+            for item in declaration["items"]:
+                entry = by_id[item["input_id"]]
+                old = previous.get(entry.value)
+                item_id = old["id"] if old else f"b{next_batch_number}"
+                if old is None:
+                    next_batch_number += 1
+                self.batch_items.append({
+                    "id": item_id,
+                    "input_id": entry.identifier, "reference": entry.value,
+                    "kind": entry.resource_kind or entry.kind,
+                    "requirement_ids": list(item["requirement_ids"]),
+                })
+        self.batch_initialized = True
+        self.batch_needs_declaration = False
+
+    def batch_complete(self) -> bool:
+        self.refresh()
+        if self.batch_mode != "per_input":
+            return not self.batch_declaration_required_for()
+        if self.batch_needs_declaration or len(self.batch_items) < 2:
+            return False
+        outcome_ids = {identifier for identifier, requirement in self.requirements.items()
+                       if requirement.get("state") != "superseded" and
+                       requirement.get("scope", "outcome") != "prerequisite"}
+        mapped = set(self.batch_global_requirement_ids)
+        for item in self.batch_items:
+            requirement_ids = item.get("requirement_ids", [])
+            if not requirement_ids:
+                return False
+            for identifier in requirement_ids:
+                requirement = self.requirements.get(identifier)
+                if (requirement is None or requirement.get("state") == "superseded" or
+                        requirement.get("scope", "outcome") == "prerequisite" or
+                        requirement.get("state") != "proven"):
+                    return False
+                mapped.add(identifier)
+        return mapped == outcome_ids and all(
+            self.requirements[identifier].get("state") == "proven" for identifier in self.batch_global_requirement_ids
+            if identifier in self.requirements and self.requirements[identifier].get("state") != "superseded"
+        )
 
     def apply_instruction_revision(self, task: str, exact_input_references: list[dict]) -> None:
         """Retain history while making all prior proof provisional for revised instructions."""
+        previous_items = {item["reference"]: deepcopy(item) for item in self.batch_items}
+        next_batch_number = max((int(item["id"][1:]) for item in self.batch_items
+                                 if re.fullmatch(r"b[1-9][0-9]*", item.get("id", ""))), default=0) + 1
         self.task = task
         self.instruction_revision += 1
         self.inputs = TaskInputBindings(task, exact_input_references=exact_input_references)
+        current_resources = self.batch_source_candidates()
+        self.batch_items = []
+        for entry in current_resources:
+            old = previous_items.get(entry.value)
+            item_id = old["id"] if old else f"b{next_batch_number}"
+            if old is None:
+                next_batch_number += 1
+            self.batch_items.append({
+                "id": item_id, "input_id": entry.identifier, "reference": entry.value,
+                "kind": entry.resource_kind or entry.kind,
+                "requirement_ids": list(old.get("requirement_ids", [])) if old else [],
+            })
+        self.batch_mode = "per_input" if len(current_resources) >= 2 and requests_per_input_work(task) else None
+        self.batch_source_input_ids = [entry.identifier for entry in current_resources] if self.batch_mode else []
+        self.batch_excluded_inputs = []
+        self.batch_global_requirement_ids = []
+        self.batch_initialized = False
+        self.batch_needs_declaration = self.batch_mode == "per_input"
         self.coverage_complete = False
         self.local_complete_grammar = False
         self.observation_id = None
@@ -813,6 +1108,7 @@ class TaskEvidenceLedger:
         active = [r for r in self.requirements.values() if r.get("state") != "superseded"]
         if not active or not (self.coverage_complete or self.local_complete_grammar): return False
         if any(r["state"] != "proven" for r in active): return False
+        if not self.batch_complete(): return False
         if output is not None:
             for r in active:
                 if r["check"]["type"] in {"file_read", "stdout_equals"}:
@@ -863,10 +1159,17 @@ class TaskEvidenceLedger:
         superseded = {identifier: {key: requirement[key] for key in ("source", "description", "superseded_by") if key in requirement}
                       for identifier, requirement in self.requirements.items()
                       if requirement.get("state") == "superseded"}
-        return {"version": CHECKLIST_VERSION, "whole_request_coverage": "audited" if self.coverage_complete else "pending",
-                "requirements": bounded(requirements), "superseded_requirements": bounded(superseded),
-                "evidence": {key: {**bounded(e["fact"]), **({"origin": e["origin"]} if e["origin"] else {})}
-                             for key, e in self.evidence.items() if e["valid"]}}
+        batch_prompt = None
+        if self.batch_initialized or self.batch_declaration_required_for():
+            batch_prompt = {**self.batch_declaration(),
+                            "needs_declaration": self.batch_declaration_required_for()}
+        state = {"version": CHECKLIST_VERSION, "whole_request_coverage": "audited" if self.coverage_complete else "pending",
+                 "requirements": bounded(requirements), "superseded_requirements": bounded(superseded),
+                 "evidence": {key: {**bounded(e["fact"]), **({"origin": e["origin"]} if e["origin"] else {})}
+                              for key, e in self.evidence.items() if e["valid"]}}
+        if batch_prompt is not None:
+            state["batch"] = batch_prompt
+        return state
 
     def presentation_state(self, active_requirement_ids: list[str] | None = None,
                            lifecycle: str = "running") -> dict:
@@ -885,6 +1188,7 @@ class TaskEvidenceLedger:
         range_budget = 4096
         evidence_budget = 512 * 1024
         projected_active = []
+        projected_requirement_states = {}
         for identifier, requirement in list(self.requirements.items())[:512]:
             if requirement.get("state") == "superseded":
                 continue
@@ -926,6 +1230,7 @@ class TaskEvidenceLedger:
                 # Never present a confirmed clause unless this projection can
                 # carry at least one matching, currently valid proof summary.
                 projected_state = "pending"
+            projected_requirement_states[identifier] = projected_state
             summaries.append({
                 "id": identifier,
                 # The UI already owns the original task. Byte ranges avoid
@@ -938,13 +1243,85 @@ class TaskEvidenceLedger:
             if identifier in active and lifecycle == "running" and projected_state != "proven":
                 projected_active.append(identifier)
         return {
-            "version": 2,
+            "version": 3,
             "lifecycle": lifecycle,
             "whole_request_coverage": "audited" if self.coverage_complete else "pending",
             "active_requirement_ids": projected_active,
             "requirements": summaries,
             "result_objects": self._presentation_result_objects(),
+            "batch": self._presentation_batch(active, lifecycle, projected_requirement_states),
         }
+
+    @staticmethod
+    def _batch_outcome_label(check: dict) -> str:
+        return {
+            "file_read": "Read the requested input",
+            "file_append": "Append the requested content",
+            "file_written": "Write the requested output",
+            "file_contents": "Match the requested file contents",
+            "file_exists": "Confirm the requested file exists",
+            "directory_exists": "Confirm the requested folder exists",
+            "path_absent": "Confirm the requested path is absent",
+            "command_executed": "Complete the requested command",
+            "command_operation": "Verify the requested operation",
+            "stdout_equals": "Match the requested output",
+            "window_active": "Confirm the requested window",
+            "field_value": "Confirm the requested field value",
+            "dialog_present": "Confirm the expected dialog",
+            "visual": "Check the requested visible result",
+            "answer": "Provide the requested answer",
+        }.get(check.get("type"), "Verify the requested outcome")
+
+    def _presentation_batch(self, active: set[str], lifecycle: str,
+                            projected_states: dict[str, str]) -> dict | None:
+        if self.batch_mode != "per_input" or len(self.batch_items) < 2:
+            return None
+        items = []
+        handled = 0
+        terminal = lifecycle in {"completed", "failed", "stopped"}
+        for item in self.batch_items[:128]:
+            requirement_ids = [identifier for identifier in item.get("requirement_ids", [])
+                              if identifier in self.requirements and
+                              self.requirements[identifier].get("state") != "superseded"]
+            requirements = [self.requirements[identifier] for identifier in requirement_ids]
+            outcomes = [{"id": identifier, "label": self._batch_outcome_label(requirement["check"])}
+                        for identifier, requirement in zip(requirement_ids, requirements)]
+            invalidated = any(projected_states.get(identifier) == "invalidated" for identifier in requirement_ids)
+            all_proven = bool(requirements) and all(projected_states.get(identifier) == "proven"
+                                                     for identifier in requirement_ids)
+            active_ids = [identifier for identifier in requirement_ids
+                          if identifier in active and projected_states.get(identifier) != "proven"]
+            if invalidated:
+                state = "needs_recheck"
+                step = "Earlier proof needs to be checked again."
+            elif self.batch_needs_declaration:
+                state = "unfinished" if terminal else "waiting"
+                step = ("This input was not fully mapped before the run ended." if terminal else
+                        "Rechecking which outcomes belong to this input.")
+            elif all_proven:
+                state = "verified"
+                step = "All assigned outcomes have current proof."
+                handled += 1
+            elif terminal:
+                state = "unfinished"
+                step = "This input was not fully verified before the run ended."
+            elif not requirements:
+                state = "waiting"
+                step = "Rechecking which outcomes belong to this input."
+            elif lifecycle == "running" and active_ids:
+                state = "working"
+                requirement = self.requirements[active_ids[0]]
+                step = "Working on: " + self._batch_outcome_label(requirement["check"]) + "."
+            else:
+                state = "waiting"
+                step = "Waiting for its requested outcomes."
+            items.append({
+                "id": item["id"], "input_id": item["input_id"], "reference": item["reference"],
+                "kind": item["kind"], "state": state, "active": state == "working",
+                "current_step": step, "outcomes": outcomes,
+            })
+        return {"version": BATCH_PROGRESS_VERSION, "needs_declaration": self.batch_needs_declaration,
+                "handled_count": handled, "items": items}
 
     def latest_confirmed_status(self) -> str:
         """Describe the newest currently valid proof for a proven outcome."""
@@ -1254,6 +1631,10 @@ class TaskEvidenceLedger:
         return self._state.revision
 
     def _sync_state(self) -> None:
-        self._state.update([CHECKLIST_VERSION, self.task, self.generation, self.inputs.fingerprint(), self.requirements,
+        self._state.update([CHECKLIST_VERSION, BATCH_PROGRESS_VERSION, self.task, self.generation,
+                       self.inputs.fingerprint(), self.requirements,
                        {key: [e["fact_fingerprint"], e["action_fingerprint"], e["valid"], e["mutable"], e["origin"], e.get('effect_check')]
-                        for key, e in self.evidence.items()}, self.coverage_complete])
+                        for key, e in self.evidence.items()}, self.coverage_complete,
+                       self.batch_mode, self.batch_items, self.batch_source_input_ids,
+                       self.batch_excluded_inputs, self.batch_global_requirement_ids,
+                       self.batch_initialized, self.batch_needs_declaration])

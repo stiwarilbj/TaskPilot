@@ -83,10 +83,10 @@ final class TaskProgressMapTests: XCTestCase {
     func testSnapshotRequiresExactGenerationAndStrictSafeEvidenceFields() throws {
         let base: [String: Any] = [
             "kind": "task_progress", "task_generation_id": "generation", "revision": 2,
-            "version": 2, "lifecycle": "running", "whole_request_coverage": "pending",
+            "version": 3, "lifecycle": "running", "whole_request_coverage": "pending",
             "active_requirement_ids": ["r1"],
             "requirements": [["id": "r1", "source_ranges": [[0, 15]], "state": "pending", "active": true, "evidence": []]],
-            "result_objects": []
+            "result_objects": [], "batch": NSNull()
         ]
         let parsed = try XCTUnwrap(AgentTaskProgressSnapshot.parse(base, generationID: "generation"))
         XCTAssertEqual(parsed.revision, 2)
@@ -107,15 +107,82 @@ final class TaskProgressMapTests: XCTestCase {
         XCTAssertNil(AgentTaskProgressSnapshot.parse(secret, generationID: "generation"))
     }
 
+    func testBatchSnapshotRequiresTaskOwnedInputsAndCurrentRequirementAssociations() throws {
+        let base: [String: Any] = [
+            "kind": "task_progress", "task_generation_id": "generation", "revision": 5,
+            "version": 3, "lifecycle": "running", "whole_request_coverage": "pending",
+            "active_requirement_ids": ["r1"],
+            "requirements": [
+                ["id": "r1", "source_ranges": [[0, 1]], "state": "pending", "active": true, "evidence": []],
+                ["id": "r2", "source_ranges": [[2, 3]], "state": "pending", "active": false, "evidence": []]
+            ],
+            "result_objects": [],
+            "batch": [
+                "version": 1, "needs_declaration": false, "handled_count": 0,
+                "items": [
+                    ["id": "b1", "input_id": "input_0123456789abcdef_1", "reference": "/Inputs/January.pdf",
+                     "kind": "file", "state": "working", "active": true,
+                     "current_step": "Working on: Write the requested output.",
+                     "outcomes": [["id": "r1", "label": "Write the requested output"]]],
+                    ["id": "b2", "input_id": "input_0123456789abcdef_2", "reference": "/Inputs/February.pdf",
+                     "kind": "file", "state": "waiting", "active": false,
+                     "current_step": "Waiting for its requested outcomes.",
+                     "outcomes": [["id": "r2", "label": "Write the requested output"]]]
+                ]
+            ]
+        ]
+        let parsed = try XCTUnwrap(AgentTaskProgressSnapshot.parse(base, generationID: "generation"))
+        XCTAssertEqual(parsed.batch?.items.map(\.state), [.working, .waiting])
+        XCTAssertEqual(parsed.batch?.handledCount, 0)
+
+        var forgedHandledCount = base
+        forgedHandledCount["batch"] = [
+            "version": 1, "needs_declaration": false, "handled_count": 1,
+            "items": (base["batch"] as! [String: Any])["items"]!
+        ]
+        XCTAssertNil(AgentTaskProgressSnapshot.parse(forgedHandledCount, generationID: "generation"))
+
+        var staleRequirement = base
+        var batch = staleRequirement["batch"] as! [String: Any]
+        var items = batch["items"] as! [[String: Any]]
+        items[0]["outcomes"] = [["id": "r9", "label": "Write the requested output"]]
+        batch["items"] = items
+        staleRequirement["batch"] = batch
+        XCTAssertNil(AgentTaskProgressSnapshot.parse(staleRequirement, generationID: "generation"))
+    }
+
+    func testBatchStatesSuspendWorkingAcrossPauseAndMarkTerminalWorkUnfinished() {
+        let item = AgentTaskBatchItem(id: "b1", inputID: "input_0123456789abcdef_1",
+                                      reference: "/Inputs/January.pdf", kind: "file", state: .working,
+                                      active: true, currentStep: "Working", outcomes: [])
+        XCTAssertEqual(TaskBatchProgressPresentation.state(for: item, lifecycle: .paused), .waiting)
+        XCTAssertEqual(TaskBatchProgressPresentation.state(for: item, lifecycle: .waitingForUser), .waiting)
+        XCTAssertEqual(TaskBatchProgressPresentation.state(for: item, lifecycle: .failed), .unfinished)
+        let verified = AgentTaskBatchItem(id: "b1", inputID: item.inputID, reference: item.reference,
+                                          kind: item.kind, state: .verified, active: false,
+                                          currentStep: "Verified", outcomes: [])
+        XCTAssertEqual(TaskBatchProgressPresentation.state(for: verified, lifecycle: .stopped), .verified)
+    }
+
+    func testSameFilenameLabelsUseShortestDifferingParentSuffix() {
+        let items = [
+            AgentTaskBatchItem(id: "b1", inputID: "input_0123456789abcdef_1", reference: "/Users/one/January/report.pdf",
+                               kind: "file", state: .waiting, active: false, currentStep: "Waiting", outcomes: []),
+            AgentTaskBatchItem(id: "b2", inputID: "input_0123456789abcdef_2", reference: "/Users/two/February/report.pdf",
+                               kind: "file", state: .waiting, active: false, currentStep: "Waiting", outcomes: [])
+        ]
+        XCTAssertEqual(TaskBatchProgressPresentation.labels(for: items), ["January/report.pdf", "February/report.pdf"])
+    }
+
     func testOnlyConfirmedFileEvidenceCanOfferFinderReveal() throws {
         let base: [String: Any] = [
             "kind": "task_progress", "task_generation_id": "generation", "revision": 3,
-            "version": 2, "lifecycle": "completed", "whole_request_coverage": "audited",
+            "version": 3, "lifecycle": "completed", "whole_request_coverage": "audited",
             "active_requirement_ids": [],
             "requirements": [["id": "r1", "source_ranges": [[0, 15]], "state": "proven", "active": false,
                               "evidence": [["label": "File contents matched", "detail": "/tmp/report.txt",
                                             "reveal_path": "/tmp/report.txt"]]]],
-            "result_objects": []
+            "result_objects": [], "batch": NSNull()
         ]
         let parsed = try XCTUnwrap(AgentTaskProgressSnapshot.parse(base, generationID: "generation"))
         XCTAssertEqual(parsed.requirements[0].evidence[0].revealPath, "/tmp/report.txt")
@@ -161,10 +228,10 @@ final class TaskProgressMapTests: XCTestCase {
     func testByteRangesMustRespectUTF8BoundariesAndTaskLength() throws {
         let base: [String: Any] = [
             "kind": "task_progress", "task_generation_id": "generation", "revision": 4,
-            "version": 2, "lifecycle": "running", "whole_request_coverage": "pending",
+            "version": 3, "lifecycle": "running", "whole_request_coverage": "pending",
             "active_requirement_ids": [],
             "requirements": [["id": "r1", "source_ranges": [[0, 1]], "state": "pending", "active": false, "evidence": []]],
-            "result_objects": []
+            "result_objects": [], "batch": NSNull()
         ]
         XCTAssertNotNil(AgentTaskProgressSnapshot.parse(base, generationID: "generation"))
         var malformed = base

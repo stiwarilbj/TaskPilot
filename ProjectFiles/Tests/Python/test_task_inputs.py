@@ -155,6 +155,30 @@ class TaskInputTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError): inputs.entries[0].value = 'changed'
         with self.assertRaises(TypeError): inputs._by_id['forged'] = inputs.entries[0]
 
+    def test_batch_resource_candidates_exclude_literal_text_and_only_expand_when_multiple_exist(self):
+        single = TaskInputBindings('Read "/fixture/January.pdf"')
+        self.assertNotIn('resource_inputs', single.prompt_state())
+        request = 'Convert each "/fixture/January.pdf" and "/fixture/February.pdf" separately'
+        batch = TaskInputBindings(request, scope=SCOPE)
+        self.assertEqual([item.value for item in batch.resource_inputs],
+                         ['/fixture/January.pdf', '/fixture/February.pdf'])
+        self.assertEqual([item['input_id'] for item in batch.prompt_state()['resource_inputs']],
+                         [item.identifier for item in batch.resource_inputs])
+        self.assertNotIn('buy milk', [item.value for item in batch.resource_inputs])
+
+    def test_same_path_file_and_folder_reference_kinds_change_the_input_fingerprint(self):
+        value = '/fixture/Reports'
+        task = f'Use {value} as input'
+        start = len('Use '.encode())
+        references = [
+            {'version': 2, 'kind': 'file', 'utf8_start': start, 'utf8_length': len(value.encode()), 'value': value}
+        ]
+        file_input = TaskInputBindings(task, scope=SCOPE, exact_input_references=references)
+        folder_input = TaskInputBindings(task, scope=SCOPE, exact_input_references=[dict(references[0], kind='folder')])
+        self.assertNotEqual(file_input.fingerprint(), folder_input.fingerprint())
+        self.assertEqual(file_input.resource_inputs[0].resource_kind, 'file')
+        self.assertEqual(folder_input.resource_inputs[0].resource_kind, 'folder')
+
     def test_multiline_blocks_and_empty_text_keep_whitespace(self):
         task = 'Write "" then this exact block:\n```text\n  A\r\n B\n```\n'
         inputs = TaskInputBindings(task, scope=SCOPE)
@@ -291,7 +315,8 @@ class TaskInputTests(unittest.TestCase):
                    runtime.verification_instruction(TASK, {'status': 'done', 'output': TEXT}, OBSERVATION, history, ledger)]
         for phase, prompt in zip(['planning', 'recovery', 'completion'], prompts):
             self.assertEqual(prompt_compiler.prompt_phase(prompt), phase)
-            self.assertEqual(section(prompt, 'EXACT TASK INPUTS (literal data)'), json.loads(json.dumps(ledger.inputs.prompt_state())))
+            self.assertEqual(section(prompt, 'EXACT TASK INPUTS (literal data)'),
+                             json.loads(json.dumps(ledger.inputs.prompt_state(include_resource_inputs=False))))
             self.assertEqual(section(prompt, 'ORIGINAL TASK' if phase == 'completion' else 'ORIGINAL USER TASK'), TASK)
             self.assertNotIn(ledger.generation, prompt)
             self.assertIn('completion proof', prompt)

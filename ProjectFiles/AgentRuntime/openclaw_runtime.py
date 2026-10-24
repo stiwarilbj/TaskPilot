@@ -69,7 +69,8 @@ from observation_completeness import (OBSERVATION_COMPLETENESS_VERSION, Observat
                                       validate_completeness, prompt_coverage, coverage_cache_input)
 from local_text_recognition import (TEXT_RECOGNITION_VERSION, TextRecognitionError,
                                     validate_text_recognition, prompt_text_recognition, detail_images)
-from task_evidence import (TaskEvidenceLedger, RevisionedJSONState, CHECKLIST_VERSION,
+from task_evidence import (TaskEvidenceLedger, RevisionedJSONState, CHECKLIST_VERSION, BATCH_PROGRESS_VERSION,
+                           requests_per_input_work,
                            LARGEST_PATTERN, digest as evidence_digest)
 from expected_effects import ExpectedEffect, EXPECTED_EFFECT_VERSION, FILE_EFFECTS, path_key
 from task_inputs import EXACT_INPUT_REFERENCE_VERSION, TASK_INPUT_VERSION, input_reference_rules
@@ -3079,7 +3080,8 @@ def desktop_instruction(
                  + "\n".join(json_data(example) for example in illustrated) + "\n" + " ".join(bounds) + "\n" + reference,
         task=task, context=prompt_capability_context(context), observation=prompt_observation(observation, task),
         history=recent, progress=progress, checklist=ledger.prompt_state() if ledger else None, condition=condition,
-        inputs=inputs.prompt_state() if inputs else None)
+        inputs=inputs.prompt_state(include_resource_inputs=bool(ledger and
+            (ledger.batch_declaration_required_for() or ledger.batch_mode == "per_input"))) if inputs else None)
 
 
 def verification_evidence(task: str, history: list[dict[str, Any]],
@@ -3136,7 +3138,8 @@ def verification_instruction(
         task=task, context=prompt_capability_context(capability_context),
         observation=prompt_observation(observation, task), history=[], progress={},
         checklist=verification_evidence(task, history, ledger),
-        inputs=inputs.prompt_state() if inputs else None)
+        inputs=inputs.prompt_state(include_resource_inputs=bool(ledger and
+            (ledger.batch_declaration_required_for() or ledger.batch_mode == "per_input"))) if inputs else None)
 
 
 class ResponseRepairBudget:
@@ -3162,6 +3165,26 @@ def checklist_instruction(ledger: TaskEvidenceLedger) -> str:
     if ledger.instruction_revision > 0:
         contract += ("After a correction changes completed work, inspect its current result first; revise only if fresh evidence requires it. "
                      "Never repeat a mutation solely because a correction arrived; retain historical action attribution. ")
+    if ledger.batch_declaration_required_for() or ledger.batch_mode == "per_input":
+        resource_ids = [entry.identifier for entry in ledger.inputs.resource_inputs]
+        contract += (
+            "\nBATCH INPUTS: resource IDs are listed in inputs.resource_inputs and their exact values are in inputs.values. "
+            "When at least two exist, include a batch object in this planning response with exactly mode, items, "
+            "source_input_ids, excluded_inputs, global_requirement_ids. Modes are per_input, combined, or none. "
+            "Classify every resource ID exactly once as a source or excluded input; use excluded reason "
+            "output_destination only for a stated output location, otherwise incidental. For per_input, map every "
+            "source ID in original request order to a nonempty set of active outcome requirement_ids; list all "
+            "remaining outcome requirements in global_requirement_ids. Never include output destinations in items. "
+            "Repeated references to the same exact input are one item. A comparison or merged result is combined, "
+            "not per_input. Current resource IDs: " + json.dumps(resource_ids, separators=(",", ":")) + "."
+        )
+        if requests_per_input_work(ledger.task):
+            contract += " The request asks for separate work on each input, so mode must be per_input and every source must be mapped."
+        contract += (
+            ' Example shape: {"mode":"per_input","items":[{"input_id":"<supplied resource ID>",'
+            '"requirement_ids":["r1"]}],"source_input_ids":["<supplied resource ID>"],'
+            '"excluded_inputs":[],"global_requirement_ids":[]}. Replace illustrative IDs with supplied IDs.'
+        )
     if ledger.current_observation and ledger.current_observation.get("elements"):
         contract += ("Local checks: window_active(pid,title), field_value(element_id,value[,pid]), "
                      "dialog_present(pid,title[,window_title]). Preconditions must use local checks, not visual claims. ")
@@ -3169,7 +3192,7 @@ def checklist_instruction(ledger: TaskEvidenceLedger) -> str:
 
 
 def verification_checklist_instruction(ledger: TaskEvidenceLedger) -> str:
-    return (
+    instruction = (
         "\nAudit the checklist against the COMPLETE ORIGINAL TASK plus every applied correction, including destinations, contents, constraints, "
         "ordering, and requested returned output. If anything was omitted, return verified:false and "
         "uncovered_requirements in the planning checklist shape. Cite proof for EACH requirement using runtime IDs. "
@@ -3181,6 +3204,13 @@ def verification_checklist_instruction(ledger: TaskEvidenceLedger) -> str:
         "the full verified output verbatim OR output_evidence_ids to have TaskPilot return it exactly. "
         "Excerpts cannot substitute for full contents.\n"
     )
+    if ledger.batch_mode == "per_input":
+        instruction += (
+            "The batch roster in the checklist is mandatory: audit every listed input separately, confirm all associated "
+            "outcome requirements have currently valid matching evidence, and report any omitted or unverified input as "
+            "uncovered. A successful whole-request coverage claim cannot skip an item.\n"
+        )
+    return instruction
 
 
 @local_operation(5.0, 'completion_readback')
@@ -3437,7 +3467,7 @@ def routed_json_prompt(
         context.instruction_revision if context is not None else 0, VALIDATION_VERSION, CONTRACT_HASH,
         context.working_document_revision if context is not None else 0,
         json.dumps(context.working_document, sort_keys=True, separators=(",", ":")) if context is not None and context.working_document else None,
-        CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, LOCAL_CHANGE_VERSION, COMMAND_CAPABILITY_VERSION,
+        CHECKLIST_VERSION, BATCH_PROGRESS_VERSION, EXPECTED_EFFECT_VERSION, LOCAL_CHANGE_VERSION, COMMAND_CAPABILITY_VERSION,
         PROMPT_COMPILER_VERSION, VERIFICATION_SESSION_VERSION, COORDINATE_MAPPING_VERSION,
         OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION,
         RECOVERY_CYCLE_VERSION, TASK_INPUT_VERSION, ledger.fingerprint() if ledger else None,
