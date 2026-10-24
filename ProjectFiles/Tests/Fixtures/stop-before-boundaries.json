@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "cases": [
+    {"id": "dont-send", "request": "Draft the email, but don't send it.", "expected": ["send"]},
+    {"id": "never-publish", "request": "Never publish this post.", "expected": ["publish"]},
+    {"id": "without-deploying", "request": "Prepare the changes without deploying.", "expected": ["deploy"]},
+    {"id": "curly-dont-send", "request": "Draft the note, but don’t send it.", "expected": ["send"]},
+    {"id": "curly-quoted-negation", "request": "The quote says “don’t send it”.", "expected": []},
+    {"id": "single-quoted-negation", "request": "The quote says 'don't submit it'.", "expected": []},
+    {"id": "markdown-quoted-negation", "request": "Quoted text:\n> Don't send it.\nPrepare the draft.", "expected": []},
+    {"id": "exact-input-negation", "request": "Open this note: don't send it", "reference": "don't send it", "expected": []},
+    {"id": "positive-correction", "request": "Don't submit it. You can submit now.", "expected": []},
+    {"id": "positive-correction-punctuation", "request": "Don't send yet. Actually, send it now.", "expected": []},
+    {"id": "permission-correction", "request": "Don't send yet. You can send it now.", "expected": []},
+    {"id": "direct-correction", "request": "Draft this, don't send. User correction: Send it now.", "expected": []},
+    {"id": "ambiguous-correction-preserves", "request": "Draft this, don't send. User correction: keep it ready.", "expected": ["send"]},
+    {"id": "purchase-order", "request": "Prepare checkout, but don't place an order.", "expected": ["purchase"]},
+    {"id": "purchase-your-order", "request": "Prepare the cart but don't place your order.", "expected": ["purchase"]},
+    {"id": "multiple-boundaries", "request": "Prepare the post; don't publish or deploy it.", "expected": ["publish", "deploy"]},
+    {"id": "dont-forget", "request": "Create the draft and don't forget to send it.", "expected": []},
+    {"id": "hit-submit", "request": "Fill out the form but don't hit Submit.", "expected": ["submit"]}
+  ]
+}

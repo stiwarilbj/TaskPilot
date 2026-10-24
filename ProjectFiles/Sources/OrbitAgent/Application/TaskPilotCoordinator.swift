@@ -1362,14 +1362,16 @@ final class TaskPilotCoordinator: ObservableObject {
         requestMetrics = nil
         userInputRequest = nil
         userInputDraft = ""
-        let lease = TaskLease(taskRequest: request, closePersistentProcesses: closesTaskAppsAfterUse,
+        let lease = TaskLease(taskRequest: request, exactInputReferences: submission.exactInputReferences,
+            closePersistentProcesses: closesTaskAppsAfterUse,
             recoveryJournal: recoveryJournal, recoveryTask: authorization.id)
         taskWaitDetails = AgentTaskWaitSnapshot(generationID: lease.id, revision: 0, operationID: 0,
             phase: .starting, lastConfirmed: "No confirmed result yet.",
             waitingFor: "Connecting to the app", attention: .none)
         lastTaskWaitRevision = 0
         currentTaskLease = lease
-        taskProgressMap = TaskProgressMap(request: request, generationID: lease.id)
+        taskProgressMap = TaskProgressMap(request: request, generationID: lease.id,
+                                          exactInputReferences: submission.exactInputReferences)
         lastTaskProgressRevision = 0
         viewer.beginTask(lease.id)
         accessibility.beginTaskResourceTracking(on: display, lease: lease)
@@ -1693,6 +1695,7 @@ final class TaskPilotCoordinator: ObservableObject {
         authorization.corrections?[index].applied = true
         currentTaskAuthorization = authorization
         taskProgressMap?.originalRequest = authorization.effectiveSubmission.request
+        taskProgressMap?.exactInputReferences = authorization.effectiveSubmission.exactInputReferences
         do {
             try taskLedgerStore.save(queue: queuedTasks, history: taskHistory, activeTask: authorization)
         } catch {
@@ -2017,7 +2020,8 @@ final class TaskPilotCoordinator: ObservableObject {
                   snapshot.requirements.flatMap(\.sourceRanges), in: request
               ) else { return }
         lastTaskProgressRevision = snapshot.revision
-        var map = TaskProgressMap(request: request, snapshot: snapshot)
+        var map = TaskProgressMap(request: request, snapshot: snapshot,
+                                  exactInputReferences: taskProgressMap?.exactInputReferences ?? [])
         switch runState {
         case .paused, .takingOver: map.lifecycle = .paused
         case .waitingForUser: map.lifecycle = .waitingForUser

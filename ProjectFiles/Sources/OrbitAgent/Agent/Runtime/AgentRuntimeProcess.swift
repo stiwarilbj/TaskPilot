@@ -149,6 +149,7 @@ final class AgentRuntimeProcess {
         var pendingUserInputID: String?
         var pendingUserInputRevision: UInt64?
         var correctionIDs: Set<String> = []
+        var corrections: [String: TaskInstructionCorrection] = [:]
         var workingDocumentIDs: Set<String> = []
         var terminalDelivered = false
         var drainStarted: ContinuousClock.Instant?
@@ -279,6 +280,7 @@ final class AgentRuntimeProcess {
                 "action_contract_version": ActionContract.version,
                 "task_generation_id": lease.id,
                 "instruction_revision": lease.currentInstructionRevision,
+                "stop_boundary_policy_version": StopBoundaryPolicy.version,
                 "working_document_protocol_version": WorkingDocumentUpdate.protocolVersion,
                 "task_protocol_version": ActionContract.taskProtocolVersion,
                 "exact_input_reference_version": AgentTaskInputReferenceProtocol.version,
@@ -396,6 +398,7 @@ final class AgentRuntimeProcess {
             }
             try run.lease.beginInstructionCorrection(id: correction.id.uuidString, revision: correction.revision)
             run.correctionIDs.insert(correction.id.uuidString.lowercased())
+            run.corrections[correction.id.uuidString.lowercased()] = correction
             return run
         }
         _ = run
@@ -699,7 +702,8 @@ final class AgentRuntimeProcess {
                   let uuid = UUID(uuidString: id), uuid.uuidString.lowercased() == id,
                   let revision = exactRevision(message["instruction_revision"]) else { return }
             do {
-                try run.lease.applyInstructionCorrection(id: id, revision: revision)
+                guard let correction = run.corrections[id] else { throw TaskInstructionCorrectionError.stale }
+                try run.lease.applyInstructionCorrection(id: id, revision: revision, correction: correction)
                 if run.pendingUserInputRevision != revision {
                     run.pendingUserInputID = nil
                     run.pendingUserInputRevision = nil

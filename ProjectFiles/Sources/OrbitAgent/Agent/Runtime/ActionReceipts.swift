@@ -20,6 +20,7 @@ final class ActionReceiptStore: @unchecked Sendable {
         func complete(_ result: [String: Any]) throws { try store.complete(id, result: result) }
         func fail(_ error: Error, code: String) { store.fail(id, error: error, code: code) }
         var receipt: [String: Any] { store.lookup(id) }
+        var action: [String: Any]? { store.action(id) }
     }
     enum Claim { case new(Token), existing([String: Any]) }
     private struct Entry {
@@ -74,6 +75,10 @@ final class ActionReceiptStore: @unchecked Sendable {
             return ["action_id": id.lowercased(), "state": "unknown", "terminal": false]
         }
         return snapshot(id.lowercased(), entry)
+    }
+    private func action(_ id: String) -> [String: Any]? {
+        lock.lock(); defer { lock.unlock() }
+        return entries[id.lowercased()]?.action
     }
     func discard() {
         lock.lock(); defer { lock.unlock() }

@@ -80,9 +80,7 @@ final class AgentAutomationBridge {
                 }
             }
         } catch {
-            let code = error is ManagedRuntimeGateError ? "runtime_recovering" : error is LocalOperationBudget.Exhausted ? "local_budget_exhausted" : error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" :
-                (error as? WorkingDocumentUpdateError).map { _ in "working_document_superseded" } ??
-                (error as? TaskInstructionCorrectionError).map { _ in "instruction_superseded" } ?? (error as? ActionReceiptStore.ReceiptError)?.code ?? (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? (error is BoundFileOperation.Conflict ? "file_conflict" : "action_rejected")
+            let code = failureCode(for: error)
             return ["task_generation_id": lease?.id ?? "", "kind": "bridge_response", "request_id": requestID,
                     "ok": false, "error_code": code, "error": error.localizedDescription,
                     "instruction_revision": Self.exactRevision(request["instruction_revision"]) ?? 0,
@@ -392,7 +390,11 @@ final class AgentAutomationBridge {
                 let action = validatedAction!
                 let kind = ActionKind(rawValue: action["type"] as! String)!
                 if params["private_input"] as? Bool == true { accessibility.clearActionMagnifier() }
+                let boundaryCheck: ([String: Any], [StopBoundaryRecord]) throws -> Void = { action, boundaries in
+                    try self.accessibility.validateStopBoundary(action: action, on: display, boundaries: boundaries)
+                }
                 result = try await TaskOwnership.$actionReceipt.withValue(receiptToken) {
+                    try await TaskOwnership.$stopBoundaryPreflight.withValue(boundaryCheck) {
                     if kind.owner == .task_tool {
                         return try await taskTools.perform(action: action, commandBindingID: params["command_inspection_id"] as? String)
                     } else {
@@ -407,6 +409,7 @@ final class AgentAutomationBridge {
                                 try await self.verifyTextTarget(action, display: display, lease: lease,
                                     revision: params["observation_revision"] as? String ?? "")
                             })
+                    }
                     }
                 }
                 try LocalOperationBudget.check()
@@ -431,8 +434,7 @@ final class AgentAutomationBridge {
                 "result": result
             ]
         } catch {
-            let code = error is ManagedRuntimeGateError ? "runtime_recovering" : error is LocalOperationBudget.Exhausted ? "local_budget_exhausted" : error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" : (error as? WorkingDocumentUpdateError).map { _ in "working_document_superseded" } ?? (error as? TaskInstructionCorrectionError).map { _ in "instruction_superseded" } ??
-                (error as? ActionReceiptStore.ReceiptError)?.code ?? (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? (error is BoundFileOperation.Conflict ? "file_conflict" : "action_rejected")
+            let code = failureCode(for: error)
             receiptToken?.fail(error, code: code)
             if let title = magnifierActionTitle, let receiptToken {
                 let receiptState = receiptToken.receipt["state"] as? String
@@ -459,6 +461,23 @@ final class AgentAutomationBridge {
             ].merging(ActionContract.nativeFailure(error, code: code,
                 outcome: receiptToken?.receipt["state"] as? String == "unconfirmed" || code == "delivery_uncertain" || (error as? BoundFileOperation.Conflict)?.delivered == true ? "delivered_unconfirmed" : "rejected")) { _, new in new }
         }
+    }
+
+    private func failureCode(for error: Error) -> String {
+        if let boundary = error as? StopBoundaryViolation { return boundary.code }
+        if error is ManagedRuntimeGateError { return "runtime_recovering" }
+        if error is LocalOperationBudget.Exhausted { return "local_budget_exhausted" }
+        if error is ActionContract.NativeProtocolError { return "protocol_error" }
+        if error is CancellationError { return "cancelled" }
+        if error is ObservationConsistencyError { return "observation_unstable" }
+        if error is ActionContract.ValidationError { return "invalid_action" }
+        if error is WorkingDocumentUpdateError { return "working_document_superseded" }
+        if error is TaskInstructionCorrectionError { return "instruction_superseded" }
+        if let receipt = error as? ActionReceiptStore.ReceiptError { return receipt.code }
+        if let accessibility = error as? AccessibilityActionError { return accessibility.code }
+        if let taskTool = error as? TaskToolError { return taskTool.code }
+        if error is BoundFileOperation.Conflict { return "file_conflict" }
+        return "action_rejected"
     }
 
     private static func exactRevision(_ value: Any?) -> UInt64? {

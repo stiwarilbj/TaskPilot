@@ -18,6 +18,9 @@ final class TaskLease: @unchecked Sendable {
     private var instructionRevision: UInt64 = 0
     private var pendingCorrection: (id: String, revision: UInt64)?
     private var appliedCorrections: [String: UInt64] = [:]
+    private var boundaryRequest: String
+    private var boundaryReferences: [AgentTaskInputReference]
+    private var stopBeforeBoundaries: [StopBoundaryRecord]
     private var workingDocumentRevision: UInt64 = 0
     private var pendingWorkingDocument: (id: String, revision: UInt64)?
     private var appliedWorkingDocumentUpdates: [String: UInt64] = [:]
@@ -26,10 +29,14 @@ final class TaskLease: @unchecked Sendable {
     private var closePersistentProcesses: Bool
     private var persistentProcesses: [SubprocessSupervisor] = []
     private var processCleanupStarted = false
-    init(id: String = UUID().uuidString, taskRequest: String = "", closePersistentProcesses: Bool = true,
+    init(id: String = UUID().uuidString, taskRequest: String = "",
+         exactInputReferences: [AgentTaskInputReference] = [], closePersistentProcesses: Bool = true,
          recoveryJournal: ActionRecoveryJournal? = nil, recoveryTask: UUID? = nil) {
         self.id = id; self.actionReceipts = ActionReceiptStore(generation: id, journal: recoveryJournal, recoveryTask: recoveryTask)
         self.closePersistentProcesses = closePersistentProcesses
+        boundaryRequest = taskRequest
+        boundaryReferences = exactInputReferences
+        stopBeforeBoundaries = StopBoundaryPolicy.detect(in: taskRequest, exactInputReferences: exactInputReferences)
         // Conservative authorization from the original user request, never a
         // model response or command's background operator alone.
         let text = taskRequest.lowercased()
@@ -70,6 +77,7 @@ final class TaskLease: @unchecked Sendable {
     var pauseWaiterCount: Int { lock.lock(); defer { lock.unlock() }; return pauseWaiters.count }
     var pauseWaitRegistrationCount: Int { lock.lock(); defer { lock.unlock() }; return pauseRegistrations }
     var currentInstructionRevision: UInt64 { lock.lock(); defer { lock.unlock() }; return instructionRevision }
+    var activeStopBoundaries: [StopBoundaryRecord] { lock.lock(); defer { lock.unlock() }; return stopBeforeBoundaries }
     var hasPendingInstructionCorrection: Bool { lock.lock(); defer { lock.unlock() }; return pendingCorrection != nil }
     var currentWorkingDocumentRevision: UInt64 { lock.lock(); defer { lock.unlock() }; return workingDocumentRevision }
     var hasPendingWorkingDocumentUpdate: Bool { lock.lock(); defer { lock.unlock() }; return pendingWorkingDocument != nil }
@@ -135,16 +143,38 @@ final class TaskLease: @unchecked Sendable {
         pendingCorrection = nil
     }
 
-    func applyInstructionCorrection(id: String, revision: UInt64) throws {
+    func applyInstructionCorrection(id: String, revision: UInt64,
+                                    correction: TaskInstructionCorrection? = nil) throws {
         lock.lock(); defer { lock.unlock() }
         let normalizedID = id.lowercased()
         if appliedCorrections[normalizedID] == revision { return }
         guard (value == .running || value == .paused), pendingWorkingDocument == nil,
               pendingCorrection?.id == normalizedID, pendingCorrection?.revision == revision,
               revision == instructionRevision + 1 else { throw TaskInstructionCorrectionError.stale }
+        if let correction {
+            guard correction.id.uuidString.lowercased() == normalizedID,
+                  correction.revision == revision else { throw TaskInstructionCorrectionError.stale }
+            try correction.submission.validateExactInputReferences()
+            let header = "\n\nUser correction: "
+            let start = boundaryRequest.utf8.count + header.utf8.count
+            boundaryRequest += header + correction.request
+            boundaryReferences.append(contentsOf: correction.exactInputReferences.map {
+                AgentTaskInputReference(version: $0.version, kind: $0.kind,
+                    utf8Start: start + $0.utf8Start, utf8Length: $0.utf8Length, value: $0.value)
+            })
+            stopBeforeBoundaries = StopBoundaryPolicy.detect(in: boundaryRequest,
+                                                              exactInputReferences: boundaryReferences)
+        }
         instructionRevision = revision
         pendingCorrection = nil
         appliedCorrections[normalizedID] = revision
+    }
+
+    func stopBoundaries(for revision: UInt64) throws -> [StopBoundaryRecord] {
+        lock.lock(); defer { lock.unlock() }
+        guard (value == .running || value == .paused), pendingCorrection == nil,
+              revision == instructionRevision else { throw TaskInstructionCorrectionError.superseded }
+        return stopBeforeBoundaries
     }
 
     func validateInstructionRevision(_ revision: UInt64, allowDispatchedReceipt: Bool = false) throws {
@@ -324,6 +354,7 @@ enum TaskOwnership {
     @TaskLocal static var actionReceipt: ActionReceiptStore.Token?
     @TaskLocal static var instructionRevision: UInt64?
     @TaskLocal static var workingDocumentRevision: UInt64?
+    @TaskLocal static var stopBoundaryPreflight: (([String: Any], [StopBoundaryRecord]) throws -> Void)?
     static func check() throws { try current?.check(); try LocalOperationBudget.check(); try Task.checkCancellation() }
     static func checkpoint() async throws {
         try LocalOperationBudget.check(); try await current?.checkpoint(); try LocalOperationBudget.check()
@@ -338,13 +369,27 @@ enum TaskOwnership {
                 try LocalOperationBudget.check()
                 if let actionReceipt {
                     guard actionReceipt.generation == current.id else { throw CancellationError() }
+                    let alreadyDispatched = actionReceipt.receipt["state"] as? String == "dispatched"
                     if let revision = instructionRevision {
                         try current.validateInstructionRevision(revision,
-                            allowDispatchedReceipt: actionReceipt.receipt["state"] as? String == "dispatched")
+                            allowDispatchedReceipt: alreadyDispatched)
                     }
                     if let revision = workingDocumentRevision {
                         try current.validateWorkingDocumentRevision(revision,
-                            allowDispatchedReceipt: actionReceipt.receipt["state"] as? String == "dispatched")
+                            allowDispatchedReceipt: alreadyDispatched)
+                    }
+                    // The policy is a dispatch barrier. An operation that has
+                    // already crossed the receipt boundary must finish and be
+                    // reconciled under its originating instruction revision.
+                    if !alreadyDispatched, let stopBoundaryPreflight {
+                        let revision = instructionRevision ?? current.currentInstructionRevision
+                        let boundaries = try current.stopBoundaries(for: revision)
+                        if !boundaries.isEmpty {
+                            guard let action = actionReceipt.action else {
+                                throw StopBoundaryViolation.uncertain(boundaries[0].label)
+                            }
+                            try stopBoundaryPreflight(action, boundaries)
+                        }
                     }
                     // Receipt dispatch and delivery share the lease's atomic
                     // boundary. Failed delivery after this point is uncertain.

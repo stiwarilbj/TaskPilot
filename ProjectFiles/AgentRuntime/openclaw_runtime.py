@@ -75,6 +75,8 @@ from task_evidence import (TaskEvidenceLedger, RevisionedJSONState, CHECKLIST_VE
 from expected_effects import ExpectedEffect, EXPECTED_EFFECT_VERSION, FILE_EFFECTS, path_key
 from task_inputs import EXACT_INPUT_REFERENCE_VERSION, TASK_INPUT_VERSION, input_reference_rules
 from task_inputs import TaskInputBindings, InputReferenceError
+from task_action_boundaries import (STOP_BOUNDARY_POLICY_VERSION, BoundaryViolation,
+                                    detect_stop_boundaries, validate_action_against_boundaries)
 from command_intents import explicit_operation
 from evidence_consistency import EvidenceConsistency, EVIDENCE_CONSISTENCY_VERSION
 from recovery_cycles import RecoveryCycles, RECOVERY_CYCLE_VERSION
@@ -1106,6 +1108,8 @@ def action_failure_recovery(code: str) -> str:
     return {"local_budget_exhausted": "inspect_after_local_budget", "file_conflict": "inspect_filesystem_again", "stale_target": "observe_again", "disabled_target": "wait_or_choose_enabled",
             "focus_mismatch": "observe_and_refocus", "activation_failed": "observe_and_activate",
             "unsupported_action": "choose_supported_method", "ambiguous_target": "select_specific_control",
+            "stop_boundary_rejected": "inspect_or_choose_safe_preparation",
+            "stop_boundary_uncertain": "inspect_or_choose_safe_preparation",
             "delivery_uncertain": "inspect_effect", "command_tool_missing": "select_installed_tool",
             "command_options_unverified": "choose_inspected_options", "command_capabilities_changed": "inspect_command_again",
             "command_syntax": "correct_command_syntax"}.get(code, "choose_different_action")
@@ -1859,11 +1863,38 @@ def request_and_enter_user_input(
     }
 
 
-def complete_from_decision(decision: dict[str, Any], fallback: str, ledger: TaskEvidenceLedger) -> None:
+def has_unresolved_stop_boundary_action(history: list[dict[str, Any]], boundaries: list[dict[str, Any]]) -> bool:
+    if not boundaries:
+        return False
+    uncertain_outcomes = {"dispatched", "delivered_unconfirmed", "unknown"}
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        action, result = entry.get("action"), entry.get("result")
+        if not isinstance(action, dict) or not isinstance(result, dict):
+            continue
+        if result.get("outcome") not in uncertain_outcomes and result.get("error_code") != "delivery_uncertain":
+            continue
+        kind = action.get("type")
+        if kind in {"click", "double_click", "press", "key", "navigate_browser", "open_route"}:
+            return True
+        if kind == "run_command":
+            operation = action.get("operation")
+            if not isinstance(operation, dict) or operation.get("type") not in {
+                "create_directory", "copy_file", "move_file", "remove_file", "remove_empty_directory", "print_text"
+            }:
+                return True
+    return False
+
+
+def complete_from_decision(decision: dict[str, Any], fallback: str, ledger: TaskEvidenceLedger,
+                           history: list[dict[str, Any]] | None = None) -> None:
     message = decision["output"] if isinstance(decision.get("output"), str) else str(fallback or "Task completed")
     if not ledger.can_complete(message):
         raise RuntimeError("TaskPilot cannot complete without evidence for every requested requirement")
     context = current_task.get()
+    if context is not None and has_unresolved_stop_boundary_action(history or [], context.stop_boundaries):
+        raise RuntimeError("TaskPilot cannot claim the stop-before boundary was preserved until the uncertain action is reconciled")
     if context is not None:
         gate = None
         for attempt in range(2):
@@ -3038,6 +3069,8 @@ def desktop_instruction(
         condition = {**condition, "failed_action": recent[-1].get("action"), "result": recent[-1].get("result")}
     rules = decision_rules(bool(observation.get("elements")), condition,
                            bool(observation.get('text_recognition', {}).get('targets')))
+    if task_context is not None and task_context.stop_boundaries:
+        rules += stop_boundary_guidance(task_context.stop_boundaries)
     if context.get("working_document"):
         rules += ("The user selected a working document. Treat it as the primary target for references such as ‘this document’ or ‘this spreadsheet’; "
                   "use only a current observation window marked working_document. Other apps remain available when the task explicitly requires them. "
@@ -3129,8 +3162,10 @@ def verification_instruction(
     if task_context is not None and task_context.working_document:
         capability_context["working_document"] = {key: task_context.working_document[key]
             for key in ("state", "application", "title", "location", "revision") if key in task_context.working_document}
+    boundary_rules = stop_boundary_guidance(task_context.stop_boundaries, completion=True) if task_context is not None else ""
     return compile_prompt("completion",
         instructions=COMPLETION_RULES + (verification_checklist_instruction(ledger) if ledger else "")
+                     + boundary_rules
                      + ("Vision labels/crops are provisional text, not proof of control role, enabled state, focus or successful execution.\n"
                         if observation.get('text_recognition', {}).get('targets') else "")
                      + (task_guidance + "\n" if task_guidance else "")
@@ -3140,6 +3175,21 @@ def verification_instruction(
         checklist=verification_evidence(task, history, ledger),
         inputs=inputs.prompt_state(include_resource_inputs=bool(ledger and
             (ledger.batch_declaration_required_for() or ledger.batch_mode == "per_input"))) if inputs else None)
+
+
+def stop_boundary_guidance(boundaries: list[dict[str, Any]], completion: bool = False) -> str:
+    if not boundaries:
+        return ""
+    labels = ", ".join(dict.fromkeys(str(item.get("label") or "") for item in boundaries))
+    sources = "\n".join(f'- User instruction: “{item["source"]}”' for item in boundaries if item.get("source"))
+    if completion:
+        return ("\nHARD USER STOP-BEFORE BOUNDARY: " + labels + ". The prohibition remains active regardless of any model interpretation. "
+                "Verify only the permitted preparation. Do not claim a prohibited action occurred or that merely reaching its control completed the task. "
+                "If a possibly finalizing action has an uncertain receipt, do not claim the boundary was preserved.\n" + sources + "\n")
+    return ("\nHARD USER STOP-BEFORE BOUNDARY: " + labels + ". These restrictions come directly from the user's unquoted request and exact-input values are excluded. "
+            "Prepare the requested work, but never deliver the prohibited final action. The visible presence of a Send/Publish/Submit/Purchase/Deploy control is not permission. "
+            "Do not press Return/Enter or use shortcuts whose effect is uncertain; use direct text entry for line breaks. Do not attempt opaque commands, scripts, or unidentified controls that could cross a boundary; inspect read-only or choose a clearly safe preparation step. "
+            "Do not count a rejected boundary action as progress or completion.\n" + sources + "\n")
 
 
 class ResponseRepairBudget:
@@ -3260,6 +3310,13 @@ def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int
                            evidence_guard: EvidenceConsistency | None = None) -> bool:
     emit("status", message="Checking evidence for every requested requirement…")
     evidence_guard = evidence_guard or EvidenceConsistency()
+    context = current_task.get()
+    if context is not None and has_unresolved_stop_boundary_action(history, context.stop_boundaries):
+        history.append({"action": "boundary_reconciliation_required", "result": {
+            "outcome": "rejected", "error_code": "stop_boundary_uncertain",
+            "message": "An earlier action has an uncertain delivery result; inspect its effect before claiming the boundary was preserved."}})
+        emit("status", message="Checking whether an earlier action crossed the stop-before boundary…")
+        return False
     try:
         observation = refresh_completion_evidence(display_id, ledger, evidence_guard, router)
     except (LocalBudgetExpired, ActionRejected) as error:
@@ -3306,7 +3363,8 @@ def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int
         if exact not in message: message += "\n\n" + exact
     publish_task_metrics(router, client, ledger)
     complete_from_decision({"output": message, "output_title": verification.get("title") or candidate.get("output_title") or "OpenClaw result",
-                            "output_kind": verification.get("kind") or candidate.get("output_kind") or "result"}, message, ledger)
+                            "output_kind": verification.get("kind") or candidate.get("output_kind") or "result"}, message, ledger,
+                           history=history)
     return True
 
 
@@ -3463,7 +3521,7 @@ def routed_json_prompt(
         raise InstructionSuperseded("A task correction is waiting to be applied")
     if context is not None: context.machine.require("verify" if purpose == "verification" else "plan")
     image = screenshot_buffer(screenshot_path, (observation or {}).get("observation_revision"))
-    identity = (STATE_FINGERPRINT_VERSION, _task_value('generation'),
+    identity = (STATE_FINGERPRINT_VERSION, STOP_BOUNDARY_POLICY_VERSION, _task_value('generation'),
         context.instruction_revision if context is not None else 0, VALIDATION_VERSION, CONTRACT_HASH,
         context.working_document_revision if context is not None else 0,
         json.dumps(context.working_document, sort_keys=True, separators=(",", ":")) if context is not None and context.working_document else None,
@@ -3506,6 +3564,7 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
         raise ExecutionStateError("A task already owns this execution context")
     context = TaskContext(task, display_id, _task_value('generation'),
                           exact_input_references=list(_exact_input_references),
+                          stop_boundaries=detect_stop_boundaries(task, list(_exact_input_references)),
                           original_task=task, original_input_references=list(_exact_input_references),
                           correction_key=_task_value('correction_key'),
                           working_document_revision=_task_value('working_document_revision'),
@@ -3634,7 +3693,8 @@ class TaskExecution:
             publish_task_progress(c.ledger)
             c.machine.transition(Phase.VERIFYING, local_request=True)
             self.local_metrics()
-            complete_from_decision({"output": message, "output_title": "Largest File in Downloads", "output_kind": "answer"}, message, c.ledger)
+            complete_from_decision({"output": message, "output_title": "Largest File in Downloads", "output_kind": "answer"}, message, c.ledger,
+                                   history=c.history)
             return True
         if not c.ledger.local_complete_grammar:
             return False
@@ -3657,7 +3717,8 @@ class TaskExecution:
         c.machine.transition(Phase.OBSERVING)
         c.machine.transition(Phase.VERIFYING, local_request=True)
         self.local_metrics()
-        complete_from_decision({"output": output, "output_title": "File contents", "output_kind": "result"}, str(result.get("message") or "Read file"), c.ledger)
+        complete_from_decision({"output": output, "output_title": "File contents", "output_kind": "result"},
+                               str(result.get("message") or "Read file"), c.ledger, history=c.history)
         return True
 
     def local_metrics(self) -> None:
@@ -3908,6 +3969,25 @@ class TaskExecution:
         c.last_action_signature, c.last_screen_digest = signature, c.screenshot_digest
         if c.identical_action_count > MAX_IDENTICAL_ACTIONS:
             raise RuntimeError(f"OpenClaw repeated the same desktop action on an unchanged screen; {PRODUCT_NAME} stopped the loop safely")
+        if c.stop_boundaries and c.observation is not None:
+            try:
+                validate_action_against_boundaries(c.action, c.observation, c.stop_boundaries)
+            except BoundaryViolation as error:
+                failure = {"message": str(error), "outcome": "rejected", "error_code": error.code,
+                           "recovery": action_failure_recovery(error.code)}
+                c.consecutive_action_failures += 1
+                c.recovery.rejected(c.action, c.observation, error.code)
+                c.recovery_cycles.record(c.action, c.observation, failure, c.ledger, c.screenshot_digest)
+                record_action_diagnostic(c.action, failure)
+                c.history.append({"step": c.step, "action": c.action, "result": failure,
+                    **action_history_context(c.decision, c.action, c.observation),
+                    "completed_requirements": c.decision.get("completed_requirements") or [],
+                    "remaining_requirements": c.decision.get("remaining_requirements") or []})
+                publish_task_progress(c.ledger, active_requirement_ids=[])
+                emit("status", message="Rechecking the target and continuing with safe preparation…")
+                c.machine.transition(Phase.OBSERVING)
+                c.reconcile_reason = "stop_boundary"
+                return
         if not c.recovered_result and action_type not in {"wait", "none"}:
             if self.defer_for_dependencies():
                 c.machine.transition(Phase.OBSERVING)
@@ -4124,6 +4204,7 @@ class TaskExecution:
         TaskInputBindings(revised_task, exact_input_references=references)
         c.task = revised_task
         c.exact_input_references = references
+        c.stop_boundaries = detect_stop_boundaries(revised_task, references)
         c.instruction_revision = correction["revision"]
         global _instruction_revision
         _instruction_revision = correction["revision"]
@@ -4261,6 +4342,8 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
         _instruction_revision = configuration["instruction_revision"]
         if type(configuration.get("task_protocol_version")) is not int or configuration["task_protocol_version"] != TASK_PROTOCOL_VERSION:
             raise RuntimeError("TaskPilot task ownership protocol does not match; rebuild the bundled components together")
+        if type(configuration.get("stop_boundary_policy_version")) is not int or configuration["stop_boundary_policy_version"] != STOP_BOUNDARY_POLICY_VERSION:
+            raise RuntimeError("TaskPilot stop-before boundary policies do not match; rebuild the bundled components together")
         if type(configuration.get("coordinate_mapping_version")) is not int or configuration["coordinate_mapping_version"] != COORDINATE_MAPPING_VERSION:
             raise RuntimeError("TaskPilot screen coordinate mapping versions do not match; rebuild the bundled components together")
         if type(configuration.get("observation_completeness_version")) is not int or configuration["observation_completeness_version"] != OBSERVATION_COMPLETENESS_VERSION:

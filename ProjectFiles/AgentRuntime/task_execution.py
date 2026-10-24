@@ -141,6 +141,7 @@ class TaskContext:
     display_id: int
     generation: str | None
     exact_input_references: list[dict] = field(default_factory=list)
+    stop_boundaries: list[dict] = field(default_factory=list)
     original_task: str = ""
     original_input_references: list[dict] = field(default_factory=list)
     instruction_corrections: list[dict] = field(default_factory=list)

@@ -397,6 +397,13 @@ struct TaskPilotMainView: View {
                 }
             }
 
+            if model.isActive, let progressMap = model.taskProgressMap,
+               progressMap.generationID == model.currentTaskGenerationID,
+               !progressMap.stopBoundaries.isEmpty {
+                TaskStopBoundaryNoticeView(boundaries: progressMap.stopBoundaries)
+                    .id(progressMap.generationID)
+            }
+
             if model.isActive || model.taskCorrectionSession != nil {
                 HStack {
                     Spacer()
@@ -891,6 +898,61 @@ struct TaskPilotMainView: View {
                 .controlSize(.large)
             }
         }
+    }
+}
+
+private struct TaskStopBoundaryNoticeView: View {
+    let boundaries: [StopBoundaryRecord]
+    @State private var expanded = false
+
+    private var labels: String {
+        boundaries.map(\.label).joined(separator: ", ")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Button {
+                expanded.toggle()
+            } label: {
+                HStack(alignment: .top, spacing: 7) {
+                    Image(systemName: "hand.raised.fill")
+                        .font(.caption.weight(.semibold))
+                        .padding(.top, 2)
+                    Text("Stop before: \(labels)")
+                        .font(.caption.weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .padding(.top, 2)
+                }
+                .foregroundStyle(.orange)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Stop before: \(labels). \(expanded ? "Hide" : "Show") the instruction and preparation details.")
+            .accessibilityIdentifier("task-stop-before-boundary-toggle")
+
+            if expanded {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("TaskPilot will finish the permitted preparation and stop before these actions.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    ForEach(boundaries) { boundary in
+                        Text("“\(boundary.source)”")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.leading, 22)
+                .accessibilityIdentifier("task-stop-before-boundary-details")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 2)
     }
 }
 

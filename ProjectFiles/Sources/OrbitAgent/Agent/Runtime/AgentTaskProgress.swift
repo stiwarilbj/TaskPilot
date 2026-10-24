@@ -294,6 +294,7 @@ struct AgentTaskProgressSnapshot: Equatable {
 
 struct TaskProgressMap: Equatable {
     var originalRequest: String
+    var exactInputReferences: [AgentTaskInputReference]
     let generationID: String
     var revision: UInt64
     var lifecycle: AgentTaskProgressLifecycle
@@ -303,8 +304,13 @@ struct TaskProgressMap: Equatable {
     var resultObjects: [AgentTaskResultObject]
     var batch: AgentTaskBatchProgress?
 
-    init(request: String, generationID: String) {
+    var stopBoundaries: [StopBoundaryRecord] {
+        StopBoundaryPolicy.detect(in: originalRequest, exactInputReferences: exactInputReferences)
+    }
+
+    init(request: String, generationID: String, exactInputReferences: [AgentTaskInputReference] = []) {
         originalRequest = request
+        self.exactInputReferences = exactInputReferences
         self.generationID = generationID
         revision = 0
         lifecycle = .running
@@ -315,8 +321,10 @@ struct TaskProgressMap: Equatable {
         batch = nil
     }
 
-    init(request: String, snapshot: AgentTaskProgressSnapshot) {
+    init(request: String, snapshot: AgentTaskProgressSnapshot,
+         exactInputReferences: [AgentTaskInputReference] = []) {
         originalRequest = request
+        self.exactInputReferences = exactInputReferences
         generationID = snapshot.generationID
         revision = snapshot.revision
         lifecycle = snapshot.lifecycle

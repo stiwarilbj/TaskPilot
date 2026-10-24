@@ -68,7 +68,7 @@ class TaskOwnershipTests(unittest.TestCase):
             self.assertEqual(runtime.wait_for_user_input('same'), 'current')
 
     def test_startup_requires_valid_generation_only_for_tasks_and_clears_old_state(self):
-        config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=CONTRACT_HASH, action_contract_version=CONTRACT_VERSION, instruction_revision=0, task_protocol_version=TASK_PROTOCOL_VERSION, coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION, observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION, text_recognition_version=runtime.TEXT_RECOGNITION_VERSION, evidence_consistency_version=runtime.EVIDENCE_CONSISTENCY_VERSION, wait_presentation_version=runtime.WAIT_PRESENTATION_VERSION, command_capability_version=runtime.COMMAND_CAPABILITY_VERSION, exact_input_reference_version=runtime.EXACT_INPUT_REFERENCE_VERSION, exact_input_references=[], working_document_protocol_version=runtime.WORKING_DOCUMENT_PROTOCOL_VERSION)
+        config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=CONTRACT_HASH, action_contract_version=CONTRACT_VERSION, instruction_revision=0, task_protocol_version=TASK_PROTOCOL_VERSION, stop_boundary_policy_version=runtime.STOP_BOUNDARY_POLICY_VERSION, coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION, observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION, text_recognition_version=runtime.TEXT_RECOGNITION_VERSION, evidence_consistency_version=runtime.EVIDENCE_CONSISTENCY_VERSION, wait_presentation_version=runtime.WAIT_PRESENTATION_VERSION, command_capability_version=runtime.COMMAND_CAPABILITY_VERSION, exact_input_reference_version=runtime.EXACT_INPUT_REFERENCE_VERSION, exact_input_references=[], working_document_protocol_version=runtime.WORKING_DOCUMENT_PROTOCOL_VERSION)
         for invalid in [None, '', 'old', True, 7]:
             with self.subTest(invalid=invalid), mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(dict(config, task_generation_id=invalid)))):
                 with self.assertRaisesRegex(RuntimeError, 'generation ID'): runtime.read_runtime_configuration(require_generation=True)
@@ -84,6 +84,7 @@ class TaskOwnershipTests(unittest.TestCase):
     def test_startup_requires_matching_wait_presentation_version(self):
         config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=CONTRACT_HASH,
             action_contract_version=CONTRACT_VERSION, task_protocol_version=runtime.TASK_PROTOCOL_VERSION,
+            stop_boundary_policy_version=runtime.STOP_BOUNDARY_POLICY_VERSION,
             task_generation_id=self.generation, instruction_revision=0, coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION,
             observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION,
             text_recognition_version=runtime.TEXT_RECOGNITION_VERSION,
@@ -106,9 +107,29 @@ class TaskOwnershipTests(unittest.TestCase):
         self.assertIsNone(runtime._bridge_observation_revision)
         self.assertEqual(runtime._exact_input_references, [])
 
+    def test_startup_requires_matching_stop_boundary_policy_version(self):
+        config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=CONTRACT_HASH,
+            action_contract_version=CONTRACT_VERSION, task_protocol_version=TASK_PROTOCOL_VERSION,
+            stop_boundary_policy_version=runtime.STOP_BOUNDARY_POLICY_VERSION,
+            task_generation_id=self.generation, instruction_revision=0,
+            coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION,
+            observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION,
+            text_recognition_version=runtime.TEXT_RECOGNITION_VERSION,
+            evidence_consistency_version=runtime.EVIDENCE_CONSISTENCY_VERSION,
+            wait_presentation_version=runtime.WAIT_PRESENTATION_VERSION,
+            command_capability_version=runtime.COMMAND_CAPABILITY_VERSION,
+            exact_input_reference_version=runtime.EXACT_INPUT_REFERENCE_VERSION,
+            exact_input_references=[], working_document_protocol_version=runtime.WORKING_DOCUMENT_PROTOCOL_VERSION)
+        for version in [None, True, '1', 0, runtime.STOP_BOUNDARY_POLICY_VERSION + 1]:
+            with self.subTest(version=version), mock.patch.object(sys, 'stdin', io.StringIO(
+                    json.dumps(dict(config, stop_boundary_policy_version=version)))):
+                with self.assertRaisesRegex(RuntimeError, 'stop-before boundary policies'):
+                    runtime.read_runtime_configuration(require_generation=True)
+
     def test_startup_requires_versioned_bounded_reference_metadata(self):
         config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=CONTRACT_HASH,
             action_contract_version=CONTRACT_VERSION, task_protocol_version=TASK_PROTOCOL_VERSION,
+            stop_boundary_policy_version=runtime.STOP_BOUNDARY_POLICY_VERSION,
             task_generation_id=self.generation, instruction_revision=0, coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION,
             observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION,
             text_recognition_version=runtime.TEXT_RECOGNITION_VERSION,

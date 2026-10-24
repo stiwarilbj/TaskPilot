@@ -129,10 +129,12 @@ final class RuntimeTransportTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("runtime")
+        let boundaryVersion = StopBoundaryPolicy.version
         try ("""
         #!/usr/bin/python3
         import json, sys, time, signal
         config = json.loads(sys.stdin.readline())
+        assert config.get('stop_boundary_policy_version') == \(boundaryVersion)
         def emit(kind, **fields):
             print(json.dumps(dict(kind=kind, task_generation_id=config['task_generation_id'],
                 instruction_revision=fields.pop('instruction_revision', 0),

@@ -3104,6 +3104,69 @@ final class AccessibilityController {
         return value
     }
 
+    /// Re-resolves the currently observed target immediately before the native
+    /// receipt crosses its dispatched boundary. Stop-before decisions use live
+    /// Accessibility identity and ancestry; screenshot text or model claims
+    /// cannot authorize the finalizing control.
+    func validateStopBoundary(action: [String: Any], on display: DisplayDescriptor,
+                              boundaries: [StopBoundaryRecord]) throws {
+        guard !boundaries.isEmpty else { return }
+        let type = action["type"] as? String ?? ""
+        guard ["click", "double_click", "press", "key", "set_value", "type_text", "focus", "scroll"].contains(type) else {
+            try StopBoundaryPolicy.validate(action: action, boundaries: boundaries)
+            return
+        }
+
+        let record: ElementRecord?
+        if let elementID = action["element_id"] as? String {
+            record = try self.record(for: ["element_id": elementID])
+        } else if type == "click" || type == "double_click" || type == "press" {
+            guard type != "press",
+                  action["x"] != nil, action["y"] != nil else {
+                throw StopBoundaryViolation.uncertain(boundaries[0].label)
+            }
+            let point = try self.point(from: action, display: display)
+            let pid = try actionPID(action, on: display, fallbackPoint: point)
+            try validateCoordinateWindows(pid, on: display)
+            guard pointerTargetIsVisible(pid, at: point, display: display),
+                  let resolved = try observedControl(at: point, pid: pid) else {
+                throw StopBoundaryViolation.uncertain(boundaries[0].label)
+            }
+            record = resolved
+        } else if type == "key" || type == "type_text" {
+            let pid = try actionPID(action, on: display)
+            let focused = lock.withLock {
+                elementMap.values.filter { $0.pid == pid && $0.wasFocused }
+            }
+            guard focused.count == 1 else { throw StopBoundaryViolation.uncertain(boundaries[0].label) }
+            record = focused[0]
+        } else {
+            record = nil
+        }
+
+        guard let record else {
+            try StopBoundaryPolicy.validate(action: action, boundaries: boundaries)
+            return
+        }
+        try validateRecord(record, action: action, on: display)
+        let app = NSRunningApplication(processIdentifier: record.pid)
+        let window = record.role == "AXWindow" ? record.element : accessibilityElement(record.element, kAXWindowAttribute)
+        let fresh = targetIdentity(record.element, application: app.map(applicationIdentity) ?? record.identity.application,
+                                   window: window)
+        // Context names are not action names: an app named Mail or a window
+        // titled "Email draft" must not turn an unrelated Save control into
+        // a Send control. Keep the live control and its AX ancestry/labels.
+        var labels = [fresh.label]
+        for node in fresh.structure {
+            guard node.role != "AXApplication" else { continue }
+            labels.append(node.label)
+            labels.append(contentsOf: node.labels)
+        }
+        labels = labels.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        try StopBoundaryPolicy.validate(action: action, boundaries: boundaries, targetRole: fresh.role,
+            targetLabels: labels, targetIsReliable: true, applicationName: fresh.application.name)
+    }
+
     private func validateRecord(_ record: ElementRecord, action: [String: Any], on display: DisplayDescriptor) throws {
         guard !inputIsCancelled() else { throw AccessibilityActionError.cancelled }
         try validateObservation(record.revision)
