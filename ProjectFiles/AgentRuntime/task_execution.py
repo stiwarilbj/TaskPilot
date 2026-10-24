@@ -172,6 +172,7 @@ class TaskContext:
     progress_revision: int = 0
     progress_fingerprint: str = ""
     wait_publisher: Any = None
+    destination_publisher: Any = None
     wait_request_sequence: int = 0
     observation_keywords: list = field(default_factory=list)
     receipt_metrics: dict = field(default_factory=lambda: dict(receipt_queries=0, receipt_recoveries=0, receipt_unresolved=0))

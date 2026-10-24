@@ -14,19 +14,22 @@ struct AccessibilitySnapshot {
     let elements: [[String: Any]]
     let applications: [[String: Any]]
     let resultDestinations: [[String: Any]]
+    let savePanelDestinations: [[String: Any]]
     let installedApplications: [[String: Any]]
     let systemContext: [String: Any]
     let completeness: [String: Any]
     let workingDocument: [String: Any]?
 
     init(revision: String, elements: [[String: Any]], applications: [[String: Any]],
-         resultDestinations: [[String: Any]], installedApplications: [[String: Any]],
+         resultDestinations: [[String: Any]], savePanelDestinations: [[String: Any]] = [],
+         installedApplications: [[String: Any]],
          systemContext: [String: Any], completeness: [String: Any],
          workingDocument: [String: Any]? = nil) {
         self.revision = revision
         self.elements = elements
         self.applications = applications
         self.resultDestinations = resultDestinations
+        self.savePanelDestinations = savePanelDestinations
         self.installedApplications = installedApplications
         self.systemContext = systemContext
         self.completeness = completeness
@@ -483,6 +486,75 @@ final class AccessibilityController {
         return url
     }
 
+    /// Reads only a standard save/export sheet that exposes one labelled name
+    /// field and one Save or Export button. A complete destination is emitted
+    /// only when that same sheet exposes a directory URL that still identifies
+    /// a directory; titles and sidebar names are never treated as paths.
+    private func collectSavePanelDestinations(elements: [[String: Any]],
+                                               elementMap: [String: ElementRecord]) -> [[String: Any]] {
+        let byID = Dictionary(elements.compactMap { row -> (String, [String: Any])? in
+            (row["id"] as? String).map { ($0, row) }
+        }, uniquingKeysWith: { first, _ in first })
+        func belongsToSheet(_ row: [String: Any], sheetID: String) -> Bool {
+            var cursor = row["parent_id"] as? String
+            var visited = Set<String>()
+            while let id = cursor, visited.insert(id).inserted, let parent = byID[id] {
+                if id == sheetID { return true }
+                cursor = parent["parent_id"] as? String
+            }
+            return false
+        }
+        return elements.compactMap { sheet -> [String: Any]? in
+            guard sheet["role"] as? String == "AXSheet",
+                  let sheetID = sheet["id"] as? String,
+                  let pid = sheet["pid"] as? Int,
+                  let windowID = sheet["window_id"] as? String else { return nil }
+            let children = elements.filter {
+                $0["pid"] as? Int == pid && $0["window_id"] as? String == windowID
+                    && belongsToSheet($0, sheetID: sheetID)
+            }
+            let hasSaveButton = children.contains { row in
+                row["role"] as? String == "AXButton"
+                    && ["save", "save as", "export"].contains((row["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+            }
+            guard hasSaveButton else { return nil }
+            let fields = children.filter { row in
+                let role = row["role"] as? String
+                guard role == "AXTextField" || role == "AXComboBox",
+                      let label = row["title"] as? String else { return false }
+                let normalized = label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                return ["save as", "save as:", "name", "name:", "file name", "file name:", "filename", "filename:"]
+                    .contains(normalized)
+            }
+            guard fields.count == 1, let fieldID = fields[0]["id"] as? String,
+                  let fieldRecord = elementMap[fieldID],
+                  let filename = attribute(fieldRecord.element, kAXValueAttribute) as? String,
+                  !filename.isEmpty, filename.utf8.count <= 240,
+                  !filename.contains("/"), filename != ".", filename != ".." else { return nil }
+
+            let sheetRecord = elementMap[sheetID]
+            let rawDirectory = sheetRecord.flatMap {
+                attribute($0.element, kAXDocumentAttribute) ?? attribute($0.element, kAXURLAttribute)
+            }
+            let directoryURL = Self.workingDocumentURL(rawDirectory).flatMap { url -> URL? in
+                guard url.isFileURL,
+                      (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return nil }
+                return url.standardizedFileURL
+            }
+            var row: [String: Any] = ["pid": pid, "window_id": windowID,
+                                      "selected_filename": filename,
+                                      "path_confirmed": directoryURL != nil]
+            if let directoryURL {
+                let path = directoryURL.appendingPathComponent(filename, isDirectory: false)
+                    .standardizedFileURL.path
+                guard path.utf8.count <= 2_048 else { return nil }
+                row["actual_path"] = path
+                row["destination_exists"] = FileManager.default.fileExists(atPath: path)
+            }
+            return row
+        }.prefix(8).map { $0 }
+    }
+
     private static func workingDocumentLocation(_ url: URL) -> String? {
         if url.isFileURL { return url.standardizedFileURL.path }
         guard let host = url.host else { return nil }
@@ -630,6 +702,7 @@ final class AccessibilityController {
     func snapshot(on display: DisplayDescriptor) -> AccessibilitySnapshot {
         guard let staged = try? stageSnapshot(on: display) else {
             return AccessibilitySnapshot(revision: "", elements: [], applications: [], resultDestinations: [],
+                savePanelDestinations: [],
                 installedApplications: [], systemContext: [:],
                 completeness: ["version": 1, "state": "partial", "reason_counts": ["collection_failed": 1]],
                 workingDocument: nil)
@@ -860,11 +933,13 @@ final class AccessibilityController {
 
         try collectRoots(expand: true)
 
+        let savePanelDestinations = collectSavePanelDestinations(elements: elementRows, elementMap: newMap)
         let snapshot = AccessibilitySnapshot(
             revision: revision,
             elements: elementRows,
             applications: applicationRows,
             resultDestinations: resultDestinations,
+            savePanelDestinations: savePanelDestinations,
             installedApplications: installedApplicationEntries.map { entry in
                 var row: [String: Any] = [
                     "name": entry.name,
@@ -909,7 +984,8 @@ final class AccessibilityController {
         let signature = String(decoding: try JSONSerialization.data(withJSONObject:
             ["controls": controls, "collection_gaps": collection.reasonCounts,
              "working_document": workingDocument.map { $0 as Any } ?? (NSNull() as Any),
-             "result_destinations": destinationSignature], options: [.sortedKeys]), as: UTF8.self)
+             "result_destinations": destinationSignature,
+             "save_panel_destinations": savePanelDestinations], options: [.sortedKeys]), as: UTF8.self)
         let lease = TaskOwnership.current
         return StagedAccessibilitySnapshot(snapshot: snapshot, consistencySignature: signature, publish: { [self] in
             try TaskOwnership.$current.withValue(lease) {

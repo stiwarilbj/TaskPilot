@@ -362,6 +362,7 @@ final class AgentAutomationBridge {
                     "coordinate_mapping": coordinates.metadata(revision: snapshot.revision),
                     "applications": snapshot.applications,
                     "result_destinations": snapshot.resultDestinations,
+                    "save_panel_destinations": snapshot.savePanelDestinations,
                     "installed_applications": snapshot.installedApplications,
                     "system_context": snapshot.systemContext,
                     "elements": snapshot.elements,

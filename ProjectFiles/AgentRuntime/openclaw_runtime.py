@@ -56,6 +56,7 @@ from task_execution import (TaskContext, Phase, ExecutionStateError, Instruction
                             WorkingDocumentSuperseded,
                             current_task)
 from task_wait import TaskWaitPublisher, WAIT_PRESENTATION_VERSION
+from task_destination import TaskDestinationPublisher, planned_destination, explicit_destination_instruction
 from bounded_transport import ACPTransport, TransportFailure, FRAME_BYTES, read_frames, write_frame
 from prompt_compiler import (
     PROMPT_COMPILER_VERSION, COMPLETION_RULES, json_data, recovery_condition,
@@ -386,6 +387,147 @@ def publish_task_wait(phase: str, waiting_for: str, *, attention: str = "none",
         return
 
 
+def publish_task_destination(*, state: str, operation_key: str, planned_path: Any = None,
+                             actual_path: Any = None, requested_filename: Any = None,
+                             selected_filename: Any = None, destination_exists: Any = None,
+                             instruction: Any = None, observation_revision: Any = None) -> None:
+    """Publish bounded destination information without affecting task execution."""
+    context = current_task.get()
+    if context is None or context.generation is None:
+        return
+    if context.destination_publisher is None:
+        context.destination_publisher = TaskDestinationPublisher(context.generation)
+    try:
+        snapshot = context.destination_publisher.update(
+            state=state, operation_key=operation_key, planned_path=planned_path,
+            actual_path=actual_path, requested_filename=requested_filename,
+            selected_filename=selected_filename, destination_exists=destination_exists,
+            instruction=instruction, observation_revision=observation_revision)
+        if snapshot is not None:
+            emit(**snapshot)
+    except Exception:
+        return
+
+
+def publish_planned_destination(ledger: TaskEvidenceLedger | None) -> None:
+    context = current_task.get()
+    if context is None or context.generation is None or ledger is None:
+        return
+    path, filename = planned_destination(ledger)
+    publish_task_destination(
+        state="planned" if path or filename else "cleared",
+        operation_key=f"planned:{context.instruction_revision}",
+        planned_path=path,
+        requested_filename=filename,
+        instruction=explicit_destination_instruction(ledger.task, ledger.inputs.exact_references),
+    )
+
+
+def current_destination_values() -> dict[str, Any]:
+    context = current_task.get()
+    publisher = context.destination_publisher if context else None
+    current = publisher.current if publisher else None
+    if not current:
+        return {}
+    return {key: current.get(key) for key in
+            ("planned_path", "requested_filename", "instruction") if current.get(key) is not None}
+
+
+def action_destination(action: dict[str, Any], observation: dict[str, Any] | None = None) -> tuple[str | None, str | None]:
+    """Return only destinations carried by validated native action parameters."""
+    action_type = action.get("type")
+    if action_type == "write_file" and isinstance(action.get("path"), str):
+        return action["path"], "native_write"
+    operation = action.get("operation")
+    if action_type == "run_command" and isinstance(operation, dict):
+        kind = operation.get("type")
+        operand = "destination" if kind in {"copy_file", "move_file"} else "path" if kind == "create_directory" else None
+        if operand and isinstance(operation.get(operand), str):
+            return operation[operand], "deterministic_command"
+    if observation and action_type in {"click", "press"}:
+        elements = observation.get("elements", [])
+        target = next((row for row in elements if isinstance(row, dict) and row.get("id") == action.get("element_id")), None)
+        if target and str(target.get("title") or "").strip().casefold() in {"save", "save as", "export"}:
+            candidates = observation.get("save_panel_destinations", [])
+            matched = [row for row in candidates if isinstance(row, dict) and
+                       row.get("path_confirmed") is True and
+                       row.get("pid") == target.get("pid") and
+                       row.get("window_id") == target.get("window_id") and
+                       isinstance(row.get("actual_path"), str)]
+            if len(matched) == 1:
+                return matched[0]["actual_path"], "save_panel"
+    return None, None
+
+
+def publish_action_destination(action: dict[str, Any], task: str, observation: dict[str, Any] | None,
+                               step: int, *, delivered: bool = False) -> None:
+    path, source = action_destination(action, observation)
+    if path is None:
+        return
+    import os
+    expanded = os.path.expanduser(path)
+    exists = os.path.lexists(expanded) if os.path.isabs(expanded) else None
+    preserved = current_destination_values()
+    context = current_task.get()
+    exact_references = context.ledger.inputs.exact_references if context and context.ledger else ()
+    preserved["instruction"] = explicit_destination_instruction(task, exact_references) or preserved.get("instruction")
+    selected_filename = (os.path.basename(expanded.rstrip(os.sep)) or None) if os.path.isabs(expanded) else None
+    publish_task_destination(
+        state="checking" if delivered else "preparing",
+        operation_key=f"save:{step}:{source}", actual_path=path,
+        selected_filename=selected_filename,
+        **preserved,
+        destination_exists=exists,
+        observation_revision=(observation or {}).get("observation_revision") if source == "save_panel" else None,
+    )
+
+
+def publish_observed_destination(observation: dict[str, Any], task: str, step: int) -> None:
+    context = current_task.get()
+    exact_references = context.ledger.inputs.exact_references if context and context.ledger else ()
+    preserved = current_destination_values()
+    preserved["instruction"] = explicit_destination_instruction(task, exact_references) or preserved.get("instruction")
+    panels = observation.get("save_panel_destinations", [])
+    if not isinstance(panels, list) or not panels:
+        publisher = context.destination_publisher if context else None
+        current = publisher.current if publisher else None
+        if current and current.get("state") in {"selected", "selected_unconfirmed"}:
+            publish_planned_destination(context.ledger)
+        return
+    if len(panels) != 1 or not isinstance(panels[0], dict):
+        publish_task_destination(state="selected_unconfirmed", operation_key=f"panel-ambiguous:{step}",
+                                 **preserved)
+        return
+    panel = panels[0]
+    path = panel.get("actual_path") if panel.get("path_confirmed") is True else None
+    filename = panel.get("selected_filename")
+    publisher = context.destination_publisher if context else None
+    current = publisher.current if publisher else None
+    state = "checking" if current and current.get("state") == "checking" else "selected"
+    publish_task_destination(
+        state=state if path else "selected_unconfirmed",
+        operation_key=f"save-panel:{panel.get('pid')}:{panel.get('window_id')}",
+        actual_path=path, selected_filename=filename, **preserved,
+        destination_exists=panel.get("destination_exists") if path else None,
+        observation_revision=observation.get("observation_revision"),
+    )
+
+
+def clear_destination_after_proof(ledger: TaskEvidenceLedger | None) -> None:
+    context = current_task.get()
+    current = context.destination_publisher.current if context and context.destination_publisher else None
+    path = current.get("actual_path") if current else None
+    if not ledger or not path:
+        return
+    from expected_effects import path_key
+    if any(requirement.get("state") == "proven" and
+           isinstance(requirement.get("check"), dict) and
+           requirement["check"].get("path") and
+           path_key(requirement["check"]["path"]) == path_key(path)
+           for requirement in ledger.requirements.values()):
+        publish_task_destination(state="cleared", operation_key=f"verified:{context.step}")
+
+
 def latest_confirmed_status(ledger: TaskEvidenceLedger | None) -> str:
     if ledger is None:
         return "No confirmed result yet."
@@ -411,6 +553,7 @@ def publish_task_progress(ledger: TaskEvidenceLedger | None, *, lifecycle: str |
         context.progress_fingerprint = fingerprint
         context.progress_revision += 1
         emit("task_progress", revision=context.progress_revision, **snapshot)
+        clear_destination_after_proof(ledger)
         if context.wait_publisher is not None:
             publish_task_wait(context.wait_publisher.phase, context.wait_publisher.waiting_for,
                               attention=context.wait_publisher.attention,
@@ -1944,7 +2087,7 @@ def compact_observation(observation: dict[str, Any], task: str = "") -> dict[str
     compact = {
         key: value for key, value in observation.items()
         if key not in {"screenshot_path", "agent_cursor", "installed_applications", "elements", "text_recognition",
-                       "result_destinations", "working_document"}
+                       "result_destinations", "save_panel_destinations", "working_document"}
     }
     working_document = observation.get("working_document")
     if isinstance(working_document, dict):
@@ -2874,6 +3017,7 @@ def prompt_observation(observation: dict[str, Any], task: str = "") -> dict[str,
     compact.pop("agent_tools", None)
     compact.pop("local_change_notifications", None)
     compact.pop("command_capability_version", None)
+    compact.pop("save_panel_destinations", None)
     return compact
 
 
@@ -3601,6 +3745,7 @@ class TaskExecution:
         try:
             c.ledger = TaskEvidenceLedger(c.task, c.generation,
                                           exact_input_references=c.exact_input_references)
+            publish_planned_destination(c.ledger)
             publish_task_wait("starting", "Connecting to the app",
                               operation_key="task-startup", ledger=c.ledger)
             publish_task_progress(c.ledger, force=True)
@@ -3738,6 +3883,7 @@ class TaskExecution:
         discard_observation_image(c.observation)
         c.observation = c.pending_observation if c.pending_observation is not None else bridge_call("observe", c.display_id)
         c.pending_observation = None
+        publish_observed_destination(c.observation, c.task, c.step)
         while instruction_correction_pending():
             discard_observation_image(c.observation)
             c.observation = None
@@ -3745,6 +3891,7 @@ class TaskExecution:
             c.observation = bridge_call("observe", c.display_id)
         while isinstance(c.observation.get("working_document"), dict) and c.observation["working_document"].get("state") == "needs_reselection":
             missing_document = c.observation["working_document"]
+            publish_planned_destination(c.ledger)
             emit("working_document_needs_reselection",
                  binding_revision=missing_document.get("revision"),
                  application=str(missing_document.get("application") or "Unknown app")[:120],
@@ -4069,6 +4216,7 @@ class TaskExecution:
                 command_params = inspect_general_command(c.action, c.display_id, c.observation)
                 c.ledger.before_action(c.action)
                 publish_task_progress(c.ledger)
+                publish_action_destination(c.action, c.task, c.observation, c.step)
                 result = bridge_call("act", c.display_id, action=c.action, **command_params)
             except InstructionSuperseded:
                 c.machine.reconcile()
@@ -4089,6 +4237,7 @@ class TaskExecution:
                     return
                 self.action_rejected(error)
                 return
+            publish_action_destination(c.action, c.task, c.observation, c.step, delivered=True)
             c.consecutive_action_failures = c.consecutive_evidence_conflicts = 0
             c.action = bind_command_outcomes(c.action, result)
             c.evidence_guard.remember_native(c.action, c.observation, result)
@@ -4111,6 +4260,9 @@ class TaskExecution:
         c.router.metrics["action_rejections"] += 1
         c.failure = {"message": str(error), "outcome": "delivered_unconfirmed" if uncertain else "rejected",
                      "error_code": error.code, "recovery": action_failure_recovery(code), **error.details}
+        publisher = current_task.get().destination_publisher if current_task.get() else None
+        if not uncertain and publisher and publisher.current and publisher.current.get("state") == "preparing":
+            publish_planned_destination(c.ledger)
         c.recovery.rejected(c.action, c.observation, code)
         c.recovery_cycles.record(c.action, c.observation, c.failure, c.ledger, c.screenshot_digest)
         record_action_diagnostic(c.action, c.failure)
@@ -4210,6 +4362,7 @@ class TaskExecution:
         _instruction_revision = correction["revision"]
         c.instruction_corrections.append(correction)
         c.ledger.apply_instruction_revision(revised_task, references)
+        publish_planned_destination(c.ledger)
         c.observation_keywords = sorted(w for w in words(revised_task) if len(w) <= 64 and w.isalnum())[:48]
         c.bridge_observation_revision = None
         c.command_hints_inspected = False
@@ -4260,6 +4413,7 @@ class TaskExecution:
         _working_document_revision = update["revision"]
         c.working_document = binding
         c.ledger.apply_working_document_revision()
+        publish_planned_destination(c.ledger)
         c.bridge_observation_revision = None
         c.action = c.result = c.recovered_result = c.failure = None
         if not preserve_secure_input:

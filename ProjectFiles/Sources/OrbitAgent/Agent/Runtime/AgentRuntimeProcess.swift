@@ -67,6 +67,7 @@ enum RuntimeEvent {
     case userInputRequired(AgentUserInputRequest)
     case taskProgress(AgentTaskProgressSnapshot)
     case taskWait(AgentTaskWaitSnapshot)
+    case taskDestination(AgentTaskDestinationSnapshot)
     case instructionCorrectionApplied(id: String, taskGenerationID: String, revision: UInt64)
     case workingDocumentApplied(id: String, taskGenerationID: String, revision: UInt64, document: [String: Any]?)
     case workingDocumentNeedsReselection(taskGenerationID: String, revision: UInt64, application: String, title: String)
@@ -134,6 +135,7 @@ final class AgentRuntimeProcess {
         var receiptIDs: Set<String> = []
         var progressRevision: UInt64 = 0
         var waitRevision: UInt64 = 0
+        var destinationRevision: UInt64 = 0
         var queuedEventBytes = 0
         var queuedEventCount = 0
         var pendingBridgeBytes = 0
@@ -696,6 +698,12 @@ final class AgentRuntimeProcess {
                   wait.revision > run.waitRevision else { return }
             run.waitRevision = wait.revision
             emit(.taskWait(wait), for: run)
+        case "task_destination":
+            guard let destination = AgentTaskDestinationSnapshot.parse(message, generationID: run.lease.id),
+                  destination.instructionRevision == run.lease.currentInstructionRevision,
+                  destination.revision > run.destinationRevision else { return }
+            run.destinationRevision = destination.revision
+            emit(.taskDestination(destination), for: run)
         case "instruction_correction_applied":
             guard message["task_generation_id"] as? String == run.lease.id,
                   let id = message["correction_id"] as? String,

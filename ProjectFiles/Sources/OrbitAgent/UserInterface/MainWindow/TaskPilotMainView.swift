@@ -397,6 +397,12 @@ struct TaskPilotMainView: View {
                 }
             }
 
+            if let destination = model.taskDestination,
+               destination.generationID == model.currentTaskGenerationID {
+                TaskDestinationAddressView(snapshot: destination)
+                    .id(destination.disclosureIdentity)
+            }
+
             if model.isActive, let progressMap = model.taskProgressMap,
                progressMap.generationID == model.currentTaskGenerationID,
                !progressMap.stopBoundaries.isEmpty {

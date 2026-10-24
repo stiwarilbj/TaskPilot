@@ -7,6 +7,7 @@ struct RuntimeSnapshotFilter {
     private var status: String?
     private var diagnostics: AgentRequestMetrics?
     private var taskWait: AgentTaskWaitSnapshot?
+    private var taskDestination: AgentTaskDestinationSnapshot?
 
     mutating func shouldSchedule(_ event: RuntimeEvent) -> Bool {
         switch event {
@@ -26,6 +27,22 @@ struct RuntimeSnapshotFilter {
                 return false
             }
             taskWait = value
+        case .taskDestination(let value):
+            if let current = taskDestination,
+               current.generationID == value.generationID,
+               current.instructionRevision == value.instructionRevision,
+               current.operationID == value.operationID,
+               current.state == value.state,
+               current.plannedPath == value.plannedPath,
+               current.actualPath == value.actualPath,
+               current.requestedFilename == value.requestedFilename,
+               current.selectedFilename == value.selectedFilename,
+               current.destinationExists == value.destinationExists,
+               current.instruction == value.instruction,
+               current.observationRevision == value.observationRevision {
+                return false
+            }
+            taskDestination = value
         case .userInputRequired:
             // The input handoff changes status outside the runtime channel.
             invalidateStatus()

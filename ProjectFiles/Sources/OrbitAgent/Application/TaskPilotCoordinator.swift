@@ -122,6 +122,7 @@ final class TaskPilotCoordinator: ObservableObject {
     @Published private(set) var taskCorrectionSession: TaskCorrectionSession?
     @Published private(set) var taskProgressMap: TaskProgressMap?
     @Published private(set) var taskWaitDetails: AgentTaskWaitSnapshot?
+    @Published private(set) var taskDestination: AgentTaskDestinationSnapshot?
     @Published private(set) var workingDocumentPresentation: WorkingDocumentPresentation?
     @Published private(set) var workingDocumentNotice: String?
     private var pendingWorkingDocumentUpdateID: String?
@@ -1368,6 +1369,7 @@ final class TaskPilotCoordinator: ObservableObject {
         taskWaitDetails = AgentTaskWaitSnapshot(generationID: lease.id, revision: 0, operationID: 0,
             phase: .starting, lastConfirmed: "No confirmed result yet.",
             waitingFor: "Connecting to the app", attention: .none)
+        taskDestination = nil
         lastTaskWaitRevision = 0
         currentTaskLease = lease
         taskProgressMap = TaskProgressMap(request: request, generationID: lease.id,
@@ -1404,6 +1406,7 @@ final class TaskPilotCoordinator: ObservableObject {
             setTaskProgressLifecycle(.failed)
             runState = .failed
             taskWaitDetails = nil
+            taskDestination = nil
             let message = "Could not start the agent: \(error.localizedDescription)"
             status = message
             recordCurrentTask(
@@ -1843,6 +1846,8 @@ final class TaskPilotCoordinator: ObservableObject {
             acceptTaskProgress(snapshot)
         case .taskWait(let snapshot):
             acceptTaskWait(snapshot)
+        case .taskDestination(let snapshot):
+            acceptTaskDestination(snapshot)
         case let .instructionCorrectionApplied(id, generationID, revision):
             acceptInstructionCorrection(id: id, generationID: generationID, revision: revision)
         case let .workingDocumentApplied(id, generationID, revision, document):
@@ -1910,6 +1915,7 @@ final class TaskPilotCoordinator: ObservableObject {
             )
             runState = .completed
             taskWaitDetails = nil
+            taskDestination = nil
             status = statusWithCleanup(message, cleanup: cleanup)
             let payload = CompletionNotificationService.payload(
                 output: taskOutput,
@@ -1956,6 +1962,7 @@ final class TaskPilotCoordinator: ObservableObject {
             )
             runState = .failed
             taskWaitDetails = nil
+            taskDestination = nil
             if Self.isCapturePermissionFailure(message) {
                 hasScreenRecordingPermission = false
                 captureAuthorization = .denied
@@ -1990,6 +1997,7 @@ final class TaskPilotCoordinator: ObservableObject {
             )
             runState = .idle
             taskWaitDetails = nil
+            taskDestination = nil
             status = statusWithCleanup("Stopped", cleanup: cleanup)
             recordCurrentTask(
                 outcome: .stopped,
@@ -2051,6 +2059,15 @@ final class TaskPilotCoordinator: ObservableObject {
         default:
             taskWaitDetails = snapshot
         }
+    }
+
+    private func acceptTaskDestination(_ snapshot: AgentTaskDestinationSnapshot) {
+        guard currentTaskLease?.id == snapshot.generationID,
+              snapshot.instructionRevision == currentTaskLease?.currentInstructionRevision,
+              [.running, .paused, .waitingForUser, .takingOver, .stopping].contains(runState) else { return }
+        if let current = taskDestination, current.generationID == snapshot.generationID,
+           snapshot.revision <= current.revision { return }
+        taskDestination = snapshot.state == .cleared ? nil : snapshot
     }
 
     private func updateTaskWaitLocally(phase: AgentTaskWaitPhase, waitingFor: String,
