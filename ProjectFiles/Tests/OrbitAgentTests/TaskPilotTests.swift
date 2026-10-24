@@ -937,11 +937,11 @@ final class TaskPilotTests: XCTestCase {
         #!/bin/bash
         IFS= read -r configuration
         for index in {1..100}; do
-          printf '%s\\n' '{"task_generation_id":"\(lease.id)","instruction_revision":0,"kind":"status","message":"Streaming"}'
+          printf '%s\\n' '{"task_generation_id":"\(lease.id)","instruction_revision":0,"working_document_revision":0,"kind":"status","message":"Streaming"}'
         done
-        printf '%s\\n' '{"task_generation_id":"\(lease.id)","instruction_revision":0,"kind":"bridge_request","request_id":"fixture","method":"completion_gate","params":{"display_id":1}}'
+        printf '%s\\n' '{"task_generation_id":"\(lease.id)","instruction_revision":0,"working_document_revision":0,"kind":"bridge_request","request_id":"fixture","method":"completion_gate","params":{"display_id":1}}'
         IFS= read -r response
-        printf '%s' '{"task_generation_id":"\(lease.id)","instruction_revision":0,"kind":"complete","message":"Late completion"}'
+        printf '%s' '{"task_generation_id":"\(lease.id)","instruction_revision":0,"working_document_revision":0,"kind":"complete","message":"Late completion"}'
         """
         try script.write(to: helper, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
@@ -970,7 +970,7 @@ final class TaskPilotTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let helper = directory.appendingPathComponent("runtime")
         let lease = TaskLease()
-        try "#!/bin/bash\nIFS= read -r configuration\nprintf '%s\\n' '{\"task_generation_id\":\"\(lease.id)\",\"instruction_revision\":0,\"kind\":\"status\",\"message\":\"Pending\"}'\nexec /bin/sleep 20\n".write(to: helper, atomically: true, encoding: .utf8)
+        try "#!/bin/bash\nIFS= read -r configuration\nprintf '%s\\n' '{\"task_generation_id\":\"\(lease.id)\",\"instruction_revision\":0,\"working_document_revision\":0,\"kind\":\"status\",\"message\":\"Pending\"}'\nexec /bin/sleep 20\n".write(to: helper, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
         let runtime = AgentRuntimeProcess(bridge: AgentAutomationBridge(
             displayService: DisplayService(), accessibility: AccessibilityController(), capture: ScreenCaptureService()

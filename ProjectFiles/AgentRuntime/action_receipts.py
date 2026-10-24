@@ -27,6 +27,7 @@ class RuntimeInbox:
         self.transport = RequestTransport()
         self.transport.register(('runtime_configuration', None, None))
         self._instruction_correction_key = None
+        self._working_document_update_key = None
         self._started = False
         self._start_lock = threading.Lock()
 
@@ -56,6 +57,28 @@ class RuntimeInbox:
         if not self._instruction_correction_key:
             raise TransportFailure('transport_unknown_request')
         return self.transport.get(self._instruction_correction_key, timeout)
+
+    def register_working_document_updates(self, generation):
+        key = ('working_document_update', None, generation)
+        if self._working_document_update_key is None:
+            self.transport.register(key)
+            self._working_document_update_key = key
+        elif self._working_document_update_key != key:
+            raise TransportFailure('transport_generation_mismatch')
+        return key
+
+    @property
+    def working_document_update_key(self):
+        return self._working_document_update_key
+
+    def has_working_document_update(self):
+        return bool(self._working_document_update_key and
+                    self.transport.has_pending(self._working_document_update_key))
+
+    def take_working_document_update(self, timeout=0):
+        if not self._working_document_update_key:
+            raise TransportFailure('transport_unknown_request')
+        return self.transport.get(self._working_document_update_key, timeout)
 
     def start(self):
         with self._start_lock:
@@ -88,6 +111,14 @@ class RuntimeInbox:
             if key != ('instruction_correction', None, generation):
                 return
             # Corrections are bounded control events, not terminal replies.
+            self.transport.put(key, line + '\n', size=len(frame), terminal=False)
+            return
+        elif kind == 'working_document_update':
+            if not isinstance(generation, str) or not generation:
+                return
+            key = self._working_document_update_key
+            if key != ('working_document_update', None, generation):
+                return
             self.transport.put(key, line + '\n', size=len(frame), terminal=False)
             return
         elif isinstance(kind, str) and isinstance(request_id, str) and (generation is None or isinstance(generation, str)):

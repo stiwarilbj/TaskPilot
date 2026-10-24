@@ -137,9 +137,9 @@ class ActionReceiptTests(unittest.TestCase):
         self.assert_once()
 
     def test_late_response_and_other_task_receipt_are_rejected_on_the_wire(self):
-        replies = [dict(kind='bridge_response', request_id='old-request', task_generation_id=self.generation, ok=True, result={'old': True}),
-                   dict(kind='bridge_response', request_id='lookup', task_generation_id='old-task', ok=True, result={'wrong': True}),
-                   dict(kind='bridge_response', request_id='lookup', task_generation_id=self.generation, ok=True, result=self.receipt(result=native_result(self.action)))]
+        replies = [dict(kind='bridge_response', request_id='old-request', task_generation_id=self.generation, working_document_revision=0, ok=True, result={'old': True}),
+                   dict(kind='bridge_response', request_id='lookup', task_generation_id='old-task', working_document_revision=0, ok=True, result={'wrong': True}),
+                   dict(kind='bridge_response', request_id='lookup', task_generation_id=self.generation, working_document_revision=0, ok=True, result=self.receipt(result=native_result(self.action)))]
         with mock.patch.object(sys, 'stdin', io.StringIO('\n'.join(map(json.dumps, replies)))), \
              mock.patch.object(runtime.uuid, 'uuid4', return_value='lookup'), mock.patch.object(runtime, 'emit') as emitted:
             result = runtime.bridge_call('action_receipt', 1, action_id=self.action_id, _reply_timeout=1)
@@ -234,7 +234,7 @@ class ActionReceiptTests(unittest.TestCase):
             return 'plan'
         with tempfile.TemporaryDirectory() as directory:
             frames = 0
-            def exchange(method, display, params, timeout):
+            def exchange(method, display, params, timeout, working_document_revision=None):
                 nonlocal frames
                 if method == 'completion_gate': return {'ok': True, 'result': {'accepted': True, 'pending_correction': False}}
                 if method == 'act':

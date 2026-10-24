@@ -17,15 +17,25 @@ final class AgentScreenViewerModel: ObservableObject {
     @Published private(set) var status = "Connecting to the agent screen…"
     @Published private(set) var interactionStatus = "Click the screen to control it; type after selecting an app"
     @Published private(set) var agentCursor: AgentCursorPresentation?
+    @Published private(set) var workingDocumentCandidates: [WorkingDocumentCandidate] = []
+    @Published var showingWorkingDocumentPicker = false
     let actionMagnifier = AgentActionMagnifierModel()
 
     var interactionHandler: ((AgentScreenInteraction, DisplayDescriptor) throws -> String)?
+    var workingDocumentCandidateProvider: ((DisplayDescriptor) -> [WorkingDocumentCandidate])?
+    var canSelectWorkingDocument: (() -> Bool)?
+    var onWorkingDocumentSelection: ((WorkingDocumentCandidate?) -> Void)?
 
     private let capture: ScreenCaptureService
     private var captureTask: Task<Void, Never>?
     private var cursorVisibilityTask: Task<Void, Never>?
     private var currentDisplayID: CGDirectDisplayID?
     private var isViewerVisible = false
+
+    var focusedWorkingDocumentLabel: String {
+        guard let focused = workingDocumentCandidates.first(where: \.focused) else { return "Choose a window" }
+        return "\(focused.title.isEmpty ? "Untitled window" : focused.title) — \(focused.applicationName)"
+    }
 
     init(capture: ScreenCaptureService) {
         self.capture = capture
@@ -114,6 +124,21 @@ final class AgentScreenViewerModel: ObservableObject {
             interactionStatus = error.localizedDescription
         }
     }
+
+    func openWorkingDocumentPicker() { showingWorkingDocumentPicker = true }
+
+    func refreshWorkingDocumentCandidates(display: DisplayDescriptor?) {
+        guard isViewerVisible, let display else { workingDocumentCandidates = []; return }
+        workingDocumentCandidates = Array((workingDocumentCandidateProvider?(display) ?? []).prefix(32))
+    }
+
+    func selectWorkingDocument(_ candidate: WorkingDocumentCandidate?) {
+        guard canSelectWorkingDocument?() == true else { return }
+        onWorkingDocumentSelection?(candidate)
+        showingWorkingDocumentPicker = false
+    }
+
+    var workingDocumentSelectionEnabled: Bool { canSelectWorkingDocument?() == true }
 }
 
 struct AgentScreenViewer: View {
@@ -164,18 +189,38 @@ struct AgentScreenViewer: View {
             }
         }
         .overlay(alignment: .topLeading) {
-            HStack(spacing: 7) {
-                Circle()
-                    .fill(model.image == nil ? Color.orange : Color.green)
-                    .frame(width: 8, height: 8)
-                Text(model.status)
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(1)
+            HStack(spacing: 8) {
+                HStack(spacing: 7) {
+                    Circle()
+                        .fill(model.image == nil ? Color.orange : Color.green)
+                        .frame(width: 8, height: 8)
+                    Text(model.status)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 11)
+                .padding(.vertical, 7)
+                .background(.black.opacity(0.68), in: Capsule())
+
+                Button { model.openWorkingDocumentPicker() } label: {
+                    Label(model.focusedWorkingDocumentLabel, systemImage: "doc.text.magnifyingglass")
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                        .frame(maxWidth: 280, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .disabled(!model.workingDocumentSelectionEnabled)
+                .accessibilityLabel("Choose the working document. Focused window: \(model.focusedWorkingDocumentLabel)")
+                .padding(.horizontal, 11)
+                .padding(.vertical, 7)
+                .background(.black.opacity(0.68), in: Capsule())
+                .popover(isPresented: $model.showingWorkingDocumentPicker, arrowEdge: .top) {
+                    workingDocumentPicker
+                        .onAppear { model.refreshWorkingDocumentCandidates(display: display) }
+                        .frame(width: 340)
+                }
             }
             .foregroundStyle(.white)
-            .padding(.horizontal, 11)
-            .padding(.vertical, 7)
-            .background(.black.opacity(0.68), in: Capsule())
             .padding(14)
         }
         .overlay(alignment: .bottom) {
@@ -188,11 +233,68 @@ struct AgentScreenViewer: View {
                 .background(.black.opacity(0.72), in: Capsule())
                 .padding(14)
         }
-        .onAppear { model.start(display: display) }
+        .onAppear {
+            model.start(display: display)
+            model.refreshWorkingDocumentCandidates(display: display)
+        }
         .onDisappear { model.stop() }
         .onChange(of: display) { _, updatedDisplay in
             model.start(display: updatedDisplay)
+            model.refreshWorkingDocumentCandidates(display: updatedDisplay)
         }
+    }
+
+    private var workingDocumentPicker: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Working document")
+                .font(.headline)
+            Text("Choose a visible window for references like ‘this spreadsheet.’ TaskPilot will confirm it before using it.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let focused = model.workingDocumentCandidates.first(where: \.focused) {
+                Button {
+                    model.selectWorkingDocument(focused)
+                } label: {
+                    Label("Use this document for the current request", systemImage: "checkmark.document")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .disabled(!model.workingDocumentSelectionEnabled)
+                .accessibilityLabel("Use focused document \(focused.title) from \(focused.applicationName) for the current request")
+                Divider()
+            }
+            if model.workingDocumentCandidates.isEmpty {
+                Text("No eligible windows are visible on this display.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(model.workingDocumentCandidates) { candidate in
+                            Button {
+                                model.selectWorkingDocument(candidate)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(candidate.menuTitle)
+                                        .font(.callout)
+                                        .lineLimit(2)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    if let location = candidate.location {
+                                        Text(location).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                                    }
+                                }
+                                .padding(.vertical, 5)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(!model.workingDocumentSelectionEnabled)
+                            .accessibilityLabel("Select \(candidate.title.isEmpty ? "Untitled window" : candidate.title), \(candidate.applicationName)\(candidate.location.map { ", \($0)" } ?? "")")
+                        }
+                    }
+                }
+                .frame(maxHeight: 300)
+            }
+        }
+        .padding(15)
     }
 }
 

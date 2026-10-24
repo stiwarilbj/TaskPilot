@@ -143,7 +143,7 @@ final class LocalOperationBudgetTests: XCTestCase {
         let bridge = AgentAutomationBridge(displayService: DisplayService(), accessibility: AccessibilityController(), capture: ScreenCaptureService())
         try bridge.bind(lease)
         for value: Any in [true, "100", 0, -1, 1.5, Double.infinity, 3_600_001] {
-            let response = await bridge.handleOwned(["task_generation_id": lease.id, "instruction_revision": 0, "method": "action_receipt",
+            let response = await bridge.handleOwned(["task_generation_id": lease.id, "instruction_revision": 0, "working_document_revision": 0, "method": "action_receipt",
                 "params": ["action_id": UUID().uuidString, "local_budget_ms": value]], lease: lease)
             XCTAssertEqual(response["ok"] as? Bool, false)
             XCTAssertEqual(response["outcome"] as? String, "rejected")

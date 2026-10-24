@@ -135,7 +135,8 @@ final class RuntimeTransportTests: XCTestCase {
         config = json.loads(sys.stdin.readline())
         def emit(kind, **fields):
             print(json.dumps(dict(kind=kind, task_generation_id=config['task_generation_id'],
-                instruction_revision=fields.pop('instruction_revision', 0), **fields)), flush=True)
+                instruction_revision=fields.pop('instruction_revision', 0),
+                working_document_revision=0, **fields)), flush=True)
         """ + "\n" + body + "\n").write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
         return url

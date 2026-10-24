@@ -161,7 +161,7 @@ class ExecutionBoundaryTests(unittest.TestCase):
     def test_lost_reply_must_reconcile_before_another_dispatch(self):
         self.context.machine.phase = Phase.EXECUTING
         calls = []
-        def exchange(method, display, params, timeout):
+        def exchange(method, display, params, timeout, working_document_revision=None):
             calls.append((method, self.context.machine.phase, params['action_id']))
             if method == 'act': raise BridgeReplyLost('lost')
             with self.assertRaises(ExecutionStateError):
@@ -251,7 +251,7 @@ class TaskDispatcherTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             frames = 0
             receipt = None
-            def exchange(method, display, params, timeout):
+            def exchange(method, display, params, timeout, working_document_revision=None):
                 nonlocal frames, receipt
                 native_calls.append(method)
                 c = current_task.get()

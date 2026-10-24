@@ -64,24 +64,35 @@ final class AgentAutomationBridge {
             guard let instructionRevision = Self.exactRevision(request["instruction_revision"]) else {
                 throw BridgeError.invalidRequest("Missing or invalid task instruction revision")
             }
-            if request["method"] as? String == "act" {
+            guard let workingDocumentRevision = Self.exactRevision(request["working_document_revision"]) else {
+                throw BridgeError.invalidRequest("Missing or invalid working-document revision")
+            }
+            let method = request["method"] as? String ?? ""
+            if method != "bind_working_document" {
                 try lease.validateInstructionRevision(instructionRevision)
+                try lease.validateWorkingDocumentRevision(workingDocumentRevision,
+                    allowDispatchedReceipt: method == "act")
             }
             return await TaskOwnership.$instructionRevision.withValue(instructionRevision) {
-                await self.handleInstructionRevisionRequest(request, requestID: requestID, lease: lease,
-                                                            instructionRevision: instructionRevision)
+                await TaskOwnership.$workingDocumentRevision.withValue(workingDocumentRevision) {
+                    await self.handleInstructionRevisionRequest(request, requestID: requestID, lease: lease,
+                        instructionRevision: instructionRevision, workingDocumentRevision: workingDocumentRevision)
+                }
             }
         } catch {
             let code = error is ManagedRuntimeGateError ? "runtime_recovering" : error is LocalOperationBudget.Exhausted ? "local_budget_exhausted" : error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" :
+                (error as? WorkingDocumentUpdateError).map { _ in "working_document_superseded" } ??
                 (error as? TaskInstructionCorrectionError).map { _ in "instruction_superseded" } ?? (error as? ActionReceiptStore.ReceiptError)?.code ?? (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? (error is BoundFileOperation.Conflict ? "file_conflict" : "action_rejected")
             return ["task_generation_id": lease?.id ?? "", "kind": "bridge_response", "request_id": requestID,
                     "ok": false, "error_code": code, "error": error.localizedDescription,
-                    "instruction_revision": Self.exactRevision(request["instruction_revision"]) ?? 0]
+                    "instruction_revision": Self.exactRevision(request["instruction_revision"]) ?? 0,
+                    "working_document_revision": Self.exactRevision(request["working_document_revision"]) ?? 0]
         }
     }
 
     private func handleInstructionRevisionRequest(_ request: [String: Any], requestID: String,
-                                                   lease: TaskLease, instructionRevision: UInt64) async -> [String: Any] {
+                                                   lease: TaskLease, instructionRevision: UInt64,
+                                                   workingDocumentRevision: UInt64) async -> [String: Any] {
         var receiptToken: ActionReceiptStore.Token?
         var runtimePermit: ManagedRuntimePermit?
         defer { withExtendedLifetime(runtimePermit) {} }
@@ -102,6 +113,40 @@ final class AgentAutomationBridge {
                 }
             }
             try LocalOperationBudget.check(method)
+            if method == "bind_working_document" {
+                let params = request["params"] as? [String: Any] ?? [:]
+                guard let updateID = params["update_id"] as? String,
+                      let uuid = UUID(uuidString: updateID), uuid.uuidString.lowercased() == updateID,
+                      let bindingRevision = Self.exactRevision(params["binding_revision"]),
+                      let requestBindingRevision = Self.exactRevision(request["working_document_revision"]),
+                      bindingRevision == requestBindingRevision else {
+                    throw BridgeError.invalidRequest("Malformed working-document update")
+                }
+                if lease.appliedWorkingDocumentRevision(id: updateID) == bindingRevision {
+                    return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
+                            "ok": true, "result": ["applied": true,
+                                "working_document": (accessibility.workingDocumentInfo(generationID: lease.id) as Any?) ?? NSNull()]]
+                }
+                guard lease.currentWorkingDocumentRevision + 1 == bindingRevision else {
+                    throw WorkingDocumentUpdateError.stale
+                }
+                do {
+                    let selectionID = params["selection_id"] as? String
+                    let binding = try accessibility.prepareWorkingDocumentBinding(selectionID: selectionID,
+                        generationID: lease.id, revision: bindingRevision)
+                    try lease.applyWorkingDocumentUpdate(id: updateID, revision: bindingRevision) {
+                        accessibility.installWorkingDocumentBinding(binding, generationID: lease.id)
+                    }
+                    return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
+                            "ok": true, "result": ["applied": true,
+                                "working_document": (accessibility.workingDocumentInfo(generationID: lease.id) as Any?) ?? NSNull()]]
+                } catch WorkingDocumentUpdateError.unavailable {
+                    lease.cancelWorkingDocumentUpdate(id: updateID)
+                    return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
+                            "ok": true, "result": ["applied": false,
+                                "working_document": (accessibility.workingDocumentInfo(generationID: lease.id) as Any?) ?? NSNull()]]
+                }
+            }
             if method == "inspect_command" {
                 guard let action = params["action"] as? [String: Any] else { throw BridgeError.invalidRequest("Missing command inspection payload") }
                 let result = try await taskTools.inspectCommand(action: action)
@@ -110,10 +155,17 @@ final class AgentAutomationBridge {
                         "ok": true, "result": result]
             }
             if method == "completion_gate" {
+                let workingDocument = accessibility.workingDocumentInfo(generationID: lease.id)
+                if workingDocument?["state"] as? String == "needs_reselection" {
+                    return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
+                            "ok": true, "result": ["accepted": false, "pending_correction": false,
+                                "pending_working_document": false, "needs_working_document": true]]
+                }
                 let gate = lease.claimCompletionGate(instructionRevision: instructionRevision)
                 return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
                         "ok": true, "result": ["accepted": gate.accepted,
-                            "pending_correction": gate.pendingCorrection]]
+                            "pending_correction": gate.pendingCorrection,
+                            "pending_working_document": gate.pendingWorkingDocument]]
             }
             if method == "wait_file_effect" {
                 guard let input = params["check"] else { throw BridgeError.invalidRequest("Missing expected effect check") }
@@ -175,6 +227,7 @@ final class AgentAutomationBridge {
                 identity.removeValue(forKey: "local_budget_ms")
                 identity["action"] = action
                 identity["instruction_revision"] = instructionRevision
+                identity["working_document_revision"] = workingDocumentRevision
                 switch try lease.commit({ try lease.actionReceipts.begin(id: id, payload: identity) }) {
                 case .existing(let receipt):
                     return try receiptResponse(receipt, requestID: requestID, generation: lease.id)
@@ -314,6 +367,7 @@ final class AgentAutomationBridge {
                     "installed_applications": snapshot.installedApplications,
                     "system_context": snapshot.systemContext,
                     "elements": snapshot.elements,
+                    "working_document": snapshot.workingDocument ?? NSNull(),
                     "observation_completeness": snapshot.completeness,
                     "text_recognition": textMetadata,
                     "agent_tools": [
@@ -377,7 +431,7 @@ final class AgentAutomationBridge {
                 "result": result
             ]
         } catch {
-            let code = error is ManagedRuntimeGateError ? "runtime_recovering" : error is LocalOperationBudget.Exhausted ? "local_budget_exhausted" : error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" : (error as? TaskInstructionCorrectionError).map { _ in "instruction_superseded" } ??
+            let code = error is ManagedRuntimeGateError ? "runtime_recovering" : error is LocalOperationBudget.Exhausted ? "local_budget_exhausted" : error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" : (error as? WorkingDocumentUpdateError).map { _ in "working_document_superseded" } ?? (error as? TaskInstructionCorrectionError).map { _ in "instruction_superseded" } ??
                 (error as? ActionReceiptStore.ReceiptError)?.code ?? (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? (error is BoundFileOperation.Conflict ? "file_conflict" : "action_rejected")
             receiptToken?.fail(error, code: code)
             if let title = magnifierActionTitle, let receiptToken {

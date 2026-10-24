@@ -37,8 +37,8 @@ class TaskOwnershipTests(unittest.TestCase):
     def test_cross_task_bridge_reply_is_ignored_and_observation_is_bound(self):
         fixture = fixture_coordinates('current')
         replies = [
-            {'kind': 'bridge_response', 'request_id': 'same', 'task_generation_id': 'old', 'ok': True, 'result': {'observation_revision': 'old'}},
-            {'kind': 'bridge_response', 'request_id': 'same', 'task_generation_id': self.generation, 'ok': True,
+            {'kind': 'bridge_response', 'request_id': 'same', 'task_generation_id': 'old', 'working_document_revision': 0, 'ok': True, 'result': {'observation_revision': 'old'}},
+            {'kind': 'bridge_response', 'request_id': 'same', 'task_generation_id': self.generation, 'working_document_revision': 0, 'ok': True,
              'result': {**fixture, 'task_generation_id': self.generation, 'observation_revision': 'current', 'elements': []}},
         ]
         with mock.patch.object(runtime.uuid, 'uuid4', return_value='same'), mock.patch.object(sys, 'stdin', io.StringIO('\n'.join(map(json.dumps, replies)))), mock.patch.object(runtime, 'emit') as emit:
@@ -54,7 +54,7 @@ class TaskOwnershipTests(unittest.TestCase):
         self.assertEqual(emit.call_args.kwargs['params']['observation_revision'], 'current')
 
     def test_cross_task_observation_never_reaches_planning(self):
-        reply = dict(kind='bridge_response', request_id='same', task_generation_id=self.generation, ok=True,
+        reply = dict(kind='bridge_response', request_id='same', task_generation_id=self.generation, working_document_revision=0, ok=True,
                      result=dict(task_generation_id='old', observation_revision='old'))
         with mock.patch.object(runtime.uuid, 'uuid4', return_value='same'), mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(reply))), mock.patch.object(runtime, 'emit'):
             with self.assertRaises(runtime.ActionRejected): runtime.bridge_call('observe', 1)
@@ -68,12 +68,14 @@ class TaskOwnershipTests(unittest.TestCase):
             self.assertEqual(runtime.wait_for_user_input('same'), 'current')
 
     def test_startup_requires_valid_generation_only_for_tasks_and_clears_old_state(self):
-        config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=CONTRACT_HASH, action_contract_version=CONTRACT_VERSION, instruction_revision=0, task_protocol_version=TASK_PROTOCOL_VERSION, coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION, observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION, text_recognition_version=runtime.TEXT_RECOGNITION_VERSION, evidence_consistency_version=runtime.EVIDENCE_CONSISTENCY_VERSION, wait_presentation_version=runtime.WAIT_PRESENTATION_VERSION, command_capability_version=runtime.COMMAND_CAPABILITY_VERSION, exact_input_reference_version=runtime.EXACT_INPUT_REFERENCE_VERSION, exact_input_references=[])
+        config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=CONTRACT_HASH, action_contract_version=CONTRACT_VERSION, instruction_revision=0, task_protocol_version=TASK_PROTOCOL_VERSION, coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION, observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION, text_recognition_version=runtime.TEXT_RECOGNITION_VERSION, evidence_consistency_version=runtime.EVIDENCE_CONSISTENCY_VERSION, wait_presentation_version=runtime.WAIT_PRESENTATION_VERSION, command_capability_version=runtime.COMMAND_CAPABILITY_VERSION, exact_input_reference_version=runtime.EXACT_INPUT_REFERENCE_VERSION, exact_input_references=[], working_document_protocol_version=runtime.WORKING_DOCUMENT_PROTOCOL_VERSION)
         for invalid in [None, '', 'old', True, 7]:
             with self.subTest(invalid=invalid), mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(dict(config, task_generation_id=invalid)))):
                 with self.assertRaisesRegex(RuntimeError, 'generation ID'): runtime.read_runtime_configuration(require_generation=True)
         with mock.patch.object(runtime.RuntimeInbox, 'register_instruction_corrections',
                                return_value=('instruction_correction', None, self.generation)), \
+             mock.patch.object(runtime.RuntimeInbox, 'register_working_document_updates',
+                               return_value=('working_document_update', None, self.generation)), \
              mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(dict(config, task_generation_id=self.generation)))):
             runtime.read_runtime_configuration(require_generation=True)
         self.assertEqual(runtime._task_generation_id, self.generation)
@@ -89,6 +91,7 @@ class TaskOwnershipTests(unittest.TestCase):
             wait_presentation_version=runtime.WAIT_PRESENTATION_VERSION,
             command_capability_version=runtime.COMMAND_CAPABILITY_VERSION,
             exact_input_reference_version=runtime.EXACT_INPUT_REFERENCE_VERSION, exact_input_references=[])
+        config["working_document_protocol_version"] = runtime.WORKING_DOCUMENT_PROTOCOL_VERSION
         for version in [None, True, '1', 0, runtime.WAIT_PRESENTATION_VERSION + 1]:
             with self.subTest(version=version), mock.patch.object(sys, 'stdin', io.StringIO(
                     json.dumps(dict(config, wait_presentation_version=version)))):
@@ -113,6 +116,7 @@ class TaskOwnershipTests(unittest.TestCase):
             wait_presentation_version=runtime.WAIT_PRESENTATION_VERSION,
             command_capability_version=runtime.COMMAND_CAPABILITY_VERSION,
             exact_input_reference_version=runtime.EXACT_INPUT_REFERENCE_VERSION, exact_input_references=[])
+        config["working_document_protocol_version"] = runtime.WORKING_DOCUMENT_PROTOCOL_VERSION
         for version in [None, True, 0, runtime.EXACT_INPUT_REFERENCE_VERSION + 1]:
             with self.subTest(version=version), mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(
                     dict(config, exact_input_reference_version=version)))):

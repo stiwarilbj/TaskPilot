@@ -256,7 +256,7 @@ final class ActionRecoveryJournalTests: XCTestCase {
         let lease = TaskLease(recoveryJournal: journal, recoveryTask: Self.taskID)
         let bridge = AgentAutomationBridge(displayService: DisplayService(), accessibility: AccessibilityController(), capture: ScreenCaptureService())
         try bridge.bind(lease)
-        let reply = await bridge.handleOwned(["task_generation_id": lease.id, "instruction_revision": 0, "method": "act", "params": [
+        let reply = await bridge.handleOwned(["task_generation_id": lease.id, "instruction_revision": 0, "working_document_revision": 0, "method": "act", "params": [
             "action_id": Self.actionID, "action": action, "display_id": 999_999, "observation_revision": "stale"]], lease: lease)
         XCTAssertEqual(reply["ok"] as? Bool, false)
         XCTAssertEqual(reply["error_code"] as? String, "protocol_error")

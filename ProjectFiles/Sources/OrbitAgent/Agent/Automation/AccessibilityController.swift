@@ -17,6 +17,21 @@ struct AccessibilitySnapshot {
     let installedApplications: [[String: Any]]
     let systemContext: [String: Any]
     let completeness: [String: Any]
+    let workingDocument: [String: Any]?
+
+    init(revision: String, elements: [[String: Any]], applications: [[String: Any]],
+         resultDestinations: [[String: Any]], installedApplications: [[String: Any]],
+         systemContext: [String: Any], completeness: [String: Any],
+         workingDocument: [String: Any]? = nil) {
+        self.revision = revision
+        self.elements = elements
+        self.applications = applications
+        self.resultDestinations = resultDestinations
+        self.installedApplications = installedApplications
+        self.systemContext = systemContext
+        self.completeness = completeness
+        self.workingDocument = workingDocument
+    }
 }
 
 struct StagedAccessibilitySnapshot {
@@ -84,6 +99,8 @@ enum AccessibilityActionError: LocalizedError {
     case focusMismatch
     case unsupportedAction
     case ambiguousTarget
+    case workingDocumentLost
+    case workingDocumentTargetMismatch
 
     var code: String {
         switch self {
@@ -97,6 +114,8 @@ enum AccessibilityActionError: LocalizedError {
         case .unsupportedAction: return "unsupported_action"
         case .ambiguousTarget: return "ambiguous_target"
         case .controllerProtected: return "protected_target"
+        case .workingDocumentLost: return "working_document_lost"
+        case .workingDocumentTargetMismatch: return "working_document_target_mismatch"
         case .invalidAction: return "invalid_action"
         case .operationFailed: return "delivery_rejected"
         }
@@ -116,6 +135,8 @@ enum AccessibilityActionError: LocalizedError {
         case .focusMismatch: return "The intended field does not have confirmed focus; observe and focus the correct field before typing"
         case .unsupportedAction: return "Accessibility press is unsupported and no verified coordinate fallback is available; observe and choose another supported method"
         case .ambiguousTarget: return "These coordinates match multiple controls; observe their app, window, and panel and select one complete element ID"
+        case .workingDocumentLost: return "The selected document window disappeared or changed. Choose the working document again before continuing."
+        case .workingDocumentTargetMismatch: return "This action targets a different window than the selected working document. Observe the current window and choose the intended document."
         }
     }
 }
@@ -204,6 +225,8 @@ final class AccessibilityController {
     private var discoveryGraph: NativeGraphSession?
     private var teardownForeground: (NSRunningApplication, pid_t)?
     private var taskGenerationID: String?
+    private var workingDocumentSelections: [String: WorkingDocumentSelectionRecord] = [:]
+    private var workingDocumentBinding: WorkingDocumentNativeBinding?
     private var inputGeneration = 0
     private var inputCancelled = false
     private var restoreWorkItem: DispatchWorkItem?
@@ -252,6 +275,8 @@ final class AccessibilityController {
         observationMagnifierSource = nil
         actionMagnifierSequence = 0; activeMagnifierAction = nil
         manualTargetPID = nil
+        workingDocumentSelections.removeAll()
+        workingDocumentBinding = nil
         taskDisplayOverrideID = nil
         taskApplicationBaseline = TaskApplicationBaseline(
             display: display,
@@ -261,6 +286,212 @@ final class AccessibilityController {
         )
         lock.unlock()
         previousGraph?.close()
+    }
+
+    func workingDocumentCandidates(on display: DisplayDescriptor) -> [WorkingDocumentCandidate] {
+        guard AXIsProcessTrusted() else { return [] }
+        var candidates: [WorkingDocumentCandidate] = []
+        let apps = orderedApplicationsForSnapshot(on: display)
+        for app in apps {
+            let pid = app.processIdentifier
+            guard pid != controllerPID, app.bundleIdentifier != Bundle.main.bundleIdentifier,
+                  let launchDate = app.launchDate,
+                  let bundleID = app.bundleIdentifier else { continue }
+            let appElement = AXUIElementCreateApplication(pid)
+            let appWindows = attribute(appElement, kAXWindowsAttribute) as? [AXUIElement] ?? []
+            let focusedWindow = accessibilityElement(appElement, kAXFocusedWindowAttribute)
+            let graphics = graphicsWindows(of: pid)
+            let identity = applicationIdentity(app)
+            for window in appWindows {
+                guard let frame = frame(of: window), frame.intersects(display.frame) else { continue }
+                let title = stringAttribute(window, kAXTitleAttribute) ?? ""
+                let documentURL = Self.workingDocumentURL(
+                    attribute(window, kAXDocumentAttribute) ?? attribute(window, kAXURLAttribute)
+                )
+                let windowGraphics = graphics.max { lhs, rhs in
+                    Self.intersectionArea(lhs.frame, frame) < Self.intersectionArea(rhs.frame, frame)
+                }
+                let graphicsID = windowGraphics.flatMap {
+                    Self.intersectionArea($0.frame, frame) > 0 ? $0.id : nil
+                }
+                let selectionID = UUID().uuidString.lowercased()
+                let candidate = WorkingDocumentCandidate(
+                    selectionID: selectionID,
+                    displayID: display.id,
+                    pid: pid,
+                    bundleID: bundleID,
+                    processLaunchTime: launchDate.timeIntervalSince1970,
+                    applicationName: app.localizedName ?? "Unknown app",
+                    title: title,
+                    location: documentURL.flatMap(Self.workingDocumentLocation),
+                    documentURL: documentURL?.absoluteString,
+                    accessibilityIdentity: String(CFHash(window)),
+                    graphicsWindowID: graphicsID,
+                    focused: focusedWindow.map { CFEqual($0, window) } == true && app.isActive
+                )
+                let record = WorkingDocumentSelectionRecord(candidate: candidate, window: window,
+                    application: identity, documentURL: documentURL,
+                    expiresAt: ProcessInfo.processInfo.systemUptime + 90)
+                candidates.append(candidate)
+                lock.withLock {
+                    workingDocumentSelections = workingDocumentSelections.filter {
+                        $0.value.expiresAt > ProcessInfo.processInfo.systemUptime
+                    }
+                    workingDocumentSelections[selectionID] = record
+                }
+            }
+        }
+        return candidates.sorted {
+            if $0.focused != $1.focused { return $0.focused }
+            let appOrder = $0.applicationName.localizedCaseInsensitiveCompare($1.applicationName)
+            if appOrder != .orderedSame { return appOrder == .orderedAscending }
+            return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        }
+    }
+
+    func prepareWorkingDocumentBinding(selectionID: String?, generationID: String,
+                                       revision: UInt64) throws -> WorkingDocumentNativeBinding? {
+        guard lock.withLock({ taskGenerationID == generationID }) else { throw WorkingDocumentUpdateError.stale }
+        guard let selectionID else { return nil }
+        let selection = lock.withLock { workingDocumentSelections[selectionID] }
+        guard let selection, selection.expiresAt >= ProcessInfo.processInfo.systemUptime else {
+            throw WorkingDocumentUpdateError.unavailable
+        }
+        guard let app = NSRunningApplication(processIdentifier: selection.candidate.pid), !app.isTerminated,
+              app.bundleIdentifier == selection.candidate.bundleID,
+              app.bundleURL?.path == selection.application.bundlePath,
+              abs((app.launchDate?.timeIntervalSince1970 ?? 0) - selection.candidate.processLaunchTime) < 0.01,
+              let retainedWindow = windows(of: selection.candidate.pid).first(where: { CFEqual($0, selection.window) }) else {
+            throw WorkingDocumentUpdateError.unavailable
+        }
+        let currentURL = Self.workingDocumentURL(
+            attribute(retainedWindow, kAXDocumentAttribute) ?? attribute(retainedWindow, kAXURLAttribute)
+        )
+        if let expected = selection.documentURL?.absoluteString,
+           currentURL?.absoluteString != expected {
+            throw WorkingDocumentUpdateError.unavailable
+        }
+        let currentFrame = frame(of: retainedWindow)
+        let graphicsID = currentFrame.flatMap { frame in
+            graphicsWindows(of: selection.candidate.pid).max {
+                Self.intersectionArea($0.frame, frame) < Self.intersectionArea($1.frame, frame)
+            }.flatMap { Self.intersectionArea($0.frame, frame) > 0 ? $0.id : nil }
+        }
+        if let expected = selection.candidate.graphicsWindowID, let graphicsID,
+           expected != graphicsID, currentURL == nil {
+            throw WorkingDocumentUpdateError.unavailable
+        }
+        return WorkingDocumentNativeBinding(generationID: generationID, revision: revision,
+            pid: selection.candidate.pid, application: selection.application, window: retainedWindow,
+            accessibilityIdentity: selection.candidate.accessibilityIdentity,
+            graphicsWindowID: graphicsID ?? selection.candidate.graphicsWindowID,
+            title: stringAttribute(retainedWindow, kAXTitleAttribute) ?? selection.candidate.title,
+            location: currentURL.flatMap(Self.workingDocumentLocation), documentURL: currentURL,
+            displayID: selection.candidate.displayID)
+    }
+
+    func installWorkingDocumentBinding(_ binding: WorkingDocumentNativeBinding?, generationID: String) {
+        lock.withLock {
+            guard taskGenerationID == generationID else { return }
+            workingDocumentBinding = binding
+        }
+    }
+
+    func workingDocumentInfo(generationID: String) -> [String: Any]? {
+        guard let binding = lock.withLock({ workingDocumentBinding }), binding.generationID == generationID else { return nil }
+        let state = refreshWorkingDocumentBinding(binding)
+        guard let active = state.binding else {
+            return ["state": "needs_reselection", "application": binding.application.name ?? "Unknown app",
+                    "title": binding.title, "revision": Int(binding.revision)]
+        }
+        if state.changed { installWorkingDocumentBinding(active, generationID: generationID) }
+        return ["state": "active", "application": active.application.name ?? "Unknown app",
+                "title": active.title,
+                "location": active.location as Any? ?? NSNull(),
+                "revision": Int(active.revision),
+                "pid": Int(active.pid),
+                "bundle_id": active.application.bundleID ?? "",
+                "accessibility_identity": active.accessibilityIdentity]
+    }
+
+    private func isWorkingDocumentWindow(_ element: AXUIElement, pid: pid_t, generationID: String) -> Bool {
+        lock.withLock {
+            guard let binding = workingDocumentBinding,
+                  binding.generationID == generationID,
+                  binding.pid == pid else { return false }
+            return CFEqual(binding.window, element)
+        }
+    }
+
+    private func refreshWorkingDocumentBinding(_ binding: WorkingDocumentNativeBinding)
+        -> (binding: WorkingDocumentNativeBinding?, changed: Bool) {
+        guard let app = NSRunningApplication(processIdentifier: binding.pid), !app.isTerminated,
+              app.bundleIdentifier == binding.application.bundleID,
+              binding.application.bundlePath == nil || app.bundleURL?.path == binding.application.bundlePath,
+              abs((app.launchDate?.timeIntervalSince1970 ?? 0) - (binding.application.launchDate?.timeIntervalSince1970 ?? 0)) < 0.01 else {
+            return (nil, false)
+        }
+        let appWindows = windows(of: binding.pid)
+        if let retained = appWindows.first(where: { CFEqual($0, binding.window) }) {
+            let currentURL = Self.workingDocumentURL(
+                attribute(retained, kAXDocumentAttribute) ?? attribute(retained, kAXURLAttribute)
+            )
+            guard binding.documentURL == nil || currentURL?.absoluteString == binding.documentURL?.absoluteString else {
+                return rediscoverWorkingDocument(binding, in: appWindows)
+            }
+            let currentGraphicsID = frame(of: retained).flatMap { target in
+                graphicsWindows(of: binding.pid).max {
+                    Self.intersectionArea($0.frame, target) < Self.intersectionArea($1.frame, target)
+                }.flatMap { Self.intersectionArea($0.frame, target) > 0 ? $0.id : nil }
+            }
+            if let expected = binding.graphicsWindowID, let currentGraphicsID, expected != currentGraphicsID {
+                guard binding.documentURL != nil else { return (nil, false) }
+                return rediscoverWorkingDocument(binding, in: appWindows)
+            }
+            return (binding, false)
+        }
+        return rediscoverWorkingDocument(binding, in: appWindows)
+    }
+
+    private func rediscoverWorkingDocument(_ binding: WorkingDocumentNativeBinding, in windows: [AXUIElement])
+        -> (binding: WorkingDocumentNativeBinding?, changed: Bool) {
+        guard let url = binding.documentURL else { return (nil, false) }
+        let matches = windows.filter {
+            Self.workingDocumentURL(attribute($0, kAXDocumentAttribute) ?? attribute($0, kAXURLAttribute))?.absoluteString == url.absoluteString
+        }
+        guard matches.count == 1, let window = matches.first else { return (nil, false) }
+        let frame = frame(of: window)
+        let graphicsID = frame.flatMap { target in graphicsWindows(of: binding.pid).max {
+            Self.intersectionArea($0.frame, target) < Self.intersectionArea($1.frame, target)
+        }.flatMap { Self.intersectionArea($0.frame, target) > 0 ? $0.id : nil } }
+        return (WorkingDocumentNativeBinding(generationID: binding.generationID, revision: binding.revision,
+            pid: binding.pid, application: binding.application, window: window,
+            accessibilityIdentity: String(CFHash(window)), graphicsWindowID: graphicsID,
+            title: stringAttribute(window, kAXTitleAttribute) ?? binding.title,
+            location: Self.workingDocumentLocation(url), documentURL: url, displayID: binding.displayID), true)
+    }
+
+    private static func workingDocumentURL(_ value: Any?) -> URL? {
+        let raw: String?
+        if let value = value as? String { raw = value }
+        else if let value = value as? URL { raw = value.absoluteString }
+        else if let value = value as? NSURL { raw = value.absoluteString }
+        else { raw = nil }
+        guard let raw, !raw.isEmpty, raw.utf8.count <= 4096,
+              let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
+              ["file", "http", "https"].contains(scheme) else { return nil }
+        return url
+    }
+
+    private static func workingDocumentLocation(_ url: URL) -> String? {
+        if url.isFileURL { return url.standardizedFileURL.path }
+        guard let host = url.host else { return nil }
+        return host + (url.path.isEmpty ? "" : url.path)
+    }
+
+    private static func intersectionArea(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
+        let intersection = lhs.intersection(rhs)
+        return intersection.isNull || intersection.isEmpty ? 0 : intersection.width * intersection.height
     }
 
     /// Ends task tracking. When cleanup is enabled, only new windows currently
@@ -284,6 +515,8 @@ final class AccessibilityController {
         observationMagnifierSource = nil
         activeMagnifierAction = nil
         manualTargetPID = nil
+        workingDocumentSelections.removeAll()
+        workingDocumentBinding = nil
         taskDisplayOverrideID = nil
         lock.unlock()
 
@@ -398,7 +631,8 @@ final class AccessibilityController {
         guard let staged = try? stageSnapshot(on: display) else {
             return AccessibilitySnapshot(revision: "", elements: [], applications: [], resultDestinations: [],
                 installedApplications: [], systemContext: [:],
-                completeness: ["version": 1, "state": "partial", "reason_counts": ["collection_failed": 1]])
+                completeness: ["version": 1, "state": "partial", "reason_counts": ["collection_failed": 1]],
+                workingDocument: nil)
         }
         try? staged.publish()
         return staged.snapshot
@@ -487,6 +721,9 @@ final class AccessibilityController {
         let revision = UUID().uuidString
         var observedGraphics: [pid_t: [AutomationGraphicsWindow]] = [:]
         var observedApps: [pid_t: AutomationApplicationIdentity] = [:]
+        let workingDocument = TaskOwnership.current.flatMap { self.workingDocumentInfo(generationID: $0.id) }
+        let workingDocumentGeneration = TaskOwnership.current?.id
+        let workingDocumentIsActive = workingDocument?["state"] as? String == "active"
 
         let apps = orderedApplicationsForSnapshot(on: display)
         graph?.retainProcesses(Set(apps.map(\.processIdentifier)))
@@ -574,9 +811,15 @@ final class AccessibilityController {
                 },
                 "windows": windowRecords.compactMap { record -> [String: Any]? in
                     guard let serialized = serializedAccessibilityFrame(record.frame) else { return nil }
-                    return ["title": stringAttribute(record.element, kAXTitleAttribute) ?? "",
+                    var row: [String: Any] = ["title": stringAttribute(record.element, kAXTitleAttribute) ?? "",
                             "window_id": record.id, "focused": record.focused,
                             "topmost_on_agent_screen": record.topmost, "frame": serialized]
+                    if workingDocumentIsActive,
+                       let workingDocumentGeneration,
+                       self.isWorkingDocumentWindow(record.element, pid: pid, generationID: workingDocumentGeneration) {
+                        row["working_document"] = true
+                    }
+                    return row
                 } + (visibleWindows.isEmpty ? cgFrames.compactMap { rectangle -> [String: Any]? in
                     guard let serialized = serializedAccessibilityFrame(rectangle) else { return nil }
                     return ["frame": serialized, "source": "core_graphics"]
@@ -634,7 +877,8 @@ final class AccessibilityController {
                 }
                 return row
             },
-            systemContext: systemContext(), completeness: collection.metadata
+            systemContext: systemContext(), completeness: collection.metadata,
+            workingDocument: workingDocument
         )
         // Compare full target labels/geometry and full editable text in memory;
         // prompt clipping must not hide a change. Secure values are never read.
@@ -664,6 +908,7 @@ final class AccessibilityController {
         let destinationSignature = try ObservationConsistency.resultDestinationSignature(resultDestinations)
         let signature = String(decoding: try JSONSerialization.data(withJSONObject:
             ["controls": controls, "collection_gaps": collection.reasonCounts,
+             "working_document": workingDocument.map { $0 as Any } ?? (NSNull() as Any),
              "result_destinations": destinationSignature], options: [.sortedKeys]), as: UTF8.self)
         let lease = TaskOwnership.current
         return StagedAccessibilitySnapshot(snapshot: snapshot, consistencySignature: signature, publish: { [self] in
@@ -1238,8 +1483,10 @@ final class AccessibilityController {
         let pid = try record?.pid ?? actionPID(action, on: display,
             fallbackPoint: (action["x"] != nil && action["y"] != nil) ? point(from: action, display: display) : nil)
         try ensureAllowedOnDisplay(pid, display: display)
+        try validateWorkingDocumentTarget(action: action, record: record, pid: pid, display: display)
         try await beginVerifiedInput(to: pid)
         defer { scheduleInputRestoration(pid) }
+        try validateWorkingDocumentTarget(action: action, record: record, pid: pid, display: display)
         if let record { try validateRecord(record, action: action, on: display) }
         else if ["click", "double_click", "scroll"].contains(type) {
             try validateCoordinateWindows(pid, on: display)
@@ -1434,6 +1681,8 @@ final class AccessibilityController {
                             try self.validatePointerHit(coordinateRecord, at: point)
                         }
                     }
+                    try self.validateWorkingDocumentTarget(action: action, record: record ?? coordinateRecord,
+                                                           pid: pid, display: display, point: point)
                     if !magnifierPublished {
                         magnifierPublished = true
                         self.publishActionMagnifier(type: type, record: record ?? coordinateRecord,
@@ -1451,7 +1700,9 @@ final class AccessibilityController {
                 throw AccessibilityActionError.invalidAction("key requires a key name")
             }
             let modifiers = action["modifiers"] as? [String] ?? []
-            try postKey(key, modifiers: modifiers, to: pid)
+            try postKey(key, modifiers: modifiers, to: pid, preflight: {
+                try self.validateWorkingDocumentTarget(action: action, record: nil, pid: pid, display: display)
+            })
             return "Sent the \(key) key"
 
         case .scroll:
@@ -1476,6 +1727,7 @@ final class AccessibilityController {
                 point = CGPoint(x: rectangle.midX, y: rectangle.midY)
             }
             try ensureAllowedOnDisplay(pid, display: display)
+            try validateWorkingDocumentTarget(action: action, record: record, pid: pid, display: display, point: point)
             rememberManualTarget(pid)
             let deltaX = intValue(action["delta_x"]) ?? 0
             let deltaY = intValue(action["delta_y"]) ?? 0
@@ -1486,6 +1738,11 @@ final class AccessibilityController {
                 deltaX: deltaX,
                 deltaY: deltaY,
                 on: display,
+                preflight: {
+                    if let record { try self.validateRecord(record, action: action, on: display) }
+                    try self.validateWorkingDocumentTarget(action: action, record: record, pid: pid,
+                                                           display: display, point: point)
+                },
                 onResolvedPoint: { resolvedPoint in
                     guard !magnifierPublished else { return }
                     magnifierPublished = true
@@ -2871,6 +3128,57 @@ final class AccessibilityController {
             current: targetIdentity(record.element, application: applicationIdentity(app), window: currentWindow),
             sameWindow: sameWindow, enabled: boolAttribute(record.element, kAXEnabledAttribute) != false,
             displayFrame: display.frame)
+        try validateWorkingDocumentTarget(action: action, record: record, pid: record.pid, display: display)
+    }
+
+    private func validateWorkingDocumentTarget(action: [String: Any], record: ElementRecord?,
+                                               pid: pid_t, display: DisplayDescriptor,
+                                               point: CGPoint? = nil) throws {
+        guard let stored = lock.withLock({ workingDocumentBinding }),
+              stored.generationID == (TaskOwnership.current?.id ?? taskGenerationID) else { return }
+        let refreshed = refreshWorkingDocumentBinding(stored)
+        guard let binding = refreshed.binding else { throw AccessibilityActionError.workingDocumentLost }
+        if refreshed.changed { installWorkingDocumentBinding(binding, generationID: binding.generationID) }
+        // Other applications remain available to the task. The binding only
+        // constrains actions routed into the selected document's application.
+        guard pid == binding.pid else { return }
+        if let record {
+            let role = record.role
+            let menuAction = role.hasPrefix("AXMenu") || role == "AXMenuBar"
+            let expectedWindow = record.window ?? (role == "AXWindow" ? record.element : nil)
+            if menuAction || action["type"] as? String == "key" {
+                let focused = accessibilityElement(AXUIElementCreateApplication(pid), kAXFocusedWindowAttribute)
+                guard let focused, window(focused, belongsTo: binding.window) else {
+                    throw AccessibilityActionError.workingDocumentTargetMismatch
+                }
+            } else if let expectedWindow, window(expectedWindow, belongsTo: binding.window) {
+                return
+            } else {
+                throw AccessibilityActionError.workingDocumentTargetMismatch
+            }
+            return
+        }
+        if let point {
+            guard let boundFrame = frame(of: binding.window), boundFrame.contains(point) else {
+                throw AccessibilityActionError.workingDocumentTargetMismatch
+            }
+            return
+        }
+        let focused = accessibilityElement(AXUIElementCreateApplication(pid), kAXFocusedWindowAttribute)
+        guard let focused, window(focused, belongsTo: binding.window) else {
+            throw AccessibilityActionError.workingDocumentTargetMismatch
+        }
+    }
+
+    private func window(_ candidate: AXUIElement, belongsTo selected: AXUIElement) -> Bool {
+        var current: AXUIElement? = candidate
+        var visited: Set<UInt> = []
+        for _ in 0..<32 {
+            guard let element = current, visited.insert(CFHash(element)).inserted else { break }
+            if CFEqual(element, selected) { return true }
+            current = accessibilityElement(element, kAXParentAttribute)
+        }
+        return false
     }
 
     private func applicationIdentity(_ app: NSRunningApplication) -> AutomationApplicationIdentity {
@@ -3464,6 +3772,7 @@ final class AccessibilityController {
         deltaX: Int,
         deltaY: Int,
         on display: DisplayDescriptor,
+        preflight: () throws -> Void = {},
         onResolvedPoint: ((CGPoint) -> Void)? = nil
     ) throws -> Bool {
         let previouslyActiveApp = activateForTargetedInput(pid)
@@ -3495,9 +3804,11 @@ final class AccessibilityController {
         try TaskOwnership.commit {
             defer { if let originalPointer { CGWarpMouseCursorPosition(originalPointer) } }
             try validateEventGeometry(on: display)
+            try preflight()
             move?.post(tap: .cgSessionEventTap)
             Thread.sleep(forTimeInterval: 0.025)
             try validateEventGeometry(on: display)
+            try preflight()
             event.location = resolvedPoint
             event.post(tap: .cgSessionEventTap)
         }

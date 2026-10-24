@@ -64,7 +64,7 @@ EFFECTS = {
     Phase.EXECUTING: frozenset({"execute", "read"}),
     Phase.RECOVERING: frozenset({"connect", "read", "receipt"}),
     Phase.RECONCILING: frozenset({"observe", "read", "receipt"}),
-    Phase.WAITING_INPUT: frozenset({"secure_input", "execute"}),
+    Phase.WAITING_INPUT: frozenset({"secure_input", "execute", "read"}),
     Phase.VERIFYING: frozenset({"observe", "read", "verify", "complete"}),
     Phase.DRAINING: frozenset({"cleanup"}),
     Phase.FINISHED: frozenset(),
@@ -147,6 +147,12 @@ class TaskContext:
     instruction_revision: int = 0
     correction_key: Any = None
     pending_correction_message: dict | None = None
+    working_document_revision: int = 0
+    working_document_key: Any = None
+    pending_working_document_message: dict | None = None
+    pending_task_control: dict | None = None
+    working_document: dict | None = None
+    working_document_update_handler: Any = None
     machine: ExecutionMachine = field(default_factory=ExecutionMachine)
     ledger: Any = None
     runtime_state: Any = None
@@ -200,6 +206,10 @@ class TaskContext:
 class InstructionSuperseded(RuntimeError):
     """A terminal provider response belongs to an instruction revision that was superseded."""
     superseded_instructions = True
+
+
+class WorkingDocumentSuperseded(InstructionSuperseded):
+    """A response or action belongs to a prior selected-document binding."""
 
 
 current_task: ContextVar[TaskContext | None] = ContextVar("task_execution_context", default=None)

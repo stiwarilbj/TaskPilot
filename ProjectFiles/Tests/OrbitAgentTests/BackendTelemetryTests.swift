@@ -153,12 +153,13 @@ final class BackendPhaseFixtureTests: XCTestCase {
             revision=fields.pop('instruction_revision', 0)
             if kind == 'complete':
                 request=dict(kind='bridge_request', task_generation_id=config['task_generation_id'],
-                    instruction_revision=revision, request_id=str(uuid.uuid4()), method='completion_gate', params={})
+                    instruction_revision=revision, working_document_revision=0,
+                    request_id=str(uuid.uuid4()), method='completion_gate', params={})
                 print(json.dumps(request), flush=True)
                 response=json.loads(sys.stdin.readline())
                 assert response.get('ok') and response.get('result', {}).get('accepted') is True
             print(json.dumps(dict(kind=kind, task_generation_id=config['task_generation_id'],
-                instruction_revision=revision, **fields)), flush=True)
+                instruction_revision=revision, working_document_revision=0, **fields)), flush=True)
         """ + "\n" + body + "\n").write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
         return url

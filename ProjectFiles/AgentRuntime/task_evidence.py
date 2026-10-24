@@ -23,7 +23,7 @@ from task_inputs import TaskInputBindings
 from expected_effects import ExpectedEffect, ExpectedEffectError, validate_expectation
 from observation_context import coordinate_targets, observation_indexes
 
-CHECKLIST_VERSION = 9
+CHECKLIST_VERSION = 10
 RESULT_BROWSER_BUNDLE_IDS = frozenset({
     "com.apple.Safari", "com.apple.SafariTechnologyPreview",
     "com.google.Chrome", "com.google.Chrome.beta", "com.google.Chrome.canary", "com.google.Chrome.dev",
@@ -422,6 +422,25 @@ class TaskEvidenceLedger:
             if requirement.get("state") != "superseded":
                 requirement["state"] = "invalidated" if requirement.get("evidence_ids") else "pending"
             requirement["evidence_ids"] = []
+        self.refresh()
+
+    def apply_working_document_revision(self) -> None:
+        """Invalidate target-sensitive proof without discarding execution history."""
+        self.coverage_complete = False
+        self.local_complete_grammar = False
+        self.observation_id = None
+        self.current_observation = None
+        self.observation_checks.clear()
+        target_sensitive = OBSERVATION_CHECKS | {"observation", "requirement_observed"}
+        for evidence in self.evidence.values():
+            if evidence["valid"] and (evidence["mutable"] or evidence["fact"].get("type") in target_sensitive):
+                evidence["valid"] = False
+        for requirement in self.requirements.values():
+            if requirement.get("state") == "superseded":
+                continue
+            if requirement.get("check", {}).get("type") in OBSERVATION_CHECKS:
+                requirement["state"] = "invalidated" if requirement.get("evidence_ids") else "pending"
+                requirement["evidence_ids"] = []
         self.refresh()
 
     def canonical_entries(self, entries: list[dict], observation: dict | None = None) -> list[dict]:

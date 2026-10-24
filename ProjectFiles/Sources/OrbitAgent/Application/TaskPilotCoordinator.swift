@@ -122,6 +122,10 @@ final class TaskPilotCoordinator: ObservableObject {
     @Published private(set) var taskCorrectionSession: TaskCorrectionSession?
     @Published private(set) var taskProgressMap: TaskProgressMap?
     @Published private(set) var taskWaitDetails: AgentTaskWaitSnapshot?
+    @Published private(set) var workingDocumentPresentation: WorkingDocumentPresentation?
+    @Published private(set) var workingDocumentNotice: String?
+    private var pendingWorkingDocumentUpdateID: String?
+    private var workingDocumentPresentationBeforeUpdate: WorkingDocumentPresentation?
     @Published var showingSetup = false
     @Published private(set) var runsOnMainDisplay = UserDefaults.standard.bool(
         forKey: "OrbitAgent.runsOnMainDisplay"
@@ -280,6 +284,13 @@ final class TaskPilotCoordinator: ObservableObject {
         [.running, .paused, .waitingForUser, .takingOver, .stopping].contains(runState)
     }
 
+    var canSelectWorkingDocument: Bool {
+        guard isActive, runState != .stopping, let lease = currentTaskLease,
+              currentTaskAuthorization != nil, !lease.hasPendingWorkingDocumentUpdate,
+              taskCorrectionSession?.state != .pending else { return false }
+        return lease.state == .running || lease.state == .paused
+    }
+
     var canSubmitUserInput: Bool {
         userInputRequest != nil &&
         !userInputDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -335,6 +346,11 @@ final class TaskPilotCoordinator: ObservableObject {
             guard let self else { return "Live control disconnected" }
             return try self.accessibility.performViewerInteraction(interaction, on: display)
         }
+        viewer.workingDocumentCandidateProvider = { [weak self] display in
+            self?.accessibility.workingDocumentCandidates(on: display) ?? []
+        }
+        viewer.canSelectWorkingDocument = { [weak self] in self?.canSelectWorkingDocument == true }
+        viewer.onWorkingDocumentSelection = { [weak self] candidate in self?.selectWorkingDocument(candidate) }
     }
 
     // MARK: - Setup and readiness
@@ -1324,6 +1340,10 @@ final class TaskPilotCoordinator: ObservableObject {
         }
         currentTaskAuthorization = authorization
         currentTaskRequest = request
+        workingDocumentPresentation = nil
+        workingDocumentNotice = nil
+        pendingWorkingDocumentUpdateID = nil
+        workingDocumentPresentationBeforeUpdate = nil
         currentTaskStartedAt = authorization.startedAt
         currentTaskWasQueued = queuedTask != nil
         if var correction = taskCorrectionSession {
@@ -1499,6 +1519,96 @@ final class TaskPilotCoordinator: ObservableObject {
         taskCorrectionSession = TaskCorrectionSession(generationID: lease.id, draft: TaskComposerDraft())
     }
 
+    func selectWorkingDocument(_ candidate: WorkingDocumentCandidate?) {
+        guard canSelectWorkingDocument, let lease = currentTaskLease else { return }
+        guard candidate == nil || candidate?.displayID == agentDisplay?.id else {
+            workingDocumentNotice = "Choose a window visible on the current Live View display."
+            return
+        }
+        if candidate == nil && workingDocumentPresentation == nil { return }
+        let revision = lease.currentWorkingDocumentRevision + 1
+        let update = WorkingDocumentUpdate(id: UUID().uuidString.lowercased(), generationID: lease.id,
+                                           revision: revision, candidate: candidate)
+        do {
+            try runtime.prepareWorkingDocumentUpdate(update, generationID: lease.id)
+        } catch {
+            workingDocumentNotice = "The task changed before this document could be selected. Try again."
+            return
+        }
+        workingDocumentPresentationBeforeUpdate = workingDocumentPresentation
+        pendingWorkingDocumentUpdateID = update.id
+        if let candidate {
+            workingDocumentPresentation = WorkingDocumentPresentation(
+                generationID: lease.id, revision: revision, application: candidate.applicationName,
+                title: candidate.title, location: candidate.location, state: .pending)
+        } else if var current = workingDocumentPresentation {
+            current.revision = revision
+            current.state = .pending
+            workingDocumentPresentation = current
+        }
+        workingDocumentNotice = nil
+        do {
+            try runtime.sendWorkingDocumentUpdate(update, generationID: lease.id)
+        } catch {
+            // A failed send must not release an update barrier that may already
+            // have entered the private pipe. Stop revokes it and drains safely.
+            status = "Document selection delivery is uncertain. Stopping safely."
+            runState = .stopping
+            lease.revoke()
+            runtime.stop()
+        }
+    }
+
+    func removeWorkingDocumentReference() {
+        guard workingDocumentPresentation != nil else { return }
+        selectWorkingDocument(nil)
+    }
+
+    func requestWorkingDocumentPicker() {
+        guard canSelectWorkingDocument else { return }
+        viewer.openWorkingDocumentPicker()
+    }
+
+    private func acceptWorkingDocumentUpdate(id: String, generationID: String, revision: UInt64,
+                                             document: [String: Any]?) {
+        guard currentTaskLease?.id == generationID,
+              pendingWorkingDocumentUpdateID == id,
+              var presentation = workingDocumentPresentation,
+              presentation.generationID == generationID, presentation.revision == revision,
+              presentation.state == .pending else { return }
+        if let document {
+            guard document["state"] as? String == "active",
+                  (document["revision"] as? Int) == Int(revision),
+                  let application = document["application"] as? String,
+                  let title = document["title"] as? String else {
+                // The native binding may already have changed, so restoring the
+                // previous label would make the UI describe the wrong target.
+                // Retire the task rather than leave a pending or false-active
+                // document reference in place.
+                pendingWorkingDocumentUpdateID = nil
+                workingDocumentPresentationBeforeUpdate = nil
+                workingDocumentPresentation = nil
+                workingDocumentNotice = "The selected document could not be verified. The task is stopping safely."
+                stop()
+                return
+            }
+            presentation.application = application
+            presentation.title = title
+            presentation.location = document["location"] as? String
+            presentation.state = .active
+            workingDocumentPresentation = presentation
+        } else {
+            workingDocumentPresentation = nil
+        }
+        pendingWorkingDocumentUpdateID = nil
+        workingDocumentPresentationBeforeUpdate = nil
+        if var request = userInputRequest, request.taskGenerationID == generationID {
+            request.workingDocumentRevision = revision
+            userInputRequest = request
+        }
+        workingDocumentNotice = nil
+    }
+
     func updateTaskCorrectionDraft(_ draft: TaskComposerDraft) {
         guard var session = taskCorrectionSession, session.state == .editing else { return }
         session.draft = draft
@@ -1625,9 +1735,13 @@ final class TaskPilotCoordinator: ObservableObject {
         guard let request = userInputRequest, canSubmitUserInput else { return }
         let value = userInputDraft
         let accepted = runtime.submitUserInput(requestID: request.requestID, value: value,
-            taskGenerationID: request.taskGenerationID, instructionRevision: request.instructionRevision)
+            taskGenerationID: request.taskGenerationID, instructionRevision: request.instructionRevision,
+            workingDocumentRevision: request.workingDocumentRevision)
+        guard accepted else {
+            status = "The secure input is still waiting while the working document update is resolved."
+            return
+        }
         userInputDraft = ""
-        guard accepted else { return }
         userInputRequest = nil
         runState = .running
         updateTaskWaitLocally(phase: .reconciling, waitingFor: "Continuing after secure input",
@@ -1728,6 +1842,28 @@ final class TaskPilotCoordinator: ObservableObject {
             acceptTaskWait(snapshot)
         case let .instructionCorrectionApplied(id, generationID, revision):
             acceptInstructionCorrection(id: id, generationID: generationID, revision: revision)
+        case let .workingDocumentApplied(id, generationID, revision, document):
+            acceptWorkingDocumentUpdate(id: id, generationID: generationID, revision: revision, document: document)
+        case let .workingDocumentNeedsReselection(generationID, revision, application, title):
+            guard currentTaskLease?.id == generationID,
+                  workingDocumentPresentation?.revision == revision else { return }
+            workingDocumentPresentation?.state = .needsReselection
+            workingDocumentPresentation?.application = application
+            workingDocumentPresentation?.title = title
+            workingDocumentNotice = "Choose the working document again before continuing."
+            if runState != .paused && runState != .waitingForUser && runState != .takingOver {
+                status = "Waiting for the working document to be selected again"
+            }
+        case let .workingDocumentUpdateRejected(id, generationID, revision, message):
+            guard currentTaskLease?.id == generationID,
+                  pendingWorkingDocumentUpdateID == id,
+                  workingDocumentPresentation?.generationID == generationID,
+                  workingDocumentPresentation?.revision == revision,
+                  workingDocumentPresentation?.state == .pending else { return }
+            pendingWorkingDocumentUpdateID = nil
+            workingDocumentPresentation = workingDocumentPresentationBeforeUpdate
+            workingDocumentPresentationBeforeUpdate = nil
+            workingDocumentNotice = message
         case .userInputRequired(let request):
             agentCursor.hide()
             viewer.clearActionMagnifier()
@@ -1966,6 +2102,10 @@ final class TaskPilotCoordinator: ObservableObject {
             taskCorrectionSession = correction
         }
         currentTaskRequest = nil
+        workingDocumentPresentation = nil
+        workingDocumentNotice = nil
+        pendingWorkingDocumentUpdateID = nil
+        workingDocumentPresentationBeforeUpdate = nil
         currentTaskStartedAt = nil
         currentTaskWasQueued = false
         currentTaskAuthorization = nil

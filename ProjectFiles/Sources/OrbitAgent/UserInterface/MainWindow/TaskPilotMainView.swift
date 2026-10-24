@@ -10,6 +10,7 @@ struct TaskPilotMainView: View {
     @FocusState private var promptFocused: Bool
     @FocusState private var userInputFocused: Bool
     @State private var expandedWaitIdentity: String?
+    @State private var showingWorkingDocumentDetails = false
     @AppStorage(TaskPilotAppearancePreferences.themeKey) private var themeRawValue = TaskPilotTheme.light.rawValue
     @AppStorage(TaskPilotAppearancePreferences.inputFontSizeKey) private var inputFontSize = TaskPilotAppearancePreferences.defaultInputFontSize
     @AppStorage(TaskPilotAppearancePreferences.outputFontSizeKey) private var outputFontSize = TaskPilotAppearancePreferences.defaultOutputFontSize
@@ -356,11 +357,21 @@ struct TaskPilotMainView: View {
                 Label("Current task", systemImage: "play.circle.fill")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.indigo)
-                Text(request)
-                    .font(.callout.weight(.medium))
-                    .lineLimit(2)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                if let workingDocument = model.workingDocumentPresentation,
+                   workingDocument.generationID == model.currentTaskGenerationID {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(alignment: .top, spacing: 10) {
+                            currentRequestText(request)
+                            workingDocumentReference(workingDocument)
+                        }
+                        VStack(alignment: .leading, spacing: 7) {
+                            currentRequestText(request)
+                            workingDocumentReference(workingDocument)
+                        }
+                    }
+                } else {
+                    currentRequestText(request)
+                }
             }
 
             if let details = model.taskWaitDetails {
@@ -415,6 +426,93 @@ struct TaskPilotMainView: View {
         .overlay {
             RoundedRectangle(cornerRadius: 12)
                 .stroke(theme.borderColor, lineWidth: 1)
+        }
+    }
+
+    private func currentRequestText(_ request: String) -> some View {
+        Text(request)
+            .font(.callout.weight(.medium))
+            .lineLimit(2)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func workingDocumentReference(_ document: WorkingDocumentPresentation) -> some View {
+        Button {
+            showingWorkingDocumentDetails = true
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: document.state == .needsReselection ? "doc.badge.ellipsis" : "doc.text")
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(document.summary)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                    Text(document.stateLabel)
+                        .font(.caption2)
+                        .foregroundStyle(document.state == .active ? Color.green : Color.orange)
+                        .lineLimit(1)
+                }
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .background(theme.surfaceColor.opacity(0.72), in: RoundedRectangle(cornerRadius: 9))
+            .overlay {
+                RoundedRectangle(cornerRadius: 9)
+                    .stroke(theme.borderColor, lineWidth: 1)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 9))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(document.summary), \(document.stateLabel). Show working document details.")
+        .popover(isPresented: $showingWorkingDocumentDetails, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Working document", systemImage: "doc.text.magnifyingglass")
+                    .font(.headline)
+                Text(document.title.isEmpty ? "Untitled window" : document.title)
+                    .font(.body.weight(.semibold))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                Label(document.application, systemImage: "app")
+                    .font(.callout)
+                if let location = document.location {
+                    Label(location, systemImage: "folder")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(3)
+                }
+                Label(document.stateLabel, systemImage: document.state == .active ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(document.state == .active ? .green : .orange)
+
+                if let notice = model.workingDocumentNotice {
+                    Text(notice)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                HStack {
+                    Button("Change") {
+                        showingWorkingDocumentDetails = false
+                        openWindow(id: "agent-viewer")
+                        Task { @MainActor in
+                            await Task.yield()
+                            model.requestWorkingDocumentPicker()
+                        }
+                    }
+                    .disabled(!model.canSelectWorkingDocument)
+                    .accessibilityLabel("Choose a different working document in Live View")
+                    Spacer()
+                    Button("Remove reference", role: .destructive) {
+                        showingWorkingDocumentDetails = false
+                        model.removeWorkingDocumentReference()
+                    }
+                    .disabled(!model.canSelectWorkingDocument)
+                }
+            }
+            .padding(16)
+            .frame(width: 320, alignment: .leading)
         }
     }
 

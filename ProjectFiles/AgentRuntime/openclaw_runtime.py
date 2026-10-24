@@ -53,6 +53,7 @@ from provider_errors import ProviderRequestError, facts as provider_error_facts,
 from action_receipts import BridgeReplyLost, RuntimeInbox, reconcile_receipt
 from local_budget import LocalBudget, LocalBudgetExpired, current_budget, local_scope, local_operation
 from task_execution import (TaskContext, Phase, ExecutionStateError, InstructionSuperseded,
+                            WorkingDocumentSuperseded,
                             current_task)
 from task_wait import TaskWaitPublisher, WAIT_PRESENTATION_VERSION
 from bounded_transport import ACPTransport, TransportFailure, FRAME_BYTES, read_frames, write_frame
@@ -128,11 +129,15 @@ STANDARD_LOCATIONS = {
     "music": "~/Music",
 }
 
+WORKING_DOCUMENT_PROTOCOL_VERSION = 1
+
 _active_acp_process: subprocess.Popen[str] | None = None
 _bridge_observation_revision: str | None = None
 _task_generation_id: str | None = None
 _instruction_revision = 0
 _instruction_correction_key = None
+_working_document_revision = 0
+_working_document_update_key = None
 _observation_keywords: list[str] = []
 _exact_input_references: list[dict[str, Any]] = []
 _runtime_inbox: RuntimeInbox | None = None
@@ -151,6 +156,8 @@ def _task_value(name: str) -> Any:
         return getattr(context, name)
     if name == "generation": return _task_generation_id
     if name == "correction_key": return _instruction_correction_key
+    if name == "working_document_revision": return _working_document_revision
+    if name == "working_document_key": return _working_document_update_key
     return globals()["_" + name]
 
 
@@ -203,8 +210,57 @@ def instruction_correction_pending() -> bool:
     context = current_task.get()
     return bool(context is not None and (
         context.pending_correction_message is not None or
-        (context.correction_key and runtime_inbox().has_instruction_correction())
+        (context.correction_key and runtime_inbox().has_instruction_correction()) or
+        context.pending_working_document_message is not None or
+        context.pending_task_control is not None or
+        (context.working_document_key and runtime_inbox().has_working_document_update())
     ))
+
+
+def receive_pending_task_control(timeout: float | None = 0) -> dict[str, Any]:
+    context = current_task.get()
+    if context is None:
+        raise InstructionSuperseded("No task control is available to apply")
+    if context.pending_task_control is not None:
+        control = context.pending_task_control
+        context.pending_task_control = None
+        return control
+    if context.pending_correction_message is not None or (
+            context.correction_key and runtime_inbox().has_instruction_correction()):
+        return {"control_kind": "instruction_correction", **receive_instruction_correction(timeout)}
+    if context.pending_working_document_message is not None:
+        message = context.pending_working_document_message
+        context.pending_working_document_message = None
+    else:
+        if not context.working_document_key:
+            raise InstructionSuperseded("No working document update is available")
+        line = runtime_inbox().take_working_document_update(timeout)
+        try:
+            message = json.loads(line)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("TaskPilot received malformed working-document control data") from error
+    if (not isinstance(message, dict) or message.get("kind") != "working_document_update" or
+            message.get("task_generation_id") != context.generation or message.get("version") != 1 or
+            type(message.get("binding_revision")) is not int or
+            message["binding_revision"] != context.working_document_revision + 1):
+        raise RuntimeError("TaskPilot received a working-document update for another task or revision")
+    identifier = message.get("update_id")
+    try:
+        canonical = str(uuid.UUID(identifier)).lower()
+    except (ValueError, TypeError, AttributeError) as error:
+        raise RuntimeError("TaskPilot received an invalid working-document update ID") from error
+    if canonical != identifier:
+        raise RuntimeError("TaskPilot received a noncanonical working-document update ID")
+    selection_id = message.get("selection_id")
+    if selection_id is not None:
+        try:
+            selection_canonical = str(uuid.UUID(selection_id)).lower()
+        except (ValueError, TypeError, AttributeError) as error:
+            raise RuntimeError("TaskPilot received an invalid working-document selection") from error
+        if selection_canonical != selection_id:
+            raise RuntimeError("TaskPilot received a noncanonical working-document selection")
+    return {"control_kind": "working_document_update", "id": canonical,
+            "revision": message["binding_revision"], "selection_id": selection_id}
 
 
 def receive_instruction_correction(timeout: float | None = 0) -> dict[str, Any]:
@@ -304,6 +360,7 @@ def emit(kind: str, **payload: Any) -> None:
     context = current_task.get()
     if _task_value('generation') is not None:
         envelope["instruction_revision"] = _task_value('instruction_revision')
+        envelope["working_document_revision"] = _task_value('working_document_revision')
     print(json.dumps(envelope, separators=(",", ":")), flush=True)
 
 
@@ -565,16 +622,21 @@ def _perform_model_check(path: str, state: RuntimeState, read_only: bool = False
     return any(c["state"] == "verified" for c in checks.values())
 
 
-def bridge_exchange(method: str, display_id: int, params: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
+def bridge_exchange(method: str, display_id: int, params: dict[str, Any], timeout: float | None = None,
+                    working_document_revision: int | None = None) -> dict[str, Any]:
     request_id = str(uuid.uuid4())
     inbox = runtime_inbox()
     generation = _task_value('generation')
     context = current_task.get()
     revision = context.instruction_revision if context is not None else 0
+    binding_revision = (context.working_document_revision if working_document_revision is None and context is not None
+                        else _task_value('working_document_revision') if working_document_revision is None
+                        else working_document_revision)
     key = inbox.register('bridge_response', request_id, generation)
     try:
         emit("bridge_request", request_id=request_id, method=method,
-             instruction_revision=revision, params={"display_id": display_id, **params})
+             instruction_revision=revision, working_document_revision=binding_revision,
+             params={"display_id": display_id, **params})
         response = json.loads(runtime_line(timeout, key=key))
         if not isinstance(response, dict):
             raise NativeProtocolError("bridge_response must be an object")
@@ -582,12 +644,20 @@ def bridge_exchange(method: str, display_id: int, params: dict[str, Any], timeou
             raise RuntimeError("TaskPilot received a bridge reply for a different task")
         if context is not None and response.get("instruction_revision") != revision:
             raise InstructionSuperseded("The native response belongs to an older instruction revision")
+        if (generation is not None or context is not None) and response.get("working_document_revision") != binding_revision:
+            raise WorkingDocumentSuperseded("The native response belongs to another working document revision")
         if response.get("error_code") == "instruction_superseded":
             if method == "act" and context is not None:
                 action_id = params.get("action_id")
                 if action_id and context.machine.pending_action == action_id:
                     context.machine.resolve(action_id)
             raise InstructionSuperseded(response.get("error") or "A newer correction superseded this decision")
+        if response.get("error_code") == "working_document_superseded":
+            if method == "act" and context is not None:
+                action_id = params.get("action_id")
+                if action_id and context.machine.pending_action == action_id:
+                    context.machine.resolve(action_id)
+            raise WorkingDocumentSuperseded(response.get("error") or "The working document changed")
         return response
     finally:
         inbox.transport.unregister(key)
@@ -607,10 +677,11 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
         effect = {"act": "execute", "observe": "observe", "action_receipt": "receipt",
                   "check_effect": "read", "wait_file_effect": "read", "recheck": "read",
                   "inspect_command": "read", "wait_for_change": "read",
-                  "completion_gate": "complete"}.get(method)
+                  "completion_gate": "complete", "bind_working_document": "read"}.get(method)
         if effect is None: raise ExecutionStateError("Unknown task bridge operation")
         context.machine.require(effect)
     timeout = params.pop("_reply_timeout", None)
+    working_document_revision = params.pop("_working_document_revision", None)
     if method == "observe":
         params.setdefault("observation_keywords", _task_value('observation_keywords'))
     if method == "act":
@@ -634,7 +705,12 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
     params['local_budget_ms'] = max(1, math.floor(remaining * 1000))
     timeout = remaining if timeout is None else min(timeout, remaining)
     try:
-        response = bridge_exchange(method, display_id, params, timeout)
+        if context is None and working_document_revision is None:
+            # Keep isolated bridge fixtures and generation-free local helpers
+            # compatible; real task calls always carry the binding revision.
+            response = bridge_exchange(method, display_id, params, timeout)
+        else:
+            response = bridge_exchange(method, display_id, params, timeout, working_document_revision)
         if not isinstance(response, dict) or type(response.get('ok')) is not bool:
             raise NativeProtocolError('bridge_response.ok must be a boolean')
         if response['ok']:
@@ -1695,16 +1771,31 @@ def wait_for_user_input(request_id: str, *, key=None) -> str:
     key = key or inbox.register('user_input_response', request_id, _task_value('generation'))
     try:
         context = current_task.get()
-        if context is not None and context.correction_key:
+        control_keys = []
+        if context is not None:
+            if context.correction_key: control_keys.append(context.correction_key)
+            if context.working_document_key: control_keys.append(context.working_document_key)
+        while control_keys:
             inbox.start()
-            selected, line = inbox.transport.get_any([context.correction_key, key])
+            selected, line = inbox.transport.get_any([*control_keys, key])
+            if selected == key:
+                response = json.loads(line)
+                break
+            try: message = json.loads(line)
+            except (TypeError, ValueError) as error:
+                raise RuntimeError("TaskPilot received malformed task-control data") from error
             if selected == context.correction_key:
-                try:
-                    context.pending_correction_message = json.loads(line)
-                except (TypeError, ValueError) as error:
-                    raise RuntimeError("TaskPilot received malformed correction control data") from error
+                context.pending_correction_message = message
                 raise InstructionSuperseded("A correction arrived while secure input was waiting")
-            response = json.loads(line)
+            context.pending_working_document_message = message
+            update = receive_pending_task_control(timeout=0)
+            handler = context.working_document_update_handler
+            if handler is None:
+                raise WorkingDocumentSuperseded("The working document changed while secure input was waiting")
+            # Apply the target change at this safe boundary while leaving the
+            # secure-input request open. This preserves Pause/secure-input
+            # state and avoids asking the user or model again for the same step.
+            handler(update, preserve_secure_input=True)
         else:
             response = json.loads(runtime_line(key=key))
         value = response.get("value")
@@ -1714,6 +1805,8 @@ def wait_for_user_input(request_id: str, *, key=None) -> str:
             raise RuntimeError("The secure value is unexpectedly long")
         if context is not None and response.get("instruction_revision") != context.instruction_revision:
             raise InstructionSuperseded("Secure input was submitted for superseded instructions")
+        if context is not None and response.get("working_document_revision") != context.working_document_revision:
+            raise WorkingDocumentSuperseded("Secure input was submitted for a superseded working document")
         return value
     finally:
         if owns_key:
@@ -1735,7 +1828,16 @@ def request_and_enter_user_input(
         emit("user_input_required", request_id=request_id, title=target["title"],
              message=target["message"], input_kind=target["input_kind"])
         secret = wait_for_user_input(request_id, key=key)
-        if instruction_correction_pending():
+        while instruction_correction_pending():
+            control = receive_pending_task_control(timeout=0)
+            if control.get("control_kind") == "working_document_update":
+                handler = context.working_document_update_handler if context is not None else None
+                if handler is None:
+                    raise WorkingDocumentSuperseded("The working document changed before secure input delivery")
+                handler(control, preserve_secure_input=True)
+                continue
+            if context is not None:
+                context.pending_task_control = control
             raise InstructionSuperseded("A correction arrived before secure input delivery")
     finally:
         inbox.transport.unregister(key)
@@ -1767,10 +1869,23 @@ def complete_from_decision(decision: dict[str, Any], fallback: str, ledger: Task
             gate = bridge_call("completion_gate", context.display_id)
             if gate.get("accepted") is True:
                 break
+            if gate.get("needs_working_document") is True:
+                publish_task_wait("reconciling", "Choose the working document again",
+                                  operation_key=f"working-document-reselect:{context.working_document_revision}", ledger=ledger)
+                context.pending_task_control = receive_pending_task_control(timeout=None)
+                raise WorkingDocumentSuperseded("Completion is waiting for the selected document to be confirmed again")
+            if gate.get("pending_working_document") is True:
+                publish_task_wait("reconciling", "Applying the selected working document",
+                                  operation_key=f"working-document-update:{context.working_document_revision + 1}", ledger=ledger)
+                context.pending_task_control = receive_pending_task_control(timeout=None)
+                raise WorkingDocumentSuperseded("Completion was held while the working document changed")
             if gate.get("pending_correction") is not True:
                 raise RuntimeError("TaskPilot could not atomically authorize completion for this instruction revision")
             try:
-                context.pending_correction_message = receive_instruction_correction(timeout=5.0)
+                context.pending_task_control = {
+                    "control_kind": "instruction_correction",
+                    **receive_instruction_correction(timeout=5.0),
+                }
             except TimeoutError:
                 # A persistence failure can revoke the temporary dispatch
                 # barrier without sending a correction. Rechecking the native
@@ -1797,8 +1912,18 @@ def compact_observation(observation: dict[str, Any], task: str = "") -> dict[str
     compact = {
         key: value for key, value in observation.items()
         if key not in {"screenshot_path", "agent_cursor", "installed_applications", "elements", "text_recognition",
-                       "result_destinations"}
+                       "result_destinations", "working_document"}
     }
+    working_document = observation.get("working_document")
+    if isinstance(working_document, dict):
+        # The native observation carries process/window identities for local
+        # validation. Only descriptive fields and the binding state belong in
+        # the model-facing observation.
+        compact["working_document"] = {
+            key: working_document[key]
+            for key in ("state", "application", "title", "location", "revision")
+            if key in working_document
+        }
     text = prompt_text_recognition(observation)
     if text is not None: compact['text_recognition'] = text
     installed = observation.get("installed_applications")
@@ -2849,6 +2974,10 @@ def desktop_instruction(
     ledger: TaskEvidenceLedger | None = None,
 ) -> str:
     context = task_capability_context(task, observation)
+    task_context = current_task.get()
+    if task_context is not None and task_context.working_document:
+        working_document = task_context.working_document
+        context["working_document"] = {key: working_document[key] for key in ("state", "application", "title", "location", "revision") if key in working_document}
     if _task_value('command_capabilities'):
         context['command_capabilities'] = [_task_value('command_capabilities')[key] for key in sorted(_task_value('command_capabilities'))]
     examples = relevant_action_examples(context, observation, history)
@@ -2908,6 +3037,10 @@ def desktop_instruction(
         condition = {**condition, "failed_action": recent[-1].get("action"), "result": recent[-1].get("result")}
     rules = decision_rules(bool(observation.get("elements")), condition,
                            bool(observation.get('text_recognition', {}).get('targets')))
+    if context.get("working_document"):
+        rules += ("The user selected a working document. Treat it as the primary target for references such as ‘this document’ or ‘this spreadsheet’; "
+                  "use only a current observation window marked working_document. Other apps remain available when the task explicitly requires them. "
+                  "The selection is not proof of completion. If the selected target is marked needs_reselection, wait for the user to choose it again.\n")
     bounds = [PROMPT_BOUNDS["wait"]] if 'wait' in types else []
     if observation.get('elements'):
         bounds.append('Expected checks: dialog_appeared(pid,title[,window_title]); field_value(element_id,value[,pid]); '
@@ -2989,13 +3122,18 @@ def verification_instruction(
                      '"proofs":[{"requirement_id":"r1","evidence_ids":["e1"],"rationale":"<what the evidence proves>"}]}. '
                      'These IDs are illustrations; use supplied IDs.\n')
     inputs = ledger.inputs if ledger is not None and ledger.inputs.entries else None
+    capability_context = task_capability_context(task, observation)
+    task_context = current_task.get()
+    if task_context is not None and task_context.working_document:
+        capability_context["working_document"] = {key: task_context.working_document[key]
+            for key in ("state", "application", "title", "location", "revision") if key in task_context.working_document}
     return compile_prompt("completion",
         instructions=COMPLETION_RULES + (verification_checklist_instruction(ledger) if ledger else "")
                      + ("Vision labels/crops are provisional text, not proof of control role, enabled state, focus or successful execution.\n"
                         if observation.get('text_recognition', {}).get('targets') else "")
                      + (task_guidance + "\n" if task_guidance else "")
                      + (input_reference_rules(completion=True) if inputs else ""), examples=examples,
-        task=task, context=prompt_capability_context(task_capability_context(task, observation)),
+        task=task, context=prompt_capability_context(capability_context),
         observation=prompt_observation(observation, task), history=[], progress={},
         checklist=verification_evidence(task, history, ledger),
         inputs=inputs.prompt_state() if inputs else None)
@@ -3297,6 +3435,8 @@ def routed_json_prompt(
     image = screenshot_buffer(screenshot_path, (observation or {}).get("observation_revision"))
     identity = (STATE_FINGERPRINT_VERSION, _task_value('generation'),
         context.instruction_revision if context is not None else 0, VALIDATION_VERSION, CONTRACT_HASH,
+        context.working_document_revision if context is not None else 0,
+        json.dumps(context.working_document, sort_keys=True, separators=(",", ":")) if context is not None and context.working_document else None,
         CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, LOCAL_CHANGE_VERSION, COMMAND_CAPABILITY_VERSION,
         PROMPT_COMPILER_VERSION, VERIFICATION_SESSION_VERSION, COORDINATE_MAPPING_VERSION,
         OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION,
@@ -3337,7 +3477,9 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
     context = TaskContext(task, display_id, _task_value('generation'),
                           exact_input_references=list(_exact_input_references),
                           original_task=task, original_input_references=list(_exact_input_references),
-                          correction_key=_task_value('correction_key'))
+                          correction_key=_task_value('correction_key'),
+                          working_document_revision=_task_value('working_document_revision'),
+                          working_document_key=_task_value('working_document_key'))
     token = current_task.set(context)
     try:
         with screenshot_buffer_scope():
@@ -3363,6 +3505,7 @@ class TaskExecution:
     """
     def __init__(self, context: TaskContext):
         self.c = context
+        context.working_document_update_handler = self.apply_working_document_update
 
     def run(self, openclaw_path: str | None, api_key: str) -> None:
         c = self.c
@@ -3509,6 +3652,27 @@ class TaskExecution:
             c.observation = None
             self.apply_pending_correction()
             c.observation = bridge_call("observe", c.display_id)
+        while isinstance(c.observation.get("working_document"), dict) and c.observation["working_document"].get("state") == "needs_reselection":
+            missing_document = c.observation["working_document"]
+            emit("working_document_needs_reselection",
+                 binding_revision=missing_document.get("revision"),
+                 application=str(missing_document.get("application") or "Unknown app")[:120],
+                 title=str(missing_document.get("title") or "Untitled window")[:240])
+            publish_task_wait("reconciling", "Choose the working document again",
+                operation_key=f"working-document-reselect:{c.working_document_revision}", ledger=c.ledger)
+            c.pending_task_control = receive_pending_task_control(timeout=None)
+            discard_observation_image(c.observation)
+            c.observation = None
+            self.apply_pending_correction()
+            c.observation = bridge_call("observe", c.display_id)
+        observed_document = c.observation.get("working_document")
+        if isinstance(observed_document, dict):
+            c.working_document = observed_document
+            if observed_document.get("state") == "needs_reselection":
+                emit("working_document_needs_reselection",
+                     binding_revision=observed_document.get("revision"),
+                     application=str(observed_document.get("application") or "Unknown app")[:120],
+                     title=str(observed_document.get("title") or "Untitled window")[:240])
         c.screenshot_path = Path(str(c.observation.get("screenshot_path") or ""))
         if not c.screenshot_path.is_file():
             raise RuntimeError(f"{PRODUCT_NAME} did not provide a readable screen image")
@@ -3645,13 +3809,15 @@ class TaskExecution:
             return
         else:
             raise ExecutionStateError("Unknown task reconciliation reason")
-        c.machine.transition(Phase.OBSERVING)
+        if c.machine.phase != Phase.OBSERVING:
+            c.machine.transition(Phase.OBSERVING)
 
     def prepare_decision(self) -> None:
         c = self.c
         if instruction_correction_pending():
             self.apply_pending_correction()
-            c.machine.transition(Phase.OBSERVING)
+            if c.machine.phase != Phase.OBSERVING:
+                c.machine.transition(Phase.OBSERVING)
             return
         if self.defer_for_evidence():
             c.machine.transition(Phase.OBSERVING)
@@ -3909,7 +4075,11 @@ class TaskExecution:
 
     def apply_pending_correction(self) -> None:
         c = self.c
-        correction = receive_instruction_correction()
+        control = receive_pending_task_control()
+        if control.get("control_kind") == "working_document_update":
+            self.apply_working_document_update(control)
+            return
+        correction = control
         if correction.get("duplicate") is True:
             return
         header = "\n\nUser correction: "
@@ -3951,7 +4121,59 @@ class TaskExecution:
             c.consecutive_evidence_conflicts += 1
             if c.consecutive_evidence_conflicts >= 3:
                 raise RuntimeError("TaskPilot could not reconcile completion evidence after three fresh decisions; completion remains unconfirmed")
-        c.machine.transition(Phase.OBSERVING)
+        if c.machine.phase != Phase.OBSERVING:
+            c.machine.transition(Phase.OBSERVING)
+
+    def apply_working_document_update(self, update: dict[str, Any], *, preserve_secure_input: bool = False) -> bool:
+        c = self.c
+        if update.get("control_kind") != "working_document_update":
+            raise RuntimeError("Invalid working-document update")
+        result = bridge_call(
+            "bind_working_document", c.display_id,
+            update_id=update["id"], binding_revision=update["revision"],
+            selection_id=update.get("selection_id"),
+            _working_document_revision=update["revision"],
+        )
+        if result.get("applied") is not True:
+            emit("working_document_update_rejected", update_id=update["id"],
+                 binding_revision=update["revision"],
+                 message="That window changed before it could be selected. Choose the document again.")
+            if not preserve_secure_input and c.machine.phase != Phase.OBSERVING:
+                c.machine.transition(Phase.OBSERVING)
+            return False
+        binding = result.get("working_document")
+        if binding is not None and (not isinstance(binding, dict) or binding.get("state") != "active"):
+            raise RuntimeError("The selected document could not be bound safely; choose it again in Live View")
+        c.working_document_revision = update["revision"]
+        global _working_document_revision
+        _working_document_revision = update["revision"]
+        c.working_document = binding
+        c.ledger.apply_working_document_revision()
+        c.bridge_observation_revision = None
+        c.action = c.result = c.recovered_result = c.failure = None
+        if not preserve_secure_input:
+            c.decision = c.input_target = None
+        if c.client is not None:
+            c.client.decision_cache = {}
+        c.recovery = ActionRecovery()
+        c.recovery_cycles = RecoveryCycles(rejection_limit=MAX_IDENTICAL_ACTIONS)
+        c.evidence_guard = EvidenceConsistency()
+        c.identical_action_count = 0
+        c.last_action_signature = c.last_screen_digest = ""
+        if not preserve_secure_input:
+            discard_observation_image(c.pending_observation)
+            discard_observation_image(c.observation)
+            c.pending_observation = c.observation = None
+            c.screenshot_path = None
+            c.screenshot_digest = ""
+        c.reconcile_reason = ""
+        presentation = ({key: binding[key] for key in ("state", "application", "title", "location", "revision") if key in binding}
+                        if isinstance(binding, dict) else None)
+        emit("working_document_applied", update_id=update["id"], binding_revision=update["revision"],
+             working_document=presentation)
+        if not preserve_secure_input and c.machine.phase != Phase.OBSERVING:
+            c.machine.transition(Phase.OBSERVING)
+        return True
 
 
 def _stop_handler(_signal_number: int, _frame: Any) -> None:
@@ -3978,13 +4200,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_runtime_configuration(require_generation: bool = False) -> str:
-    global _task_generation_id, _instruction_revision, _bridge_observation_revision, _observation_keywords, _exact_input_references, _instruction_correction_key
+    global _task_generation_id, _instruction_revision, _bridge_observation_revision, _observation_keywords, _exact_input_references, _instruction_correction_key, _working_document_revision, _working_document_update_key
     _task_generation_id = None
     _instruction_revision = 0
     _bridge_observation_revision = None
     _observation_keywords = []
     _exact_input_references = []
     _instruction_correction_key = None
+    _working_document_revision = 0
+    _working_document_update_key = None
     raw_line = runtime_line()
     try:
         configuration = json.loads(raw_line)
@@ -4025,7 +4249,10 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
         if type(references) is not list or len(references) > 128:
             raise RuntimeError("TaskPilot provided invalid exact-input reference metadata")
         _exact_input_references = references
+        if type(configuration.get("working_document_protocol_version")) is not int or configuration["working_document_protocol_version"] != WORKING_DOCUMENT_PROTOCOL_VERSION:
+            raise RuntimeError("TaskPilot working-document protocol does not match; rebuild the bundled components together")
         _instruction_correction_key = runtime_inbox().register_instruction_corrections(generation)
+        _working_document_update_key = runtime_inbox().register_working_document_updates(generation)
     api_key = configuration.get("gemini_api_key")
     if not isinstance(api_key, str):
         raise RuntimeError(f"{PRODUCT_NAME} did not provide the secure runtime configuration")

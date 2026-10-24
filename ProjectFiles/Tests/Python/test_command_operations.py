@@ -248,7 +248,7 @@ class CommandOperationTaskLoopTests(unittest.TestCase):
                     def close(client): pass
                 client = Client()
                 def plan(task, observation, history, ledger): client.ledger = ledger; return 'plan'
-                def exchange(method, display, params, timeout):
+                def exchange(method, display, params, timeout, working_document_revision=None):
                     methods.append(method)
                     if method == 'completion_gate': return {'ok': True, 'result': {'accepted': True, 'pending_correction': False}}
                     if method == 'observe':

@@ -225,7 +225,7 @@ final class LocalChangeNotificationTests: XCTestCase {
         let lease = TaskLease()
         let bridge = AgentAutomationBridge(displayService: DisplayService(), accessibility: AccessibilityController(), capture: ScreenCaptureService())
         try bridge.bind(lease)
-        let request: [String: Any] = ["task_generation_id": lease.id, "instruction_revision": 0, "request_id": "wait", "method": "wait_file_effect",
+        let request: [String: Any] = ["task_generation_id": lease.id, "instruction_revision": 0, "working_document_revision": 0, "request_id": "wait", "method": "wait_file_effect",
             "params": ["check": ["type": "file_contents", "path": target.path, "content": "wanted"], "timeout_ms": 100]]
         let response = await bridge.handleOwned(request, lease: lease)
         XCTAssertEqual(response["ok"] as? Bool, true)
@@ -242,11 +242,11 @@ final class LocalChangeNotificationTests: XCTestCase {
         let bridge = AgentAutomationBridge(displayService: DisplayService(), accessibility: AccessibilityController(), capture: ScreenCaptureService())
         try bridge.bind(lease)
         for timeout: Any in [true, "100", 0, -1, 2.5, 2001, Double.infinity] {
-            let response = await bridge.handleOwned(["task_generation_id": lease.id, "instruction_revision": 0, "method": "wait_file_effect",
+            let response = await bridge.handleOwned(["task_generation_id": lease.id, "instruction_revision": 0, "working_document_revision": 0, "method": "wait_file_effect",
                 "params": ["check": ["type": "file_exists", "path": target.path], "timeout_ms": timeout]], lease: lease)
             XCTAssertEqual(response["ok"] as? Bool, false)
         }
-        let unknown = await bridge.handleOwned(["task_generation_id": lease.id, "instruction_revision": 0, "method": "wait_file_effect",
+        let unknown = await bridge.handleOwned(["task_generation_id": lease.id, "instruction_revision": 0, "working_document_revision": 0, "method": "wait_file_effect",
             "params": ["check": ["type": "stdout_equals", "text": "not a file"]]], lease: lease)
         XCTAssertEqual(unknown["ok"] as? Bool, false)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), [])

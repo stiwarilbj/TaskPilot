@@ -18,6 +18,9 @@ final class TaskLease: @unchecked Sendable {
     private var instructionRevision: UInt64 = 0
     private var pendingCorrection: (id: String, revision: UInt64)?
     private var appliedCorrections: [String: UInt64] = [:]
+    private var workingDocumentRevision: UInt64 = 0
+    private var pendingWorkingDocument: (id: String, revision: UInt64)?
+    private var appliedWorkingDocumentUpdates: [String: UInt64] = [:]
     private var completionClaimed = false
     let permitsPersistentProcesses: Bool
     private var closePersistentProcesses: Bool
@@ -68,10 +71,58 @@ final class TaskLease: @unchecked Sendable {
     var pauseWaitRegistrationCount: Int { lock.lock(); defer { lock.unlock() }; return pauseRegistrations }
     var currentInstructionRevision: UInt64 { lock.lock(); defer { lock.unlock() }; return instructionRevision }
     var hasPendingInstructionCorrection: Bool { lock.lock(); defer { lock.unlock() }; return pendingCorrection != nil }
+    var currentWorkingDocumentRevision: UInt64 { lock.lock(); defer { lock.unlock() }; return workingDocumentRevision }
+    var hasPendingWorkingDocumentUpdate: Bool { lock.lock(); defer { lock.unlock() }; return pendingWorkingDocument != nil }
+    func appliedWorkingDocumentRevision(id: String) -> UInt64? {
+        lock.lock(); defer { lock.unlock() }
+        return appliedWorkingDocumentUpdates[id.lowercased()]
+    }
+
+    func beginWorkingDocumentUpdate(id: String, revision: UInt64) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard (value == .running || value == .paused), pendingWorkingDocument == nil,
+              pendingCorrection == nil, !completionClaimed,
+              revision == workingDocumentRevision + 1, UUID(uuidString: id) != nil else {
+            throw WorkingDocumentUpdateError.stale
+        }
+        pendingWorkingDocument = (id.lowercased(), revision)
+    }
+
+    func cancelWorkingDocumentUpdate(id: String) {
+        lock.lock(); defer { lock.unlock() }
+        guard pendingWorkingDocument?.id == id.lowercased() else { return }
+        pendingWorkingDocument = nil
+    }
+
+    func applyWorkingDocumentUpdate(id: String, revision: UInt64, install: () throws -> Void) throws {
+        lock.lock(); defer { lock.unlock() }
+        let normalizedID = id.lowercased()
+        if appliedWorkingDocumentUpdates[normalizedID] == revision { return }
+        guard (value == .running || value == .paused),
+              pendingWorkingDocument?.id == normalizedID,
+              pendingWorkingDocument?.revision == revision,
+              revision == workingDocumentRevision + 1 else { throw WorkingDocumentUpdateError.stale }
+        try install()
+        workingDocumentRevision = revision
+        pendingWorkingDocument = nil
+        appliedWorkingDocumentUpdates[normalizedID] = revision
+    }
+
+    func validateWorkingDocumentRevision(_ revision: UInt64, allowDispatchedReceipt: Bool = false,
+                                         allowPendingUpdate: Bool = false) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard value == .running || value == .paused else { throw CancellationError() }
+        if allowDispatchedReceipt, revision <= workingDocumentRevision { return }
+        if allowPendingUpdate, pendingWorkingDocument?.revision == revision { return }
+        guard pendingWorkingDocument == nil, revision == workingDocumentRevision else {
+            throw WorkingDocumentUpdateError.superseded
+        }
+    }
 
     func beginInstructionCorrection(id: String, revision: UInt64) throws {
         lock.lock(); defer { lock.unlock() }
         guard (value == .running || value == .paused), pendingCorrection == nil,
+              pendingWorkingDocument == nil,
               !completionClaimed, revision == instructionRevision + 1, UUID(uuidString: id) != nil else {
             throw TaskInstructionCorrectionError.stale
         }
@@ -88,7 +139,7 @@ final class TaskLease: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         let normalizedID = id.lowercased()
         if appliedCorrections[normalizedID] == revision { return }
-        guard (value == .running || value == .paused),
+        guard (value == .running || value == .paused), pendingWorkingDocument == nil,
               pendingCorrection?.id == normalizedID, pendingCorrection?.revision == revision,
               revision == instructionRevision + 1 else { throw TaskInstructionCorrectionError.stale }
         instructionRevision = revision
@@ -115,6 +166,7 @@ final class TaskLease: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         if completionClaimed { return revision == instructionRevision }
         guard (value == .running || value == .paused), pendingCorrection == nil,
+              pendingWorkingDocument == nil,
               revision == instructionRevision, !completionClaimed else { return false }
         completionClaimed = true
         return true
@@ -123,14 +175,17 @@ final class TaskLease: @unchecked Sendable {
     /// Completion and correction acceptance share one lock. Returning the
     /// pending state from this same critical section prevents a rollback from
     /// being mistaken for a permanently rejected completion.
-    func claimCompletionGate(instructionRevision revision: UInt64) -> (accepted: Bool, pendingCorrection: Bool) {
+    func claimCompletionGate(instructionRevision revision: UInt64)
+        -> (accepted: Bool, pendingCorrection: Bool, pendingWorkingDocument: Bool) {
         lock.lock(); defer { lock.unlock() }
-        if completionClaimed { return (revision == instructionRevision, false) }
-        guard value == .running || value == .paused else { return (false, false) }
-        if pendingCorrection != nil { return (false, true) }
-        guard revision == instructionRevision else { return (false, false) }
+        if completionClaimed { return (revision == instructionRevision, false, false) }
+        guard value == .running || value == .paused else { return (false, false, false) }
+        if pendingCorrection != nil || pendingWorkingDocument != nil {
+            return (false, pendingCorrection != nil, pendingWorkingDocument != nil)
+        }
+        guard revision == instructionRevision else { return (false, false, false) }
         completionClaimed = true
-        return (true, false)
+        return (true, false, false)
     }
     func pause() { lock.lock(); defer { lock.unlock() }; if value == .running { value = .paused; suspensions += 1 } }
     func resume() {
@@ -268,6 +323,7 @@ enum TaskOwnership {
     @TaskLocal static var current: TaskLease?
     @TaskLocal static var actionReceipt: ActionReceiptStore.Token?
     @TaskLocal static var instructionRevision: UInt64?
+    @TaskLocal static var workingDocumentRevision: UInt64?
     static func check() throws { try current?.check(); try LocalOperationBudget.check(); try Task.checkCancellation() }
     static func checkpoint() async throws {
         try LocalOperationBudget.check(); try await current?.checkpoint(); try LocalOperationBudget.check()
@@ -284,6 +340,10 @@ enum TaskOwnership {
                     guard actionReceipt.generation == current.id else { throw CancellationError() }
                     if let revision = instructionRevision {
                         try current.validateInstructionRevision(revision,
+                            allowDispatchedReceipt: actionReceipt.receipt["state"] as? String == "dispatched")
+                    }
+                    if let revision = workingDocumentRevision {
+                        try current.validateWorkingDocumentRevision(revision,
                             allowDispatchedReceipt: actionReceipt.receipt["state"] as? String == "dispatched")
                     }
                     // Receipt dispatch and delivery share the lease's atomic
@@ -311,6 +371,19 @@ enum TaskInstructionCorrectionError: LocalizedError {
         switch self {
         case .stale: "This correction is no longer current."
         case .superseded: "This action was planned before the latest instruction update."
+        }
+    }
+}
+
+enum WorkingDocumentUpdateError: LocalizedError {
+    case stale
+    case superseded
+    case unavailable
+    var errorDescription: String? {
+        switch self {
+        case .stale: "This working document selection is no longer current."
+        case .superseded: "This action was planned before the working document changed."
+        case .unavailable: "The working document is no longer available; choose it again from Live View."
         }
     }
 }

@@ -40,9 +40,21 @@ struct AgentUserInputRequest: Equatable, Identifiable {
     let requestID: String
     let taskGenerationID: String
     let instructionRevision: UInt64
+    var workingDocumentRevision: UInt64
     let title: String
     let message: String
     let kind: AgentUserInputKind
+
+    init(requestID: String, taskGenerationID: String, instructionRevision: UInt64,
+         workingDocumentRevision: UInt64 = 0, title: String, message: String, kind: AgentUserInputKind) {
+        self.requestID = requestID
+        self.taskGenerationID = taskGenerationID
+        self.instructionRevision = instructionRevision
+        self.workingDocumentRevision = workingDocumentRevision
+        self.title = title
+        self.message = message
+        self.kind = kind
+    }
 
     var id: String { requestID }
 }
@@ -56,6 +68,9 @@ enum RuntimeEvent {
     case taskProgress(AgentTaskProgressSnapshot)
     case taskWait(AgentTaskWaitSnapshot)
     case instructionCorrectionApplied(id: String, taskGenerationID: String, revision: UInt64)
+    case workingDocumentApplied(id: String, taskGenerationID: String, revision: UInt64, document: [String: Any]?)
+    case workingDocumentNeedsReselection(taskGenerationID: String, revision: UInt64, application: String, title: String)
+    case workingDocumentUpdateRejected(id: String, taskGenerationID: String, revision: UInt64, message: String)
     case actionPresentation(actionID: String, taskGenerationID: String, verificationScope: String)
     case completed(String)
     case failed(String)
@@ -134,6 +149,7 @@ final class AgentRuntimeProcess {
         var pendingUserInputID: String?
         var pendingUserInputRevision: UInt64?
         var correctionIDs: Set<String> = []
+        var workingDocumentIDs: Set<String> = []
         var terminalDelivered = false
         var drainStarted: ContinuousClock.Instant?
         var drainReported = false
@@ -263,6 +279,7 @@ final class AgentRuntimeProcess {
                 "action_contract_version": ActionContract.version,
                 "task_generation_id": lease.id,
                 "instruction_revision": lease.currentInstructionRevision,
+                "working_document_protocol_version": WorkingDocumentUpdate.protocolVersion,
                 "task_protocol_version": ActionContract.taskProtocolVersion,
                 "exact_input_reference_version": AgentTaskInputReferenceProtocol.version,
                 "exact_input_references": exactInputReferences.map(\.wireValue),
@@ -338,7 +355,7 @@ final class AgentRuntimeProcess {
 
     @discardableResult
     func submitUserInput(requestID: String, value: String, taskGenerationID: String,
-                         instructionRevision: UInt64) -> Bool {
+                         instructionRevision: UInt64, workingDocumentRevision: UInt64 = 0) -> Bool {
         // The credential crosses only the existing private stdin pipe. It is
         // never placed in arguments, environment variables, status text, or
         // the OpenClaw conversation.
@@ -347,6 +364,8 @@ final class AgentRuntimeProcess {
                   run.pendingUserInputRevision == instructionRevision,
                   run.lease.accepts(taskGenerationID) else { return nil }
             do { try run.lease.validateInstructionRevision(instructionRevision) }
+            catch { return nil }
+            do { try run.lease.validateWorkingDocumentRevision(workingDocumentRevision) }
             catch { return nil }
             run.pendingUserInputID = nil
             run.pendingUserInputRevision = nil
@@ -357,6 +376,7 @@ final class AgentRuntimeProcess {
         send([
             "task_generation_id": run.lease.id,
             "instruction_revision": instructionRevision,
+            "working_document_revision": workingDocumentRevision,
             "kind": "user_input_response",
             "request_id": requestID,
             "value": value
@@ -412,6 +432,47 @@ final class AgentRuntimeProcess {
             return run
         }
         _ = run
+    }
+
+    func prepareWorkingDocumentUpdate(_ update: WorkingDocumentUpdate, generationID: String) throws {
+        try ioQueue.sync {
+            guard let run = invocation, run.lease.id == generationID,
+                  run.lease.state == .running || run.lease.state == .paused else {
+                throw WorkingDocumentUpdateError.stale
+            }
+            guard update.generationID == generationID,
+                  update.revision == run.lease.currentWorkingDocumentRevision + 1,
+                  !run.workingDocumentIDs.contains(update.id) else {
+                throw WorkingDocumentUpdateError.stale
+            }
+            try run.lease.beginWorkingDocumentUpdate(id: update.id, revision: update.revision)
+            run.workingDocumentIDs.insert(update.id)
+        }
+    }
+
+    func sendWorkingDocumentUpdate(_ update: WorkingDocumentUpdate, generationID: String) throws {
+        let run = try ioQueue.sync { () throws -> Invocation in
+            guard let run = invocation, run.lease.id == generationID,
+                  run.workingDocumentIDs.contains(update.id),
+                  run.lease.state == .running || run.lease.state == .paused else {
+                throw WorkingDocumentUpdateError.stale
+            }
+            return run
+        }
+        var frame = try telemetry.encodeJSON(update.wireValue.merging(["kind": "working_document_update"]) { _, new in new }, recordSize: false)
+        frame.append(0x0A)
+        run.writer?.enqueue(frame, priority: true) { [weak self, weak run] delivered in
+            guard let self, let run else { return }
+            if !delivered { self.ioQueue.async { self.failTransport("transport_closed", for: run) } }
+        }
+    }
+
+    func cancelWorkingDocumentUpdate(_ updateID: String, generationID: String) {
+        ioQueue.sync {
+            guard let run = invocation, run.lease.id == generationID else { return }
+            run.lease.cancelWorkingDocumentUpdate(id: updateID)
+            run.workingDocumentIDs.remove(updateID.lowercased())
+        }
     }
 
     private func signalRuntime(_ signal: Int32) {
@@ -500,7 +561,7 @@ final class AgentRuntimeProcess {
             return
         }
         accepted = true
-        if !["runtime_ready", "instruction_correction_applied", "bridge_request"].contains(kind) {
+        if !["runtime_ready", "instruction_correction_applied", "working_document_applied", "bridge_request"].contains(kind) {
             guard let revision = exactRevision(message["instruction_revision"]) else {
                 failTransport("instruction_revision_mismatch", for: run)
                 return
@@ -508,6 +569,10 @@ final class AgentRuntimeProcess {
             // Late status, progress, secure-input, or output frames from an
             // earlier instruction must never replace the current task view.
             guard revision == run.lease.currentInstructionRevision else { return }
+        }
+        if !["runtime_ready", "working_document_applied", "bridge_request"].contains(kind) {
+            guard let revision = exactRevision(message["working_document_revision"]),
+                  revision == run.lease.currentWorkingDocumentRevision else { return }
         }
         // Older helpers lack runtime_ready; their first valid non-error frame
         // is the compatibility boundary. Current helpers announce readiness.
@@ -527,8 +592,33 @@ final class AgentRuntimeProcess {
         case "request_metrics":
             if let metrics = try? run.metricsDecoder.decode(AgentRequestMetrics.self, from: data) { emit(.diagnostics(metrics), for: run) }
         case "bridge_request":
+            guard let method = message["method"] as? String,
+                  let instructionRevision = exactRevision(message["instruction_revision"]),
+                  let workingDocumentRevision = exactRevision(message["working_document_revision"]) else {
+                failTransport("working_document_revision_mismatch", for: run); return
+            }
+            do {
+                try run.lease.validateInstructionRevision(instructionRevision, allowDispatchedReceipt: method == "act")
+                if method == "bind_working_document" {
+                    let params = message["params"] as? [String: Any] ?? [:]
+                    guard let id = params["update_id"] as? String,
+                          let uuid = UUID(uuidString: id), uuid.uuidString.lowercased() == id,
+                          run.workingDocumentIDs.contains(id),
+                          exactRevision(params["binding_revision"]) == workingDocumentRevision,
+                          workingDocumentRevision == run.lease.currentWorkingDocumentRevision + 1 ||
+                            run.lease.appliedWorkingDocumentRevision(id: id) == workingDocumentRevision else {
+                        throw WorkingDocumentUpdateError.stale
+                    }
+                    try run.lease.validateWorkingDocumentRevision(workingDocumentRevision, allowPendingUpdate: true)
+                } else {
+                    try run.lease.validateWorkingDocumentRevision(workingDocumentRevision, allowDispatchedReceipt: method == "act")
+                }
+            } catch {
+                failTransport(error is WorkingDocumentUpdateError ? "working_document_revision_mismatch" : "instruction_revision_mismatch", for: run)
+                return
+            }
             let requestBytes = data.count
-            let receiptLookup = message["method"] as? String == "action_receipt"
+            let receiptLookup = method == "action_receipt"
             let allowance = (receiptLookup ? 32 : 24) * 1024 * 1024
             guard run.operations.count < (receiptLookup ? 32 : 31) else { failTransport("transport_request_limit", for: run); return }
             guard run.pendingBridgeBytes + requestBytes <= allowance else { failTransport("transport_buffer_limit", for: run); return }
@@ -545,12 +635,17 @@ final class AgentRuntimeProcess {
             let operation = Task { [weak self] in
                 guard let self else { bridgeSpan.finish(.cancelled); return }
                 var response = await TaskOwnership.$current.withValue(run.lease) {
+                    await TaskOwnership.$instructionRevision.withValue(instructionRevision) {
+                    await TaskOwnership.$workingDocumentRevision.withValue(workingDocumentRevision) {
                     if let handler = self.bridgeHandler {
                         return await TaskOwnership.withCancellationWakeup { await handler(message) }
                     }
                     return await self.bridge.handle(message)
+                    }
+                    }
                 }
                 response["instruction_revision"] = message["instruction_revision"]
+                response["working_document_revision"] = message["working_document_revision"]
                 self.ioQueue.async {
                     self.send(response, for: run, bridgeSpan: bridgeSpan)
                     run.operations.removeValue(forKey: operationID)
@@ -580,6 +675,7 @@ final class AgentRuntimeProcess {
                 requestID: requestID,
                 taskGenerationID: run.lease.id,
                 instructionRevision: revision,
+                workingDocumentRevision: exactRevision(message["working_document_revision"]) ?? 0,
                 title: message["title"] as? String ?? "Password required",
                 message: message["message"] as? String ?? "Enter the requested credential to continue.",
                 kind: AgentUserInputKind(
@@ -612,6 +708,46 @@ final class AgentRuntimeProcess {
             } catch {
                 failTransport("instruction_revision_mismatch", for: run)
             }
+        case "working_document_applied":
+            guard message["task_generation_id"] as? String == run.lease.id,
+                  let id = message["update_id"] as? String,
+                  let uuid = UUID(uuidString: id), uuid.uuidString.lowercased() == id,
+                  run.workingDocumentIDs.contains(id),
+                  let revision = exactRevision(message["binding_revision"]),
+                  revision == run.lease.currentWorkingDocumentRevision,
+                  run.lease.appliedWorkingDocumentRevision(id: id) == revision else { return }
+            let rawDocument = message["working_document"]
+            let document = rawDocument as? [String: Any]
+            if let document {
+                guard document["state"] as? String == "active",
+                      document["revision"] as? Int == Int(revision),
+                      let application = document["application"] as? String,
+                      let title = document["title"] as? String,
+                      Set(document.keys).isSubset(of: ["state", "application", "title", "location", "revision"]) else { return }
+                _ = application; _ = title
+            } else if !(rawDocument is NSNull) { return }
+            run.workingDocumentIDs.remove(id)
+            emit(.workingDocumentApplied(id: id, taskGenerationID: run.lease.id,
+                                         revision: revision, document: document), for: run)
+        case "working_document_needs_reselection":
+            guard message["task_generation_id"] as? String == run.lease.id,
+                  exactRevision(message["binding_revision"]) == run.lease.currentWorkingDocumentRevision,
+                  exactRevision(message["working_document_revision"]) == run.lease.currentWorkingDocumentRevision,
+                  let application = message["application"] as? String,
+                  let title = message["title"] as? String else { return }
+            emit(.workingDocumentNeedsReselection(taskGenerationID: run.lease.id,
+                revision: run.lease.currentWorkingDocumentRevision,
+                application: String(application.prefix(120)), title: String(title.prefix(240))), for: run)
+        case "working_document_update_rejected":
+            guard message["task_generation_id"] as? String == run.lease.id,
+                  let id = message["update_id"] as? String,
+                  run.workingDocumentIDs.contains(id),
+                  let revision = exactRevision(message["binding_revision"]),
+                  revision == run.lease.currentWorkingDocumentRevision + 1,
+                  !run.lease.hasPendingWorkingDocumentUpdate else { return }
+            run.workingDocumentIDs.remove(id)
+            emit(.workingDocumentUpdateRejected(id: id, taskGenerationID: run.lease.id,
+                revision: revision, message: String((message["message"] as? String ?? "Choose the working document again.").prefix(240))), for: run)
         case "action_presentation":
             guard let presentation = AgentActionPresentationMessage.parse(
                 message, generationID: run.lease.id, knownActionIDs: run.receiptIDs

@@ -245,7 +245,7 @@ class BoundedTransportTests(unittest.TestCase):
             if payload['method'] == 'act': os.write(write_fd, b'x' * 4097 + b'\n')
             else:
                 receipt = {'action_id': action_id, 'state': 'confirmed', 'terminal': True, 'result': native_result(action)}
-                reply = dict(kind='bridge_response', request_id=payload['request_id'], task_generation_id='task', ok=True, result=receipt)
+                reply = dict(kind='bridge_response', request_id=payload['request_id'], task_generation_id='task', working_document_revision=0, ok=True, result=receipt)
                 os.write(write_fd, json.dumps(reply).encode() + b'\n')
         real_reader = read_frames
         try:
