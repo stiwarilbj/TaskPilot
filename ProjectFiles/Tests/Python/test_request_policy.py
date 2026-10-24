@@ -313,8 +313,10 @@ class RequestPolicyTests(unittest.TestCase):
             client.reconnect()
         self.assertEqual(events, ['old child ended', ('sessions.abort', {'key':'old'}), 'new client'])
         self.assertEqual(client.reconnects, 1)
-        with self.assertRaisesRegex(RuntimeError, 'disconnected again'):
-            client.reconnect()
+        with mock.patch.object(runtime.ACPClient, '__init__'):
+            client.reconnect(); client.reconnect()
+            with self.assertRaisesRegex(RuntimeError, 'reconnect budget exhausted'):
+                client.reconnect()
 
     def test_reconnect_does_not_replay_without_terminal_acknowledgement(self):
         client = runtime.ACPClient.__new__(runtime.ACPClient)

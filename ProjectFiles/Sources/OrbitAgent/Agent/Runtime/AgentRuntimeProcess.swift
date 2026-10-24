@@ -198,6 +198,7 @@ final class AgentRuntimeProcess {
         // always resolve the same private instance used by readiness and setup.
         if let descriptor = try? ManagedOpenClawDescriptor.load(), descriptor.executable == openClawURL.path {
             environment.merge(descriptor.environment) { _, managed in managed }
+            lease.managedRuntimeRoot = ManagedOpenClawDescriptor.root
         }
         process.environment = environment
         process.standardInput = input

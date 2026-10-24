@@ -31,7 +31,7 @@ class ExecutionGraphTests(unittest.TestCase):
             'planning': {'reconciling', 'recovering', 'draining'},
             'reconciling': {'observing', 'executing', 'waiting_input', 'verifying', 'recovering', 'draining'},
             'executing': {'reconciling', 'recovering', 'draining'},
-            'waiting_input': {'reconciling', 'draining'},
+            'waiting_input': {'reconciling', 'recovering', 'draining'},
             'verifying': {'observing', 'recovering', 'draining'},
             'recovering': {'starting', 'planning', 'verifying', 'reconciling', 'executing', 'draining'},
             'draining': {'finished'}, 'finished': set(),

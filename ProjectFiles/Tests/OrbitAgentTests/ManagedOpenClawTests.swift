@@ -4,6 +4,53 @@ import XCTest
 @testable import OrbitAgent
 
 final class ManagedOpenClawTests: XCTestCase {
+    private func descriptor(_ root: URL) throws -> ManagedOpenClawDescriptor {
+        let port = 24200
+        let value: [String:Any] = ["version":1,"instance_id":UUID().uuidString.lowercased(),
+            "installation_fingerprint":"pin","configuration_fingerprint":"config",
+            "executable":root.path+"/openclaw","node":root.path+"/node","entry":root.path+"/entry",
+            "state":root.path+"/state","config":root.path+"/config","workspace":root.path+"/workspace",
+            "token_file":root.path+"/token","port":port,"endpoint":"ws://127.0.0.1:\(port)",
+            "openclaw_version":"fixture","node_version":"fixture"]
+        try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
+        try JSONSerialization.data(withJSONObject:value).write(to:root.appendingPathComponent("runtime.json"))
+        return try ManagedOpenClawDescriptor.load(from:root.appendingPathComponent("runtime.json"))
+    }
+    func testHealthRequiresFreshMatchingFingerprintsAndBothBirthIdentities() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at:root) }
+        let instance = try descriptor(root)
+        let identity = try XCTUnwrap(ManagedProcessIdentity.read(getpid()))
+        let record = try JSONSerialization.jsonObject(with:JSONEncoder().encode(identity))
+        let healthy: [String:Any] = ["version":1,"state":"healthy","instance_id":instance.instanceID,
+            "installation_fingerprint":"pin","configuration_fingerprint":"config","checked_at":1000.0,
+            "host_identity":record,"gateway_identity":record]
+        XCTAssertTrue(instance.acceptsHealth(healthy,now:1001))
+        for (key, value) in [("installation_fingerprint","old" as Any),("configuration_fingerprint","old"),
+                             ("checked_at",900.0),("checked_at",1002.0),("gateway_identity",[:])] {
+            var changed = healthy; changed[key] = value
+            XCTAssertFalse(instance.acceptsHealth(changed,now:1001))
+        }
+        var reused = healthy
+        reused["gateway_identity"] = ["pid":identity.pid,"seconds":identity.seconds+1,"microseconds":identity.microseconds]
+        XCTAssertFalse(instance.acceptsHealth(reused,now:1001))
+    }
+    func testRepairExcludesWholeActionsAndNewDeliveryWithoutBlocking() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at:root) }
+        try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
+        var action: ManagedRuntimePermit? = try ManagedRuntimePermit(root:root,repairing:false,requireHealth:false)
+        XCTAssertThrowsError(try ManagedRuntimePermit(root:root,repairing:true))
+        withExtendedLifetime(action) {}; action = nil
+        var repair: ManagedRuntimePermit? = try ManagedRuntimePermit(root:root,repairing:true)
+        XCTAssertThrowsError(try ManagedRuntimePermit(root:root,repairing:false,requireHealth:false))
+        let lease = TaskLease(); lease.managedRuntimeRoot = root
+        var delivered = false
+        XCTAssertThrowsError(try lease.commit { delivered = true })
+        XCTAssertFalse(delivered)
+        withExtendedLifetime(repair) {}; repair = nil
+        XCTAssertNoThrow(try ManagedRuntimePermit(root:root,repairing:true))
+    }
     func testRestartBudgetSurvivesSerializationAndHealthyRefreshDoesNotEraseAttempts() throws {
         var budget = GatewayRecoveryBudget()
         XCTAssertEqual(budget.failed(now:1000),1)
@@ -93,9 +140,12 @@ final class ManagedOpenClawTests: XCTestCase {
             "port":port,"endpoint":"ws://127.0.0.1:\(port)","openclaw_version":"fixture","node_version":"fixture"]
         try JSONSerialization.data(withJSONObject:value).write(to:url)
         let client = try ManagedGatewayHost.registerClient(root:root)
+        let runtime = root.appendingPathComponent("runtime")
+        try "#!/bin/sh\nprintf '{\"ok\":true}\\n'\n".write(to:runtime,atomically:true,encoding:.utf8)
+        try FileManager.default.setAttributes([.posixPermissions:0o700],ofItemAtPath:runtime.path)
         let ended = expectation(description:"Gateway descendants drained")
         DispatchQueue.global().async {
-            XCTAssertEqual(ManagedGatewayHost.run(descriptorURL:url,runtimeURL:URL(fileURLWithPath:"/usr/bin/true")),0)
+            XCTAssertEqual(ManagedGatewayHost.run(descriptorURL:url,runtimeURL:runtime),0)
             ended.fulfill()
         }
         let limit = ProcessInfo.processInfo.systemUptime + 5
@@ -108,8 +158,22 @@ final class ManagedOpenClawTests: XCTestCase {
             Thread.sleep(forTimeInterval:0.02)
         }
         XCTAssertTrue(healthy)
-        XCTAssertEqual(ManagedGatewayHost.run(descriptorURL:url,runtimeURL:URL(fileURLWithPath:"/usr/bin/true")),0)
+        XCTAssertEqual(ManagedGatewayHost.run(descriptorURL:url,runtimeURL:runtime),0)
         XCTAssertEqual(try String(contentsOf:root.appendingPathComponent("launches"),encoding:.utf8).split(separator:"\n").count,1)
+        // Supported offline configuration updates must drain the owned tree,
+        // exclude native delivery, and resume only after the requester releases.
+        let request = root.appendingPathComponent("configuration-request.json")
+        let id = UUID().uuidString
+        let owner = try JSONSerialization.jsonObject(with:JSONEncoder().encode(ManagedProcessIdentity.read(getpid())!))
+        try JSONSerialization.data(withJSONObject:["request_id":id,"owner":owner]).write(to:request,options:.atomic)
+        let acknowledged = root.appendingPathComponent("configuration-ack.json")
+        let drainDeadline = ProcessInfo.processInfo.systemUptime + 5
+        while !FileManager.default.fileExists(atPath:acknowledged.path) && ProcessInfo.processInfo.systemUptime < drainDeadline {
+            Thread.sleep(forTimeInterval:0.02)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath:acknowledged.path))
+        XCTAssertThrowsError(try ManagedRuntimePermit(root:root,repairing:false,requireHealth:false))
+        try FileManager.default.removeItem(at:request)
         try FileManager.default.removeItem(at:client)
         wait(for:[ended],timeout:5)
         XCTAssertFalse(FileManager.default.fileExists(atPath:root.appendingPathComponent("gateway-processes.json").path))

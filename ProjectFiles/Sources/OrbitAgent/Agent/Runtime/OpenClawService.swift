@@ -123,14 +123,7 @@ final class OpenClawService {
             let health = (try? Data(contentsOf: healthURL)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             let matchesInstance = health?["instance_id"] as? String == descriptor.instanceID &&
                 health?["configuration_fingerprint"] as? String == descriptor.configurationFingerprint
-            let age = Date().timeIntervalSince1970 - (health?["checked_at"] as? Double ?? 0)
-            func identityAlive(_ key: String) -> Bool {
-                guard let value = health?[key], let data = try? JSONSerialization.data(withJSONObject:value),
-                      let identity = try? JSONDecoder().decode(ManagedProcessIdentity.self,from:data) else { return false }
-                return identity.alive
-            }
-            let ready = matchesInstance && age < 45 && health?["state"] as? String == "healthy" &&
-                identityAlive("host_identity") && identityAlive("gateway_identity")
+            let ready = health.map { descriptor.acceptsHealth($0) } ?? false
             return OpenClawProbe(executableURL: URL(fileURLWithPath: descriptor.executable), version: descriptor.openclawVersion,
                 configured: ready, detail: matchesInstance ? (health?["detail"] as? String ?? "Starting private OpenClaw") : "Starting TaskPilot’s private OpenClaw Gateway")
         } catch {

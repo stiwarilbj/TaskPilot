@@ -419,6 +419,7 @@ def configuration_transaction():
 class RuntimeState:
     """Short cross-process transactions; no plaintext user/provider data."""
     def __init__(self, fingerprint: str, version: str, root: Path | None = None, configuration: str = "") -> None:
+        self.source_fingerprint = fingerprint
         self.root = root or runtime_state_root()
         self.path = self.root / "runtime-readiness.json"
         self.credential = hashlib.sha256(fingerprint.encode()).hexdigest()
@@ -428,6 +429,12 @@ class RuntimeState:
         self.configuration_key = hashlib.sha256(configuration_path.encode()).hexdigest()
         self.value: dict[str, Any] = {}
         self.refresh()
+
+    def rebind_managed(self, version: str, configuration: str) -> None:
+        if self.managed_configuration != os.environ.get("TASKPILOT_MANAGED_FINGERPRINT", ""):
+            # Retain the credential namespace/cooldowns, but never verify a new
+            # installation under the previous descriptor's cache identity.
+            self.__init__(self.source_fingerprint, version, root=self.root, configuration=configuration)
 
     def model_health_records(self, bucket):
         # Local catalog/config faults from another managed installation must

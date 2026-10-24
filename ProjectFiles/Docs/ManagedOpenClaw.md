@@ -49,7 +49,8 @@ output is continuously drained and discarded with bounded retention.
 Python's recovering state permits no action, planning, or completion. A lost
 reasoning transport first ends its ACP child, waits for private health, and
 requires the Gateway's terminal abort acknowledgement before one reasoning
-reconnect. Receipt reconciliation still owns dispatched desktop mutations;
+reconnect per interrupted request, capped at three reconnects per task in a rolling
+ten minutes. Wrapper and direct-Node alternatives share that allowance. Receipt reconciliation still owns dispatched desktop mutations;
 recovery does not replay them. Native instruction revisions, Pause, secure input,
 and task ownership remain authoritative. Restarting the app starts no old task.
 
@@ -68,9 +69,55 @@ remain incomplete; offline checks and a successful provider probe cannot promise
 service availability under external provider outages, revoked credentials, or
 exhausted quota.
 
-Validation for this change: 753 Python tests and 582 Swift tests (one skipped),
-mock setup integration, generated-contract checks, signed bundle verification,
-and headless ACP image/JSON verification. The healthy probe succeeded on
-3.5 Flash-Lite with one generation, zero repairs, and no model fallback.
-The last headless client released its lease and its Gateway tree drained.
-No fixer, Chrome interaction, live-control tester, or desktop task was run.
+## Local drift checks and connection recovery
+
+Both Swift and Python require fresh authenticated health (under 45 seconds),
+matching instance/configuration/installation fingerprints, and live host and
+Gateway birth identities. A dead or reused PID invalidates cached health before
+native delivery. Local audits run on startup, relevant faults, and every five
+minutes. They check sealed installation files, the wrapper contents, Google
+plugin, model catalog/defaults, private workspace/endpoint/token, supported CLI
+configuration readback, and the private credential-store record. None generates
+provider requests.
+
+Known defects get one persisted repair reservation per unchanged failure
+fingerprint per ten minutes. Repair first tries a different, integrity-verified
+working installation when code is damaged; otherwise it stages the same pinned
+release. Configuration repair replaces managed settings while preserving unrelated
+metadata and reads them back through `config get`. Missing private credentials
+are restored through the supported auth command using TaskPilot's saved key.
+An unsaved key being explicitly checked has a bounded grace period, then the saved
+key becomes authoritative again. A failed check restores that saved key promptly.
+
+`execution-repair.lock` separates complete native action lifetimes from offline
+repair. The host waits for shared action permits before taking the exclusive
+repair permit. New delivery checks the same gate immediately before side effects;
+known rejections wait locally and refresh evidence. Dispatched or uncertain receipts
+still require reconciliation and never authorize automatic mutation replay.
+Explicit configuration writers use a birth-bound drain request/acknowledgement;
+requester exit releases abandoned holds. ACP probes yield to these requests to
+avoid configuration-lock inversion. Stop and existing Pause/correction/secure-input
+boundaries remain authoritative.
+
+ACP first uses the managed wrapper and explicit endpoint/token file. After the
+failed child ends, it may try the sealed pinned Node executable and entry point,
+with the same profile, endpoint, authentication, and contract. Session RPCs retain
+the chosen method and use `--expect-url`; repairs refresh paths and cache identity.
+Only an explicit unsupported ACP version means incompatibility. Timeout, refused
+connection, malformed protocol, startup, and authentication remain distinct causes.
+A confirmed `EADDRINUSE` alone permits endpoint relocation. Diagnostics contain
+fixed causes, methods, timings and fingerprints, never task/provider payloads.
+
+Offline validation covers real fake-ACP subprocess fallback, birth identity
+rejection, private configuration/credential drift, failed repair throttling,
+readback, action/repair exclusion, and supported drain acknowledgements, alongside
+the existing execution, receipts, instruction-correction, and prompt regressions.
+The packaging check uses only headless ACP image/JSON generation. No fixer, Chrome,
+live-control tester, or desktop task is part of this workflow.
+
+Delivery validation (2026-10-24): 769 Python tests passed; 584 Swift tests
+passed with one skipped. Setup integration, generated-artifact checks, and
+offline prompt regressions passed. The rebuilt signed bundle completed headless
+ACP image/JSON verification using 3.5 Flash-Lite in one generation call, with
+zero repairs or model fallback. Its Gateway stopped after the checker released
+its client lease. Live desktop and visual validation remain incomplete.

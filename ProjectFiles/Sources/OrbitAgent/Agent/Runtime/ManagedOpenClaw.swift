@@ -19,6 +19,7 @@ struct ManagedOpenClawDescriptor: Codable, Equatable, Sendable {
     let port: Int
     let openclawVersion: String
     let nodeVersion: String
+    private var sourceURL: URL? = nil
     enum CodingKeys: String, CodingKey {
         case version, executable, node, entry, state, config, workspace, endpoint, port
         case instanceID = "instance_id", installationFingerprint = "installation_fingerprint"
@@ -28,7 +29,7 @@ struct ManagedOpenClawDescriptor: Codable, Equatable, Sendable {
     static let root = GeminiAPIKeyStore.defaultFileURL().deletingLastPathComponent().appendingPathComponent("ManagedOpenClaw")
     static let url = root.appendingPathComponent("runtime.json")
     static func load(from url: URL = Self.url) throws -> Self {
-        let value = try JSONDecoder().decode(Self.self, from: Data(contentsOf: url))
+        var value = try JSONDecoder().decode(Self.self, from: Data(contentsOf: url))
         let root = url.deletingLastPathComponent().resolvingSymlinksInPath().path + "/"
         guard value.version == 1, UUID(uuidString: value.instanceID) != nil,
               value.port > 1024, value.port < 65400,
@@ -37,6 +38,7 @@ struct ManagedOpenClawDescriptor: Codable, Equatable, Sendable {
                 .allSatisfy({ $0.hasPrefix("/") && URL(fileURLWithPath: $0).resolvingSymlinksInPath().path.hasPrefix(root) }) else {
             throw ManagedOpenClawError.invalidDescriptor
         }
+        value.sourceURL = url
         return value
     }
     var environment: [String: String] {
@@ -46,7 +48,7 @@ struct ManagedOpenClawDescriptor: Codable, Equatable, Sendable {
         }
         env["OPENCLAW_STATE_DIR"] = state; env["OPENCLAW_CONFIG_PATH"] = config
         env["OPENCLAW_PROFILE"] = "taskpilot"; env["OPENCLAW_NO_RESPAWN"] = "1"
-        env["TASKPILOT_MANAGED_DESCRIPTOR"] = Self.url.path
+        env["TASKPILOT_MANAGED_DESCRIPTOR"] = (sourceURL ?? Self.url).path
         env["TASKPILOT_MANAGED_FINGERPRINT"] = instanceID + ":" + installationFingerprint + ":" + configurationFingerprint
         return env
     }
@@ -129,6 +131,7 @@ enum ManagedGatewayHost {
     }
     private static func writeHealth(_ descriptor: ManagedOpenClawDescriptor, state: String, detail: String, root: URL, gateway: SubprocessSupervisor? = nil) {
         var json: [String: Any] = ["version":1, "instance_id":descriptor.instanceID,
+            "installation_fingerprint":descriptor.installationFingerprint,
             "configuration_fingerprint":descriptor.configurationFingerprint,
             "state":state, "detail":detail, "checked_at":Date().timeIntervalSince1970]
         for (key, pid) in [("host_identity", getpid()), ("gateway_identity", gateway?.processIdentifier ?? 0)] {
@@ -155,10 +158,7 @@ enum ManagedGatewayHost {
             if let data = try? Data(contentsOf:root.appendingPathComponent("health.json")),
                let value = try? JSONSerialization.jsonObject(with:data) as? [String:Any],
                let descriptor = try? ManagedOpenClawDescriptor.load(from:descriptorURL),
-               value["instance_id"] as? String == descriptor.instanceID,
-               value["configuration_fingerprint"] as? String == descriptor.configurationFingerprint,
-               value["state"] as? String == "healthy",
-               Date().timeIntervalSince1970 - (value["checked_at"] as? Double ?? 0) < 45 {
+               descriptor.acceptsHealth(value) {
                 let input = FileHandle.standardInput.readData(ofLength:16384)
                 let result = OpenClawService.run(executable:runtimeURL,
                     arguments:["--check-models", "--managed-descriptor", descriptorURL.path],
@@ -177,7 +177,13 @@ enum ManagedGatewayHost {
         let cancellation = OpenClawCommandCancellation()
         let timer = DispatchSource.makeTimerSource(queue: .global(qos:.utility))
         timer.schedule(deadline:.now()+0.2, repeating:.milliseconds(200))
-        timer.setEventHandler { if !clientsAlive(root:root) { cancellation.cancel() } }
+        timer.setEventHandler {
+            // A config writer may own the configuration lock. Do not keep the
+            // host waiting on an ACP child that is waiting on that same writer.
+            let configurationPending = arguments.contains("--managed-acp-probe") &&
+                FileManager.default.fileExists(atPath:root.appendingPathComponent("configuration-request.json").path)
+            if !clientsAlive(root:root) || configurationPending { cancellation.cancel() }
+        }
         timer.resume(); defer { timer.cancel() }
         return OpenClawService.run(executable:executable, arguments:arguments, timeout:timeout,
                                   environment:environment, cancellation:cancellation)
@@ -194,6 +200,8 @@ enum ManagedGatewayHost {
         var capture: BufferedProcessOutput?
         var descriptor: ManagedOpenClawDescriptor?
         var nextHealth: TimeInterval = 0
+        var nextAudit: TimeInterval = 0
+        let resources = runtimeURL.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("OpenClaw/managed")
         var acpVerified = false
         var repair = false
         func teardown() {
@@ -235,13 +243,69 @@ enum ManagedGatewayHost {
             do {
                 let current = try ManagedOpenClawDescriptor.load(from: descriptorURL)
                 if current != descriptor {
-                    teardown(); descriptor = current; nextHealth = 0; repair = false
+                    guard let permit = try? ManagedRuntimePermit(root:root, repairing:true) else {
+                        writeHealth(current,state:"recovering",detail:"Waiting for owned work before refreshing the private runtime",root:root)
+                        Thread.sleep(forTimeInterval:0.1); continue
+                    }
+                    defer { withExtendedLifetime(permit) {} }
+                    teardown(); descriptor = current; nextHealth = 0; nextAudit = 0; repair = false
                     writeHealth(current, state:"recovering", detail:"Preparing private Gateway connectivity", root:root)
                 }
                 let now = Date().timeIntervalSince1970
+                let configurationRequest = root.appendingPathComponent("configuration-request.json")
+                if let data = try? Data(contentsOf:configurationRequest),
+                   let value = try? JSONSerialization.jsonObject(with:data) as? [String:Any],
+                   let id = value["request_id"] as? String, UUID(uuidString:id) != nil,
+                   let ownerData = try? JSONSerialization.data(withJSONObject:value["owner"] ?? [:]),
+                   let owner = try? JSONDecoder().decode(ManagedProcessIdentity.self,from:ownerData) {
+                    if owner.alive {
+                        guard let permit = try? ManagedRuntimePermit(root:root, repairing:true) else {
+                            Thread.sleep(forTimeInterval:0.1); continue
+                        }
+                        defer { withExtendedLifetime(permit) {} }
+                        writeHealth(current,state:"recovering",detail:"Finishing private configuration update",root:root)
+                        teardown()
+                        try write(["request_id":id],to:root.appendingPathComponent("configuration-ack.json"))
+                        while clientsAlive(root:root) && owner.alive,
+                              let pending = try? Data(contentsOf:configurationRequest), pending == data {
+                            Thread.sleep(forTimeInterval:0.1)
+                        }
+                        try? FileManager.default.removeItem(at:root.appendingPathComponent("configuration-ack.json"))
+                        descriptor = nil
+                        continue
+                    } else { try? FileManager.default.removeItem(at:configurationRequest) }
+                }
                 let request = root.appendingPathComponent("health-request.json")
                 let requested = FileManager.default.fileExists(atPath: request.path)
+                let faultRequested = (try? Data(contentsOf:request)).flatMap { try? JSONSerialization.jsonObject(with:$0) as? [String:Any] }?["fault"] as? Bool == true
                 if requested { try? FileManager.default.removeItem(at: request) }
+                // Audits are local CLI/readback work, not provider generation.
+                // Offline repair is excluded from every native delivery commit.
+                if now >= nextAudit || faultRequested || requested && repair {
+                    nextAudit = now + 300
+                    let audit = ownedCommand(root:root, executable:runtimeURL,
+                        arguments:["--managed-openclaw", "audit", "--managed-descriptor", descriptorURL.path], timeout:90)
+                    if audit.status != 0 || Self.object(audit.output)?["ok"] as? Bool != true {
+                        guard let permit = try? ManagedRuntimePermit(root:root, repairing:true) else {
+                            nextAudit = now + 1
+                            writeHealth(current,state:"recovering",detail:"Waiting for dispatched work to settle before private runtime repair",root:root)
+                            Thread.sleep(forTimeInterval:0.1); continue
+                        }
+                        defer { withExtendedLifetime(permit) {} }
+                        writeHealth(current,state:"recovering",detail:"Repairing TaskPilot-owned runtime settings",root:root)
+                        teardown()
+                        _ = budget.failed(now:now)
+                        try write(budget,to:root.appendingPathComponent("recovery.json"))
+                        let fixed = ownedCommand(root:root, executable:runtimeURL,
+                            arguments:["--managed-openclaw", "repair", "--managed-resources", resources.path,
+                                       "--managed-descriptor", descriptorURL.path], timeout:1200)
+                        if fixed.status == 0 { descriptor = nil; continue }
+                        repair = true
+                        writeHealth(current,state:"needs_repair",detail:"Private runtime repair did not pass its checks. Verify the saved Gemini key or reinstall TaskPilot; repeated repair is bounded.",root:root)
+                        continue
+                    }
+                    repair = false
+                }
                 if !repair && now >= budget.nextProbe && (now >= nextHealth || requested || gateway?.isRunning == false) {
                     budget.restarts.removeAll { now - $0 >= 600 }
                     if gateway == nil && !budget.restartReserved && budget.restarts.count >= 3 {
@@ -254,7 +318,7 @@ enum ManagedGatewayHost {
                         budget.restartReserved = false
                         try write(budget, to:root.appendingPathComponent("recovery.json"))
                         // Binding collision does not authorize killing the listener.
-                        if !portAvailable(current.port) {
+                        if try portCollision(current.port) {
                             let moved = ownedCommand(root:root, executable: runtimeURL,
                                 arguments: ["--managed-openclaw", "relocate", "--managed-descriptor", descriptorURL.path], timeout: 15)
                             guard moved.status == 0 else { throw ManagedOpenClawError.command("No private Gateway endpoint is available.") }
@@ -262,7 +326,8 @@ enum ManagedGatewayHost {
                         }
                         let validation = ownedCommand(root:root, executable: URL(fileURLWithPath: current.executable), arguments:["config", "validate"], timeout:15, environment:current.environment)
                         if validation.status != 0 {
-                            repair = true; writeHealth(current, state:"needs_repair", detail:"Private OpenClaw configuration is invalid. Reconfigure in Settings.", root:root); continue
+                            nextAudit = 0
+                            writeHealth(current, state:"recovering", detail:"Checking private configuration before repair", root:root); continue
                         }
                         let process = SubprocessSupervisor()
                         let output = try BufferedProcessOutput(maximumBytes:0, merged:true)
@@ -288,9 +353,18 @@ enum ManagedGatewayHost {
                     let result = ownedCommand(root:root, executable:URL(fileURLWithPath:current.executable), arguments:["health", "--json", "--timeout", "4000"], timeout:7, environment:current.environment)
                     let healthy = result.status == 0 && (result.output.data(using:.utf8).flatMap { try? JSONSerialization.jsonObject(with:$0) as? [String:Any] })?["ok"] as? Bool == true
                     if healthy && !acpVerified {
-                        let acp = ownedCommand(root:root, executable:runtimeURL, arguments:["--managed-acp-probe", "--managed-descriptor", descriptorURL.path], timeout:75, environment:current.environment)
+                        let acp = ownedCommand(root:root, executable:runtimeURL, arguments:["--managed-acp-probe", "--managed-descriptor", descriptorURL.path], timeout:150, environment:current.environment)
                         acpVerified = acp.status == 0
-                        if !acpVerified && acp.status != -2 {
+                        let cause = acp.status == -2 ? "timeout" : Self.object(acp.output)?["cause"] as? String ?? "startup"
+                        if !acpVerified && cause == "authentication" {
+                            repair = true
+                            writeHealth(current,state:"needs_repair",detail:"Private Gateway authentication was rejected; checking TaskPilot-owned configuration",root:root)
+                            nextAudit = now + 300
+                            continue
+                        }
+                        if !acpVerified && cause == "incompatible" {
+                            guard let permit = try? ManagedRuntimePermit(root:root, repairing:true) else { nextAudit = 0; continue }
+                            defer { withExtendedLifetime(permit) {} }
                             teardown()
                             let rollback = ownedCommand(root:root, executable:runtimeURL,
                                 arguments:["--managed-openclaw", "rollback", "--managed-descriptor", descriptorURL.path], timeout:30)
@@ -304,7 +378,12 @@ enum ManagedGatewayHost {
                         budget.healthy(); nextHealth = now + 30
                         writeHealth(current, state:"healthy", detail:"Private Gateway connected; ACP compatible", root:root, gateway:gateway)
                     } else {
+                        guard let permit = try? ManagedRuntimePermit(root:root, repairing:true) else {
+                            nextAudit = 0; continue
+                        }
+                        defer { withExtendedLifetime(permit) {} }
                         teardown()
+                        nextAudit = 0
                         _ = budget.failed(now: Date().timeIntervalSince1970)
                         nextHealth = budget.nextProbe
                         writeHealth(current, state:"recovering", detail:"Private Gateway unavailable; automatic recovery is waiting for its cooldown", root:root)
@@ -321,8 +400,11 @@ enum ManagedGatewayHost {
                     }
                 }
             } catch {
-                teardown()
-                if let descriptor { writeHealth(descriptor, state:"recovering", detail:"Private Gateway recovery failed: \(error.localizedDescription)", root:root) }
+                if let permit = try? ManagedRuntimePermit(root:root, repairing:true) {
+                    teardown(); withExtendedLifetime(permit) {}
+                }
+                if let descriptor { writeHealth(descriptor, state:"recovering", detail:"Private Gateway local recovery failed; waiting for the next bounded check", root:root) }
+                nextAudit = 0
                 _ = budget.failed(now:Date().timeIntervalSince1970)
                 try? write(budget, to:root.appendingPathComponent("recovery.json"))
             }
@@ -331,15 +413,22 @@ enum ManagedGatewayHost {
         if let descriptor { writeHealth(descriptor, state:"stopped", detail:"TaskPilot closed its private Gateway", root:root) }
         return 0
     }
-    static func portAvailable(_ port: Int) -> Bool {
+    static func object(_ text: String) -> [String:Any]? {
+        text.data(using:.utf8).flatMap { try? JSONSerialization.jsonObject(with:$0) as? [String:Any] }
+    }
+    static func portAvailable(_ port: Int) -> Bool { (try? portCollision(port)) == false }
+    static func portCollision(_ port: Int) throws -> Bool {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { return false }; defer { close(fd) }
+        guard fd >= 0 else { throw ManagedOpenClawError.command("Private endpoint inspection failed") }; defer { close(fd) }
         var reuse: Int32 = 1
         _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
         var address = sockaddr_in(); address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET); address.sin_port = UInt16(port).bigEndian
         address.sin_addr.s_addr = inet_addr("127.0.0.1")
-        return withUnsafePointer(to:&address) { $0.withMemoryRebound(to:sockaddr.self, capacity:1) { Darwin.bind(fd,$0,socklen_t(MemoryLayout<sockaddr_in>.size)) == 0 } }
+        let result = withUnsafePointer(to:&address) { $0.withMemoryRebound(to:sockaddr.self, capacity:1) { Darwin.bind(fd,$0,socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        if result == 0 { return false }
+        guard errno == EADDRINUSE else { throw ManagedOpenClawError.command("Private endpoint inspection failed") }
+        return true
     }
 }
 

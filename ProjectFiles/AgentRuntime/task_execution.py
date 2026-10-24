@@ -48,7 +48,7 @@ TRANSITIONS = {
     (Phase.EXECUTING, Phase.RECONCILING): Transition(),
     (Phase.WAITING_INPUT, Phase.RECONCILING): Transition(),
     (Phase.VERIFYING, Phase.OBSERVING): Transition(),
-    **{(phase, Phase.RECOVERING): Transition() for phase in (Phase.STARTING, Phase.PLANNING, Phase.VERIFYING, Phase.RECONCILING, Phase.EXECUTING)},
+    **{(phase, Phase.RECOVERING): Transition() for phase in (Phase.STARTING, Phase.PLANNING, Phase.VERIFYING, Phase.RECONCILING, Phase.EXECUTING, Phase.WAITING_INPUT)},
     **{(Phase.RECOVERING, phase): Transition(frozenset({"recovered"})) for phase in (Phase.STARTING, Phase.PLANNING, Phase.VERIFYING, Phase.RECONCILING, Phase.EXECUTING)},
     **{(phase, Phase.DRAINING): Transition() for phase in Phase
        if phase not in {Phase.DRAINING, Phase.FINISHED}},

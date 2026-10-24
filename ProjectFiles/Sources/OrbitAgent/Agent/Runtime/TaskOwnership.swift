@@ -237,6 +237,9 @@ final class TaskLease: @unchecked Sendable {
         for waiter in waiters { waiter() }
     }
 
+    // Assigned before runtime startup; fixture/manual paths do not acquire it.
+    var managedRuntimeRoot: URL?
+
     func commit<T>(_ operation: () throws -> T) throws -> T {
         // Native workers may wait through Pause; never block the main run loop.
         while true {
@@ -254,6 +257,8 @@ final class TaskLease: @unchecked Sendable {
             defer { lock.unlock() }
             guard value == .running else { discarded += 1; throw CancellationError() }
             try Task.checkCancellation()
+            let permit = try managedRuntimeRoot.map { try ManagedRuntimePermit(root:$0, repairing:false) }
+            defer { withExtendedLifetime(permit) {} }
             return try operation()
         }
     }

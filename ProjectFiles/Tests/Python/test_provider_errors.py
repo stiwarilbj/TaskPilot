@@ -345,7 +345,7 @@ class ProviderErrorTests(unittest.TestCase):
     def test_gateway_cli_error_keeps_json_and_provider_codes(self):
         client = self.client(); client.openclaw_path = 'openclaw'
         for returncode in (0, 1):
-            with mock.patch.object(runtime.subprocess, 'run', return_value=mock.Mock(returncode=returncode, stdout=json.dumps(quota()), stderr='')), \
+            with mock.patch.object(runtime.managed_openclaw, 'bounded_run', return_value=(returncode,json.dumps(quota()))), \
                  self.subTest(returncode=returncode), self.assertRaises(errors.ProviderRequestError) as caught:
                 client.gateway_configuration('sessions.get', {'key': 'unique'})
             self.assertEqual(self.failure(caught.exception.payload).code, 429)

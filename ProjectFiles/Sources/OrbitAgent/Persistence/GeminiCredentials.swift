@@ -147,7 +147,16 @@ struct GeminiModelVerifier: Sendable {
                             GeminiModelCheck(model: model, state: index == 0 ? .temporary("Verification ended before a terminal result; no model was declared ready.") : .waiting)
                         }
                     }
-                    return Self.checks(from: Data(result.output.utf8), models: models)
+                    let checks = Self.checks(from: Data(result.output.utf8), models: models)
+                    if !readOnly, !cancellation.isCancelled,
+                       !checks.contains(where: { if case .working = $0.state { return true }; return false }),
+                       let saved = try? GeminiAPIKeyStore().load(), saved != apiKey {
+                        let resources = Bundle.main.resourceURL!.appendingPathComponent("OpenClaw/managed")
+                        _ = OpenClawService.run(executable:runtimeURL,
+                            arguments:["--managed-openclaw", "ensure", "--managed-resources", resources.path],
+                            timeout:1200, input:Data((saved + "\n").utf8), cancellation:cancellation)
+                    }
+                    return checks
                 } catch {
                     return models.enumerated().map { index, model in
                         GeminiModelCheck(model: model, state: index == 0 ? .failed(error.localizedDescription) : .waiting)

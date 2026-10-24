@@ -72,7 +72,7 @@ final class AgentAutomationBridge {
                                                             instructionRevision: instructionRevision)
             }
         } catch {
-            let code = error is LocalOperationBudget.Exhausted ? "local_budget_exhausted" : error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" :
+            let code = error is ManagedRuntimeGateError ? "runtime_recovering" : error is LocalOperationBudget.Exhausted ? "local_budget_exhausted" : error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" :
                 (error as? TaskInstructionCorrectionError).map { _ in "instruction_superseded" } ?? (error as? ActionReceiptStore.ReceiptError)?.code ?? (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? (error is BoundFileOperation.Conflict ? "file_conflict" : "action_rejected")
             return ["task_generation_id": lease?.id ?? "", "kind": "bridge_response", "request_id": requestID,
                     "ok": false, "error_code": code, "error": error.localizedDescription,
@@ -83,6 +83,8 @@ final class AgentAutomationBridge {
     private func handleInstructionRevisionRequest(_ request: [String: Any], requestID: String,
                                                    lease: TaskLease, instructionRevision: UInt64) async -> [String: Any] {
         var receiptToken: ActionReceiptStore.Token?
+        var runtimePermit: ManagedRuntimePermit?
+        defer { withExtendedLifetime(runtimePermit) {} }
         var magnifierActionTitle: String?
         do {
             try await lease.checkpoint()
@@ -90,6 +92,9 @@ final class AgentAutomationBridge {
                 throw BridgeError.invalidRequest("Missing bridge method")
             }
             let params = request["params"] as? [String: Any] ?? [:]
+            if method == "act", let root = lease.managedRuntimeRoot {
+                runtimePermit = try ManagedRuntimePermit(root:root, repairing:false)
+            }
             if LocalOperationBudget.current == nil {
                 let seconds = try localBudgetSeconds(method: method, params: params)
                 return await LocalOperationBudget.$current.withValue(LocalOperationBudget(seconds: seconds, phase: method)) {
@@ -372,7 +377,7 @@ final class AgentAutomationBridge {
                 "result": result
             ]
         } catch {
-            let code = error is LocalOperationBudget.Exhausted ? "local_budget_exhausted" : error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" : (error as? TaskInstructionCorrectionError).map { _ in "instruction_superseded" } ??
+            let code = error is ManagedRuntimeGateError ? "runtime_recovering" : error is LocalOperationBudget.Exhausted ? "local_budget_exhausted" : error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" : (error as? TaskInstructionCorrectionError).map { _ in "instruction_superseded" } ??
                 (error as? ActionReceiptStore.ReceiptError)?.code ?? (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? (error is BoundFileOperation.Conflict ? "file_conflict" : "action_rejected")
             receiptToken?.fail(error, code: code)
             if let title = magnifierActionTitle, let receiptToken {

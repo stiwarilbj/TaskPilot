@@ -5,7 +5,9 @@ configuration are serialized; no task/provider data is written to diagnostics.
 """
 from __future__ import annotations
 import base64
-from contextlib import contextmanager
+import ctypes
+import sqlite3
+from contextlib import contextmanager, ExitStack, closing
 import fcntl
 import hashlib
 import json
@@ -27,6 +29,12 @@ VERSION = 1
 ROOT = Path.home() / 'Library/Application Support/Orbit Agent/ManagedOpenClaw'
 
 class ManagedRuntimeError(RuntimeError): pass
+
+class ACPConnectionError(ManagedRuntimeError):
+    def __init__(self, cause):
+        self.cause = cause
+        self.code = 'transport_' + cause
+        super().__init__('Private OpenClaw ACP connection failed (' + cause + '); supervised recovery is required.')
 
 def atomic_json(path: Path, value):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -74,7 +82,7 @@ def download(url, destination, expected):
         destination.unlink(missing_ok=True)
         raise ManagedRuntimeError('Official Node checksum did not match. Installation was not activated.')
 
-def bounded_run(argv, *, env=None, timeout=45, cwd=None, input_data=None):
+def bounded_run(argv, *, env=None, timeout=45, cwd=None, input_data=None, result=False):
     # Disk-backed capture prevents unbounded communicate() allocation for npm.
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as input_file:
         if input_data is not None:
@@ -90,6 +98,7 @@ def bounded_run(argv, *, env=None, timeout=45, cwd=None, input_data=None):
             except ProcessLookupError: pass
             process.wait(); raise
         output.seek(0); text = output.read(65536).decode('utf-8', 'replace')
+        if result: return code, text
         if code: raise ManagedRuntimeError('Managed runtime validation failed; the previous installation remains available.')
         return text
 
@@ -169,9 +178,9 @@ def private_port():
             for s in sockets: s.close()
     raise ManagedRuntimeError('No private Gateway endpoint is available.')
 
-def ensure(resources: Path, root: Path = ROOT, key: str = ''):
+def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
     from request_policy import configuration_transaction
-    with configuration_transaction(), locked(root):
+    with configuration_transaction(), locked(root), ExitStack() as cleanup:
         target, fingerprint, manifest = install(resources, root)
         try:
             rejected = json.loads((root / 'rejected-installation.json').read_text())
@@ -189,24 +198,20 @@ def ensure(resources: Path, root: Path = ROOT, key: str = ''):
         if not token.exists():
             fd = os.open(token, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             with os.fdopen(fd, 'w') as f: f.write(secrets.token_hex(32))
-        from request_policy import ALL_MODELS
         port = previous['port'] if previous else private_port()
-        desired = {'gateway': {'mode':'local', 'bind':'loopback', 'port':port,
-                    'auth': {'mode':'token','token':token.read_text()}},
-            'agents': {'defaults': {'workspace':str(workspace), 'model':{'primary':ALL_MODELS[0], 'fallbacks':list(ALL_MODELS[1:])},
-                'imageModel': {'primary':ALL_MODELS[0], 'fallbacks':list(ALL_MODELS[1:])},
-                'models':{m:{} for m in ALL_MODELS}}},
-            # This pinned release supplies Google model support as a bundled
-            # plugin. Disabling the plugin system removes the provider catalog.
-            'plugins': {'enabled':True, 'allow':['google'],
-                        'entries': {'google': {'enabled':True}}},
-            'browser': {'enabled':False}}
+        desired = desired_settings(workspace, token, port)
         # Save a compatible snapshot before promoting a changed installation.
         if previous and previous['installation_fingerprint'] != fingerprint:
             atomic_json(root / 'previous-runtime.json', previous)
             if config.exists(): shutil.copyfile(config, state / 'previous-config.json')
-        if not config.exists() or json.loads(config.read_text()) != desired:
-            atomic_json(config, desired)
+        try: current_config = json.loads(config.read_text())
+        except (OSError, ValueError): current_config = {}
+        config_changed = drained or not contains_settings(current_config, desired) or set(current_config.get('agents', {}).get('defaults', {}).get('models', {})) != set(desired['agents']['defaults']['models'])
+        offline = False
+        if config_changed:
+            cleanup.enter_context(configuration_hold(root, already_drained=drained)); offline = True
+            require_offline(root)
+            atomic_json(config, merge_settings(current_config, desired))
         auth = state / 'agents/main/agent/auth-profiles.json'
         key_record = state / 'credential-fingerprint.json'
         if key and len(key.strip()) < 20:
@@ -214,40 +219,39 @@ def ensure(resources: Path, root: Path = ROOT, key: str = ''):
         wrapper = state / 'openclaw'
         node = target / 'node/bin/node'; entry = target / 'package/node_modules/openclaw/openclaw.mjs'
         # Absolute executable and a clean environment: no ambient shared profile.
-        script = '#!/bin/sh\nunset OPENCLAW_HOME OPENCLAW_PROFILE OPENCLAW_GATEWAY_TOKEN OPENCLAW_GATEWAY_URL NODE_OPTIONS NODE_PATH\n'
-        for name, value in {'OPENCLAW_STATE_DIR':str(state),'OPENCLAW_CONFIG_PATH':str(config),
-                            'OPENCLAW_PROFILE':'taskpilot','OPENCLAW_NO_RESPAWN':'1',
-                            'OPENCLAW_HIDE_BANNER':'1','OPENCLAW_SUPPRESS_NOTES':'1'}.items():
-            script += 'export ' + name + '=' + shlex.quote(value) + '\n'
-        script += 'exec ' + shlex.quote(str(node)) + ' ' + shlex.quote(str(entry)) + ' "$@"\n'
+        script = wrapper_script(state, config, node, entry)
         if not wrapper.exists() or wrapper.read_text() != script:
             temp = wrapper.with_suffix('.new'); temp.write_text(script); temp.chmod(0o700); temp.replace(wrapper)
         # The pinned release stores authoritative configuration in SQLite and
         # exports JSON. Replacing JSON alone is reverted by the next command.
-        bounded_run([str(wrapper), 'config', 'patch', '--stdin'],
-                    input_data=json.dumps(desired).encode(), env=isolated_environment())
+        if config_changed:
+            bounded_run([str(wrapper), 'config', 'patch', '--stdin', '--replace-path', 'agents.defaults.models'],
+                        input_data=json.dumps(desired).encode(), env=isolated_environment())
+            verify_settings(wrapper, desired)
         if key:
             key_fingerprint = hashlib.sha256(key.strip().encode()).hexdigest()
             try: saved_fingerprint = json.loads(key_record.read_text()).get('fingerprint')
             except (OSError, ValueError): saved_fingerprint = None
-            if saved_fingerprint != key_fingerprint:
+            if saved_fingerprint != key_fingerprint or not credential_present(state):
+                if not offline: cleanup.enter_context(configuration_hold(root, already_drained=drained)); offline = True
+                require_offline(root)
                 # Only our private legacy file can exist here. Do not invoke doctor
                 # or import any shared store. The supported auth command writes
                 # OpenClaw's current credential schema (SQLite in this release).
                 auth.unlink(missing_ok=True)
-                process = subprocess.run([str(wrapper), 'models', 'auth', 'paste-api-key',
+                bounded_run([str(wrapper), 'models', 'auth', 'paste-api-key',
                     '--provider', 'google', '--profile-id', 'google:orbit'],
-                    input=key.strip() + '\n', text=True, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL, timeout=45, env=isolated_environment())
-                if process.returncode:
-                    raise ManagedRuntimeError('Private OpenClaw could not save the Gemini credential. Reconfigure in Settings.')
-                atomic_json(key_record, {'fingerprint':key_fingerprint})
+                    input_data=(key.strip() + '\n').encode(), env=isolated_environment())
+            try: saved_key = (root.parent / 'gemini-api-key').read_text().strip()
+            except OSError: saved_key = ''
+            atomic_json(key_record, {'fingerprint':key_fingerprint,
+                                    'verification_until':time.time() + 300 if saved_key and saved_key != key.strip() else 0})
         descriptor = {'version':VERSION, 'instance_id':identity, 'installation_fingerprint':fingerprint,
             'openclaw_version':manifest['openclaw_version'], 'node_version':manifest['node_version'],
             'node':str(node),'entry':str(entry),'executable':str(wrapper),'state':str(state),
             'config':str(config),'workspace':str(workspace),'token_file':str(token), 'port':port,
             'endpoint':f'ws://127.0.0.1:{port}',
-            'configuration_fingerprint':hashlib.sha256((json.dumps(desired,sort_keys=True) + (digest(key_record) if key_record.exists() else '')).encode()).hexdigest()}
+            'configuration_fingerprint':configuration_fingerprint(desired, key_record)}
         bounded_run([str(wrapper),'config','validate'], timeout=45, env=isolated_environment())
         atomic_json(active, descriptor)
         if not previous or previous['installation_fingerprint'] != fingerprint:
@@ -262,7 +266,6 @@ def load_descriptor(path: Path = ROOT / 'runtime.json'):
         for name in ('node','entry','executable','state','config','workspace','token_file'):
             if not Path(d[name]).is_absolute() or not Path(d[name]).resolve().is_relative_to(root): raise ValueError()
         if type(d['port']) is not int or not 1024 < d['port'] < 65400 or d['endpoint'] != f"ws://127.0.0.1:{d['port']}": raise ValueError()
-        if not Path(d['executable']).is_file(): raise ValueError()
         return d
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise ManagedRuntimeError('TaskPilot private OpenClaw is not installed or its descriptor is invalid.') from error
@@ -270,16 +273,16 @@ def load_descriptor(path: Path = ROOT / 'runtime.json'):
 def activate_environment(path):
     d = load_descriptor(path)
     for key in list(os.environ):
-        if key.startswith('OPENCLAW_'): os.environ.pop(key)
+        if key.startswith(('OPENCLAW_', 'NODE_', 'GOOGLE_', 'GEMINI_')): os.environ.pop(key)
     os.environ.update(OPENCLAW_STATE_DIR=d['state'], OPENCLAW_CONFIG_PATH=d['config'],
         OPENCLAW_PROFILE='taskpilot', ORBIT_OPENCLAW_PATH=d['executable'],
         TASKPILOT_MANAGED_DESCRIPTOR=str(path),
         TASKPILOT_MANAGED_FINGERPRINT=d['instance_id'] + ':' + d['installation_fingerprint'] + ':' + d['configuration_fingerprint'])
     return d
 
-def request_recovery(path):
+def request_recovery(path, *, fault=False):
     # Coalesced signal contains no request/task contents. Host owns the budget.
-    atomic_json(path.parent / 'health-request.json', {'requested':time.time()})
+    atomic_json(path.parent / 'health-request.json', {'requested':time.time(), 'fault':fault})
 
 def wait_for_health(path, *, sleep=time.sleep, now=time.monotonic, status=None, force=False):
     requested_at = time.time() if force else 0
@@ -290,10 +293,10 @@ def wait_for_health(path, *, sleep=time.sleep, now=time.monotonic, status=None, 
             descriptor = load_descriptor(path)
             if state.get('instance_id') == descriptor['instance_id'] and state.get('configuration_fingerprint') == descriptor['configuration_fingerprint']:
                 if state.get('state') == 'needs_repair': raise ManagedRuntimeError(state.get('detail','Private OpenClaw needs repair in Settings.'))
-                if state.get('state') == 'healthy' and requested_at <= state.get('checked_at',0) and time.time() - state.get('checked_at',0) < 45: return descriptor
+                if healthy_record(state, descriptor, requested_at=requested_at): return descriptor
         except (OSError, ValueError): pass
         if not requested:
-            request_recovery(path); requested = True
+            request_recovery(path, fault=force); requested = True
         if status: status('Waiting for TaskPilot’s private OpenClaw Gateway to recover…')
         sleep(1)  # SIGTERM/Stop interrupts this, including when provider is idle.
 
@@ -307,7 +310,7 @@ def relocate(path):
                     input_data=json.dumps({'gateway':{'port':port}}).encode(), env=isolated_environment())
         atomic_json(config, value)
         d.update(port=port, endpoint=f'ws://127.0.0.1:{port}')
-        d['configuration_fingerprint'] = hashlib.sha256((d['configuration_fingerprint'] + str(port)).encode()).hexdigest()
+        d['configuration_fingerprint'] = configuration_fingerprint(desired_settings(d['workspace'], Path(d['token_file']), port), Path(d['state']) / 'credential-fingerprint.json')
         atomic_json(path, d)
         return d
 
@@ -317,7 +320,11 @@ def command(operation, resources=None, descriptor=None):
     if operation == 'ensure':
         key = __import__('sys').stdin.readline(8192).strip()
         result = ensure(Path(resources), path.parent, key)
-    elif operation == 'relocate': result = relocate(path)
+    elif operation == 'audit': result = audit(path)
+    elif operation == 'repair': result = repair(path, Path(resources))
+    elif operation == 'relocate':
+        require_offline(path.parent)
+        result = relocate(path)
     elif operation == 'rollback': result = rollback(path)
     else: raise ManagedRuntimeError('Unsupported managed runtime operation.')
     print(json.dumps(result, separators=(',', ':')))
@@ -330,15 +337,259 @@ def mark_working(path):
         atomic_json(path.parent / 'working-config.json', json.loads(Path(d['config']).read_text()))
 
 def rollback(path):
+    require_offline(path.parent)
     with locked(path.parent):
         d = load_descriptor(path.parent / 'working-runtime.json')
         if not validate_install(Path(d['node']).parents[2], d['installation_fingerprint']):
             raise ManagedRuntimeError('The last working OpenClaw installation is unavailable; reconfigure in Settings.')
+        failed = load_descriptor(path)
+        if d['installation_fingerprint'] == failed['installation_fingerprint']:
+            raise ManagedRuntimeError('No different verified compatible installation is available for rollback.')
         configuration = json.loads((path.parent / 'working-config.json').read_text())
         bounded_run([d['executable'], 'config', 'patch', '--stdin'],
                     input_data=json.dumps(configuration).encode(), env=isolated_environment())
         atomic_json(Path(d['config']), configuration)
-        failed = load_descriptor(path)
         atomic_json(path.parent / 'rejected-installation.json', {'fingerprint':failed['installation_fingerprint']})
         atomic_json(path, d)
         return d
+
+
+def process_identity(pid):
+    """Same PROC_PIDTBSDINFO birth identity used by native ProcessSupport.
+
+    Do not accept kill(pid, 0): a reused PID is a different owner. Fail closed on
+    unsupported platforms, inaccessible processes, and zombies.
+    """
+    if platform.system() != 'Darwin' or type(pid) is not int or pid <= 0: return None
+    class BSDInfo(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint32) for name in
+                    ('flags','status','xstatus','pid','ppid','uid','gid','ruid','rgid','svuid','svgid','reserved')]
+        _fields_ += [('comm', ctypes.c_char * 16), ('name', ctypes.c_char * 32)]
+        _fields_ += [(name, ctypes.c_uint32) for name in ('nfiles','pgid','jobc','tdev','tpgid','nice')]
+        _fields_ += [('seconds', ctypes.c_uint64), ('microseconds', ctypes.c_uint64)]
+    try:
+        lib = ctypes.CDLL('/usr/lib/libproc.dylib')
+        lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        lib.proc_pidinfo.restype = ctypes.c_int
+        info = BSDInfo()
+        if lib.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info) or info.status == 5: return None
+        return dict(pid=info.pid, seconds=info.seconds, microseconds=info.microseconds)
+    except (OSError, AttributeError): return None
+
+
+def identity_alive(value):
+    return (isinstance(value, dict) and set(value) == {'pid','seconds','microseconds'} and
+            all(type(v) is int and v >= 0 for v in value.values()) and
+            process_identity(value['pid']) == value)
+
+
+def healthy_record(record, descriptor, *, requested_at=0, wall_time=None):
+    checked = record.get('checked_at')
+    return (record.get('version') == VERSION and record.get('state') == 'healthy' and
+            record.get('instance_id') == descriptor['instance_id'] and
+            record.get('installation_fingerprint') == descriptor['installation_fingerprint'] and
+            record.get('configuration_fingerprint') == descriptor['configuration_fingerprint'] and
+            type(checked) in (int, float) and requested_at <= checked and
+            0 <= (time.time() if wall_time is None else wall_time) - checked < 45 and
+            identity_alive(record.get('host_identity')) and identity_alive(record.get('gateway_identity')))
+
+
+def require_offline(root):
+    # The supervisor must drain its owned tree before any offline CLI writer.
+    for name in ('gateway-root.json', 'gateway-processes.json'):
+        try:
+            value = json.loads((root / name).read_text())
+            if any(identity_alive(v) for v in (value if isinstance(value, list) else [value])):
+                raise ManagedRuntimeError('Private Gateway must finish drainage before configuration repair.')
+        except (OSError, ValueError): pass
+
+
+def contains_settings(actual, expected):
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and all(k in actual and contains_settings(actual[k], v) for k,v in expected.items())
+    return type(actual) is type(expected) and actual == expected
+
+
+def verify_settings(wrapper, expected):
+    # Read back authoritative SQLite configuration using the supported CLI.
+    # Only managed top-level keys are compared; CLI metadata is not our setting.
+    for key, value in expected.items():
+        actual = json.loads(bounded_run([str(wrapper), 'config', 'get', key, '--json'], env=isolated_environment()))
+        if key == 'gateway' and isinstance(actual, dict) and actual.get('auth', {}).get('token') == '__OPENCLAW_REDACTED__':
+            value = {**value, 'auth':{**value['auth'], 'token':'__OPENCLAW_REDACTED__'}}
+        if not contains_settings(actual, value):
+            raise ManagedRuntimeError('Private configuration readback did not match TaskPilot settings.')
+
+
+def credential_present(state):
+    # Shared auth profiles are stored in this instance's machine database in
+    # the pinned release; per-agent overrides may live in the agent database.
+    sources = [('state/openclaw.sqlite','config_machine_state','value_json',"state_key = 'authProfiles.store'"),
+               ('agents/main/agent/openclaw-agent.sqlite','auth_profile_store','store_json',"store_key = 'primary'")]
+    for name, table, column, predicate in sources:
+        database = Path(state) / name
+        try:
+            with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=1)) as connection:
+                row = connection.execute(f"SELECT 1 FROM {table} WHERE {predicate} AND json_extract({column}, '$.profiles.\"google:orbit\".provider') = 'google' AND json_extract({column}, '$.profiles.\"google:orbit\".type') = 'api_key' AND json_type({column}, '$.profiles.\"google:orbit\".key') = 'text' AND length(json_extract({column}, '$.profiles.\"google:orbit\".key')) > 0 LIMIT 1").fetchone()
+                if row is not None: return True
+        except (OSError, sqlite3.Error): continue
+    return False
+
+
+def direct_command(descriptor):
+    directory = Path(descriptor['node']).parents[2]
+    if not validate_install(directory, descriptor['installation_fingerprint']):
+        raise ManagedRuntimeError('Private installation integrity failed; waiting for supervised repair.')
+    return [descriptor['node'], descriptor['entry']]
+
+
+def handshake_cause(error):
+    if isinstance(error, ACPConnectionError): return error.cause
+    text = str(error).lower()
+    if 'unsupported acp version' in text: return 'incompatible'
+    if any(v in text for v in ('unauthorized','authentication','invalid token','token mismatch')): return 'authentication'
+    if any(v in text for v in ('timeout','timed out')): return 'timeout'
+    if any(v in text for v in ('econnrefused','connection refused')): return 'refused'
+    if any(v in text for v in ('invalid json','invalid frame','malformed','protocol')): return 'malformed'
+    return 'startup'
+
+
+def audit(path):
+    started = time.monotonic()
+    d = load_descriptor(path)
+    faults = []
+    if not validate_install(Path(d['node']).parents[2], d['installation_fingerprint']): faults.append('installation')
+    try:
+        if Path(d['executable']).read_text() != wrapper_script(d['state'], d['config'], d['node'], d['entry']) or not os.access(d['executable'], os.X_OK): faults.append('wrapper')
+    except (OSError, UnicodeError): faults.append('wrapper')
+    try:
+        config = json.loads(Path(d['config']).read_text())
+        from request_policy import ALL_MODELS
+        required = desired_settings(d['workspace'], Path(d['token_file']), d['port'])
+        key_record = Path(d['state']) / 'credential-fingerprint.json'
+        expected_fingerprint = configuration_fingerprint(required, key_record)
+        if expected_fingerprint != d['configuration_fingerprint']: faults.append('configuration_fingerprint')
+        if not contains_settings(config, required) or set(config.get('agents', {}).get('defaults', {}).get('models', {})) != set(ALL_MODELS): faults.append('configuration')
+        if not faults: verify_settings(d['executable'], required)
+    except (OSError, ValueError, ManagedRuntimeError): faults.append('configuration')
+    if not credential_present(d['state']): faults.append('credential_store')
+    try:
+        saved_key = (path.parent.parent / 'gemini-api-key').read_text().strip()
+        record = json.loads((Path(d['state']) / 'credential-fingerprint.json').read_text())
+        key_matches = hashlib.sha256(saved_key.encode()).hexdigest() == record['fingerprint']
+        # Explicit Check may temporarily install an unsaved candidate. It cannot
+        # displace the saved key indefinitely after cancellation or failure.
+        until = record.get('verification_until', 0)
+        checking = type(until) in (int, float) and 0 < until - time.time() <= 300
+        if not key_matches and not checking: faults.append('credential_store')
+    except (OSError, ValueError, KeyError): faults.append('credential_store')
+    # Hash contents only for equality/budget identity, never persist raw config.
+    parts = [d['installation_fingerprint'], d['configuration_fingerprint'], *sorted(set(faults))]
+    for name in ('config','executable'):
+        try: parts.append(digest(d[name]))
+        except OSError: parts.append('missing')
+    fingerprint = hashlib.sha256(':'.join(parts).encode()).hexdigest()
+    result = {'version':VERSION, 'ok':not faults, 'causes':sorted(set(faults)), 'fingerprint':fingerprint,
+              'elapsed_ms':round((time.monotonic()-started)*1000)}
+    atomic_json(path.parent / 'audit.json', result)
+    return result
+
+
+def repair(path, resources):
+    require_offline(path.parent)
+    result = audit(path)
+    if result['ok']: return load_descriptor(path)
+    # Persist reservation before attempting repair; crashes cannot reset it.
+    with locked(path.parent):
+        record_path = path.parent / 'repair-budget.json'
+        try: record = json.loads(record_path.read_text())
+        except (OSError, ValueError): record = {}
+        now = time.time()
+        if record.get('fingerprint') == result['fingerprint'] and 0 <= now - record.get('attempted_at',0) < 600:
+            raise ManagedRuntimeError('This private runtime defect was already repaired recently; waiting before another attempt.')
+        atomic_json(record_path, {'fingerprint':result['fingerprint'], 'attempted_at':now})
+    if 'installation' in result['causes']:
+        try: return rollback(path)
+        except (ManagedRuntimeError, OSError, ValueError): pass
+    key_path = path.parent.parent / 'gemini-api-key'
+    try: key = key_path.read_text().strip()
+    except OSError: key = ''
+    d = ensure(resources, path.parent, key, drained=True)
+    if not audit(path)['ok']:
+        raise ManagedRuntimeError('Private runtime repair did not pass readback; check the saved key or reinstall TaskPilot.')
+    return d
+
+
+@contextmanager
+def configuration_hold(root, *, timeout=60, already_drained=False):
+    """Ask the existing owner to drain, without killing it or starting another.
+
+    A birth-bound request is removed in finally; the host also releases abandoned
+    requests when this requester exits. It never needs our configuration lock.
+    """
+    try:
+        require_offline(root)
+        if not already_drained:
+            try: health = json.loads((root / 'health.json').read_text())
+            except (OSError, ValueError): health = {}
+            if health.get('state') != 'stopped' and identity_alive(health.get('host_identity')):
+                raise ManagedRuntimeError('The owner must suspend startup before configuration changes.')
+    except ManagedRuntimeError:
+        identity = process_identity(os.getpid())
+        if identity is None: raise ManagedRuntimeError('Cannot establish configuration repair ownership.')
+        request = root / 'configuration-request.json'
+        token = str(uuid.uuid4())
+        atomic_json(request, {'request_id':token, 'owner':identity})
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    ack = json.loads((root / 'configuration-ack.json').read_text())
+                    if ack.get('request_id') == token:
+                        require_offline(root)
+                        break
+                except (OSError, ValueError): pass
+                if time.monotonic() >= deadline:
+                    raise ManagedRuntimeError('Private Gateway could not safely drain for configuration repair.')
+                time.sleep(0.1)
+            yield
+        finally:
+            request.unlink(missing_ok=True)
+    else:
+        yield
+
+
+def wrapper_script(state, config, node, entry):
+    script = '#!/bin/sh\nunset OPENCLAW_HOME OPENCLAW_PROFILE OPENCLAW_GATEWAY_TOKEN OPENCLAW_GATEWAY_URL NODE_OPTIONS NODE_PATH\n'
+    for name, value in {'OPENCLAW_STATE_DIR':str(state),'OPENCLAW_CONFIG_PATH':str(config),
+                        'OPENCLAW_PROFILE':'taskpilot','OPENCLAW_NO_RESPAWN':'1',
+                        'OPENCLAW_HIDE_BANNER':'1','OPENCLAW_SUPPRESS_NOTES':'1'}.items():
+        script += 'export ' + name + '=' + shlex.quote(value) + '\n'
+    script += 'exec ' + shlex.quote(str(node)) + ' ' + shlex.quote(str(entry)) + ' "$@"\n'
+    return script
+
+
+def configuration_fingerprint(settings, key_record):
+    return hashlib.sha256((json.dumps(settings,sort_keys=True) + (digest(key_record) if key_record.exists() else '')).encode()).hexdigest()
+
+
+def desired_settings(workspace, token, port):
+    from request_policy import ALL_MODELS
+    return {'gateway':{'mode':'local','bind':'loopback','port':port,
+                       'auth':{'mode':'token','token':Path(token).read_text()}},
+            'agents':{'defaults':{'workspace':str(workspace),
+                       'model':{'primary':ALL_MODELS[0],'fallbacks':list(ALL_MODELS[1:])},
+                       'imageModel':{'primary':ALL_MODELS[0],'fallbacks':list(ALL_MODELS[1:])},
+                       'models':{m:{} for m in ALL_MODELS}}},
+            'plugins':{'enabled':True,'allow':['google'],'entries':{'google':{'enabled':True}}},
+            'browser':{'enabled':False}}
+
+
+def merge_settings(actual, desired):
+    """Preserve unrelated metadata while replacing TaskPilot-owned leaves."""
+    merged = dict(actual) if isinstance(actual, dict) else {}
+    for key, value in desired.items():
+        merged[key] = merge_settings(merged.get(key), value) if isinstance(value, dict) else value
+    if 'agents' in desired:
+        merged['agents']['defaults']['models'] = desired['agents']['defaults']['models']
+    return merged
