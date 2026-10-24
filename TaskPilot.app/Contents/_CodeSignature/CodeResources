@@ -34,7 +34,7 @@
 		</data>
 		<key>Resources/AgentRuntime/_internal/base_library.zip</key>
 		<data>
-		e901OeDEJOA4lsljv/WIGn+8OZc=
+		/mqEg5Ycuw/0E7PZuNAETC1BHTU=
 		</data>
 		<key>Resources/AgentRuntime/_internal/libcrypto.3.dylib</key>
 		<data>
@@ -234,7 +234,7 @@
 		</data>
 		<key>Resources/AgentRuntime/orbit_openclaw_runtime</key>
 		<data>
-		haA4g38a5cgnIzGrKGnjcsGN9jc=
+		sSurDkOXoJDsZhsQEZX4SGjt8Uk=
 		</data>
 		<key>Resources/OpenClaw/action-contract.sh</key>
 		<data>
@@ -244,13 +244,25 @@
 		<data>
 		D/Gazrh2OjMwLjIY98god/iTTWc=
 		</data>
+		<key>Resources/OpenClaw/managed/package-lock.json</key>
+		<data>
+		DXhhrk3t7J86nn4ymUGmSQn1LOs=
+		</data>
+		<key>Resources/OpenClaw/managed/package.json</key>
+		<data>
+		6kQQIJPnz7DGB8eKDG/5qnaUo5w=
+		</data>
+		<key>Resources/OpenClaw/managed/runtime-manifest.json</key>
+		<data>
+		tfxd1qNMBL3Iu8Lc69+IqRlWVkA=
+		</data>
 		<key>Resources/OpenClaw/openclaw-setup.command</key>
 		<data>
-		ir6woQh9Agd1ACKEgKiBjlRXC18=
+		X5ZEREw1pwuOKhMXz49ESzFNcZc=
 		</data>
 		<key>Resources/OpenClaw/taskpilot-openclaw-bootstrap.sh</key>
 		<data>
-		2+J0EatZBwIfCT4rJYGrMPDQ3MA=
+		iLgDWbo/sNXX84sdpZeUtGTU8TM=
 		</data>
 	</dict>
 	<key>files2</key>
@@ -308,7 +320,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			RyXLarlU+xAt6iiYSFIA/ucsfhD+bK8r8ExjgvJY58k=
+			w+Eok/CJxfSbxngOJ4qnr+auHfwpINcIcY8S/gIkur0=
 			</data>
 		</dict>
 		<key>Resources/AgentRuntime/_internal/libcrypto.3.dylib</key>
@@ -658,7 +670,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			wf97dspAHh7fzxakOHxthGMUO+YC5hWqPmb4lR0pyhM=
+			cXcFWe1qZmyJbUB7L6StU08HD535hMxEl0FzF2Bj9cg=
 			</data>
 		</dict>
 		<key>Resources/OpenClaw/action-contract.sh</key>
@@ -675,18 +687,39 @@
 			gy54dLba0s1su5awA8Q9TmtF82lZDawm5FPWxLOPcqE=
 			</data>
 		</dict>
+		<key>Resources/OpenClaw/managed/package-lock.json</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			/rhCbbJ3nrIoUmEYKGtDQ11JSCia7OJ9dEWVqN+dtPo=
+			</data>
+		</dict>
+		<key>Resources/OpenClaw/managed/package.json</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			LuXXn8x1cFquAiwNX/3/PXgfolfjJn/18757kujruvY=
+			</data>
+		</dict>
+		<key>Resources/OpenClaw/managed/runtime-manifest.json</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			U/ymxNBHcdUhUz0DdRN8mxvBlbU3RjdndFfXOjb2+RE=
+			</data>
+		</dict>
 		<key>Resources/OpenClaw/openclaw-setup.command</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			Xbd2GyT3i6bcGEYXMGYDeKAdNb/wjpmGxZAiaAnXw1I=
+			bkpn8XlzAl3bFBM7MaOSlky6VUFwJhpm3DsBKSKZt0k=
 			</data>
 		</dict>
 		<key>Resources/OpenClaw/taskpilot-openclaw-bootstrap.sh</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			7EEpQs+CyZ2zNlsEP7eegnN+Y4ZIdhhFI6g/RCUtoXA=
+			58ofYnOSx10D1qnrjEZ8EiHBJ/+DPzF5XMzE7eJTfMk=
 			</data>
 		</dict>
 	</dict>

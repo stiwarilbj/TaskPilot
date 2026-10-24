@@ -87,7 +87,6 @@ struct GeminiModelCheck: Identifiable, Equatable, Sendable {
 
 struct GeminiModelVerifier: Sendable {
     var runtimeURL = BundledRuntimeLocator().executableURL
-    var openClawURL: URL? = OpenClawService.firstExecutable(from: OpenClawService.candidateExecutableURLs())
 
     static func configurationData(apiKey: String) throws -> Data {
         var data = try JSONSerialization.data(withJSONObject: [
@@ -123,29 +122,38 @@ struct GeminiModelVerifier: Sendable {
     }
 
     func verify(apiKey: String, models: [String], readOnly: Bool = false) async -> [GeminiModelCheck] {
-        await Task.detached {
-            let process = Process()
-            let input = Pipe()
-            let output = Pipe()
-            process.executableURL = runtimeURL
-            process.arguments = [readOnly ? "--read-readiness" : "--check-models"]
-            if let openClawURL { process.arguments?.append(contentsOf: ["--openclaw-path", openClawURL.path]) }
-            process.standardInput = input
-            process.standardOutput = output
-            process.standardError = FileHandle.nullDevice
-            do {
-                try process.run()
-                try input.fileHandleForWriting.write(contentsOf: Self.configurationData(apiKey: apiKey))
-                try input.fileHandleForWriting.close()
-                let data = output.fileHandleForReading.readDataToEndOfFile()
-                process.waitUntilExit()
-                return Self.checks(from: data, models: models)
-            } catch {
-                if process.isRunning { process.terminate(); process.waitUntilExit() }
-                return models.enumerated().map { index, model in
-                    GeminiModelCheck(model: model, state: index == 0 ? .failed("TaskPilot could not check its runtime: \(error.localizedDescription)") : .waiting)
+        let cancellation = OpenClawCommandCancellation()
+        return await withTaskCancellationHandler {
+            await Task.detached {
+                do {
+                    // Resolve at invocation time: installation may have changed
+                    // since the settings view/verifier was created.
+                    if !readOnly {
+                        let resources = Bundle.main.resourceURL!.appendingPathComponent("OpenClaw/managed")
+                        let installed = OpenClawService.run(executable:runtimeURL,
+                            arguments:["--managed-openclaw", "ensure", "--managed-resources", resources.path],
+                            timeout:1200, input:Data((apiKey + "\n").utf8), cancellation:cancellation)
+                        guard installed.status == 0 else { throw ManagedOpenClawError.command(installed.output) }
+                    }
+                    let descriptor = try ManagedOpenClawDescriptor.load()
+                    let result = OpenClawService.run(executable: runtimeURL,
+                        arguments: [readOnly ? "--read-readiness" : "--check-models",
+                                    "--managed-descriptor", ManagedOpenClawDescriptor.url.path],
+                        timeout: readOnly ? 30 : 240,
+                        input: try Self.configurationData(apiKey: apiKey),
+                        environment: descriptor.environment, cancellation: cancellation)
+                    if result.status == -2 {
+                        return models.enumerated().map { index, model in
+                            GeminiModelCheck(model: model, state: index == 0 ? .temporary("Verification ended before a terminal result; no model was declared ready.") : .waiting)
+                        }
+                    }
+                    return Self.checks(from: Data(result.output.utf8), models: models)
+                } catch {
+                    return models.enumerated().map { index, model in
+                        GeminiModelCheck(model: model, state: index == 0 ? .failed(error.localizedDescription) : .waiting)
+                    }
                 }
-            }
-        }.value
+            }.value
+        } onCancel: { cancellation.cancel() }
     }
 }

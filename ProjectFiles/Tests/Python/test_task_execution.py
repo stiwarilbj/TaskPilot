@@ -26,13 +26,14 @@ class ExecutionGraphTests(unittest.TestCase):
     def test_every_phase_pair_and_each_required_fact(self):
         # Independent expected adjacency: an accidental new edge fails this test.
         edges = {
-            'starting': {'observing', 'draining'},
+            'starting': {'observing', 'recovering', 'draining'},
             'observing': {'planning', 'waiting_input', 'reconciling', 'executing', 'verifying', 'draining'},
-            'planning': {'reconciling', 'draining'},
-            'reconciling': {'observing', 'executing', 'waiting_input', 'verifying', 'draining'},
-            'executing': {'reconciling', 'draining'},
+            'planning': {'reconciling', 'recovering', 'draining'},
+            'reconciling': {'observing', 'executing', 'waiting_input', 'verifying', 'recovering', 'draining'},
+            'executing': {'reconciling', 'recovering', 'draining'},
             'waiting_input': {'reconciling', 'draining'},
-            'verifying': {'observing', 'draining'},
+            'verifying': {'observing', 'recovering', 'draining'},
+            'recovering': {'starting', 'planning', 'verifying', 'reconciling', 'executing', 'draining'},
             'draining': {'finished'}, 'finished': set(),
         }
         for source, destination in itertools.product(Phase, repeat=2):

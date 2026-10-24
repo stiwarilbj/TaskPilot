@@ -1,6 +1,8 @@
 import AppKit
 import Darwin
 import Foundation
+import CryptoKit
+import Network
 
 struct OpenClawProbe: Equatable, Sendable {
     let executableURL: URL?
@@ -40,17 +42,109 @@ final class OpenClawService {
     // TaskPilot starts with the Lite pair and retains the first successful model.
     static let primaryGeminiModel = primaryGeminiModels[0]
 
-    private let setupIOQueue = DispatchQueue(label: "com.orbitagent.openclaw-setup-io")
-    private var automatedSetupProcess: Process?
-    private var automatedSetupBuffer = Data()
-    private var automatedSetupReceivedFailure = false
-    private var automatedSetupReportedInstalledOnly = false
-    private var automatedSetupHandler: ((OpenClawAutomatedSetupEvent) -> Void)?
+    private let lifecycleLock = NSLock()
+    private var inFlightProbe: Task<OpenClawProbe, Never>?
+    private var probeID = UUID()
+    private var setupTask: Task<Void, Never>?
+    private var provisionedConfiguration: String?
+    private var provisionAfter = Date.distantPast
+    private var provisioningFailures = 0
+    private var provisionedCredential: String?
+    private var clientFile: URL?
+    private var host: SubprocessSupervisor?
+    private var wakeObserver: NSObjectProtocol?
+    private let network = NWPathMonitor()
+    init() {
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(forName:NSWorkspace.didWakeNotification,
+            object:nil, queue:nil) { _ in Self.requestHealthRefresh() }
+        network.pathUpdateHandler = { path in if path.status == .satisfied { Self.requestHealthRefresh() } }
+        network.start(queue:DispatchQueue(label:"com.orbitagent.openclaw-network", qos:.utility))
+    }
+    private static func requestHealthRefresh() {
+        guard FileManager.default.fileExists(atPath:ManagedOpenClawDescriptor.url.path) else { return }
+        try? Data("{}".utf8).write(to:ManagedOpenClawDescriptor.root.appendingPathComponent("health-request.json"), options:.atomic)
+    }
 
+    deinit {
+        network.cancel()
+        if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
+        if let clientFile { try? FileManager.default.removeItem(at: clientFile) }
+    }
+
+    /// Concurrent status checks join one local operation. The host, rather than
+    /// callers, owns cadence and the persisted restart circuit.
     func probe() async -> OpenClawProbe {
-        await Task.detached(priority: .utility) {
-            Self.probeSynchronously()
-        }.value
+        let (task, id) = lifecycleLock.withLock { () -> (Task<OpenClawProbe, Never>, UUID) in
+            if let inFlightProbe { return (inFlightProbe, probeID) }
+            probeID = UUID()
+            let task = Task.detached(priority: .utility) { self.managedProbe() }
+            inFlightProbe = task
+            return (task, probeID)
+        }
+        let result = await task.value
+        lifecycleLock.withLock { if probeID == id { inFlightProbe = nil } }
+        return result
+    }
+
+    private func managedProbe(force: Bool = false) -> OpenClawProbe {
+        let key = (try? GeminiAPIKeyStore().load()) ?? ""
+        let runtime = BundledRuntimeLocator().executableURL
+        do {
+            let current = try? ManagedOpenClawDescriptor.load()
+            if force || provisionedCredential != SHA256.hash(data: Data(key.utf8)).description ||
+                current == nil || provisionedConfiguration != current?.configurationFingerprint {
+                guard Date() >= provisionAfter else {
+                    throw ManagedOpenClawError.command("Private OpenClaw installation is waiting for network recovery; TaskPilot will retry automatically.")
+                }
+                let resources = Bundle.main.resourceURL!.appendingPathComponent("OpenClaw/managed")
+                let result = Self.run(executable: runtime,
+                    arguments: ["--managed-openclaw", "ensure", "--managed-resources", resources.path],
+                    timeout: 1200, input: Data((key + "\n").utf8))
+                guard result.status == 0 else {
+                    provisioningFailures += 1
+                    provisionAfter = Date().addingTimeInterval(min(300, 30 * pow(2, Double(min(provisioningFailures - 1, 4)))))
+                    throw ManagedOpenClawError.command(result.output)
+                }
+                provisioningFailures = 0; provisionAfter = .distantPast
+                provisionedConfiguration = try ManagedOpenClawDescriptor.load().configurationFingerprint
+                provisionedCredential = SHA256.hash(data: Data(key.utf8)).description
+            }
+            let descriptor = try ManagedOpenClawDescriptor.load()
+            if clientFile == nil { clientFile = try ManagedGatewayHost.registerClient() }
+            if host?.isRunning != true {
+                let process = SubprocessSupervisor()
+                process.executableURL = Bundle.main.executableURL
+                process.arguments = ["--managed-openclaw-host", ManagedOpenClawDescriptor.url.path, runtime.path]
+                try process.run(); process.markOutputDrained(); host = process
+            }
+            // Startup may be in progress. Return promptly; ordinary refreshes
+            // neither reset the circuit nor launch a provider generation.
+            let healthURL = ManagedOpenClawDescriptor.root.appendingPathComponent("health.json")
+            let health = (try? Data(contentsOf: healthURL)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            let matchesInstance = health?["instance_id"] as? String == descriptor.instanceID &&
+                health?["configuration_fingerprint"] as? String == descriptor.configurationFingerprint
+            let age = Date().timeIntervalSince1970 - (health?["checked_at"] as? Double ?? 0)
+            func identityAlive(_ key: String) -> Bool {
+                guard let value = health?[key], let data = try? JSONSerialization.data(withJSONObject:value),
+                      let identity = try? JSONDecoder().decode(ManagedProcessIdentity.self,from:data) else { return false }
+                return identity.alive
+            }
+            let ready = matchesInstance && age < 45 && health?["state"] as? String == "healthy" &&
+                identityAlive("host_identity") && identityAlive("gateway_identity")
+            return OpenClawProbe(executableURL: URL(fileURLWithPath: descriptor.executable), version: descriptor.openclawVersion,
+                configured: ready, detail: matchesInstance ? (health?["detail"] as? String ?? "Starting private OpenClaw") : "Starting TaskPilot’s private OpenClaw Gateway")
+        } catch {
+            return OpenClawProbe(executableURL: (try? ManagedOpenClawDescriptor.load()).map { URL(fileURLWithPath:$0.executable) },
+                version:"", configured:false, detail:error.localizedDescription)
+        }
+    }
+
+    func takeActivationVerification() -> Bool {
+        let file = ManagedOpenClawDescriptor.root.appendingPathComponent("activation-verification.json")
+        let claim = file.appendingPathExtension(UUID().uuidString)
+        guard rename(file.path, claim.path) == 0 else { return false }
+        try? FileManager.default.removeItem(at:claim)
+        return true
     }
 
     @MainActor
@@ -58,88 +152,33 @@ final class OpenClawService {
         NSWorkspace.shared.open(Self.installURL)
     }
 
-    func startAutomatedSetup(
-        geminiAPIKey: String,
-        onEvent: @escaping (OpenClawAutomatedSetupEvent) -> Void
-    ) throws {
-        guard automatedSetupProcess == nil else {
-            throw OpenClawServiceError.automatedSetupAlreadyRunning
-        }
-        let scriptURL = Bundle.main.bundleURL
-            .appendingPathComponent("Contents", isDirectory: true)
-            .appendingPathComponent("Resources", isDirectory: true)
-            .appendingPathComponent("OpenClaw", isDirectory: true)
-            .appendingPathComponent("taskpilot-openclaw-bootstrap.sh")
-        guard FileManager.default.isExecutableFile(atPath: scriptURL.path) else {
-            throw OpenClawServiceError.automatedSetupHelperMissing
-        }
-
-        let process = Process()
-        let input = Pipe()
-        let output = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [scriptURL.path]
-        process.standardInput = input
-        process.standardOutput = output
-        process.standardError = output
-
-        automatedSetupBuffer.removeAll(keepingCapacity: true)
-        automatedSetupReceivedFailure = false
-        automatedSetupReportedInstalledOnly = false
-        automatedSetupHandler = onEvent
-        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            self?.consumeAutomatedSetupOutput(data)
-        }
-        process.terminationHandler = { [weak self] terminated in
-            guard let self else { return }
-            self.setupIOQueue.async {
-                output.fileHandleForReading.readabilityHandler = nil
-                let receivedFailure = self.automatedSetupReceivedFailure
-                self.automatedSetupProcess = nil
-                if terminated.terminationStatus == 0 {
-                    self.emitAutomatedSetupEvent(
-                        .completed("OpenClaw is ready for \(TaskPilotIdentity.displayName)."),
-                        through: self.automatedSetupHandler
-                    )
-                } else if terminated.terminationStatus == Self.installedWithoutKeyExitStatus {
-                    if !self.automatedSetupReportedInstalledOnly {
-                        self.emitAutomatedSetupEvent(
-                            .installed("OpenClaw is installed. Add a Gemini API key whenever you are ready."),
-                            through: self.automatedSetupHandler
-                        )
-                    }
-                } else if !receivedFailure {
-                    let message = terminated.terminationReason == .uncaughtSignal
-                        ? "OpenClaw setup was stopped."
-                        : "OpenClaw setup ended before verification completed."
-                    self.emitAutomatedSetupEvent(.failed(message), through: self.automatedSetupHandler)
-                }
-                self.automatedSetupHandler = nil
+    func startAutomatedSetup(geminiAPIKey: String, onEvent: @escaping (OpenClawAutomatedSetupEvent) -> Void) throws {
+        guard setupTask == nil else { throw OpenClawServiceError.automatedSetupAlreadyRunning }
+        setupTask = Task {
+            onEvent(.progress(0.1, "Preparing TaskPilot’s pinned private OpenClaw runtime…"))
+            // Setup and automatic readiness share the same serialized provisioning path.
+            let probe = await self.probe()
+            guard !Task.isCancelled else { self.setupTask = nil; return }
+            if !probe.installed { onEvent(.failed(probe.detail)); self.setupTask = nil; return }
+            if geminiAPIKey.isEmpty { onEvent(.installed("Private OpenClaw installed; save a Gemini API key in Settings.")); self.setupTask = nil; return }
+            onEvent(.progress(0.7, "Waiting for authenticated Gateway connectivity…"))
+            var ready = probe.configured
+            for _ in 0..<45 where !ready && !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                ready = await self.probe().configured
             }
-        }
-
-        automatedSetupProcess = process
-        do {
-            try process.run()
-            // The key is intentionally written only to stdin. It never appears
-            // in Process.arguments, Process.environment, progress, or logs.
-            try input.fileHandleForWriting.write(contentsOf: Data((geminiAPIKey + "\n").utf8))
-            try input.fileHandleForWriting.close()
-        } catch {
-            output.fileHandleForReading.readabilityHandler = nil
-            automatedSetupProcess = nil
-            automatedSetupHandler = nil
-            throw error
+            guard !Task.isCancelled else { self.setupTask = nil; return }
+            if ready {
+                let checks = await GeminiModelVerifier().verify(apiKey: geminiAPIKey, models: Self.allGeminiModels)
+                if checks.contains(where: { if case .working = $0.state { return true }; return false }) {
+                    onEvent(.completed("Private OpenClaw verified through TaskPilot with image input and JSON output."))
+                } else { onEvent(.failed("Gateway connected, but provider verification failed. Check the reported credential, quota, or capacity condition.")) }
+            } else { onEvent(.failed("Private Gateway is still recovering. TaskPilot will keep checking automatically.")) }
+            self.setupTask = nil
         }
     }
 
-    func cancelAutomatedSetup() {
-        guard let process = automatedSetupProcess, process.isRunning else { return }
-        kill(process.processIdentifier, SIGTERM)
-        process.terminate()
-    }
+    func cancelAutomatedSetup() { setupTask?.cancel(); setupTask = nil }
 
     @MainActor
     func openSetupTerminal() throws {
@@ -155,12 +194,12 @@ final class OpenClawService {
     }
 
     func openDashboard() async throws {
-        guard let executable = Self.firstExecutable(from: Self.candidateExecutableURLs()) else {
+        guard let descriptor = try? ManagedOpenClawDescriptor.load() else {
             throw OpenClawServiceError.dashboardUnavailable
         }
         let status = await Task.detached(priority: .userInitiated) {
             Self.runDiscardingOutput(
-                executable: executable,
+                executable: URL(fileURLWithPath: descriptor.executable),
                 arguments: Self.dashboardArguments,
                 timeout: 30
             )
@@ -174,25 +213,8 @@ final class OpenClawService {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> [URL] {
-        var paths: [String] = []
-        if let configured = environment["ORBIT_OPENCLAW_PATH"], !configured.isEmpty {
-            paths.append(configured)
-        }
-        paths.append(contentsOf: (environment["PATH"] ?? "")
-            .split(separator: ":")
-            .map { URL(fileURLWithPath: String($0)).appendingPathComponent("openclaw").path })
-        paths.append(contentsOf: [
-            "/opt/homebrew/bin/openclaw",
-            "/usr/local/bin/openclaw",
-            homeDirectory.appendingPathComponent(".openclaw/bin/openclaw").path,
-            homeDirectory.appendingPathComponent(".local/bin/openclaw").path,
-            homeDirectory.appendingPathComponent(".npm-global/bin/openclaw").path
-        ])
-        var seen = Set<String>()
-        return paths.compactMap { path in
-            let standardized = URL(fileURLWithPath: path).standardizedFileURL
-            return seen.insert(standardized.path).inserted ? standardized : nil
-        }
+        guard let descriptor = try? ManagedOpenClawDescriptor.load() else { return [] }
+        return [URL(fileURLWithPath: descriptor.executable)]
     }
 
     static func firstExecutable(
@@ -225,76 +247,6 @@ final class OpenClawService {
         return nil
     }
 
-    private static func probeSynchronously() -> OpenClawProbe {
-        guard let executable = firstExecutable(from: candidateExecutableURLs()) else {
-            return OpenClawProbe(
-                executableURL: nil,
-                version: "",
-                configured: false,
-                detail: "OpenClaw is not installed"
-            )
-        }
-
-        guard let lease = configurationLease() else {
-            return OpenClawProbe(executableURL: executable, version: "", configured: false,
-                                 detail: "OpenClaw configuration is being updated; recheck when setup finishes")
-        }
-        defer { close(lease) }
-        let versionResult = run(executable: executable, arguments: ["--version"], timeout: 8)
-        let version = versionResult.output
-            .split(whereSeparator: \.isNewline)
-            .first
-            .map(String.init) ?? "Installed"
-        let setupResult = run(
-            executable: executable,
-            arguments: setupArguments,
-            timeout: 15
-        )
-        let modelResult = run(
-            executable: executable,
-            arguments: modelReadinessArguments,
-            timeout: 20
-        )
-        let primaryModelResult = run(
-            executable: executable,
-            arguments: primaryModelArguments,
-            timeout: 8
-        )
-        // Setup may promote any responding candidate when the preferred model
-        // is overloaded or unavailable for this API key.
-        let usesRequestedPrimary = primaryModelResult.status == 0 &&
-            allGeminiModels.contains { primaryModelResult.output.contains($0) }
-        if setupResult.status == 0 && modelResult.status == 0 && usesRequestedPrimary {
-            return OpenClawProbe(
-                executableURL: executable,
-                version: version,
-                configured: true,
-                detail: "Configured; click Check to verify a model through TaskPilot"
-            )
-        }
-
-        if modelResult.status != 0 || !usesRequestedPrimary {
-            return OpenClawProbe(
-                executableURL: executable,
-                version: version,
-                configured: false,
-                detail: "OpenClaw is installed. Add and verify the requested Gemini model chain to enable Run."
-            )
-        }
-
-        let rawDetail = setupResult.output
-            .split(whereSeparator: \.isNewline)
-            .last
-            .map(String.init) ?? "Run openclaw setup to choose a model and start OpenClaw"
-        let detail = String(rawDetail.prefix(240))
-        return OpenClawProbe(
-            executableURL: executable,
-            version: version,
-            configured: false,
-            detail: detail
-        )
-    }
-
     struct CommandResult {
         let status: Int32
         let output: String
@@ -304,20 +256,33 @@ final class OpenClawService {
         executable: URL,
         arguments: [String],
         timeout: TimeInterval,
-        outputSpillRoot: URL = FileManager.default.temporaryDirectory
+        outputSpillRoot: URL = FileManager.default.temporaryDirectory,
+        input: Data? = nil, environment: [String: String]? = nil,
+        cancellation: OpenClawCommandCancellation? = nil
     ) -> CommandResult {
         let process = SubprocessSupervisor()
         do {
+            if cancellation?.isCancelled == true { return CommandResult(status: -2, output: "OpenClaw check cancelled") }
             process.executableURL = executable
             process.arguments = arguments
+            process.environment = environment
+            let pipe = input.map { _ in Pipe() }
+            if let pipe { process.standardInput = pipe }
             let exit = ProcessExitNotification(process)
+            cancellation?.bind(process, exit: exit)
+            defer { cancellation?.unbind() }
             defer { process.terminationHandler = nil }
-            let capture = try BufferedProcessOutput(merged: true, spillRoot: outputSpillRoot,
+            let capture = try BufferedProcessOutput(maximumBytes: 262144, combinedLimit: 1048576, merged: true, spillRoot: outputSpillRoot,
                                                    onInterruption: { exit.interrupt() })
             defer { capture.close() }
             process.standardOutput = capture.stdout
             process.standardError = capture.stderr
             try process.run()
+            if cancellation?.isCancelled == true { process.beginTeardown() }
+            if let pipe, let input {
+                try pipe.fileHandleForWriting.write(contentsOf: input)
+                try pipe.fileHandleForWriting.close()
+            }
             capture.closeWriters()
             let status = waitForCommand(process, exit: exit, timeout: timeout)
             let output = try capture.finish().stdout
@@ -327,6 +292,10 @@ final class OpenClawService {
             return CommandResult(status: status,
                 output: String(data: output.data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
         } catch {
+            if process.snapshot.launched {
+                process.beginTeardown()
+                _ = process.waitForTree(ignoreInterrupt: true)
+            }
             return CommandResult(status: -1, output: error.localizedDescription)
         }
     }
@@ -366,48 +335,7 @@ final class OpenClawService {
         return -2
     }
 
-    private func consumeAutomatedSetupOutput(_ data: Data) {
-        setupIOQueue.async { [weak self] in
-            guard let self else { return }
-            self.automatedSetupBuffer.append(data)
-            while let newline = self.automatedSetupBuffer.firstIndex(of: 0x0A) {
-                let lineData = self.automatedSetupBuffer[..<newline]
-                self.automatedSetupBuffer.removeSubrange(...newline)
-                guard let line = String(data: lineData, encoding: .utf8) else { continue }
-                self.consumeAutomatedSetupLine(line)
-            }
-        }
-    }
 
-    private func consumeAutomatedSetupLine(_ rawLine: String) {
-        guard rawLine.hasPrefix("ORBIT_SETUP|") else { return }
-        let parts = rawLine.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
-        guard parts.count == 3 else { return }
-        let type = String(parts[1])
-        let message = String(parts[2]).trimmingCharacters(in: .whitespacesAndNewlines)
-        if type == "error" {
-            automatedSetupReceivedFailure = true
-            emitAutomatedSetupEvent(.failed(message), through: automatedSetupHandler)
-        } else if type == "installed" {
-            automatedSetupReportedInstalledOnly = true
-            emitAutomatedSetupEvent(.installed(message), through: automatedSetupHandler)
-        } else if let progress = Double(type) {
-            emitAutomatedSetupEvent(
-                .progress(min(max(progress, 0), 1), message),
-                through: automatedSetupHandler
-            )
-        }
-    }
-
-    private func emitAutomatedSetupEvent(
-        _ event: OpenClawAutomatedSetupEvent,
-        through handler: ((OpenClawAutomatedSetupEvent) -> Void)?
-    ) {
-        guard let handler else { return }
-        DispatchQueue.main.async {
-            handler(event)
-        }
-    }
 }
 
 private enum OpenClawServiceError: LocalizedError {

@@ -422,11 +422,21 @@ class RuntimeState:
         self.root = root or runtime_state_root()
         self.path = self.root / "runtime-readiness.json"
         self.credential = hashlib.sha256(fingerprint.encode()).hexdigest()
-        self.identity = hashlib.sha256(json.dumps([fingerprint, version, CONFIG_VERSION, ALL_MODELS, configuration, VALIDATION_VERSION, CONTRACT_HASH, ERROR_POLICY_VERSION]).encode()).hexdigest()
+        self.managed_configuration = os.environ.get("TASKPILOT_MANAGED_FINGERPRINT", "")
+        self.identity = hashlib.sha256(json.dumps([fingerprint, version, CONFIG_VERSION, ALL_MODELS, configuration, VALIDATION_VERSION, CONTRACT_HASH, ERROR_POLICY_VERSION, os.environ.get("TASKPILOT_MANAGED_FINGERPRINT", "")]).encode()).hexdigest()
         configuration_path = os.path.abspath(os.path.expanduser(os.environ.get("OPENCLAW_CONFIG_PATH", "~/.openclaw/openclaw.json")))
         self.configuration_key = hashlib.sha256(configuration_path.encode()).hexdigest()
         self.value: dict[str, Any] = {}
         self.refresh()
+
+    def model_health_records(self, bucket):
+        # Local catalog/config faults from another managed installation must
+        # not label untested models unavailable after a configuration repair.
+        # Credential-wide cooldowns retain their shared account namespace.
+        if self.managed_configuration:
+            key = hashlib.sha256(self.managed_configuration.encode()).hexdigest()
+            return bucket.setdefault("managed_health", {}).setdefault(key, {})
+        return bucket["health"]
 
     @contextmanager
     def transaction(self, *, write: bool = False):
@@ -450,7 +460,7 @@ class RuntimeState:
                 if not isinstance(bucket.get(field), dict): bucket[field] = {}
             record = bucket["records"].setdefault(self.identity, {})
             if not isinstance(record.get("verified"), dict): record["verified"] = {}
-            self.value = {**record, "health": bucket["health"], "credential_health": bucket["credential_health"],
+            self.value = {**record, "health": self.model_health_records(bucket), "credential_health": bucket["credential_health"],
                           "config_version": document.get("configurations", {}).get(self.configuration_key), "revision": document.get("revision", 0)}
             yield document, bucket, record
             if write:
@@ -490,11 +500,11 @@ class RuntimeState:
             if max(bucket.get("invalidated_revision", 0), record.get("invalidations", {}).get("*", 0),
                    record.get("invalidations", {}).get(model, 0)) > boundary: return False
             for field, key in (("health", model), ("credential_health", model.split('/', 1)[0])):
-                failure = bucket[field].get(key, {})
+                failure = (self.model_health_records(bucket) if field == "health" else bucket[field]).get(key, {})
                 if failure and (failure.get("revision", 0) > boundary or
                     (failure.get("state") == "temporary" and failure.get("retry_at") is not None and failure["retry_at"] > now)):
                     return False
-            bucket["health"].pop(model, None)
+            self.model_health_records(bucket).pop(model, None)
             bucket["credential_health"].pop(model.split('/', 1)[0], None)
             record["verified"][model] = now
             return True
@@ -513,11 +523,12 @@ class RuntimeState:
             if failure.kind in {"credentials", "transport", "configuration"}:
                 bucket["invalidated_revision"] = health["revision"]
             field, key = ("credential_health", failure.provider or model.split('/', 1)[0]) if shared else ("health", model)
-            current = bucket[field].get(key, {})
+            health_records = self.model_health_records(bucket) if field == "health" else bucket[field]
+            current = health_records.get(key, {})
             # Shorter concurrent cooldowns cannot erase a longer applicable one.
             if current.get("state") == "temporary" and health["state"] == "temporary" and Failure.from_health(current).retry_at > failure.retry_at:
                 health = {**current, "revision": health["revision"]}
-            bucket[field][key] = health
+            health_records[key] = health
             for other_record in bucket["records"].values():
                 verified = other_record.setdefault("verified", {})
                 if failure.kind in {"credentials", "transport", "configuration"}: verified.clear()

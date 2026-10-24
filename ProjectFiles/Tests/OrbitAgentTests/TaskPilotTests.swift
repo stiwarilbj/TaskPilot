@@ -146,7 +146,7 @@ final class TaskPilotTests: XCTestCase {
         )
     }
 
-    func testOpenClawLocatorPrefersTheExplicitConfiguredPath() {
+    func testOpenClawLocatorNeverDiscoversSharedOrAmbientExecutables() {
         let urls = OpenClawService.candidateExecutableURLs(
             environment: [
                 "ORBIT_OPENCLAW_PATH": "/custom/openclaw",
@@ -154,9 +154,10 @@ final class TaskPilotTests: XCTestCase {
             ],
             homeDirectory: URL(fileURLWithPath: "/Users/test")
         )
-        XCTAssertEqual(urls.first?.path, "/custom/openclaw")
-        XCTAssertTrue(urls.map(\.path).contains("/usr/local/bin/openclaw"))
-        XCTAssertTrue(urls.map(\.path).contains("/Users/test/.openclaw/bin/openclaw"))
+        XCTAssertFalse(urls.map(\.path).contains("/custom/openclaw"))
+        XCTAssertFalse(urls.map(\.path).contains("/usr/local/bin/openclaw"))
+        XCTAssertFalse(urls.map(\.path).contains("/Users/test/.openclaw/bin/openclaw"))
+        XCTAssertTrue(urls.allSatisfy { $0.path.hasPrefix(ManagedOpenClawDescriptor.root.path) })
     }
 
     func testOpenClawReadinessProbeUsesAgentInventory() {

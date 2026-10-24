@@ -368,7 +368,7 @@ final class TaskPilotCoordinator: ObservableObject {
         }
         let bundledRuntimeInstalled = bundledRuntime.isInstalled
         let openClawProbe: OpenClawProbe?
-        if Date().timeIntervalSince(lastOpenClawProbeAt) >= 15 {
+        if !isCheckingGeminiModels && Date().timeIntervalSince(lastOpenClawProbeAt) >= 5 {
             lastOpenClawProbeAt = Date()
             openClawProbe = await openClawService.probe()
         } else {
@@ -398,10 +398,12 @@ final class TaskPilotCoordinator: ObservableObject {
             openClawConfigured = openClawProbe.configured
             openClawVersion = openClawProbe.version
             openClawDetail = openClawProbe.detail
-            if openClawProbe.installed, !isActive, !isCheckingGeminiModels,
+            if !openClawProbe.configured { geminiAPIKeyVerified = false }
+            if openClawProbe.configured, !savedGeminiAPIKey.isEmpty, !isActive, !isCheckingGeminiModels,
                geminiAPIKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines) == savedGeminiAPIKey {
+                let activationCheck = openClawService.takeActivationVerification()
                 let cached = await geminiModelVerifier.verify(apiKey: savedGeminiAPIKey,
-                    models: OpenClawService.allGeminiModels, readOnly: true)
+                    models: OpenClawService.allGeminiModels, readOnly: !activationCheck)
                 if !isActive, !isCheckingGeminiModels {
                     geminiModelChecks = cached
                     geminiAPIKeyVerified = Self.hasUsableGeminiModel(cached)
@@ -466,7 +468,7 @@ final class TaskPilotCoordinator: ObservableObject {
     private var readinessSummary: String {
         if !runtimeInstalled { return "The bundled OpenClaw bridge is missing" }
         if !openClawInstalled { return "Install OpenClaw to finish setup" }
-        if !openClawConfigured { return "Configure OpenClaw with the guided Gemini setup" }
+        if !openClawConfigured { return openClawDetail }
         if !hasAccessibilityPermission { return "Allow Accessibility control" }
         if !hasScreenRecordingPermission {
             if case .unavailable = captureAuthorization {

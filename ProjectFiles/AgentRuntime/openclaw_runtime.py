@@ -10,6 +10,7 @@ to the native controller over JSONL.
 from __future__ import annotations
 
 import argparse
+import managed_openclaw
 import base64
 from collections import deque
 from contextlib import contextmanager, nullcontext
@@ -365,7 +366,7 @@ def runtime_fingerprint(key: str) -> str:
         return hashlib.sha256(key.encode()).hexdigest()
     # A profile-file digest invalidates readiness after external credential edits
     # without ever storing or emitting the credential itself.
-    profile = Path.home() / ".openclaw/agents/main/agent/auth-profiles.json"
+    profile = Path(os.environ.get("OPENCLAW_STATE_DIR", str(Path.home() / ".openclaw"))) / "agents/main/agent/auth-profiles.json"
     try:
         return hashlib.sha256(profile.read_bytes()).hexdigest()
     except OSError:
@@ -429,11 +430,14 @@ def model_configuration_fingerprint() -> str:
 
 def prepare_runtime(path: str, key: str) -> RuntimeState:
     with configuration_transaction():
-        fingerprint, version = runtime_fingerprint(key), openclaw_version(path)
+        fingerprint = runtime_fingerprint(key)
+        descriptor_path = os.environ.get('TASKPILOT_MANAGED_DESCRIPTOR')
+        version = 'OpenClaw ' + managed_openclaw.load_descriptor(Path(descriptor_path))['openclaw_version'] if descriptor_path else openclaw_version(path)
         state = RuntimeState(fingerprint, version, configuration=model_configuration_fingerprint())
-        synchronize_model_configuration(path, state)
+        if not os.environ.get("TASKPILOT_MANAGED_DESCRIPTOR"):
+            synchronize_model_configuration(path, state)
         state = RuntimeState(fingerprint, version, configuration=model_configuration_fingerprint())
-        if key:
+        if key and not os.environ.get("TASKPILOT_MANAGED_DESCRIPTOR"):
             sync_openclaw_google_key(path, key)
         return state
 
@@ -448,11 +452,18 @@ def synthetic_check_image(path: Path) -> None:
 
 def check_models(path: str, key: str, read_only: bool = False) -> bool:
     with screenshot_buffer_scope():
-        return _check_models(path, key, read_only)
+        result = _check_models(path, key, read_only)
+        if result and not read_only and os.environ.get("TASKPILOT_MANAGED_DESCRIPTOR"):
+            managed_openclaw.mark_working(Path(os.environ["TASKPILOT_MANAGED_DESCRIPTOR"]))
+        return result
 
 
 def _check_models(path: str, key: str, read_only: bool = False) -> bool:
-    state = RuntimeState(runtime_fingerprint(key), openclaw_version(path), configuration=model_configuration_fingerprint()) if read_only else prepare_runtime(path, key)
+    if not read_only and os.environ.get('TASKPILOT_MANAGED_DESCRIPTOR'):
+        managed_openclaw.wait_for_health(Path(os.environ['TASKPILOT_MANAGED_DESCRIPTOR']))
+    descriptor = managed_openclaw.load_descriptor(Path(os.environ['TASKPILOT_MANAGED_DESCRIPTOR'])) if os.environ.get('TASKPILOT_MANAGED_DESCRIPTOR') else None
+    version = "OpenClaw " + descriptor['openclaw_version'] if descriptor else None
+    state = RuntimeState(runtime_fingerprint(key), version or openclaw_version(path), configuration=model_configuration_fingerprint()) if read_only else prepare_runtime(path, key)
     if read_only:
         return _perform_model_check(path, state, read_only=True)
     with state.explicit_check() as coalesced:
@@ -696,23 +707,16 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
 
 
 def find_openclaw(explicit_path: str | None = None) -> str:
-    candidates = [
-        explicit_path,
-        os.environ.get("ORBIT_OPENCLAW_PATH"),
-        shutil.which("openclaw"),
-        "/opt/homebrew/bin/openclaw",
-        "/usr/local/bin/openclaw",
-        str(Path.home() / ".openclaw" / "bin" / "openclaw"),
-        str(Path.home() / ".local" / "bin" / "openclaw"),
-        str(Path.home() / ".npm-global" / "bin" / "openclaw"),
-    ]
-    for candidate in candidates:
-        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return os.path.realpath(candidate)
-    raise RuntimeError(
-        f"OpenClaw is not installed. Open {PRODUCT_NAME} Settings, install OpenClaw, run "
-        "`openclaw setup`, then click Recheck."
-    )
+    descriptor_path = os.environ.get("TASKPILOT_MANAGED_DESCRIPTOR")
+    if descriptor_path:
+        descriptor = managed_openclaw.activate_environment(Path(descriptor_path))
+        if explicit_path and os.path.realpath(explicit_path) != os.path.realpath(descriptor['executable']):
+            raise managed_openclaw.ManagedRuntimeError("OpenClaw executable does not match the private runtime descriptor.")
+        return descriptor['executable']
+    # Explicit paths are retained for isolated test fixtures and old integrations;
+    # production startup always supplies a managed descriptor. No PATH discovery.
+    if explicit_path and os.path.isfile(explicit_path) and os.access(explicit_path, os.X_OK): return explicit_path
+    raise managed_openclaw.ManagedRuntimeError("TaskPilot did not provide its private OpenClaw runtime descriptor.")
 
 
 def default_openclaw_key_state_path() -> Path:
@@ -834,7 +838,7 @@ def _sync_openclaw_google_key(
 
 
 def session_transcript_cursor(session_id: str, sessions_root: Path | None = None) -> tuple[Path, int] | None:
-    root = sessions_root or Path.home() / ".openclaw/agents/main/sessions"
+    root = sessions_root or Path(os.environ.get("OPENCLAW_STATE_DIR", str(Path.home() / ".openclaw"))) / "agents/main/sessions"
     try:
         registry = json.loads((root / "sessions.json").read_text())
         for name, value in registry.items():
@@ -857,7 +861,7 @@ def openclaw_session_error(session_id: str, sessions_root: Path | None = None,
     ACP currently completes those turns without streaming the message body, so
     inspect the newest assistant record as well as explicit error records.
     """
-    root = sessions_root or Path.home() / ".openclaw" / "agents" / "main" / "sessions"
+    root = sessions_root or Path(os.environ.get("OPENCLAW_STATE_DIR", str(Path.home() / ".openclaw"))) / "agents/main/sessions"
     try:
         registry = json.loads((root / "sessions.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -2195,6 +2199,13 @@ def largest_downloads_next_action(
     return {"type": "press", "element_id": str(size_header["id"])}
 
 
+def managed_acp_arguments():
+    path = os.environ.get("TASKPILOT_MANAGED_DESCRIPTOR")
+    if not path: return []
+    descriptor = managed_openclaw.load_descriptor(Path(path))
+    return ["--url", descriptor['endpoint'], "--token-file", descriptor['token_file']]
+
+
 class ACPClient:
     def __init__(self, openclaw_path: str) -> None:
         with configuration_transaction():
@@ -2207,7 +2218,7 @@ class ACPClient:
         # Disable silence-based retries: wait for the called model to finish.
         environment["OPENCLAW_GOOGLE_GEMINI_FIRST_RESPONSE_RETRY_MS"] = "0"
         self.process = subprocess.Popen(
-            [openclaw_path, "acp", "--no-prefix-cwd"],
+            [openclaw_path, "acp", "--no-prefix-cwd"] + managed_acp_arguments(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -2483,8 +2494,14 @@ class ACPClient:
             recovered = self.gateway_configuration("sessions.get", {"key": self.session_key, "limit": 8})
             for item in reversed(recovered.get("messages") or []):
                 message = item.get("message", item) if isinstance(item, dict) else {}
-                if not current_transcript_message(message, item, started_at) or message.get("role") != "assistant":
+                if not current_transcript_message(message, item, started_at):
                     continue
+                if message.get("role") == "custom" and message.get("customType") == "run-failed-before-reply":
+                    detail = message.get("details")
+                    if not isinstance(detail, dict) or not detail.get("error"):
+                        raise ProviderRequestError({"code":"configuration", "message":"OpenClaw failed before returning a provider response"}, selected)
+                    raise ProviderRequestError(detail["error"], selected)
+                if message.get("role") != "assistant": continue
                 if message.get("stopReason") == "error":
                     raise ProviderRequestError(message, selected, "OpenClaw recovery exhausted")
                 content = message.get("content") or []
@@ -2555,6 +2572,17 @@ class ACPClient:
         path = self.openclaw_path
         session_key = self.session_key
         self.close()  # First stop and wait for the disconnected ACP child.
+        descriptor_path = os.environ.get("TASKPILOT_MANAGED_DESCRIPTOR")
+        if descriptor_path:
+            context = current_task.get()
+            prior = context.machine.phase if context else None
+            if context: context.machine.transition(Phase.RECOVERING)
+            try:
+                managed_openclaw.wait_for_health(Path(descriptor_path), force=True, status=lambda text: emit("status", message=text))
+                managed_openclaw.activate_environment(Path(descriptor_path))
+            finally:
+                if context: context.machine.transition(prior, recovered=True)
+
         # The Gateway owns inference independently of the stdio child. Its
         # abort RPC waits for terminal persistence before acknowledging.
         ended = self.gateway_configuration("sessions.abort", {"key": session_key})
@@ -3129,6 +3157,8 @@ def validated_prompt(client: ACPClient, instruction: str, screenshot_path: Path,
             if metrics is not None:
                 metrics["reconnects"] += 1
                 metrics[purpose] += 1
+            if instruction_correction_pending():
+                raise InstructionSuperseded("A correction arrived during Gateway recovery")
             client.select_model(selected)
             return request(text)
         finally:
@@ -3299,8 +3329,21 @@ class TaskExecution:
                 api_key = ""
                 c.observation_keywords = sorted(w for w in words(c.task) if len(w) <= 64 and w.isalnum())[:48]
                 c.machine.require("connect")
+                descriptor_path = os.environ.get("TASKPILOT_MANAGED_DESCRIPTOR")
+                if descriptor_path:
+                    managed_openclaw.wait_for_health(Path(descriptor_path), status=lambda text: emit("status", message=text))
                 try:
-                    c.client = ACPClient(resolved)
+                    try:
+                        c.client = ACPClient(resolved)
+                    except Exception as error:
+                        if not descriptor_path or classify_failure(error,time.time()).kind != 'transport': raise
+                        c.machine.transition(Phase.RECOVERING)
+                        publish_task_wait('reconciling','Waiting for private Gateway recovery',
+                                          operation_key='gateway-startup-recovery',ledger=c.ledger)
+                        managed_openclaw.wait_for_health(Path(descriptor_path),force=True,
+                            status=lambda text: emit('status',message=text))
+                        c.machine.transition(Phase.STARTING,recovered=True)
+                        c.client = ACPClient(resolved)
                 except Exception as error:
                     c.runtime_state.record_failure(PRIMARY_MODELS[0], classify_failure(error, time.time()))
                     emit("model_health", model=PRIMARY_MODELS[0], state="repair", detail=str(error))
@@ -3642,6 +3685,15 @@ class TaskExecution:
 
     def execute(self) -> None:
         c = self.c
+        descriptor_path = os.environ.get('TASKPILOT_MANAGED_DESCRIPTOR')
+        if descriptor_path:
+            c.machine.transition(Phase.RECOVERING)
+            publish_task_wait('reconciling', 'Checking private Gateway connectivity',
+                              operation_key=f'gateway-preflight:{c.step}', ledger=c.ledger)
+            managed_openclaw.wait_for_health(Path(descriptor_path), status=lambda text: emit('status', message=text))
+            c.machine.transition(Phase.EXECUTING, recovered=True)
+            if instruction_correction_pending():
+                c.machine.reconcile(); c.reconcile_reason = 'correction'; return
         seconds = 30.0 + (float(c.action.get('timeout_seconds', action_default('run_command', 'timeout_seconds')))
                           if c.action.get('type') == 'run_command' else 0)
         c.local_budget = LocalBudget(seconds, 'action_preparation', cancelled=lambda: c.machine.phase in {Phase.DRAINING, Phase.FINISHED})
@@ -3828,6 +3880,10 @@ def _stop_handler(_signal_number: int, _frame: Any) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=f"{PRODUCT_NAME} OpenClaw runtime")
+    parser.add_argument("--managed-openclaw", choices=("ensure", "relocate", "rollback"))
+    parser.add_argument("--managed-resources")
+    parser.add_argument("--managed-descriptor")
+    parser.add_argument("--managed-acp-probe", action="store_true")
     parser.add_argument("--configuration-command", nargs=argparse.REMAINDER)
     parser.add_argument("--task")
     parser.add_argument("--display-id", type=int)
@@ -3911,6 +3967,14 @@ def main() -> int:
     signal.signal(signal.SIGINT, _stop_handler)
     args = parse_args()
     try:
+        if args.managed_openclaw:
+            return managed_openclaw.command(args.managed_openclaw, args.managed_resources, args.managed_descriptor)
+        if args.managed_descriptor:
+            managed_openclaw.activate_environment(Path(args.managed_descriptor))
+        if args.managed_acp_probe:
+            client = ACPClient(find_openclaw(args.openclaw_path))
+            client.close()
+            return 0
         if args.configuration_command:
             with configuration_transaction() as lease:
                 # Descendants retain the lease if the wrapper exits first.

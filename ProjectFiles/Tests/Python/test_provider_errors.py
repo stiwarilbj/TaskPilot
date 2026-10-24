@@ -291,6 +291,21 @@ class ProviderErrorTests(unittest.TestCase):
         client._handle_server_message({'method': 'session/update', 'params': {'sessionId': 'current', 'update': {'sessionUpdate': 'error', 'error': quota()}}})
         self.assertEqual(len(client.turn_errors), 1)
 
+    def test_pre_reply_failure_is_classified_without_format_repair_or_sibling_requests(self):
+        client = self.client(); client.session_key = 'private-check'
+        client.request = mock.Mock(return_value={'stopReason':'end_turn'})
+        current = {'role':'custom', 'customType':'run-failed-before-reply', 'timestamp':1001,
+                   'details':{'error':'Auth profile store requires legacy credential migration'}}
+        stale = {**current, 'timestamp':999}
+        client.gateway_configuration = mock.Mock(return_value={'messages':[stale,current]})
+        with mock.patch.object(runtime.time,'time',return_value=1), \
+             mock.patch.object(runtime,'session_transcript_cursor',return_value=None), \
+             self.assertRaises(errors.ProviderRequestError) as caught:
+            client._run_prompt([],None)
+        self.assertEqual(policy.classify_failure(caught.exception,1000).kind,'configuration')
+        client.request.assert_called_once()
+        client.gateway_configuration.assert_called_once()
+
     def test_terminal_result_keeps_precise_provider_error(self):
         client = self.client(); client.request = mock.Mock(return_value={'stopReason': 'error', **quota()})
         with mock.patch.object(runtime, 'session_transcript_cursor', return_value=None), self.assertRaises(errors.ProviderRequestError) as caught:

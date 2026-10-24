@@ -59,6 +59,7 @@ if [[ ! -x "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/recovery_cycles.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/command_intents.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/prompt_compiler.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
+      || "$PROJECT_FILES_DIR/AgentRuntime/managed_openclaw.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/request_policy.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/provider_errors.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/requirements.txt" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" ]]; then

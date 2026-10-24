@@ -24,6 +24,7 @@ final class SubprocessSupervisor: @unchecked Sendable {
     var arguments: [String] = []
     var environment: [String: String]?
     var currentDirectoryURL: URL?
+    var onLaunchAcknowledged: ((TPProcessIdentity) throws -> Void)?
     var standardInput: Any = FileHandle.nullDevice
     var standardOutput: Any = FileHandle.nullDevice
     var standardError: Any = FileHandle.nullDevice
@@ -104,6 +105,12 @@ final class SubprocessSupervisor: @unchecked Sendable {
             // Strong retention is intentional: parent exit must not orphan ownership.
             timer.setEventHandler { [self] in refresh() }
             timer.resume()
+            // App-owned long-lived services may journal birth/group identity
+            // while the child is still suspended. A failed journal never releases it.
+            if let onLaunchAcknowledged {
+                guard let rootIdentity else { throw Failure.inspection }
+                try onLaunchAcknowledged(rootIdentity)
+            }
             // The program cannot fork or mutate before ownership and observers
             // are installed. Launch returns only after explicit release.
             if Darwin.kill(pid, SIGCONT) != 0 {

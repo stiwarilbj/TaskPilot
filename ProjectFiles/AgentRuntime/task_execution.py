@@ -18,6 +18,7 @@ class Phase(str, Enum):
     PLANNING = "planning"
     EXECUTING = "executing"
     RECONCILING = "reconciling"
+    RECOVERING = "recovering"
     WAITING_INPUT = "waiting_input"
     VERIFYING = "verifying"
     DRAINING = "draining"
@@ -47,6 +48,8 @@ TRANSITIONS = {
     (Phase.EXECUTING, Phase.RECONCILING): Transition(),
     (Phase.WAITING_INPUT, Phase.RECONCILING): Transition(),
     (Phase.VERIFYING, Phase.OBSERVING): Transition(),
+    **{(phase, Phase.RECOVERING): Transition() for phase in (Phase.STARTING, Phase.PLANNING, Phase.VERIFYING, Phase.RECONCILING, Phase.EXECUTING)},
+    **{(Phase.RECOVERING, phase): Transition(frozenset({"recovered"})) for phase in (Phase.STARTING, Phase.PLANNING, Phase.VERIFYING, Phase.RECONCILING, Phase.EXECUTING)},
     **{(phase, Phase.DRAINING): Transition() for phase in Phase
        if phase not in {Phase.DRAINING, Phase.FINISHED}},
     (Phase.DRAINING, Phase.FINISHED): Transition(frozenset({"cleanup"})),
@@ -59,6 +62,7 @@ EFFECTS = {
     Phase.OBSERVING: frozenset({"observe", "read"}),
     Phase.PLANNING: frozenset({"plan", "read"}),
     Phase.EXECUTING: frozenset({"execute", "read"}),
+    Phase.RECOVERING: frozenset({"connect", "read", "receipt"}),
     Phase.RECONCILING: frozenset({"observe", "read", "receipt"}),
     Phase.WAITING_INPUT: frozenset({"secure_input", "execute"}),
     Phase.VERIFYING: frozenset({"observe", "read", "verify", "complete"}),
@@ -89,7 +93,7 @@ class ExecutionMachine:
         )
         if missing:
             raise ExecutionStateError("Task transition requires " + ", ".join(missing))
-        if self.pending_action is not None and destination not in {Phase.RECONCILING, Phase.DRAINING, Phase.FINISHED}:
+        if self.pending_action is not None and destination not in {Phase.RECONCILING, Phase.RECOVERING, Phase.DRAINING, Phase.FINISHED}:
             raise ExecutionStateError("The dispatched action must be reconciled before advancing")
         self.phase = destination
         if destination in {Phase.EXECUTING, Phase.WAITING_INPUT}:
