@@ -160,7 +160,7 @@ struct TaskProgressMapView: View {
                             .padding(.vertical, 2)
                     }
                     .frame(maxHeight: 156)
-                    .accessibilityLabel("Original request clauses")
+                    .accessibilityLabel("Original request and applied corrections")
 
                     stateLegend
 

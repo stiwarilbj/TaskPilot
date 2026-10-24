@@ -376,6 +376,38 @@ struct TaskPilotMainView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
+
+            if model.isActive || model.taskCorrectionSession != nil {
+                HStack {
+                    Spacer()
+                    Menu {
+                        Button("Keep going, but…") { model.openTaskCorrection() }
+                            .disabled(!model.canOpenTaskCorrection)
+                        let corrections = model.appliedTaskCorrections
+                        if !corrections.isEmpty {
+                            Divider()
+                            Menu("Applied corrections") {
+                                ForEach(corrections) { correction in
+                                    Text(correction.request).lineLimit(3)
+                                }
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                            .font(.title3)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 32, height: 28)
+                            .contentShape(Rectangle())
+                    }
+                    .menuStyle(.borderlessButton)
+                    .accessibilityLabel("Task options")
+                }
+            }
+            if let correction = model.taskCorrectionSession {
+                TaskCorrectionEditorView(model: model, session: correction,
+                    surface: theme.surfaceColor, border: theme.borderColor,
+                    fontSize: TaskPilotAppearancePreferences.clampedInputFontSize(inputFontSize))
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)

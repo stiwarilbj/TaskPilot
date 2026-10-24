@@ -242,6 +242,7 @@ class ScreenSettlingTests(unittest.TestCase):
         client = Client()
         router = runtime.AdaptiveModelRouter(lambda *a, **k: None)
         def bridge(method, display_id, **params):
+            if method == 'completion_gate': return {'accepted': True, 'pending_correction': False}
             if method == 'act':
                 target = params['action']['element_id']
                 attempts.append(target)
@@ -298,6 +299,7 @@ class ScreenSettlingTests(unittest.TestCase):
         client = Client()
         router = runtime.AdaptiveModelRouter(lambda *a, **k: None)
         def bridge(method, display_id, **params):
+            if method == 'completion_gate': return {'accepted': True, 'pending_correction': False}
             if method == 'act':
                 deliveries.append(params['action'])
                 return native_delivery(params['action'], {'message': 'Read-back mismatch', 'outcome': 'delivered_unconfirmed', 'text_verification': 'mismatch', 'pid': 42})
@@ -353,6 +355,7 @@ class ScreenSettlingTests(unittest.TestCase):
         router = runtime.AdaptiveModelRouter(lambda *a, **k: None)
         def bridge(method, display_id, **params):
             nonlocal after_action
+            if method == 'completion_gate': return {'accepted': True, 'pending_correction': False}
             if method == 'act':
                 act_calls.append(params['action'])
                 after_action = True

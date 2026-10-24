@@ -268,6 +268,7 @@ class EvidenceTaskLoopTests(unittest.TestCase):
             ledger = TaskEvidenceLedger(*args, **kwargs); self.ledgers.append(ledger); return ledger
         def bridge(method, _display, **params):
             nonlocal revision
+            if method == 'completion_gate': return {'accepted': True, 'pending_correction': False}
             if method == 'observe':
                 revision += 1; image = Path(temporary.name) / f'{revision}.png'; image.write_bytes(b'fixture')
                 return {'observation_revision': str(revision), 'screenshot_path': str(image), 'applications': [], 'elements': []}
@@ -335,7 +336,7 @@ class EvidenceTaskLoopTests(unittest.TestCase):
             self.assertEqual(client.prompt_calls, 0)
             self.assertEqual(self.events[-1][0], 'complete')
             self.assertTrue(any(kind == 'request_metrics' for kind, _ in self.events[:-1]))
-            output = next(fields['content'] for kind, fields in self.events if kind == 'output')
+            output = next(fields['content'] for kind, fields in self.events if kind == 'complete')
             self.assertEqual(output, content)
 
     def test_truncated_local_read_never_reports_completion(self):
@@ -350,6 +351,7 @@ class EvidenceTaskLoopTests(unittest.TestCase):
     def test_exact_largest_shortcut_has_zero_calls_and_cannot_drop_additional_instructions(self):
         with mock.patch.object(runtime, 'find_openclaw'), mock.patch.object(runtime, 'prepare_runtime'), \
              mock.patch.object(runtime, 'largest_top_level_file', return_value={'name': 'fixture.txt', 'bytes': 3}), \
+             mock.patch.object(runtime, 'bridge_call', return_value={'accepted': True, 'pending_correction': False}), \
              mock.patch.object(runtime, 'emit') as emit, mock.patch.object(runtime, 'ACPClient') as client:
             runtime.run_task('What is the largest file in Downloads?', 1, 'fixture', '')
         client.assert_not_called(); self.assertTrue(any(c.args[0] == 'complete' for c in emit.call_args_list))

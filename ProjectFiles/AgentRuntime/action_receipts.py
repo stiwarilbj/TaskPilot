@@ -26,6 +26,7 @@ class RuntimeInbox:
         self.control_handler = control_handler
         self.transport = RequestTransport()
         self.transport.register(('runtime_configuration', None, None))
+        self._instruction_correction_key = None
         self._started = False
         self._start_lock = threading.Lock()
 
@@ -33,6 +34,28 @@ class RuntimeInbox:
         key = (kind, request_id, generation)
         self.transport.register(key)
         return key
+
+    def register_instruction_corrections(self, generation):
+        key = ('instruction_correction', None, generation)
+        if self._instruction_correction_key is None:
+            self.transport.register(key)
+            self._instruction_correction_key = key
+        elif self._instruction_correction_key != key:
+            raise TransportFailure('transport_generation_mismatch')
+        return key
+
+    @property
+    def instruction_correction_key(self):
+        return self._instruction_correction_key
+
+    def has_instruction_correction(self):
+        return bool(self._instruction_correction_key and
+                    self.transport.has_pending(self._instruction_correction_key))
+
+    def take_instruction_correction(self, timeout=0):
+        if not self._instruction_correction_key:
+            raise TransportFailure('transport_unknown_request')
+        return self.transport.get(self._instruction_correction_key, timeout)
 
     def start(self):
         with self._start_lock:
@@ -58,6 +81,15 @@ class RuntimeInbox:
         generation = message.get('task_generation_id')
         if kind == 'runtime_configuration':
             key = (kind, None, None)
+        elif kind == 'instruction_correction':
+            if not isinstance(generation, str) or not generation:
+                return
+            key = self._instruction_correction_key
+            if key != ('instruction_correction', None, generation):
+                return
+            # Corrections are bounded control events, not terminal replies.
+            self.transport.put(key, line + '\n', size=len(frame), terminal=False)
+            return
         elif isinstance(kind, str) and isinstance(request_id, str) and (generation is None or isinstance(generation, str)):
             key = (kind, request_id, generation)
         else:

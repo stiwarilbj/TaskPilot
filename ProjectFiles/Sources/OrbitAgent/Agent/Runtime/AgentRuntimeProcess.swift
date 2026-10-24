@@ -39,6 +39,7 @@ enum AgentUserInputKind: String, Equatable {
 struct AgentUserInputRequest: Equatable, Identifiable {
     let requestID: String
     let taskGenerationID: String
+    let instructionRevision: UInt64
     let title: String
     let message: String
     let kind: AgentUserInputKind
@@ -54,6 +55,7 @@ enum RuntimeEvent {
     case userInputRequired(AgentUserInputRequest)
     case taskProgress(AgentTaskProgressSnapshot)
     case taskWait(AgentTaskWaitSnapshot)
+    case instructionCorrectionApplied(id: String, taskGenerationID: String, revision: UInt64)
     case actionPresentation(actionID: String, taskGenerationID: String, verificationScope: String)
     case completed(String)
     case failed(String)
@@ -130,6 +132,8 @@ final class AgentRuntimeProcess {
         var operations: [UUID: Task<Void, Never>] = [:]
         var exited = false
         var pendingUserInputID: String?
+        var pendingUserInputRevision: UInt64?
+        var correctionIDs: Set<String> = []
         var terminalDelivered = false
         var drainStarted: ContinuousClock.Instant?
         var drainReported = false
@@ -252,6 +256,7 @@ final class AgentRuntimeProcess {
                 "action_contract_hash": ActionContract.fingerprint,
                 "action_contract_version": ActionContract.version,
                 "task_generation_id": lease.id,
+                "instruction_revision": lease.currentInstructionRevision,
                 "task_protocol_version": ActionContract.taskProtocolVersion,
                 "exact_input_reference_version": AgentTaskInputReferenceProtocol.version,
                 "exact_input_references": exactInputReferences.map(\.wireValue),
@@ -325,23 +330,82 @@ final class AgentRuntimeProcess {
         enforceTermination(run)
     }
 
-    func submitUserInput(requestID: String, value: String, taskGenerationID: String) {
+    @discardableResult
+    func submitUserInput(requestID: String, value: String, taskGenerationID: String,
+                         instructionRevision: UInt64) -> Bool {
         // The credential crosses only the existing private stdin pipe. It is
         // never placed in arguments, environment variables, status text, or
         // the OpenClaw conversation.
         let run = ioQueue.sync { () -> Invocation? in
-            guard let run = invocation, run.pendingUserInputID == requestID, run.lease.accepts(taskGenerationID) else { return nil }
+            guard let run = invocation, run.pendingUserInputID == requestID,
+                  run.pendingUserInputRevision == instructionRevision,
+                  run.lease.accepts(taskGenerationID) else { return nil }
+            do { try run.lease.validateInstructionRevision(instructionRevision) }
+            catch { return nil }
             run.pendingUserInputID = nil
+            run.pendingUserInputRevision = nil
             run.snapshots.invalidateStatus()
             return run
         }
-        guard let run, run.lease.accepts(taskGenerationID) else { return }
+        guard let run, run.lease.accepts(taskGenerationID) else { return false }
         send([
             "task_generation_id": run.lease.id,
+            "instruction_revision": instructionRevision,
             "kind": "user_input_response",
             "request_id": requestID,
             "value": value
         ], for: run)
+        return true
+    }
+
+    func prepareInstructionCorrection(_ correction: TaskInstructionCorrection, generationID: String) throws {
+        let run = try ioQueue.sync { () throws -> Invocation in
+            guard let run = invocation, run.lease.id == generationID,
+                  run.lease.state == .running || run.lease.state == .paused else {
+                throw TaskInstructionCorrectionError.stale
+            }
+            guard correction.revision == run.lease.currentInstructionRevision + 1,
+                  !run.correctionIDs.contains(correction.id.uuidString.lowercased()) else {
+                throw TaskInstructionCorrectionError.stale
+            }
+            try run.lease.beginInstructionCorrection(id: correction.id.uuidString, revision: correction.revision)
+            run.correctionIDs.insert(correction.id.uuidString.lowercased())
+            return run
+        }
+        _ = run
+    }
+
+    func sendInstructionCorrection(_ correction: TaskInstructionCorrection, generationID: String) throws {
+        let run = try ioQueue.sync { () throws -> Invocation in
+            guard let run = invocation, run.lease.id == generationID,
+                  run.correctionIDs.contains(correction.id.uuidString.lowercased()),
+                  run.lease.state == .running || run.lease.state == .paused else {
+                throw TaskInstructionCorrectionError.stale
+            }
+            return run
+        }
+        var frame = try telemetry.encodeJSON([
+            "kind": "instruction_correction",
+            "task_generation_id": run.lease.id,
+            "instruction_revision": correction.revision,
+            "correction": correction.wireValue
+        ], recordSize: false)
+        frame.append(0x0A)
+        run.writer?.enqueue(frame, priority: true) { [weak self, weak run] delivered in
+            guard let self, let run else { return }
+            if !delivered {
+                self.ioQueue.async { self.failTransport("transport_closed", for: run) }
+            }
+        }
+    }
+
+    func cancelInstructionCorrection(_ correctionID: UUID, generationID: String) {
+        let run = ioQueue.sync { () -> Invocation? in
+            guard let run = invocation, run.lease.id == generationID else { return nil }
+            run.lease.cancelInstructionCorrection(id: correctionID.uuidString)
+            return run
+        }
+        _ = run
     }
 
     private func signalRuntime(_ signal: Int32) {
@@ -430,6 +494,15 @@ final class AgentRuntimeProcess {
             return
         }
         accepted = true
+        if !["runtime_ready", "instruction_correction_applied", "bridge_request"].contains(kind) {
+            guard let revision = exactRevision(message["instruction_revision"]) else {
+                failTransport("instruction_revision_mismatch", for: run)
+                return
+            }
+            // Late status, progress, secure-input, or output frames from an
+            // earlier instruction must never replace the current task view.
+            guard revision == run.lease.currentInstructionRevision else { return }
+        }
         // Older helpers lack runtime_ready; their first valid non-error frame
         // is the compatibility boundary. Current helpers announce readiness.
         if ["runtime_ready", "model_health", "request_metrics", "bridge_request", "status",
@@ -465,12 +538,13 @@ final class AgentRuntimeProcess {
             run.pendingBridgeBytes += requestBytes
             let operation = Task { [weak self] in
                 guard let self else { bridgeSpan.finish(.cancelled); return }
-                let response = await TaskOwnership.$current.withValue(run.lease) {
+                var response = await TaskOwnership.$current.withValue(run.lease) {
                     if let handler = self.bridgeHandler {
                         return await TaskOwnership.withCancellationWakeup { await handler(message) }
                     }
                     return await self.bridge.handle(message)
                 }
+                response["instruction_revision"] = message["instruction_revision"]
                 self.ioQueue.async {
                     self.send(response, for: run, bridgeSpan: bridgeSpan)
                     run.operations.removeValue(forKey: operationID)
@@ -490,11 +564,16 @@ final class AgentRuntimeProcess {
             )
             emit(.output(output), for: run)
         case "user_input_required":
-            guard let requestID = message["request_id"] as? String else { return }
+            guard let requestID = message["request_id"] as? String,
+                  let revision = exactRevision(message["instruction_revision"]) else { return }
+            do { try run.lease.validateInstructionRevision(revision) }
+            catch { return }
             run.pendingUserInputID = requestID
+            run.pendingUserInputRevision = revision
             let request = AgentUserInputRequest(
                 requestID: requestID,
                 taskGenerationID: run.lease.id,
+                instructionRevision: revision,
                 title: message["title"] as? String ?? "Password required",
                 message: message["message"] as? String ?? "Enter the requested credential to continue.",
                 kind: AgentUserInputKind(
@@ -512,6 +591,21 @@ final class AgentRuntimeProcess {
                   wait.revision > run.waitRevision else { return }
             run.waitRevision = wait.revision
             emit(.taskWait(wait), for: run)
+        case "instruction_correction_applied":
+            guard message["task_generation_id"] as? String == run.lease.id,
+                  let id = message["correction_id"] as? String,
+                  let uuid = UUID(uuidString: id), uuid.uuidString.lowercased() == id,
+                  let revision = exactRevision(message["instruction_revision"]) else { return }
+            do {
+                try run.lease.applyInstructionCorrection(id: id, revision: revision)
+                if run.pendingUserInputRevision != revision {
+                    run.pendingUserInputID = nil
+                    run.pendingUserInputRevision = nil
+                }
+                emit(.instructionCorrectionApplied(id: id, taskGenerationID: run.lease.id, revision: revision), for: run)
+            } catch {
+                failTransport("instruction_revision_mismatch", for: run)
+            }
         case "action_presentation":
             guard let presentation = AgentActionPresentationMessage.parse(
                 message, generationID: run.lease.id, knownActionIDs: run.receiptIDs
@@ -523,6 +617,22 @@ final class AgentRuntimeProcess {
                                      taskGenerationID: presentation.generationID,
                                      verificationScope: presentation.verificationScope), for: run)
         case "complete":
+            guard run.lease.claimCompletion(instructionRevision: exactRevision(message["instruction_revision"]) ?? 0) else {
+                // Python always acquires this gate before publishing output.
+                // A correction that won the shared lease lock keeps the task alive.
+                failTransport("completion_gate_missing", for: run)
+                return
+            }
+            if message["show_output"] as? Bool == true {
+                let output = AgentTaskOutput(
+                    shouldShow: true,
+                    title: message["title"] as? String ?? "Output",
+                    content: message["content"] as? String ?? message["message"] as? String ?? "",
+                    decidedByAgent: message["decided_by_agent"] as? Bool ?? false,
+                    kind: AgentTaskOutputKind(rawValue: message["output_kind"] as? String ?? "result") ?? .result
+                )
+                emit(.output(output), for: run)
+            }
             run.receivedTerminalEvent = true
             run.pendingTerminalEvent = .completed(message["message"] as? String ?? "Task complete")
             beginDrain(run)
@@ -535,6 +645,14 @@ final class AgentRuntimeProcess {
         default:
             break
         }
+    }
+
+    private func exactRevision(_ value: Any?) -> UInt64? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite, number.doubleValue >= 0,
+              number.doubleValue.rounded(.towardZero) == number.doubleValue else { return nil }
+        return UInt64(number.stringValue)
     }
 
     private func send(_ object: [String: Any], for run: Invocation, bridgeSpan: BackendTelemetry.Span? = nil) {

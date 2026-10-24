@@ -59,10 +59,32 @@ final class AgentAutomationBridge {
     private func handleRequest(_ request: [String: Any]) async -> [String: Any] {
         let requestID = request["request_id"] as? String ?? UUID().uuidString
         let lease = TaskOwnership.current
+        do {
+            guard let lease, owns(lease), lease.accepts(request["task_generation_id"] as? String) else { throw CancellationError() }
+            guard let instructionRevision = Self.exactRevision(request["instruction_revision"]) else {
+                throw BridgeError.invalidRequest("Missing or invalid task instruction revision")
+            }
+            if request["method"] as? String == "act" {
+                try lease.validateInstructionRevision(instructionRevision)
+            }
+            return await TaskOwnership.$instructionRevision.withValue(instructionRevision) {
+                await self.handleInstructionRevisionRequest(request, requestID: requestID, lease: lease,
+                                                            instructionRevision: instructionRevision)
+            }
+        } catch {
+            let code = error is LocalOperationBudget.Exhausted ? "local_budget_exhausted" : error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" :
+                (error as? TaskInstructionCorrectionError).map { _ in "instruction_superseded" } ?? (error as? ActionReceiptStore.ReceiptError)?.code ?? (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? (error is BoundFileOperation.Conflict ? "file_conflict" : "action_rejected")
+            return ["task_generation_id": lease?.id ?? "", "kind": "bridge_response", "request_id": requestID,
+                    "ok": false, "error_code": code, "error": error.localizedDescription,
+                    "instruction_revision": Self.exactRevision(request["instruction_revision"]) ?? 0]
+        }
+    }
+
+    private func handleInstructionRevisionRequest(_ request: [String: Any], requestID: String,
+                                                   lease: TaskLease, instructionRevision: UInt64) async -> [String: Any] {
         var receiptToken: ActionReceiptStore.Token?
         var magnifierActionTitle: String?
         do {
-            guard let lease, owns(lease), lease.accepts(request["task_generation_id"] as? String) else { throw CancellationError() }
             try await lease.checkpoint()
             guard let method = request["method"] as? String else {
                 throw BridgeError.invalidRequest("Missing bridge method")
@@ -81,6 +103,12 @@ final class AgentAutomationBridge {
                 try TaskOwnership.check()
                 return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
                         "ok": true, "result": result]
+            }
+            if method == "completion_gate" {
+                let gate = lease.claimCompletionGate(instructionRevision: instructionRevision)
+                return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
+                        "ok": true, "result": ["accepted": gate.accepted,
+                            "pending_correction": gate.pendingCorrection]]
             }
             if method == "wait_file_effect" {
                 guard let input = params["check"] else { throw BridgeError.invalidRequest("Missing expected effect check") }
@@ -141,6 +169,7 @@ final class AgentAutomationBridge {
                 identity.removeValue(forKey: "action_id")
                 identity.removeValue(forKey: "local_budget_ms")
                 identity["action"] = action
+                identity["instruction_revision"] = instructionRevision
                 switch try lease.commit({ try lease.actionReceipts.begin(id: id, payload: identity) }) {
                 case .existing(let receipt):
                     return try receiptResponse(receipt, requestID: requestID, generation: lease.id)
@@ -343,7 +372,7 @@ final class AgentAutomationBridge {
                 "result": result
             ]
         } catch {
-            let code = error is LocalOperationBudget.Exhausted ? "local_budget_exhausted" : error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" :
+            let code = error is LocalOperationBudget.Exhausted ? "local_budget_exhausted" : error is ActionContract.NativeProtocolError ? "protocol_error" : error is CancellationError ? "cancelled" : error is ObservationConsistencyError ? "observation_unstable" : error is ActionContract.ValidationError ? "invalid_action" : (error as? TaskInstructionCorrectionError).map { _ in "instruction_superseded" } ??
                 (error as? ActionReceiptStore.ReceiptError)?.code ?? (error as? AccessibilityActionError)?.code ?? (error as? TaskToolError)?.code ?? (error is BoundFileOperation.Conflict ? "file_conflict" : "action_rejected")
             receiptToken?.fail(error, code: code)
             if let title = magnifierActionTitle, let receiptToken {
@@ -354,22 +383,30 @@ final class AgentAutomationBridge {
                 case "confirmed": presentation = .delivered(title)
                 default: presentation = .rejected
                 }
-                accessibility.finishActionMagnifier(actionID: receiptToken.id, generationID: lease?.id ?? "",
+                accessibility.finishActionMagnifier(actionID: receiptToken.id, generationID: lease.id,
                                                     state: presentation)
             }
             // Cancellation must remain a stop even if an acknowledged result
             // raced with revocation. The receipt still retains that result.
             if let receiptToken, code != "cancelled" {
-                if let response = try? receiptResponse(receiptToken.receipt, requestID: requestID, generation: lease?.id ?? "") { return response }
+                if let response = try? receiptResponse(receiptToken.receipt, requestID: requestID, generation: lease.id) { return response }
             }
             return [
-                "task_generation_id": lease?.id ?? "",
+                "task_generation_id": lease.id,
                 "kind": "bridge_response",
                 "request_id": requestID,
+                "instruction_revision": instructionRevision,
                 "ok": false
             ].merging(ActionContract.nativeFailure(error, code: code,
                 outcome: receiptToken?.receipt["state"] as? String == "unconfirmed" || code == "delivery_uncertain" || (error as? BoundFileOperation.Conflict)?.delivered == true ? "delivered_unconfirmed" : "rejected")) { _, new in new }
         }
+    }
+
+    private static func exactRevision(_ value: Any?) -> UInt64? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite, number.doubleValue >= 0,
+              number.doubleValue.rounded(.towardZero) == number.doubleValue else { return nil }
+        return UInt64(number.stringValue)
     }
 
     private func verifyTextTarget(_ action: [String: Any], display: DisplayDescriptor, lease: TaskLease,

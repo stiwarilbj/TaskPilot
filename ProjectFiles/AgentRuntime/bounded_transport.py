@@ -202,6 +202,39 @@ class RequestTransport:
                 self.count -= 1
                 return value
 
+    def get_any(self, keys, timeout=None):
+        """Read the earliest available event from several task-owned mailboxes."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self.condition:
+            while True:
+                for key in keys:
+                    slot = self.pending.get(key)
+                    if slot is None:
+                        continue
+                    if slot.failure:
+                        raise slot.failure
+                    if slot.events:
+                        value, size = slot.events.popleft()
+                    elif slot.terminal:
+                        value, size = slot.terminal
+                        slot.terminal = None
+                    else:
+                        continue
+                    self.bytes -= size
+                    self.count -= 1
+                    return key, value
+                if self.closed:
+                    raise TransportFailure('transport_closed', connected=False)
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError()
+                self.condition.wait(remaining)
+
+    def has_pending(self, key):
+        with self.condition:
+            slot = self.pending.get(key)
+            return bool(slot and (slot.events or slot.terminal))
+
     def close(self):
         with self.condition:
             self.closed = True

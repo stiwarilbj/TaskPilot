@@ -82,7 +82,11 @@ class ExecutionMachine:
         rule = TRANSITIONS.get((self.phase, destination))
         if rule is None:
             raise ExecutionStateError(f"Invalid task transition: {self.phase.value} -> {destination.value}")
-        missing = sorted(name for name in rule.prerequisites if facts.get(name) is not True)
+        correction_interrupt = (self.phase == Phase.PLANNING and destination == Phase.RECONCILING
+                                and facts.get("correction") is True)
+        missing = [] if correction_interrupt else sorted(
+            name for name in rule.prerequisites if facts.get(name) is not True
+        )
         if missing:
             raise ExecutionStateError("Task transition requires " + ", ".join(missing))
         if self.pending_action is not None and destination not in {Phase.RECONCILING, Phase.DRAINING, Phase.FINISHED}:
@@ -133,6 +137,12 @@ class TaskContext:
     display_id: int
     generation: str | None
     exact_input_references: list[dict] = field(default_factory=list)
+    original_task: str = ""
+    original_input_references: list[dict] = field(default_factory=list)
+    instruction_corrections: list[dict] = field(default_factory=list)
+    instruction_revision: int = 0
+    correction_key: Any = None
+    pending_correction_message: dict | None = None
     machine: ExecutionMachine = field(default_factory=ExecutionMachine)
     ledger: Any = None
     runtime_state: Any = None
@@ -181,6 +191,11 @@ class TaskContext:
     consecutive_dependency_blocks: int = 0
     consecutive_evidence_conflicts: int = 0
     command_hints_inspected: bool = False
+
+
+class InstructionSuperseded(RuntimeError):
+    """A terminal provider response belongs to an instruction revision that was superseded."""
+    superseded_instructions = True
 
 
 current_task: ContextVar[TaskContext | None] = ContextVar("task_execution_context", default=None)

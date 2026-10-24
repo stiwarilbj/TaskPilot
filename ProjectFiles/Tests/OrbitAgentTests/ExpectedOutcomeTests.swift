@@ -64,7 +64,7 @@ final class ExpectedOutcomeTests: XCTestCase {
         let lease = TaskLease()
         let bridge = AgentAutomationBridge(displayService: DisplayService(), accessibility: AccessibilityController(), capture: ScreenCaptureService())
         try bridge.bind(lease)
-        let request: [String: Any] = ["task_generation_id": lease.id, "request_id": "expected-check", "method": "check_effect",
+        let request: [String: Any] = ["task_generation_id": lease.id, "instruction_revision": 0, "request_id": "expected-check", "method": "check_effect",
                                       "params": ["check": ["type": "file_contents", "path": file.path, "content": "wanted"]]]
         let response = await bridge.handleOwned(request, lease: lease)
         XCTAssertEqual(response["ok"] as? Bool, true)

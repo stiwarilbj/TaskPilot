@@ -114,7 +114,7 @@ class CommandCapabilityTests(unittest.TestCase):
 
     def test_startup_mismatch_stops_before_models_and_readiness_remains_separate(self):
         config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=runtime.CONTRACT_HASH,
-            action_contract_version=runtime.CONTRACT_VERSION, task_generation_id=str(uuid.uuid4()), task_protocol_version=runtime.TASK_PROTOCOL_VERSION,
+            action_contract_version=runtime.CONTRACT_VERSION, task_generation_id=str(uuid.uuid4()), instruction_revision=0, task_protocol_version=runtime.TASK_PROTOCOL_VERSION,
             coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION, observation_completeness_version=runtime.OBSERVATION_COMPLETENESS_VERSION,
             text_recognition_version=runtime.TEXT_RECOGNITION_VERSION, evidence_consistency_version=runtime.EVIDENCE_CONSISTENCY_VERSION,
             wait_presentation_version=runtime.WAIT_PRESENTATION_VERSION)

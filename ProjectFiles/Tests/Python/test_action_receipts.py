@@ -236,6 +236,7 @@ class ActionReceiptTests(unittest.TestCase):
             frames = 0
             def exchange(method, display, params, timeout):
                 nonlocal frames
+                if method == 'completion_gate': return {'ok': True, 'result': {'accepted': True, 'pending_correction': False}}
                 if method == 'act':
                     delivered.append(params['action'])
                     native_receipts[params['action_id']] = dict(action_id=params['action_id'], state='confirmed', terminal=True,

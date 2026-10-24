@@ -21,10 +21,19 @@ final class TaskOwnershipTests: XCTestCase {
         let url = directory.appendingPathComponent("runtime")
         try ("""
         #!/usr/bin/python3
-        import json, sys, time
+        import json, sys, time, uuid
         config = json.loads(sys.stdin.readline())
+        def completion_gate(revision):
+            request = dict(kind='bridge_request', task_generation_id=config['task_generation_id'],
+                instruction_revision=revision, request_id=str(uuid.uuid4()), method='completion_gate', params={})
+            print(json.dumps(request), flush=True)
+            response = json.loads(sys.stdin.readline())
+            assert response.get('ok') and response.get('result', {}).get('accepted') is True, response
         def emit(kind, **fields):
-            print(json.dumps(dict(kind=kind, task_generation_id=config['task_generation_id'], **fields)), flush=True)
+            revision = fields.pop('instruction_revision', 0)
+            if kind == 'complete': completion_gate(revision)
+            print(json.dumps(dict(kind=kind, task_generation_id=config['task_generation_id'],
+                instruction_revision=revision, **fields)), flush=True)
         """ + "\n" + body + "\n").write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
         return url
@@ -54,6 +63,40 @@ final class TaskOwnershipTests: XCTestCase {
         XCTAssertEqual(effects, 1)
         XCTAssertEqual(old.staleWorkCount, 3)
         XCTAssertFalse(old.accepts(newer.id))
+    }
+    func testInstructionCorrectionFencesOldActionsAndCompletionButPreservesDispatchedWork() throws {
+        let lease = TaskLease(), correction = UUID().uuidString.lowercased()
+        try lease.beginInstructionCorrection(id: correction, revision: 1)
+        XCTAssertThrowsError(try lease.validateInstructionRevision(0))
+        XCTAssertNoThrow(try lease.validateInstructionRevision(0, allowDispatchedReceipt: true))
+        XCTAssertFalse(lease.claimCompletion(instructionRevision: 0))
+
+        try lease.applyInstructionCorrection(id: correction, revision: 1)
+        XCTAssertNoThrow(try lease.applyInstructionCorrection(id: correction, revision: 1))
+        XCTAssertThrowsError(try lease.validateInstructionRevision(0))
+        XCTAssertNoThrow(try lease.validateInstructionRevision(0, allowDispatchedReceipt: true))
+        XCTAssertFalse(lease.claimCompletion(instructionRevision: 0))
+        XCTAssertTrue(lease.claimCompletion(instructionRevision: 1))
+        XCTAssertThrowsError(try lease.beginInstructionCorrection(id: UUID().uuidString, revision: 2))
+    }
+    func testInstructionCorrectionPersistenceRollbackRestoresPriorAuthority() throws {
+        let lease = TaskLease(), correction = UUID().uuidString.lowercased()
+        try lease.beginInstructionCorrection(id: correction, revision: 1)
+        XCTAssertFalse(lease.claimCompletion(instructionRevision: 0))
+        lease.cancelInstructionCorrection(id: correction)
+        XCTAssertFalse(lease.hasPendingInstructionCorrection)
+        XCTAssertNoThrow(try lease.validateInstructionRevision(0))
+        XCTAssertTrue(lease.claimCompletion(instructionRevision: 0))
+    }
+    func testCorrectionCanBeAcknowledgedWhilePausedWithoutResumingLease() throws {
+        let lease = TaskLease(), correction = UUID().uuidString.lowercased()
+        lease.pause()
+        try lease.beginInstructionCorrection(id: correction, revision: 1)
+        try lease.applyInstructionCorrection(id: correction, revision: 1)
+        XCTAssertEqual(lease.state, .paused)
+        XCTAssertEqual(lease.currentInstructionRevision, 1)
+        XCTAssertNoThrow(try lease.validateInstructionRevision(1))
+        XCTAssertFalse(lease.claimCompletion(instructionRevision: 0))
     }
     func testPauseRetainsGenerationAndWaitsUntilResume() async throws {
         let lease = TaskLease(), started = expectation(description: "Suspended worker")
@@ -146,6 +189,12 @@ final class TaskOwnershipTests: XCTestCase {
         var effects = 0, terminalCount = 0, statusCount = 0
         let runtime = AgentRuntimeProcess(bridge: bridge(), drainReportingDelay: 0.05) { request in
             let owner = TaskOwnership.current!
+            if request["method"] as? String == "completion_gate" {
+                let revision = (request["instruction_revision"] as? NSNumber)?.uint64Value ?? 0
+                return ["kind": "bridge_response", "task_generation_id": owner.id,
+                        "request_id": request["request_id"]!, "ok": true,
+                        "result": ["accepted": owner.claimCompletion(instructionRevision: revision)]]
+            }
             await suspension.wait(entered) // Models a non-cancellable OS completion.
             _ = try? owner.commit { effects += 1 }
             return ["kind": "bridge_response", "task_generation_id": owner.id, "request_id": "x", "ok": true, "result": [:]]
@@ -217,14 +266,49 @@ final class TaskOwnershipTests: XCTestCase {
         let runtime = AgentRuntimeProcess(bridge: bridge())
         runtime.onEvent = { event in
             if case .userInputRequired = event {
-                runtime.submitUserInput(requestID: "same", value: "stale", taskGenerationID: TaskLease().id)
-                runtime.submitUserInput(requestID: "same", value: "current", taskGenerationID: lease.id)
+                runtime.submitUserInput(requestID: "same", value: "stale", taskGenerationID: TaskLease().id, instructionRevision: 0)
+                runtime.submitUserInput(requestID: "same", value: "current", taskGenerationID: lease.id, instructionRevision: 0)
             }
             if case .completed = event { complete.fulfill() }
             if case .failed(let message) = event { XCTFail(message); complete.fulfill() }
         }
         try runtime.start(task: "fixture", display: display, runtimeURL: helper, openClawURL: helper, geminiAPIKey: "", lease: lease)
         await fulfillment(of: [complete], timeout: 3)
+    }
+    @MainActor func testCorrectionAcknowledgmentIsIdempotentAndDropsOlderStatus() async throws {
+        let applied = expectation(description: "Correction acknowledgment received twice")
+        applied.expectedFulfillmentCount = 2
+        let currentStatus = expectation(description: "Only current-revision status delivered")
+        let complete = expectation(description: "Current-revision completion accepted")
+        let helper = try helper("""
+        correction=json.loads(sys.stdin.readline())
+        assert correction['kind']=='instruction_correction'
+        payload=correction['correction']
+        emit('instruction_correction_applied', correction_id=payload['correction_id'], instruction_revision=1)
+        emit('instruction_correction_applied', correction_id=payload['correction_id'], instruction_revision=1)
+        emit('status', message='stale status', instruction_revision=0)
+        emit('status', message='current status', instruction_revision=1)
+        emit('complete', message='completed under the corrected request', instruction_revision=1)
+        """)
+        let lease = TaskLease(), runtime = AgentRuntimeProcess(bridge: bridge())
+        var statuses: [String] = []
+        runtime.onEvent = { event in
+            switch event {
+            case .instructionCorrectionApplied: applied.fulfill()
+            case .status(let message): statuses.append(message); if message == "current status" { currentStatus.fulfill() }
+            case .completed: complete.fulfill()
+            case .failed(let message): XCTFail(message); complete.fulfill()
+            default: break
+            }
+        }
+        try runtime.start(task: "fixture", display: display, runtimeURL: helper, openClawURL: helper,
+                          geminiAPIKey: "", lease: lease)
+        let correction = TaskInstructionCorrection(revision: 1,
+            submission: AgentTaskSubmission(request: "Use the other spreadsheet"))
+        try runtime.prepareInstructionCorrection(correction, generationID: lease.id)
+        try runtime.sendInstructionCorrection(correction, generationID: lease.id)
+        await fulfillment(of: [applied, currentStatus, complete], timeout: 4)
+        XCTAssertEqual(statuses, ["current status"])
     }
     @MainActor func testStopDropsQueuedOutputAndOverridesUndeliveredCompletion() async throws {
         let helper = try helper("for _ in range(100): emit('status', message='pending')\nemit('output', content='stale')\nemit('complete', message='old')\nemit('complete', message='duplicate')")
@@ -292,16 +376,28 @@ final class TaskOwnershipTests: XCTestCase {
 
     @MainActor func testStreamedBurstAndExitTailDeliverEachEventOnceInOrder() async throws {
         let helper = try helper("""
-        messages = [dict(kind='status', task_generation_id=config['task_generation_id'], message=str(i) + ': ☃ 🧭') for i in range(1200)]
+        messages = [dict(kind='status', task_generation_id=config['task_generation_id'], instruction_revision=0, message=str(i) + ': ☃ 🧭') for i in range(1200)]
         payload = ''.join(json.dumps(message, ensure_ascii=False) + '\\n' for message in messages)
-        payload += json.dumps(dict(kind='complete', task_generation_id=config['task_generation_id'], message='burst finished'))
+        completion_gate(0)
+        payload += json.dumps(dict(kind='complete', task_generation_id=config['task_generation_id'], instruction_revision=0, message='burst finished'))
         encoded = payload.encode('utf-8')
         for offset in range(0, len(encoded), 317):
             sys.stdout.buffer.write(encoded[offset:offset + 317]); sys.stdout.buffer.flush()
         """)
         let complete = expectation(description: "Burst and final tail drained")
         var messages: [String] = [], terminalCount = 0, bridgeCalls = 0
-        let runtime = AgentRuntimeProcess(bridge: bridge()) { _ in bridgeCalls += 1; return [:] }
+        let runtime = AgentRuntimeProcess(bridge: bridge()) { request in
+            bridgeCalls += 1
+            if request["method"] as? String == "completion_gate" {
+                let owner = TaskOwnership.current!
+                let revision = (request["instruction_revision"] as? NSNumber)?.uint64Value ?? 0
+                return ["kind": "bridge_response", "task_generation_id": owner.id,
+                        "request_id": request["request_id"]!, "ok": true,
+                        "result": ["accepted": owner.claimCompletion(instructionRevision: revision)]]
+            }
+            return ["kind": "bridge_response", "task_generation_id": TaskOwnership.current!.id,
+                    "request_id": request["request_id"]!, "ok": true, "result": [:]]
+        }
         runtime.onEvent = { event in
             if case .status(let message) = event { messages.append(message) }
             if case .completed(let message) = event {
@@ -314,7 +410,7 @@ final class TaskOwnershipTests: XCTestCase {
         await fulfillment(of: [complete], timeout: 5)
         XCTAssertEqual(messages, (0..<1200).map { "\($0): ☃ 🧭" })
         XCTAssertEqual(terminalCount, 1)
-        XCTAssertEqual(bridgeCalls, 0)
+        XCTAssertEqual(bridgeCalls, 1, "Only the atomic completion gate should cross the bridge")
     }
 
     @MainActor func testRuntimeCompletionWaitsForDescendantTeardownAndDrainsExitTail() async throws {
@@ -326,7 +422,8 @@ final class TaskOwnershipTests: XCTestCase {
         import subprocess
         subprocess.Popen(['/bin/zsh', '-f', '-c', 'trap "" TERM; touch "$1"; /bin/sleep 0.7; touch "$2"', 'fixture', \(String(reflecting: started.path)), \(String(reflecting: late.path))])
         while not __import__('os').path.exists(\(String(reflecting: started.path))): time.sleep(0.005)
-        sys.stdout.write(json.dumps(dict(kind='complete', task_generation_id=config['task_generation_id'], message='exit tail')))
+        completion_gate(0)
+        sys.stdout.write(json.dumps(dict(kind='complete', task_generation_id=config['task_generation_id'], instruction_revision=0, message='exit tail')))
         sys.stdout.flush()
         """)
         let completed = expectation(description: "Tree drained before completion")
@@ -398,7 +495,8 @@ final class TaskOwnershipTests: XCTestCase {
             emit('bridge_request', request_id=str(i), method='fixture', params={})
             response=json.loads(sys.stdin.readline())
             assert response['request_id']==str(i)
-        sys.stdout.write(json.dumps(dict(kind='complete', task_generation_id=config['task_generation_id'], message='finished')))
+        completion_gate(0)
+        sys.stdout.write(json.dumps(dict(kind='complete', task_generation_id=config['task_generation_id'], instruction_revision=0, message='finished')))
         sys.stdout.flush()
         """)
         let next = try self.helper("emit('status', message='Working')\nemit('request_metrics', planning=1, verification=0, retries=0, model_switches=0, cache_hits=0, reconnects=0)\nemit('complete', message='next')")
@@ -406,6 +504,13 @@ final class TaskOwnershipTests: XCTestCase {
         var events: [String] = [], bridgeCalls = 0
         let runtime = AgentRuntimeProcess(bridge: bridge()) { request in
             bridgeCalls += 1
+            if request["method"] as? String == "completion_gate" {
+                let owner = TaskOwnership.current!
+                let revision = (request["instruction_revision"] as? NSNumber)?.uint64Value ?? 0
+                return ["kind": "bridge_response", "task_generation_id": owner.id,
+                        "request_id": request["request_id"]!, "ok": true,
+                        "result": ["accepted": owner.claimCompletion(instructionRevision: revision)]]
+            }
             return ["kind": "bridge_response", "task_generation_id": request["task_generation_id"]!,
                     "request_id": request["request_id"]!, "ok": true, "result": [:]]
         }
@@ -425,7 +530,7 @@ final class TaskOwnershipTests: XCTestCase {
         await fulfillment(of: [finished], timeout: 5)
         XCTAssertEqual(events, ["Working", "metrics:1", "Checking", "metrics:2", "Working", "metrics:1",
                                 "output", "health", "output", "health", "complete"])
-        XCTAssertEqual(bridgeCalls, 2)
+        XCTAssertEqual(bridgeCalls, 3)
         let continued = expectation(description: "New task publishes identical initial snapshots")
         events.removeAll()
         runtime.onEvent = { event in
@@ -460,8 +565,15 @@ final class TaskOwnershipTests: XCTestCase {
         let suspension = Suspension()
         var statuses = 0
         let runtime = AgentRuntimeProcess(bridge: bridge()) { request in
+            if request["method"] as? String == "completion_gate" {
+                let owner = TaskOwnership.current!
+                let revision = (request["instruction_revision"] as? NSNumber)?.uint64Value ?? 0
+                return ["kind": "bridge_response", "task_generation_id": owner.id,
+                        "request_id": request["request_id"]!, "ok": true,
+                        "result": ["accepted": owner.claimCompletion(instructionRevision: revision)]]
+            }
             await suspension.wait(entered)
-            return ["kind": "bridge_response", "task_generation_id": request["task_generation_id"]!,
+            return ["kind": "bridge_response", "task_generation_id": TaskOwnership.current!.id,
                     "request_id": request["request_id"]!, "ok": true, "result": [:]]
         }
         runtime.onEvent = { event in
@@ -471,7 +583,8 @@ final class TaskOwnershipTests: XCTestCase {
                 statuses += 1
                 if statuses == 1 { firstStatus.fulfill() }
             case .userInputRequired(let request):
-                runtime.submitUserInput(requestID: request.requestID, value: "fixture", taskGenerationID: lease.id)
+                XCTAssertTrue(runtime.submitUserInput(requestID: request.requestID, value: "fixture",
+                    taskGenerationID: lease.id, instructionRevision: request.instructionRevision))
             case .completed: finished.fulfill()
             case .failed(let message): XCTFail(message); finished.fulfill()
             default: break

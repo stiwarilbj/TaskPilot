@@ -271,7 +271,7 @@ final class PausedWorkerTests: XCTestCase {
         defer { lease.revoke() }
         lease.pause()
         let worker = Task {
-            let response = await bridge.handleOwned(["task_generation_id": lease.id, "request_id": "fixture",
+            let response = await bridge.handleOwned(["task_generation_id": lease.id, "instruction_revision": 0, "request_id": "fixture",
                 "method": "action_receipt", "params": ["action_id": UUID().uuidString]], lease: lease)
             XCTAssertEqual(response["error_code"] as? String, "cancelled")
             XCTAssertEqual(response["task_generation_id"] as? String, lease.id)

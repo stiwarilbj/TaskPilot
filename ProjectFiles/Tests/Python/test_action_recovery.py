@@ -53,6 +53,7 @@ class ActionRecoveryTests(unittest.TestCase):
         self.client = Client()
         self.router = runtime.AdaptiveModelRouter(lambda *a, **k: None)
         def bridge(method, display_id, **params):
+            if method == 'completion_gate': return {'accepted': True, 'pending_correction': False}
             if method == 'act':
                 self.attempts.append(params['action'])
                 return native_delivery(params['action'], delivery(params['action'], len(self.attempts)))

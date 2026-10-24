@@ -335,6 +335,23 @@ struct TaskQueueHistoryView: View {
                 Text(entry.request)
                     .font(.body.weight(.semibold))
                     .textSelection(.enabled)
+                ForEach(entry.corrections ?? []) { correction in
+                    HStack(alignment: .top, spacing: 7) {
+                        Image(systemName: correction.applied ? "arrow.turn.down.right" : "questionmark.circle")
+                            .foregroundStyle(correction.applied ? .orange : .secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(correction.applied ? "Applied correction" : "Correction not confirmed")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(correction.applied ? .orange : .secondary)
+                            Text(correction.request)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                        }
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("\(correction.applied ? "Applied correction" : "Correction not confirmed"): \(correction.request)")
+                }
                 Spacer()
                 Text(entry.finishedAt.formatted(date: .omitted, time: .shortened))
                     .font(.caption)

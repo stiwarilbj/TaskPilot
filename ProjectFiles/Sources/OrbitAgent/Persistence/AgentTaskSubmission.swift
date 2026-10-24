@@ -73,6 +73,22 @@ struct AgentTaskSubmission: Codable, Equatable {
         return AgentTaskSubmission(request: trimmed, exactInputReferences: adjusted)
     }
 
+    func includingCorrections(_ corrections: [TaskInstructionCorrection]) -> AgentTaskSubmission {
+        guard !corrections.isEmpty else { return self }
+        var request = self.request
+        var references = exactInputReferences
+        for correction in corrections.sorted(by: { $0.revision < $1.revision }) {
+            let header = "\n\nUser correction: "
+            let start = request.utf8.count + header.utf8.count
+            request += header + correction.request
+            references.append(contentsOf: correction.exactInputReferences.map {
+                AgentTaskInputReference(version: $0.version, kind: $0.kind,
+                    utf8Start: start + $0.utf8Start, utf8Length: $0.utf8Length, value: $0.value)
+            })
+        }
+        return AgentTaskSubmission(request: request, exactInputReferences: references)
+    }
+
     func validateExactInputReferences() throws {
         guard exactInputReferences.count <= 128 else {
             throw AgentTaskSubmissionError.tooManyReferences

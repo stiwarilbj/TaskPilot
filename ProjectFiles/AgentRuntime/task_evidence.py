@@ -23,7 +23,7 @@ from task_inputs import TaskInputBindings
 from expected_effects import ExpectedEffect, ExpectedEffectError, validate_expectation
 from observation_context import coordinate_targets, observation_indexes
 
-CHECKLIST_VERSION = 8
+CHECKLIST_VERSION = 9
 RESULT_BROWSER_BUNDLE_IDS = frozenset({
     "com.apple.Safari", "com.apple.SafariTechnologyPreview",
     "com.google.Chrome", "com.google.Chrome.beta", "com.google.Chrome.canary", "com.google.Chrome.dev",
@@ -128,13 +128,15 @@ def nonempty(value: Any, path: str) -> None:
 
 def validate_requirement(value: Any, task: str | None, path: str) -> dict:
     if not isinstance(value, dict): fail(path, "must be an object")
-    if set(value) - {"source", "description", "check", "depends_on", "scope"}: fail(path, "contains unsupported fields")
+    if set(value) - {"source", "description", "check", "depends_on", "scope", "supersedes"}: fail(path, "contains unsupported fields")
     for key in ("source", "description"):
         nonempty(value.get(key), f"{path}.{key}")
     if task is not None and value["source"] not in task:
-        fail(path + ".source", "must quote the original request exactly")
+        fail(path + ".source", "must quote the effective task instructions exactly")
     if "depends_on" in value:
         requirement_refs(value["depends_on"], path + ".depends_on", empty=True)
+    if "supersedes" in value:
+        requirement_refs(value["supersedes"], path + ".supersedes")
     if "scope" in value and value["scope"] not in ("outcome", "prerequisite"):
         fail(path + ".scope", "must be outcome or prerequisite")
     check = value.get("check")
@@ -201,7 +203,32 @@ def project_requirements(existing: dict, entries: list[dict], task: str, path="r
     for index, entry in enumerate(entries):
         field_path = f"{path}[{index}]"
         entry = validate_requirement(entry, task, field_path)
-        matching = [key for key, old in result.items() if old["source"] == entry["source"] and old["check"] == entry["check"]]
+        supersedes = entry.get("supersedes", [])
+        if supersedes:
+            correction_marker = "\n\nUser correction: "
+            latest_correction = task.rsplit(correction_marker, 1)[-1] if correction_marker in task else ""
+            if path != "requirements" or not latest_correction or entry["source"] not in latest_correction:
+                fail(field_path + ".supersedes", "may only quote a current user correction during planning")
+            unknown = [ref for ref in supersedes if ref not in result]
+            if unknown:
+                fail(field_path + ".supersedes", "must reference existing requirements from this task")
+            if any(result[ref].get("state") == "superseded" for ref in supersedes):
+                matched = next((key for key, old in result.items()
+                                if old.get("state") != "superseded" and old["source"] == entry["source"]
+                                and old["check"] == entry["check"]), None)
+                if matched and all(result[ref].get("superseded_by") == matched for ref in supersedes):
+                    origins[matched] = field_path
+                    continue
+                fail(field_path + ".supersedes", "cannot supersede an already superseded requirement")
+            dependents = [identifier for identifier, requirement in result.items()
+                          if requirement.get("state") != "superseded" and
+                          identifier not in supersedes and
+                          any(ref in supersedes for ref in requirement.get("depends_on", []))]
+            if dependents:
+                fail(field_path + ".supersedes", "must also replace or supersede active dependent requirements")
+        matching = [key for key, old in result.items()
+                    if old.get("state") != "superseded" and
+                    old["source"] == entry["source"] and old["check"] == entry["check"]]
         identifier = next((key for key in matching if entry.get("scope", result[key].get("scope", "outcome")) == result[key].get("scope", "outcome")),
                           matching[0] if matching else None)
         # The final auditor may require a current outcome in addition to an
@@ -210,7 +237,18 @@ def project_requirements(existing: dict, entries: list[dict], task: str, path="r
                 result[identifier].get("scope") == "prerequisite"):
             identifier = next((key for key, old in result.items() if old["source"] == entry["source"] and
                                old["check"] == entry["check"] and old.get("scope") == "outcome"), None)
-        if identifier:
+        if supersedes and identifier is not None:
+            fail(field_path + ".supersedes", "must define a new replacement requirement")
+        if supersedes:
+            identifier = f"r{len(result) + 1}"
+            result[identifier] = {**entry, "scope": entry.get("scope", "outcome"),
+                                  "depends_on": entry.get("depends_on", []),
+                                  "state": "pending", "evidence_ids": []}
+            for ref in supersedes:
+                result[ref]["state"] = "superseded"
+                result[ref]["superseded_by"] = identifier
+                result[ref]["evidence_ids"] = []
+        elif identifier:
             old = result[identifier]
             if "scope" in entry and entry["scope"] != old.get("scope", "outcome"):
                 fail(field_path + ".scope", "cannot change an existing requirement's proof scope")
@@ -225,6 +263,8 @@ def project_requirements(existing: dict, entries: list[dict], task: str, path="r
             field_path = origins.get(identifier, f"requirements.{identifier}") + ".depends_on"
             if ref == identifier: fail(field_path, "cannot include the requirement itself")
             if ref not in result: fail(field_path, "must reference this task's checklist")
+            if entry.get("state") != "superseded" and result[ref].get("state") == "superseded":
+                fail(field_path, "cannot depend on a superseded requirement; update the dependency")
     dependency_order(result)
     return result
 
@@ -245,7 +285,8 @@ def validate_metadata(value: dict, purpose: str, ledger: TaskEvidenceLedger | No
     if ledger: ledger.validate_observation_checks(proposed, observation)
     if "requirement_ids" in value:
         requirement_refs(value["requirement_ids"], "requirement_ids")
-        if ledger is None or any(ref not in proposed for ref in value["requirement_ids"]):
+        if ledger is None or any(ref not in proposed or proposed[ref].get("state") == "superseded"
+                                 for ref in value["requirement_ids"]):
             fail("requirement_ids", "must reference this task's checklist")
     if (purpose == "planning" and any(r.get("depends_on") for r in proposed.values()) and
             value.get("status") in {"act", "needs_user", "blocked"} and
@@ -279,7 +320,8 @@ def validate_metadata(value: dict, purpose: str, ledger: TaskEvidenceLedger | No
             seen.add(proof["requirement_id"])
             if ledger:
                 requirement = ledger.requirements.get(proof["requirement_id"])
-                if requirement is None: fail(path + ".requirement_id", "must reference this task's checklist")
+                if requirement is None or requirement.get("state") == "superseded":
+                    fail(path + ".requirement_id", "must reference an active requirement in this task's checklist")
                 for ref in refs:
                     evidence = ledger.evidence.get(ref)
                     if evidence is None or not evidence["valid"]:
@@ -294,13 +336,16 @@ def validate_metadata(value: dict, purpose: str, ledger: TaskEvidenceLedger | No
             fail("coverage_complete", "is required for completion verification")
         if value["coverage_complete"] and not value.get("uncovered_requirements"):
             claimed = {p["requirement_id"] for p in value.get("proofs", [])}
-            if claimed != set(ledger.requirements): fail("proofs", "must cite evidence for every checklist requirement")
+            active_requirements = {identifier for identifier, requirement in ledger.requirements.items()
+                                   if requirement.get("state") != "superseded"}
+            if claimed != active_requirements: fail("proofs", "must cite evidence for every active checklist requirement")
             output_refs = {ref for proof in value.get("proofs", [])
                            if ledger.requirements[proof["requirement_id"]]["check"]["type"] in {"file_read", "stdout_equals"}
                            for ref in proof["evidence_ids"]}
             if set(value.get("output_evidence_ids", [])) - output_refs:
                 fail("output_evidence_ids", "must belong to requested full-output requirements")
-            if any(r["check"]["type"] in {"answer", "file_read", "stdout_equals"} for r in ledger.requirements.values()):
+            if any(r["state"] != "superseded" and r["check"]["type"] in {"answer", "file_read", "stdout_equals"}
+                   for r in ledger.requirements.values()):
                 nonempty(value.get("message"), "message")
                 for proof in value["proofs"]:
                     check = ledger.requirements[proof["requirement_id"]]["check"]
@@ -320,6 +365,7 @@ class TaskEvidenceLedger:
         self.inputs = TaskInputBindings(task, scope=input_scope,
                                         exact_input_references=exact_input_references)
         self.requirements: dict[str, dict] = {}
+        self.instruction_revision = 0
         self.evidence: dict[str, dict] = {}
         self.coverage_complete = False
         self.local_complete_grammar = False
@@ -356,6 +402,27 @@ class TaskEvidenceLedger:
 
     def accept_plan(self, decision: dict, observation: dict | None = None) -> None:
         self.add_requirements(decision.get("requirements", []), observation)
+
+    def apply_instruction_revision(self, task: str, exact_input_references: list[dict]) -> None:
+        """Retain history while making all prior proof provisional for revised instructions."""
+        self.task = task
+        self.instruction_revision += 1
+        self.inputs = TaskInputBindings(task, exact_input_references=exact_input_references)
+        self.coverage_complete = False
+        self.local_complete_grammar = False
+        self.observation_id = None
+        self.current_observation = None
+        self.observation_checks.clear()
+        # Immutable action facts remain useful when a correction leaves their
+        # scope unchanged. Mutable screen/file state must be inspected again.
+        for evidence in self.evidence.values():
+            if evidence["mutable"]:
+                evidence["valid"] = False
+        for requirement in self.requirements.values():
+            if requirement.get("state") != "superseded":
+                requirement["state"] = "invalidated" if requirement.get("evidence_ids") else "pending"
+            requirement["evidence_ids"] = []
+        self.refresh()
 
     def canonical_entries(self, entries: list[dict], observation: dict | None = None) -> list[dict]:
         """A fresh control ID may describe the same already-bound requirement."""
@@ -437,10 +504,13 @@ class TaskEvidenceLedger:
 
     def action_requirements(self, decision: dict) -> list[str]:
         """Include deterministic effect matches even if a decision mislabels them."""
-        selected = list(decision.get("requirement_ids", []))
+        selected = [identifier for identifier in decision.get("requirement_ids", [])
+                    if identifier in self.requirements and self.requirements[identifier].get("state") != "superseded"]
         action = decision.get("action", {})
-        if not any(r.get("depends_on") for r in self.requirements.values()): return selected
+        if not any(r.get("state") != "superseded" and r.get("depends_on")
+                   for r in self.requirements.values()): return selected
         for identifier, entry in self.requirements.items():
+            if entry.get("state") == "superseded": continue
             check = entry["check"]
             matched = (action.get("type") == "write_file" and check["type"] in {"file_exists", "file_contents", "file_written", "file_append"} and
                        path_key(check["path"]) == path_key(action["path"]) and
@@ -683,6 +753,9 @@ class TaskEvidenceLedger:
     def refresh(self) -> None:
         for identifier in dependency_order(self.requirements):
             requirement = self.requirements[identifier]
+            if requirement.get("state") == "superseded":
+                requirement["evidence_ids"] = []
+                continue
             refs = [ref for ref, e in self.evidence.items() if self.requirement_matches(identifier, e)]
             old = requirement["evidence_ids"]
             if requirement["check"]["type"] in {"visual", "answer"}:
@@ -718,10 +791,11 @@ class TaskEvidenceLedger:
 
     def can_complete(self, output: str | None = None) -> bool:
         self.refresh()
-        if not self.requirements or not (self.coverage_complete or self.local_complete_grammar): return False
-        if any(r["state"] != "proven" for r in self.requirements.values()): return False
+        active = [r for r in self.requirements.values() if r.get("state") != "superseded"]
+        if not active or not (self.coverage_complete or self.local_complete_grammar): return False
+        if any(r["state"] != "proven" for r in active): return False
         if output is not None:
-            for r in self.requirements.values():
+            for r in active:
                 if r["check"]["type"] in {"file_read", "stdout_equals"}:
                     exact = self.exact_output(r["check"], r["evidence_ids"])
                     if exact is None or exact not in output: return False
@@ -737,6 +811,7 @@ class TaskEvidenceLedger:
     def recheck_actions(self) -> list[dict]:
         selected = {}
         for requirement in self.requirements.values():
+            if requirement.get("state") == "superseded": continue
             if requirement["check"]["type"] in {"answer", "visual", "command_executed", "stdout_equals", "file_append", "file_written"}: continue
             for evidence in reversed(list(self.evidence.values())):
                 action = evidence["action"]
@@ -750,6 +825,7 @@ class TaskEvidenceLedger:
     def recheck_effects(self) -> list[dict]:
         selected = {}
         for requirement in self.requirements.values():
+            if requirement.get("state") == "superseded": continue
             for evidence in self.evidence.values():
                 check = evidence.get('effect_check')
                 if check and self.matches(requirement['check'], {**evidence, 'valid': True}):
@@ -763,8 +839,13 @@ class TaskEvidenceLedger:
             if isinstance(value, dict): return {k: bounded(v) for k, v in value.items()}
             if isinstance(value, list): return [bounded(v) for v in value]
             return value
+        requirements = {identifier: requirement for identifier, requirement in self.requirements.items()
+                        if requirement.get("state") != "superseded"}
+        superseded = {identifier: {key: requirement[key] for key in ("source", "description", "superseded_by") if key in requirement}
+                      for identifier, requirement in self.requirements.items()
+                      if requirement.get("state") == "superseded"}
         return {"version": CHECKLIST_VERSION, "whole_request_coverage": "audited" if self.coverage_complete else "pending",
-                "requirements": bounded(self.requirements),
+                "requirements": bounded(requirements), "superseded_requirements": bounded(superseded),
                 "evidence": {key: {**bounded(e["fact"]), **({"origin": e["origin"]} if e["origin"] else {})}
                              for key, e in self.evidence.items() if e["valid"]}}
 
@@ -786,6 +867,8 @@ class TaskEvidenceLedger:
         evidence_budget = 512 * 1024
         projected_active = []
         for identifier, requirement in list(self.requirements.items())[:512]:
+            if requirement.get("state") == "superseded":
+                continue
             if requirement.get("scope", "outcome") == "prerequisite":
                 continue
             source = requirement["source"]

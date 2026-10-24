@@ -55,7 +55,7 @@ final class RuntimeSnapshotFilterTests: XCTestCase {
             .output(AgentTaskOutput(shouldShow: true, title: "Result", content: "Saved", decidedByAgent: false)),
             .modelHealth("fixture", "verified", "Ready"),
             .userInputRequired(AgentUserInputRequest(requestID: "input", taskGenerationID: "fixture",
-                title: "Password", message: "Enter", kind: .password)),
+                instructionRevision: 0, title: "Password", message: "Enter", kind: .password)),
             .completed("Finished"), .failed("Failure"), .stopped]
         for event in events {
             for _ in 0..<3 { XCTAssertTrue(filter.shouldSchedule(event)) }
@@ -71,7 +71,7 @@ final class RuntimeSnapshotFilterTests: XCTestCase {
         XCTAssertTrue(filter.shouldSchedule(.status("Working")))
         XCTAssertFalse(filter.shouldSchedule(.diagnostics(value)))
         XCTAssertTrue(filter.shouldSchedule(.userInputRequired(AgentUserInputRequest(requestID: "input",
-            taskGenerationID: "fixture", title: "Code", message: "Enter", kind: .verificationCode))))
+            taskGenerationID: "fixture", instructionRevision: 0, title: "Code", message: "Enter", kind: .verificationCode))))
         XCTAssertTrue(filter.shouldSchedule(.status("Working")))
         XCTAssertFalse(filter.shouldSchedule(.diagnostics(value)))
         var nextInvocation = RuntimeSnapshotFilter()

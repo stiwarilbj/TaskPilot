@@ -300,6 +300,7 @@ class ScreenshotBufferTests(unittest.TestCase):
         fixture = ACPFixture([lambda _: json.dumps(with_requirements({"status": "done"}, "Inspect the fixture")),
                               lambda _: json.dumps(proof_response(fixture.client.ledger))])
         def observe(method, _display, **_params):
+            if method == 'completion_gate': return {'accepted': True, 'pending_correction': False}
             self.assertEqual(method, "observe")
             path = Path(self.directory.name) / f"observation-{len(observed)}.png"
             path.write_bytes(self.pixels)

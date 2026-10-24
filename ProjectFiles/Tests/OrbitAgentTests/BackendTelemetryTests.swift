@@ -147,10 +147,18 @@ final class BackendPhaseFixtureTests: XCTestCase {
         let url = root.appendingPathComponent("helper")
         try ("""
         #!/usr/bin/python3
-        import json, sys
+        import json, sys, uuid
         config=json.loads(sys.stdin.readline())
         def emit(kind, **fields):
-            print(json.dumps(dict(kind=kind, task_generation_id=config['task_generation_id'], **fields)), flush=True)
+            revision=fields.pop('instruction_revision', 0)
+            if kind == 'complete':
+                request=dict(kind='bridge_request', task_generation_id=config['task_generation_id'],
+                    instruction_revision=revision, request_id=str(uuid.uuid4()), method='completion_gate', params={})
+                print(json.dumps(request), flush=True)
+                response=json.loads(sys.stdin.readline())
+                assert response.get('ok') and response.get('result', {}).get('accepted') is True
+            print(json.dumps(dict(kind=kind, task_generation_id=config['task_generation_id'],
+                instruction_revision=revision, **fields)), flush=True)
         """ + "\n" + body + "\n").write(to: url, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
         return url
@@ -163,8 +171,15 @@ final class BackendPhaseFixtureTests: XCTestCase {
         let ended = expectation(description: "Disposable helper drained")
         let runtime = BackendTelemetry.$current.withValue(telemetry) {
             AgentRuntimeProcess(bridge: bridge(), memoryPressure: MemoryPressureMonitor(listen: false)) { request in
-                ["kind": "bridge_response", "task_generation_id": request["task_generation_id"]!,
-                 "request_id": request["request_id"]!, "ok": true]
+                let owner = TaskOwnership.current!
+                if request["method"] as? String == "completion_gate" {
+                    let revision = (request["instruction_revision"] as? NSNumber)?.uint64Value ?? 0
+                    return ["kind": "bridge_response", "task_generation_id": owner.id,
+                            "request_id": request["request_id"]!, "ok": true,
+                            "result": ["accepted": owner.claimCompletion(instructionRevision: revision)]]
+                }
+                return ["kind": "bridge_response", "task_generation_id": owner.id,
+                        "request_id": request["request_id"]!, "ok": true, "result": [:]]
             }
         }
         runtime.onEvent = { event in
@@ -190,11 +205,11 @@ final class BackendPhaseFixtureTests: XCTestCase {
         try await runHelper(url, telemetry: telemetry)
         for phase in [BackendTelemetry.Phase.startup, .ipcBridge] {
             let rows = telemetry.samples().filter { $0.phase == phase }
-            XCTAssertEqual(rows.count, 1)
+            XCTAssertEqual(rows.count, phase == .ipcBridge ? 2 : 1)
             XCTAssertEqual(rows.first?.outcome, .succeeded)
         }
-        XCTAssertEqual(telemetry.samples().filter { $0.phase == .ipcSend }.count, 2)
-        XCTAssertEqual(telemetry.samples().filter { $0.phase == .ipcReceive }.count, 3)
+        XCTAssertEqual(telemetry.samples().filter { $0.phase == .ipcSend }.count, 3)
+        XCTAssertEqual(telemetry.samples().filter { $0.phase == .ipcReceive }.count, 4)
         XCTAssertGreaterThan(telemetry.samples().first { $0.phase == .ipcBridge }?.outputBytes ?? 0, 0)
     }
     @MainActor func testStartupFailureAndMissingRuntimeCloseIntervals() async throws {

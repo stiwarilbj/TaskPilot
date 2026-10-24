@@ -175,18 +175,19 @@ final class ActionReceiptTests: XCTestCase {
     func testBridgeReplaysCanonicalReceiptWithoutDisplayOrObservationAccess() async throws {
         let lease = TaskLease(), bridge = try bridge(lease), id = UUID().uuidString.lowercased()
         let action: [String: Any] = ["type": "press", "element_id": "old:send"]
-        let identity: [String: Any] = ["display_id": 999_999, "observation_revision": "old", "action": try ActionContract.validate(action)]
+        let identity: [String: Any] = ["display_id": 999_999, "observation_revision": "old", "instruction_revision": 0,
+                                       "action": try ActionContract.validate(action)]
         let receipt = try token(lease, id: id, payload: identity)
         try receipt.complete(Self.unconfirmed)
         var params = identity
         params["action_id"] = id
         params["action"] = ["type": "click", "element_id": "old:send", "x": 0, "y": 0] // canonical press
-        let reply = await bridge.handleOwned(["task_generation_id": lease.id, "request_id": "replay", "method": "act", "params": params], lease: lease)
+        let reply = await bridge.handleOwned(["task_generation_id": lease.id, "instruction_revision": 0, "request_id": "replay", "method": "act", "params": params], lease: lease)
         XCTAssertEqual(reply["ok"] as? Bool, true)
         XCTAssertEqual((reply["action_receipt"] as? [String: Any])?["state"] as? String, "unconfirmed")
-        let lookup = await bridge.handleOwned(["task_generation_id": lease.id, "request_id": "lookup", "method": "action_receipt", "params": ["action_id": id]], lease: lease)
+        let lookup = await bridge.handleOwned(["task_generation_id": lease.id, "instruction_revision": 0, "request_id": "lookup", "method": "action_receipt", "params": ["action_id": id]], lease: lease)
         XCTAssertEqual((lookup["result"] as? [String: Any])?["state"] as? String, "unconfirmed")
-        let foreign = await bridge.handleOwned(["task_generation_id": TaskLease().id, "method": "action_receipt", "params": ["action_id": id]], lease: lease)
+        let foreign = await bridge.handleOwned(["task_generation_id": TaskLease().id, "instruction_revision": 0, "method": "action_receipt", "params": ["action_id": id]], lease: lease)
         XCTAssertEqual(foreign["error_code"] as? String, "cancelled")
     }
 
@@ -212,7 +213,7 @@ final class ActionReceiptTests: XCTestCase {
 
     func testMissingIDIsRejectedBeforeNativeDispatchAndDiagnosticsStayCompatible() async throws {
         let lease = TaskLease(), bridge = try bridge(lease)
-        let reply = await bridge.handleOwned(["task_generation_id": lease.id, "method": "act", "params": ["action": ["type": "key", "pid": 42, "key": "return"]]], lease: lease)
+        let reply = await bridge.handleOwned(["task_generation_id": lease.id, "instruction_revision": 0, "method": "act", "params": ["action": ["type": "key", "pid": 42, "key": "return"]]], lease: lease)
         XCTAssertEqual(reply["error_code"] as? String, "invalid_action")
         XCTAssertThrowsError(try ActionReceiptStore.validateID("not-an-id"))
         let data = Data("{\"planning\":1,\"verification\":0,\"retries\":0,\"modelSwitches\":0,\"cacheHits\":0,\"reconnects\":0,\"receiptRecoveries\":1,\"receiptQueries\":2}".utf8)

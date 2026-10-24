@@ -254,6 +254,7 @@ class TaskDispatcherTests(unittest.TestCase):
                 nonlocal frames, receipt
                 native_calls.append(method)
                 c = current_task.get()
+                if method == 'completion_gate': return {'ok': True, 'result': {'accepted': True, 'pending_correction': False}}
                 if method == 'act':
                     receipt = {'action_id': params['action_id'], 'state': 'confirmed', 'terminal': True,
                                'result': native_result(params['action'])}

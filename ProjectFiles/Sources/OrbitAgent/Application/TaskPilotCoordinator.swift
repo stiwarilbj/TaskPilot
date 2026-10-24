@@ -119,6 +119,7 @@ final class TaskPilotCoordinator: ObservableObject {
     @Published private(set) var taskHistory: [AgentTaskHistoryEntry] = []
     @Published private(set) var requestMetrics: AgentRequestMetrics?
     @Published private(set) var currentTaskRequest: String?
+    @Published private(set) var taskCorrectionSession: TaskCorrectionSession?
     @Published private(set) var taskProgressMap: TaskProgressMap?
     @Published private(set) var taskWaitDetails: AgentTaskWaitSnapshot?
     @Published var showingSetup = false
@@ -173,6 +174,7 @@ final class TaskPilotCoordinator: ObservableObject {
     private var completedQueuedTaskCount = 0
     private var lastTaskProgressRevision: UInt64 = 0
     private var lastTaskWaitRevision: UInt64 = 0
+    private var correctionNoticeTask: Task<Void, Never>?
 
     // MARK: - Derived readiness
 
@@ -1074,8 +1076,7 @@ final class TaskPilotCoordinator: ObservableObject {
             pendingRemixHistoryEntryID = id
             return false
         }
-        let submission = AgentTaskSubmission(request: entry.request,
-            exactInputReferences: entry.exactInputReferences ?? [])
+        let submission = entry.effectiveSubmission
         guard validateSubmission(submission) else { return false }
         let draft = TaskComposerDraft(remixing: submission)
         remixSession = TaskRemixSession(sourceEntryID: entry.id, sourceRequest: entry.request,
@@ -1112,14 +1113,11 @@ final class TaskPilotCoordinator: ObservableObject {
         // Every rerun is a new execution. Duplicate wording is intentionally
         // preserved and never deduplicated against prior history.
         if isActive {
-            enqueueRequest(AgentTaskSubmission(request: entry.request,
-                exactInputReferences: entry.exactInputReferences ?? []))
+            enqueueRequest(entry.effectiveSubmission)
         } else if isReady && !windowsPresentedOnMain {
-            startTask(submission: AgentTaskSubmission(request: entry.request,
-                exactInputReferences: entry.exactInputReferences ?? []), queuedTask: nil)
+            startTask(submission: entry.effectiveSubmission, queuedTask: nil)
         } else {
-            taskDraft = TaskComposerDraft(submission: AgentTaskSubmission(request: entry.request,
-                exactInputReferences: entry.exactInputReferences ?? []))
+            taskDraft = TaskComposerDraft(submission: entry.effectiveSubmission)
             showingSetup = true
         }
     }
@@ -1326,6 +1324,16 @@ final class TaskPilotCoordinator: ObservableObject {
         currentTaskRequest = request
         currentTaskStartedAt = authorization.startedAt
         currentTaskWasQueued = queuedTask != nil
+        if var correction = taskCorrectionSession {
+            if correction.draft.expandedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                taskCorrectionSession = nil
+            } else {
+                correction.state = .finished
+                correction.notice = "Task finished; correction not applied"
+                correction.errorMessage = nil
+                taskCorrectionSession = correction
+            }
+        }
         runState = .running
         status = "Looking at the agent screen…"
         taskOutput = nil
@@ -1456,12 +1464,169 @@ final class TaskPilotCoordinator: ObservableObject {
         runtime.stop()
     }
 
+    var canOpenTaskCorrection: Bool {
+        isActive && runState != .stopping && currentTaskLease?.state != .draining && currentTaskLease?.state != .retired &&
+            (taskCorrectionSession == nil || taskCorrectionSession?.generationID == currentTaskLease?.id ||
+             taskCorrectionSession?.draft.expandedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true)
+    }
+
+    var currentTaskGenerationID: String? { currentTaskLease?.id }
+
+    func taskCorrectionDraft(for generationID: String) -> TaskComposerDraft {
+        guard let session = taskCorrectionSession, session.generationID == generationID else {
+            return TaskComposerDraft()
+        }
+        return session.draft
+    }
+
+    func canApplyTaskCorrection(generationID: String) -> Bool {
+        guard let session = taskCorrectionSession, session.generationID == generationID,
+              session.state == .editing, canOpenTaskCorrection else { return false }
+        return !session.draft.expandedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var appliedTaskCorrections: [TaskInstructionCorrection] {
+        (currentTaskAuthorization?.corrections ?? []).filter(\.applied)
+    }
+
+    func openTaskCorrection() {
+        guard canOpenTaskCorrection, let lease = currentTaskLease else { return }
+        if taskCorrectionSession?.generationID == lease.id { return }
+        if let old = taskCorrectionSession,
+           !old.draft.expandedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return }
+        taskCorrectionSession = TaskCorrectionSession(generationID: lease.id, draft: TaskComposerDraft())
+    }
+
+    func updateTaskCorrectionDraft(_ draft: TaskComposerDraft) {
+        guard var session = taskCorrectionSession, session.state == .editing else { return }
+        session.draft = draft
+        session.errorMessage = nil
+        taskCorrectionSession = session
+    }
+
+    func cancelTaskCorrection() {
+        guard let session = taskCorrectionSession, session.state != .pending else { return }
+        correctionNoticeTask?.cancel()
+        correctionNoticeTask = nil
+        taskCorrectionSession = nil
+    }
+
+    func applyTaskCorrection(_ submission: AgentTaskSubmission) {
+        guard var session = taskCorrectionSession, session.state == .editing,
+              canOpenTaskCorrection, let lease = currentTaskLease,
+              session.generationID == lease.id,
+              let authorization = currentTaskAuthorization else { return }
+        let corrected = submission.trimmedForSubmission()
+        guard !corrected.request.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard validateSubmission(corrected) else {
+            session.errorMessage = requestSubmissionError
+            taskCorrectionSession = session
+            return
+        }
+        let correction = TaskInstructionCorrection(revision: lease.currentInstructionRevision + 1,
+                                                   submission: corrected)
+        do {
+            try authorization.effectiveSubmission.includingCorrections([correction])
+                .validateExactInputReferences()
+        } catch {
+            session.errorMessage = error.localizedDescription
+            taskCorrectionSession = session
+            return
+        }
+        do {
+            try runtime.prepareInstructionCorrection(correction, generationID: lease.id)
+        } catch {
+            session.state = .finished
+            session.errorMessage = "The task is finishing, so this correction was not applied. The draft is still available."
+            session.notice = "Task finished; correction not applied"
+            taskCorrectionSession = session
+            return
+        }
+        var updatedAuthorization = authorization
+        updatedAuthorization.corrections = (authorization.corrections ?? []) + [correction]
+        do {
+            try taskLedgerStore.save(queue: queuedTasks, history: taskHistory, activeTask: updatedAuthorization)
+        } catch {
+            runtime.cancelInstructionCorrection(correction.id, generationID: lease.id)
+            session.errorMessage = "Could not save this correction. The previous instructions remain active: \(error.localizedDescription)"
+            taskCorrectionSession = session
+            return
+        }
+        currentTaskAuthorization = updatedAuthorization
+        session.state = .pending
+        session.correctionID = correction.id
+        session.revision = correction.revision
+        session.errorMessage = nil
+        session.notice = "Correction pending"
+        taskCorrectionSession = session
+        do {
+            try runtime.sendInstructionCorrection(correction, generationID: lease.id)
+        } catch {
+            status = "Correction delivery is uncertain. Stopping safely without applying older instructions."
+            runState = .stopping
+            lease.revoke()
+            runtime.stop()
+        }
+    }
+
+    private func acceptInstructionCorrection(id: String, generationID: String, revision: UInt64) {
+        guard var session = taskCorrectionSession, session.generationID == generationID,
+              session.state == .pending, session.correctionID?.uuidString.lowercased() == id,
+              session.revision == revision,
+              var authorization = currentTaskAuthorization,
+              let index = authorization.corrections?.firstIndex(where: {
+                  $0.id.uuidString.lowercased() == id && $0.revision == revision
+              }) else { return }
+        let wasWaitingForSecureInput = runState == .waitingForUser
+        authorization.corrections?[index].applied = true
+        currentTaskAuthorization = authorization
+        taskProgressMap?.originalRequest = authorization.effectiveSubmission.request
+        do {
+            try taskLedgerStore.save(queue: queuedTasks, history: taskHistory, activeTask: authorization)
+        } catch {
+            recoveryFailure = "The correction was applied, but TaskPilot could not save its history: \(error.localizedDescription)"
+        }
+        session.state = .editing
+        session.correctionID = nil
+        session.revision = revision
+        session.draft = TaskComposerDraft()
+        session.notice = "Updated instruction applied"
+        session.errorMessage = recoveryFailure
+        taskCorrectionSession = session
+        if wasWaitingForSecureInput {
+            // The old secure-input request was issued under the superseded
+            // instruction revision. Clear it and require an explicit Resume
+            // before the corrected plan continues.
+            userInputRequest = nil
+            userInputDraft = ""
+            runtime.pause()
+            runState = .paused
+            updateTaskWaitLocally(phase: .paused, waitingFor: "TaskPilot is paused after applying the correction",
+                                  attention: .resume)
+            setTaskProgressLifecycle(.paused)
+            status = "Updated instruction applied — resume when ready"
+        }
+        correctionNoticeTask?.cancel()
+        correctionNoticeTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(4))
+            guard let self, !Task.isCancelled,
+                  self.taskCorrectionSession?.generationID == generationID,
+                  self.taskCorrectionSession?.revision == revision,
+                  self.taskCorrectionSession?.notice == "Updated instruction applied" else { return }
+            var current = self.taskCorrectionSession
+            current?.notice = nil
+            self.taskCorrectionSession = current
+        }
+    }
+
     func continueWithUserInput() {
         guard let request = userInputRequest, canSubmitUserInput else { return }
         let value = userInputDraft
+        let accepted = runtime.submitUserInput(requestID: request.requestID, value: value,
+            taskGenerationID: request.taskGenerationID, instructionRevision: request.instructionRevision)
         userInputDraft = ""
+        guard accepted else { return }
         userInputRequest = nil
-        runtime.submitUserInput(requestID: request.requestID, value: value, taskGenerationID: request.taskGenerationID)
         runState = .running
         updateTaskWaitLocally(phase: .reconciling, waitingFor: "Continuing after secure input",
                               attention: .none)
@@ -1559,6 +1724,8 @@ final class TaskPilotCoordinator: ObservableObject {
             acceptTaskProgress(snapshot)
         case .taskWait(let snapshot):
             acceptTaskWait(snapshot)
+        case let .instructionCorrectionApplied(id, generationID, revision):
+            acceptInstructionCorrection(id: id, generationID: generationID, revision: revision)
         case .userInputRequired(let request):
             agentCursor.hide()
             viewer.clearActionMagnifier()
@@ -1777,12 +1944,24 @@ final class TaskPilotCoordinator: ObservableObject {
             outcome: outcome,
             startedAt: startedAt,
             wasQueued: wasQueued,
-            requestMetrics: requestMetrics
+            requestMetrics: requestMetrics,
+            corrections: currentTaskAuthorization?.corrections ?? []
         )
         taskHistory.append(entry)
         taskHistory.sort { $0.finishedAt > $1.finishedAt }
         if wasQueued {
             completedQueuedTaskCount += 1
+        }
+        if var correction = taskCorrectionSession,
+           correction.generationID == currentTaskLease?.id {
+            if correction.state == .pending {
+                correction.state = .finished
+                correction.notice = "Task finished; correction not applied"
+            } else if !correction.draft.expandedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                correction.state = .finished
+                correction.notice = "Task finished; correction not applied"
+            }
+            taskCorrectionSession = correction
         }
         currentTaskRequest = nil
         currentTaskStartedAt = nil

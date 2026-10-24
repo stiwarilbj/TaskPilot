@@ -1,5 +1,48 @@
 import Foundation
 
+struct TaskInstructionCorrection: Codable, Equatable, Identifiable {
+    let id: UUID
+    let revision: UInt64
+    let request: String
+    let exactInputReferences: [AgentTaskInputReference]
+    var applied: Bool
+
+    init(id: UUID = UUID(), revision: UInt64, submission: AgentTaskSubmission, applied: Bool = false) {
+        self.id = id
+        self.revision = revision
+        request = submission.request
+        exactInputReferences = submission.exactInputReferences
+        self.applied = applied
+    }
+
+    var submission: AgentTaskSubmission {
+        AgentTaskSubmission(request: request, exactInputReferences: exactInputReferences)
+    }
+
+    var wireValue: [String: Any] {
+        ["version": 1, "correction_id": id.uuidString.lowercased(), "instruction_revision": revision,
+         "request": request, "exact_input_references": exactInputReferences.map(\.wireValue)]
+    }
+}
+
+enum TaskCorrectionEditorState: Equatable {
+    case editing
+    case pending
+    case finished
+}
+
+struct TaskCorrectionSession: Equatable, Identifiable {
+    let generationID: String
+    var draft: TaskComposerDraft
+    var state: TaskCorrectionEditorState = .editing
+    var correctionID: UUID?
+    var revision: UInt64?
+    var errorMessage: String?
+    var notice: String?
+
+    var id: String { generationID }
+}
+
 struct AgentRequestMetrics: Codable, Equatable {
     let planning: Int
     let verification: Int
@@ -86,6 +129,7 @@ struct AgentTaskHistoryEntry: Codable, Equatable, Identifiable {
     let finishedAt: Date
     let wasQueued: Bool
     let requestMetrics: AgentRequestMetrics?
+    var corrections: [TaskInstructionCorrection]? = nil
 
     init(
         id: UUID = UUID(),
@@ -97,7 +141,8 @@ struct AgentTaskHistoryEntry: Codable, Equatable, Identifiable {
         startedAt: Date,
         finishedAt: Date = Date(),
         wasQueued: Bool,
-        requestMetrics: AgentRequestMetrics? = nil
+        requestMetrics: AgentRequestMetrics? = nil,
+        corrections: [TaskInstructionCorrection] = []
     ) {
         self.id = id
         self.request = request
@@ -109,6 +154,12 @@ struct AgentTaskHistoryEntry: Codable, Equatable, Identifiable {
         self.finishedAt = finishedAt
         self.wasQueued = wasQueued
         self.requestMetrics = requestMetrics
+        self.corrections = corrections.isEmpty ? nil : corrections
+    }
+
+    var effectiveSubmission: AgentTaskSubmission {
+        AgentTaskSubmission(request: request, exactInputReferences: exactInputReferences ?? [])
+            .includingCorrections((corrections ?? []).filter(\.applied))
     }
 }
 
@@ -121,6 +172,12 @@ struct AgentTaskAuthorization: Codable, Equatable {
     var startedAt = Date()
     let wasQueued: Bool
     var queuedTaskID: UUID? = nil
+    var corrections: [TaskInstructionCorrection]? = nil
+
+    var effectiveSubmission: AgentTaskSubmission {
+        AgentTaskSubmission(request: request, exactInputReferences: exactInputReferences ?? [])
+            .includingCorrections((corrections ?? []).filter(\.applied))
+    }
 }
 
 struct AgentTaskLedgerSnapshot: Codable, Equatable {
@@ -141,7 +198,8 @@ struct AgentTaskLedgerSnapshot: Codable, Equatable {
             history.append(AgentTaskHistoryEntry(id: activeTask.id, request: activeTask.request,
                 exactInputReferences: activeTask.exactInputReferences ?? [],
                 responseTitle: "Task interrupted", response: message, outcome: .stopped,
-                startedAt: activeTask.startedAt, wasQueued: activeTask.wasQueued))
+                startedAt: activeTask.startedAt, wasQueued: activeTask.wasQueued,
+                corrections: activeTask.corrections ?? []))
         }
         // Queue removal and active authorization were committed together before
         // launch; this also handles a recovered older duplicate queue record.

@@ -51,7 +51,8 @@ from request_policy import (
 from provider_errors import ProviderRequestError, facts as provider_error_facts, message_text, response_error
 from action_receipts import BridgeReplyLost, RuntimeInbox, reconcile_receipt
 from local_budget import LocalBudget, LocalBudgetExpired, current_budget, local_scope, local_operation
-from task_execution import TaskContext, Phase, ExecutionStateError, current_task
+from task_execution import (TaskContext, Phase, ExecutionStateError, InstructionSuperseded,
+                            current_task)
 from task_wait import TaskWaitPublisher, WAIT_PRESENTATION_VERSION
 from bounded_transport import ACPTransport, TransportFailure, FRAME_BYTES, read_frames, write_frame
 from prompt_compiler import (
@@ -70,6 +71,7 @@ from task_evidence import (TaskEvidenceLedger, RevisionedJSONState, CHECKLIST_VE
                            LARGEST_PATTERN, digest as evidence_digest)
 from expected_effects import ExpectedEffect, EXPECTED_EFFECT_VERSION, FILE_EFFECTS, path_key
 from task_inputs import EXACT_INPUT_REFERENCE_VERSION, TASK_INPUT_VERSION, input_reference_rules
+from task_inputs import TaskInputBindings, InputReferenceError
 from command_intents import explicit_operation
 from evidence_consistency import EvidenceConsistency, EVIDENCE_CONSISTENCY_VERSION
 from recovery_cycles import RecoveryCycles, RECOVERY_CYCLE_VERSION
@@ -128,6 +130,8 @@ STANDARD_LOCATIONS = {
 _active_acp_process: subprocess.Popen[str] | None = None
 _bridge_observation_revision: str | None = None
 _task_generation_id: str | None = None
+_instruction_revision = 0
+_instruction_correction_key = None
 _observation_keywords: list[str] = []
 _exact_input_references: list[dict[str, Any]] = []
 _runtime_inbox: RuntimeInbox | None = None
@@ -144,7 +148,9 @@ def _task_value(name: str) -> Any:
     context = current_task.get()
     if context is not None:
         return getattr(context, name)
-    return globals()["_task_generation_id" if name == "generation" else "_" + name]
+    if name == "generation": return _task_generation_id
+    if name == "correction_key": return _instruction_correction_key
+    return globals()["_" + name]
 
 
 def _set_task_value(name: str, value: Any) -> None:
@@ -192,6 +198,65 @@ def runtime_line(timeout: float | None = None, *, key=None) -> str:
     return inbox.read(timeout, **({'key': key} if key is not None else {}))
 
 
+def instruction_correction_pending() -> bool:
+    context = current_task.get()
+    return bool(context is not None and (
+        context.pending_correction_message is not None or
+        (context.correction_key and runtime_inbox().has_instruction_correction())
+    ))
+
+
+def receive_instruction_correction(timeout: float | None = 0) -> dict[str, Any]:
+    context = current_task.get()
+    if context is None or not context.correction_key:
+        raise InstructionSuperseded("No correction is available to apply")
+    if context.pending_correction_message is not None:
+        message = context.pending_correction_message
+        context.pending_correction_message = None
+    else:
+        line = runtime_inbox().take_instruction_correction(timeout)
+        try:
+            message = json.loads(line)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("TaskPilot received malformed correction control data") from error
+    correction = message.get("correction") if isinstance(message, dict) else None
+    if (not isinstance(message, dict) or message.get("kind") != "instruction_correction" or
+            message.get("task_generation_id") != context.generation or
+            type(message.get("instruction_revision")) is not int or
+            type(correction) is not dict or correction.get("version") != 1 or
+            correction.get("instruction_revision") != message.get("instruction_revision") or
+            not isinstance(correction.get("correction_id"), str)):
+        raise RuntimeError("TaskPilot received a correction for another task or revision")
+    try:
+        identifier = str(uuid.UUID(correction["correction_id"])).lower()
+    except (ValueError, TypeError, AttributeError) as error:
+        raise RuntimeError("TaskPilot received an invalid correction ID") from error
+    if identifier != correction["correction_id"]:
+        raise RuntimeError("TaskPilot received a noncanonical correction ID")
+    request = correction.get("request")
+    references = correction.get("exact_input_references")
+    for applied in context.instruction_corrections:
+        if applied.get("id") != identifier:
+            continue
+        if (applied.get("revision") == correction.get("instruction_revision") and
+                applied.get("request") == request and
+                applied.get("exact_input_references") == references):
+            return {"id": identifier, "revision": correction["instruction_revision"],
+                    "request": request, "exact_input_references": references,
+                    "duplicate": True}
+        raise RuntimeError("TaskPilot received a correction ID with conflicting contents")
+    if correction["instruction_revision"] != context.instruction_revision + 1:
+        raise RuntimeError("TaskPilot received a stale or skipped correction revision")
+    if (not isinstance(request, str) or not request.strip() or len(request.encode("utf-8")) > 32768 or
+            type(references) is not list or len(references) > 128):
+        raise RuntimeError("TaskPilot received invalid correction text or exact inputs")
+    # Validate every UTF-8 range against the corrected source before changing
+    # task bindings or invalidating current evidence.
+    TaskInputBindings(request, exact_input_references=references)
+    return {"id": identifier, "revision": correction["instruction_revision"],
+            "request": request, "exact_input_references": references}
+
+
 class ActionRejected(RuntimeError):
     def __init__(self, message: str, code: str = "action_rejected", details: dict[str, Any] | None = None) -> None:
         super().__init__(message)
@@ -235,6 +300,9 @@ def emit(kind: str, **payload: Any) -> None:
         return
     envelope = {"kind": kind, **payload}
     if _task_value('generation') is not None: envelope["task_generation_id"] = _task_value('generation')
+    context = current_task.get()
+    if _task_value('generation') is not None:
+        envelope["instruction_revision"] = _task_value('instruction_revision')
     print(json.dumps(envelope, separators=(",", ":")), flush=True)
 
 
@@ -487,11 +555,27 @@ def _perform_model_check(path: str, state: RuntimeState, read_only: bool = False
 def bridge_exchange(method: str, display_id: int, params: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
     request_id = str(uuid.uuid4())
     inbox = runtime_inbox()
-    key = inbox.register('bridge_response', request_id, _task_value('generation'))
+    generation = _task_value('generation')
+    context = current_task.get()
+    revision = context.instruction_revision if context is not None else 0
+    key = inbox.register('bridge_response', request_id, generation)
     try:
         emit("bridge_request", request_id=request_id, method=method,
-             params={"display_id": display_id, **params})
-        return json.loads(runtime_line(timeout, key=key))
+             instruction_revision=revision, params={"display_id": display_id, **params})
+        response = json.loads(runtime_line(timeout, key=key))
+        if not isinstance(response, dict):
+            raise NativeProtocolError("bridge_response must be an object")
+        if generation is not None and response.get("task_generation_id") != generation:
+            raise RuntimeError("TaskPilot received a bridge reply for a different task")
+        if context is not None and response.get("instruction_revision") != revision:
+            raise InstructionSuperseded("The native response belongs to an older instruction revision")
+        if response.get("error_code") == "instruction_superseded":
+            if method == "act" and context is not None:
+                action_id = params.get("action_id")
+                if action_id and context.machine.pending_action == action_id:
+                    context.machine.resolve(action_id)
+            raise InstructionSuperseded(response.get("error") or "A newer correction superseded this decision")
+        return response
     finally:
         inbox.transport.unregister(key)
 
@@ -509,7 +593,8 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
     if context is not None:
         effect = {"act": "execute", "observe": "observe", "action_receipt": "receipt",
                   "check_effect": "read", "wait_file_effect": "read", "recheck": "read",
-                  "inspect_command": "read", "wait_for_change": "read"}.get(method)
+                  "inspect_command": "read", "wait_for_change": "read",
+                  "completion_gate": "complete"}.get(method)
         if effect is None: raise ExecutionStateError("Unknown task bridge operation")
         context.machine.require(effect)
     timeout = params.pop("_reply_timeout", None)
@@ -1603,12 +1688,26 @@ def wait_for_user_input(request_id: str, *, key=None) -> str:
     owns_key = key is None
     key = key or inbox.register('user_input_response', request_id, _task_value('generation'))
     try:
-        response = json.loads(runtime_line(key=key))
+        context = current_task.get()
+        if context is not None and context.correction_key:
+            inbox.start()
+            selected, line = inbox.transport.get_any([context.correction_key, key])
+            if selected == context.correction_key:
+                try:
+                    context.pending_correction_message = json.loads(line)
+                except (TypeError, ValueError) as error:
+                    raise RuntimeError("TaskPilot received malformed correction control data") from error
+                raise InstructionSuperseded("A correction arrived while secure input was waiting")
+            response = json.loads(line)
+        else:
+            response = json.loads(runtime_line(key=key))
         value = response.get("value")
         if not isinstance(value, str) or not value:
             raise RuntimeError(f"{PRODUCT_NAME} did not receive the requested secure value")
         if len(value) > 4096:
             raise RuntimeError("The secure value is unexpectedly long")
+        if context is not None and response.get("instruction_revision") != context.instruction_revision:
+            raise InstructionSuperseded("Secure input was submitted for superseded instructions")
         return value
     finally:
         if owns_key:
@@ -1630,6 +1729,8 @@ def request_and_enter_user_input(
         emit("user_input_required", request_id=request_id, title=target["title"],
              message=target["message"], input_kind=target["input_kind"])
         secret = wait_for_user_input(request_id, key=key)
+        if instruction_correction_pending():
+            raise InstructionSuperseded("A correction arrived before secure input delivery")
     finally:
         inbox.transport.unregister(key)
     try:
@@ -1655,6 +1756,25 @@ def complete_from_decision(decision: dict[str, Any], fallback: str, ledger: Task
         raise RuntimeError("TaskPilot cannot complete without evidence for every requested requirement")
     context = current_task.get()
     if context is not None:
+        gate = None
+        for attempt in range(2):
+            gate = bridge_call("completion_gate", context.display_id)
+            if gate.get("accepted") is True:
+                break
+            if gate.get("pending_correction") is not True:
+                raise RuntimeError("TaskPilot could not atomically authorize completion for this instruction revision")
+            try:
+                context.pending_correction_message = receive_instruction_correction(timeout=5.0)
+            except TimeoutError:
+                # A persistence failure can revoke the temporary dispatch
+                # barrier without sending a correction. Rechecking the native
+                # gate lets the still-current instructions complete safely.
+                if attempt == 0:
+                    continue
+                raise RuntimeError("TaskPilot could not resolve a pending correction before completion")
+            raise InstructionSuperseded("Completion was held because a correction is pending")
+        if gate is None or gate.get("accepted") is not True:
+            raise RuntimeError("TaskPilot could not atomically authorize completion for this instruction revision")
         publish_task_wait("draining", "Finishing the task safely",
                           operation_key="task-draining", ledger=ledger)
         context.machine.complete()
@@ -1663,11 +1783,8 @@ def complete_from_decision(decision: dict[str, Any], fallback: str, ledger: Task
     kind = str(decision.get("output_kind") or "result")
     if kind not in {"answer", "result", "completion"}:
         kind = "result"
-    emit(
-        "output", show_output=True, title=title, content=message,
-        decided_by_agent=True, output_kind=kind,
-    )
-    emit("complete", message=message)
+    emit("complete", message=message, show_output=True, title=title, content=message,
+         decided_by_agent=True, output_kind=kind)
 
 
 def compact_observation(observation: dict[str, Any], task: str = "") -> dict[str, Any]:
@@ -2800,17 +2917,22 @@ class ResponseRepairBudget:
 
 def checklist_instruction(ledger: TaskEvidenceLedger) -> str:
     contract = (
-        "\nCHECKLIST: ALL requirements(source,description,check[,depends_on]); quote narrow exact clauses (include punctuation/qualifiers). "
-        "Actions list outcome requirement_ids. "
-        "scope: prerequisite/outcome. "
+        "\nCHECKLIST: enumerate every requirement as source,description,check[,depends_on,supersedes]; quote exact clauses. "
+        "Actions list outcome requirement_ids; scope is prerequisite/outcome. "
         "Checks: visual/answer(expected); file_read/file_exists/directory_exists/path_absent(path); "
-        "final file_contents(path,content[,encoding]); file_written(path,content,mode); stdout_equals(text); "
-        "command_executed(argv|command[,working_directory]); command_operation(operation). "
+        "file_contents(path,content[,encoding]); file_written(path,content,mode); stdout_equals(text); "
+        "command_executed(argv|command[,working_directory]); command_operation(operation)."
 
-    ) if not ledger.requirements else ("\nCHECKLIST: fulfill all entries; pending/invalidated need evidence, not uncertain repeats. "
+    ) if not ledger.requirements else ("\nCHECKLIST: fulfill all active entries; superseded entries are historical and cannot be reported proven. "
+        "Pending/invalidated need evidence, not uncertain repeats. "
         "Sources are narrow exact clauses with punctuation and qualifiers; each action lists advanced requirement_ids. "
+        + (("Original clauses remain unless the latest correction conflicts. For replacements, quote the correction and set supersedes:[old IDs]; "
+            "replace active dependents too. ") if ledger.instruction_revision > 0 else "")
         + ("Prove direct depends_on with fresh checks before acting. "
-           if any(r.get("depends_on") for r in ledger.requirements.values()) else ""))
+           if any(r.get("state") != "superseded" and r.get("depends_on") for r in ledger.requirements.values()) else ""))
+    if ledger.instruction_revision > 0:
+        contract += ("After a correction changes completed work, inspect its current result first; revise only if fresh evidence requires it. "
+                     "Never repeat a mutation solely because a correction arrived; retain historical action attribution. ")
     if ledger.current_observation and ledger.current_observation.get("elements"):
         contract += ("Local checks: window_active(pid,title), field_value(element_id,value[,pid]), "
                      "dialog_present(pid,title[,window_title]). Preconditions must use local checks, not visual claims. ")
@@ -2819,7 +2941,7 @@ def checklist_instruction(ledger: TaskEvidenceLedger) -> str:
 
 def verification_checklist_instruction(ledger: TaskEvidenceLedger) -> str:
     return (
-        "\nAudit the checklist against the COMPLETE ORIGINAL TASK, including destinations, contents, constraints, "
+        "\nAudit the checklist against the COMPLETE ORIGINAL TASK plus every applied correction, including destinations, contents, constraints, "
         "ordering, and requested returned output. If anything was omitted, return verified:false and "
         "uncovered_requirements in the planning checklist shape. Cite proof for EACH requirement using runtime IDs. "
         "Audit prerequisite ordering and keep final outcomes distinct from historical preconditions. "
@@ -2911,7 +3033,8 @@ def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int
     if not ledger.audit(verification):
         publish_task_progress(ledger, active_requirement_ids=[])
         missing = verification.get("missing") or []
-        missing += [r["description"] for r in ledger.requirements.values() if r["state"] != "proven"]
+        missing += [r["description"] for r in ledger.requirements.values()
+                    if r["state"] not in {"proven", "superseded"}]
         history.append({"action": "completion_rejected", "result": missing or ["Whole-request coverage is not proven"]})
         emit("status", message="The evidence check found more work — continuing…")
         return False
@@ -2997,6 +3120,8 @@ def validated_prompt(client: ACPClient, instruction: str, screenshot_path: Path,
         try:
             return request(text)
         except Exception as error:
+            if instruction_correction_pending():
+                raise InstructionSuperseded("A correction arrived while the previous model request was finishing") from error
             if classify_failure(error, time.time()).kind != "transport" or getattr(client, "reconnects", 0) >= 1:
                 raise
             selected = client.selected_model
@@ -3039,9 +3164,13 @@ def validated_prompt(client: ACPClient, instruction: str, screenshot_path: Path,
         return validate_response(value, purpose, observation, ledger)
 
     response = prompt(instruction)
+    if instruction_correction_pending():
+        raise InstructionSuperseded("The model response was superseded by a task correction")
     try:
         return validate(response)
     except ResponseValidationError as error:
+        if instruction_correction_pending():
+            raise InstructionSuperseded("The response became invalid only after its instruction revision was superseded") from error
         if budget.used:
             raise ModelAttemptError(str(error)) from error
         budget.used = True
@@ -3051,6 +3180,8 @@ def validated_prompt(client: ACPClient, instruction: str, screenshot_path: Path,
         emit("status", message="Correcting the response format before changing models…")
         repair = compile_repair(instruction, response, str(error), purpose)
         repaired = prompt(repair)
+        if instruction_correction_pending():
+            raise InstructionSuperseded("The repaired response was superseded by a task correction")
         try:
             return validate(repaired)
         except ResponseValidationError as error:
@@ -3067,9 +3198,12 @@ def routed_json_prompt(
     ledger: TaskEvidenceLedger | None = None,
 ) -> dict[str, Any]:
     context = current_task.get()
+    if instruction_correction_pending():
+        raise InstructionSuperseded("A task correction is waiting to be applied")
     if context is not None: context.machine.require("verify" if purpose == "verification" else "plan")
     image = screenshot_buffer(screenshot_path, (observation or {}).get("observation_revision"))
-    identity = (STATE_FINGERPRINT_VERSION, _task_value('generation'), VALIDATION_VERSION, CONTRACT_HASH,
+    identity = (STATE_FINGERPRINT_VERSION, _task_value('generation'),
+        context.instruction_revision if context is not None else 0, VALIDATION_VERSION, CONTRACT_HASH,
         CHECKLIST_VERSION, EXPECTED_EFFECT_VERSION, LOCAL_CHANGE_VERSION, COMMAND_CAPABILITY_VERSION,
         PROMPT_COMPILER_VERSION, VERIFICATION_SESSION_VERSION, COORDINATE_MAPPING_VERSION,
         OBSERVATION_COMPLETENESS_VERSION, TEXT_RECOGNITION_VERSION, EVIDENCE_CONSISTENCY_VERSION,
@@ -3108,7 +3242,9 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
     if current_task.get() is not None:
         raise ExecutionStateError("A task already owns this execution context")
     context = TaskContext(task, display_id, _task_value('generation'),
-                          exact_input_references=list(_exact_input_references))
+                          exact_input_references=list(_exact_input_references),
+                          original_task=task, original_input_references=list(_exact_input_references),
+                          correction_key=_task_value('correction_key'))
     token = current_task.set(context)
     try:
         with screenshot_buffer_scope():
@@ -3151,7 +3287,13 @@ class TaskExecution:
             if is_largest_downloads_file_task(c.task) or c.ledger.local_complete_grammar:
                 c.runtime_state = prepare_runtime(resolved, api_key)
                 api_key = ""
-                if self.local_task(): return
+                try:
+                    if self.local_task(): return
+                except InstructionSuperseded:
+                    if not instruction_correction_pending(): raise
+                    if c.machine.phase == Phase.VERIFYING:
+                        c.machine.transition(Phase.OBSERVING)
+                    self.apply_pending_correction()
             with configuration_transaction():
                 c.runtime_state = prepare_runtime(resolved, api_key)
                 api_key = ""
@@ -3244,6 +3386,8 @@ class TaskExecution:
 
     def observe(self) -> None:
         c = self.c
+        if instruction_correction_pending():
+            self.apply_pending_correction()
         c.step += 1
         if c.step > MAX_STEPS:
             raise RuntimeError(f"{PRODUCT_NAME} reached its {MAX_STEPS}-step safety limit")
@@ -3253,6 +3397,11 @@ class TaskExecution:
         discard_observation_image(c.observation)
         c.observation = c.pending_observation if c.pending_observation is not None else bridge_call("observe", c.display_id)
         c.pending_observation = None
+        while instruction_correction_pending():
+            discard_observation_image(c.observation)
+            c.observation = None
+            self.apply_pending_correction()
+            c.observation = bridge_call("observe", c.display_id)
         c.screenshot_path = Path(str(c.observation.get("screenshot_path") or ""))
         if not c.screenshot_path.is_file():
             raise RuntimeError(f"{PRODUCT_NAME} did not provide a readable screen image")
@@ -3290,8 +3439,15 @@ class TaskExecution:
             c.decision = routed_json_prompt(c.router, c.client,
                 desktop_instruction(c.task, c.observation, c.history, c.ledger), c.screenshot_path,
                 observation=c.observation, ledger=c.ledger)
+        except InstructionSuperseded:
+            c.decision = None
+            c.reconcile_reason = "correction"
+            c.machine.transition(Phase.RECONCILING, correction=True)
         finally:
             discard_observation_image(c.observation)
+            c.observation = None if c.machine.phase == Phase.RECONCILING and c.reconcile_reason == "correction" else c.observation
+        if c.reconcile_reason == "correction":
+            return
         c.ledger.accept_plan(c.decision, c.observation)
         active_ids = c.ledger.action_requirements(c.decision) if effective_decision_status(c.decision) == "act" else []
         publish_task_progress(c.ledger, lifecycle="running", active_requirement_ids=active_ids)
@@ -3338,7 +3494,9 @@ class TaskExecution:
 
     def reconcile(self) -> None:
         c = self.c
-        if c.reconcile_reason == "loading":
+        if c.reconcile_reason == "correction":
+            self.apply_pending_correction()
+        elif c.reconcile_reason == "loading":
             publish_task_wait("reconciling", "The page to finish loading",
                               operation_key=f"loading:{c.step}:{c.loading_pid}", ledger=c.ledger)
             if c.loading_waits >= 2:
@@ -3384,6 +3542,10 @@ class TaskExecution:
 
     def prepare_decision(self) -> None:
         c = self.c
+        if instruction_correction_pending():
+            self.apply_pending_correction()
+            c.machine.transition(Phase.OBSERVING)
+            return
         if self.defer_for_evidence():
             c.machine.transition(Phase.OBSERVING)
             return
@@ -3465,7 +3627,12 @@ class TaskExecution:
                           operation_key=f"secure-input:{c.step}", ledger=c.ledger)
         emit("status", message=f"{PRODUCT_NAME} paused because the waiting app needs secure input…")
         c.ledger.before_action({"type": "type_text"})
-        result = request_and_enter_user_input(c.input_target, c.display_id)
+        try:
+            result = request_and_enter_user_input(c.input_target, c.display_id)
+        except InstructionSuperseded:
+            c.reconcile_reason = "correction"
+            c.machine.reconcile()
+            return
         decision = c.decision or {}
         c.history.append({"step": c.step, "action": "user_input_entered", "result": result,
             "completed_requirements": decision.get("completed_requirements") or [],
@@ -3501,6 +3668,10 @@ class TaskExecution:
                 c.ledger.before_action(c.action)
                 publish_task_progress(c.ledger)
                 result = bridge_call("act", c.display_id, action=c.action, **command_params)
+            except InstructionSuperseded:
+                c.machine.reconcile()
+                c.reconcile_reason = "correction"
+                return
             except RuntimeError as error:
                 if not isinstance(error, ActionRejected) or error.code in {"cancelled", "permission_denied", "protected_target", "secure_input"}:
                     raise
@@ -3587,9 +3758,59 @@ class TaskExecution:
         c = self.c
         publish_task_wait("verifying", "Checking the requested results",
                           operation_key=f"completion:{c.step}", ledger=c.ledger)
-        if verify_task_completion(c.task, c.decision, c.display_id, c.history, c.router, c.client, c.ledger, c.evidence_guard):
-            c.machine.drain()
+        try:
+            completed = verify_task_completion(c.task, c.decision, c.display_id, c.history, c.router, c.client, c.ledger, c.evidence_guard)
+        except InstructionSuperseded:
+            c.machine.transition(Phase.OBSERVING)
             return
+        if completed:
+            c.machine.drain()
+        else:
+            # A failed audit is a request to reconsider the current task state,
+            # not a reason to ask the same completion question repeatedly.
+            c.machine.transition(Phase.OBSERVING)
+            return
+
+    def apply_pending_correction(self) -> None:
+        c = self.c
+        correction = receive_instruction_correction()
+        if correction.get("duplicate") is True:
+            return
+        header = "\n\nUser correction: "
+        source_start = len(c.task.encode("utf-8")) + len(header.encode("utf-8"))
+        request = correction["request"]
+        references = list(c.exact_input_references)
+        for reference in correction["exact_input_references"]:
+            references.append({**reference, "utf8_start": source_start + reference["utf8_start"]})
+        revised_task = c.task + header + request
+        if len(references) > 128:
+            raise RuntimeError("The correction exceeds the task’s limit of 128 exact inputs")
+        TaskInputBindings(revised_task, exact_input_references=references)
+        c.task = revised_task
+        c.exact_input_references = references
+        c.instruction_revision = correction["revision"]
+        global _instruction_revision
+        _instruction_revision = correction["revision"]
+        c.instruction_corrections.append(correction)
+        c.ledger.apply_instruction_revision(revised_task, references)
+        c.observation_keywords = sorted(w for w in words(revised_task) if len(w) <= 64 and w.isalnum())[:48]
+        c.bridge_observation_revision = None
+        c.command_hints_inspected = False
+        c.decision = c.action = c.result = c.recovered_result = c.input_target = c.failure = None
+        if c.client is not None: c.client.decision_cache = {}
+        c.recovery = ActionRecovery()
+        c.recovery_cycles = RecoveryCycles(rejection_limit=MAX_IDENTICAL_ACTIONS)
+        c.evidence_guard = EvidenceConsistency()
+        c.identical_action_count = 0
+        c.last_action_signature = c.last_screen_digest = ""
+        discard_observation_image(c.pending_observation)
+        discard_observation_image(c.observation)
+        c.pending_observation = c.observation = None
+        c.screenshot_path = None
+        c.screenshot_digest = ""
+        c.reconcile_reason = ""
+        emit("instruction_correction_applied", correction_id=correction["id"],
+             instruction_revision=correction["revision"])
         if c.history and isinstance(c.history[-1].get("result"), dict) and c.history[-1]["result"].get("error_code") == "evidence_conflict":
             c.consecutive_evidence_conflicts += 1
             if c.consecutive_evidence_conflicts >= 3:
@@ -3617,11 +3838,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_runtime_configuration(require_generation: bool = False) -> str:
-    global _task_generation_id, _bridge_observation_revision, _observation_keywords, _exact_input_references
+    global _task_generation_id, _instruction_revision, _bridge_observation_revision, _observation_keywords, _exact_input_references, _instruction_correction_key
     _task_generation_id = None
+    _instruction_revision = 0
     _bridge_observation_revision = None
     _observation_keywords = []
     _exact_input_references = []
+    _instruction_correction_key = None
     raw_line = runtime_line()
     try:
         configuration = json.loads(raw_line)
@@ -3639,6 +3862,9 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
         except (ValueError, AttributeError):
             raise RuntimeError("TaskPilot did not provide a valid task generation ID")
         _task_generation_id = generation
+        if type(configuration.get("instruction_revision")) is not int or configuration["instruction_revision"] != 0:
+            raise RuntimeError("TaskPilot instruction revision protocol does not match; rebuild the bundled components together")
+        _instruction_revision = configuration["instruction_revision"]
         if type(configuration.get("task_protocol_version")) is not int or configuration["task_protocol_version"] != TASK_PROTOCOL_VERSION:
             raise RuntimeError("TaskPilot task ownership protocol does not match; rebuild the bundled components together")
         if type(configuration.get("coordinate_mapping_version")) is not int or configuration["coordinate_mapping_version"] != COORDINATE_MAPPING_VERSION:
@@ -3659,6 +3885,7 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
         if type(references) is not list or len(references) > 128:
             raise RuntimeError("TaskPilot provided invalid exact-input reference metadata")
         _exact_input_references = references
+        _instruction_correction_key = runtime_inbox().register_instruction_corrections(generation)
     api_key = configuration.get("gemini_api_key")
     if not isinstance(api_key, str):
         raise RuntimeError(f"{PRODUCT_NAME} did not provide the secure runtime configuration")

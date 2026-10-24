@@ -307,7 +307,7 @@ final class CommandCapabilityTests: XCTestCase {
     func testBridgeInspectionIsTaskScopedAndDoesNotNeedADisplay() async throws {
         let bridge = AgentAutomationBridge(displayService: DisplayService(), accessibility: AccessibilityController(), capture: ScreenCaptureService())
         let lease = TaskLease(); try bridge.bind(lease)
-        let request: [String: Any] = ["task_generation_id": lease.id, "method": "inspect_command", "request_id": "probe",
+        let request: [String: Any] = ["task_generation_id": lease.id, "instruction_revision": 0, "method": "inspect_command", "request_id": "probe",
                                      "params": ["action": ["type": "run_command", "argv": ["/usr/bin/true"]]]]
         let result = await bridge.handleOwned(request, lease: lease)
         XCTAssertEqual(result["ok"] as? Bool, true)

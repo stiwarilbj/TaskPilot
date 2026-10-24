@@ -250,6 +250,7 @@ class CommandOperationTaskLoopTests(unittest.TestCase):
                 def plan(task, observation, history, ledger): client.ledger = ledger; return 'plan'
                 def exchange(method, display, params, timeout):
                     methods.append(method)
+                    if method == 'completion_gate': return {'ok': True, 'result': {'accepted': True, 'pending_correction': False}}
                     if method == 'observe':
                         frame[0] += 1; image = Path(directory) / (str(frame[0]) + '.png'); image.write_bytes(b'fixture')
                         return {'ok': True, 'result': {**fixture_coordinates(str(frame[0])), 'task_generation_id': generation, 'observation_revision': str(frame[0]),

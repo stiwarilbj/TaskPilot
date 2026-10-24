@@ -152,7 +152,7 @@ struct AgentTaskProgressSnapshot: Equatable {
 }
 
 struct TaskProgressMap: Equatable {
-    let originalRequest: String
+    var originalRequest: String
     let generationID: String
     var revision: UInt64
     var lifecycle: AgentTaskProgressLifecycle

@@ -310,6 +310,10 @@ class AdaptiveModelRouter:
             try:
                 return True, accept(model, attempt(model, retry))
             except Exception as error:
+                if getattr(error, "superseded_instructions", False):
+                    # The current provider request reached its terminal state,
+                    # but its decision is stale. Do not repair or query a sibling.
+                    raise
                 failure = classify_failure(error, self.clock(), model)
                 if failure.provider_retries is not None and not failure.provider_retries_counted:
                     self.metrics["provider_retries"] = (self.metrics["provider_retries"] or 0) + failure.provider_retries

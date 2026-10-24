@@ -178,7 +178,7 @@ class LocalTextRecognitionTests(unittest.TestCase):
 
     def test_startup_rejects_text_version_mismatches_before_model_requests(self):
         config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=runtime.CONTRACT_HASH,
-            action_contract_version=runtime.CONTRACT_VERSION, task_protocol_version=runtime.TASK_PROTOCOL_VERSION,
+            action_contract_version=runtime.CONTRACT_VERSION, instruction_revision=0, task_protocol_version=runtime.TASK_PROTOCOL_VERSION,
             task_generation_id='d0b9c0fc-01af-42f0-b749-1027c907a2cd', coordinate_mapping_version=1, observation_completeness_version=1)
         for version in (None, True, '1', 2):
             with mock.patch.object(runtime, 'runtime_line', return_value=json.dumps(dict(config, text_recognition_version=version))):

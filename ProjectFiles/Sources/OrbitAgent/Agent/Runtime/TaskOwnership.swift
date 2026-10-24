@@ -15,6 +15,10 @@ final class TaskLease: @unchecked Sendable {
     private var revocationObservers: [UUID: @Sendable () -> Void] = [:]
     private var pauseWaiters: [UUID: @Sendable () -> Void] = [:]
     private var pauseRegistrations = 0
+    private var instructionRevision: UInt64 = 0
+    private var pendingCorrection: (id: String, revision: UInt64)?
+    private var appliedCorrections: [String: UInt64] = [:]
+    private var completionClaimed = false
     let permitsPersistentProcesses: Bool
     private var closePersistentProcesses: Bool
     private var persistentProcesses: [SubprocessSupervisor] = []
@@ -62,6 +66,72 @@ final class TaskLease: @unchecked Sendable {
     // Private counts also let offline tests distinguish parking from polling.
     var pauseWaiterCount: Int { lock.lock(); defer { lock.unlock() }; return pauseWaiters.count }
     var pauseWaitRegistrationCount: Int { lock.lock(); defer { lock.unlock() }; return pauseRegistrations }
+    var currentInstructionRevision: UInt64 { lock.lock(); defer { lock.unlock() }; return instructionRevision }
+    var hasPendingInstructionCorrection: Bool { lock.lock(); defer { lock.unlock() }; return pendingCorrection != nil }
+
+    func beginInstructionCorrection(id: String, revision: UInt64) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard (value == .running || value == .paused), pendingCorrection == nil,
+              !completionClaimed, revision == instructionRevision + 1, UUID(uuidString: id) != nil else {
+            throw TaskInstructionCorrectionError.stale
+        }
+        pendingCorrection = (id.lowercased(), revision)
+    }
+
+    func cancelInstructionCorrection(id: String) {
+        lock.lock(); defer { lock.unlock() }
+        guard pendingCorrection?.id == id.lowercased() else { return }
+        pendingCorrection = nil
+    }
+
+    func applyInstructionCorrection(id: String, revision: UInt64) throws {
+        lock.lock(); defer { lock.unlock() }
+        let normalizedID = id.lowercased()
+        if appliedCorrections[normalizedID] == revision { return }
+        guard (value == .running || value == .paused),
+              pendingCorrection?.id == normalizedID, pendingCorrection?.revision == revision,
+              revision == instructionRevision + 1 else { throw TaskInstructionCorrectionError.stale }
+        instructionRevision = revision
+        pendingCorrection = nil
+        appliedCorrections[normalizedID] = revision
+    }
+
+    func validateInstructionRevision(_ revision: UInt64, allowDispatchedReceipt: Bool = false) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard value == .running || value == .paused else { throw CancellationError() }
+        if completionClaimed && !(allowDispatchedReceipt && revision == instructionRevision) {
+            throw TaskInstructionCorrectionError.superseded
+        }
+        // Once an operation crossed the dispatched receipt boundary it owns
+        // its original revision through terminal reconciliation, even after
+        // the correction has been acknowledged and the barrier is lifted.
+        if allowDispatchedReceipt, revision <= instructionRevision { return }
+        guard pendingCorrection == nil, revision == instructionRevision else {
+            throw TaskInstructionCorrectionError.superseded
+        }
+    }
+
+    func claimCompletion(instructionRevision revision: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if completionClaimed { return revision == instructionRevision }
+        guard (value == .running || value == .paused), pendingCorrection == nil,
+              revision == instructionRevision, !completionClaimed else { return false }
+        completionClaimed = true
+        return true
+    }
+
+    /// Completion and correction acceptance share one lock. Returning the
+    /// pending state from this same critical section prevents a rollback from
+    /// being mistaken for a permanently rejected completion.
+    func claimCompletionGate(instructionRevision revision: UInt64) -> (accepted: Bool, pendingCorrection: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        if completionClaimed { return (revision == instructionRevision, false) }
+        guard value == .running || value == .paused else { return (false, false) }
+        if pendingCorrection != nil { return (false, true) }
+        guard revision == instructionRevision else { return (false, false) }
+        completionClaimed = true
+        return (true, false)
+    }
     func pause() { lock.lock(); defer { lock.unlock() }; if value == .running { value = .paused; suspensions += 1 } }
     func resume() {
         lock.lock()
@@ -192,6 +262,7 @@ final class TaskLease: @unchecked Sendable {
 enum TaskOwnership {
     @TaskLocal static var current: TaskLease?
     @TaskLocal static var actionReceipt: ActionReceiptStore.Token?
+    @TaskLocal static var instructionRevision: UInt64?
     static func check() throws { try current?.check(); try LocalOperationBudget.check(); try Task.checkCancellation() }
     static func checkpoint() async throws {
         try LocalOperationBudget.check(); try await current?.checkpoint(); try LocalOperationBudget.check()
@@ -206,6 +277,10 @@ enum TaskOwnership {
                 try LocalOperationBudget.check()
                 if let actionReceipt {
                     guard actionReceipt.generation == current.id else { throw CancellationError() }
+                    if let revision = instructionRevision {
+                        try current.validateInstructionRevision(revision,
+                            allowDispatchedReceipt: actionReceipt.receipt["state"] as? String == "dispatched")
+                    }
                     // Receipt dispatch and delivery share the lease's atomic
                     // boundary. Failed delivery after this point is uncertain.
                     try actionReceipt.dispatched()
@@ -221,6 +296,17 @@ enum TaskOwnership {
     }
     static func callback(_ lease: TaskLease?, _ operation: () -> Void) {
         if let lease { _ = try? lease.commit { $current.withValue(lease, operation: operation) } } else { operation() }
+    }
+}
+
+enum TaskInstructionCorrectionError: LocalizedError {
+    case stale
+    case superseded
+    var errorDescription: String? {
+        switch self {
+        case .stale: "This correction is no longer current."
+        case .superseded: "This action was planned before the latest instruction update."
+        }
     }
 }
 

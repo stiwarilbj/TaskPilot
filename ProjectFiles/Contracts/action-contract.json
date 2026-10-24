@@ -1106,7 +1106,7 @@
     "option": 524288,
     "control": 262144
   },
-  "task_protocol_version": 8,
+  "task_protocol_version": 9,
   "command_operations": {
     "create_directory": {
       "fields": {
