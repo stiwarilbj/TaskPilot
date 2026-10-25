@@ -20,6 +20,7 @@ class Phase(str, Enum):
     RECONCILING = "reconciling"
     RECOVERING = "recovering"
     WAITING_INPUT = "waiting_input"
+    WAITING_CHOICE = "waiting_choice"
     VERIFYING = "verifying"
     DRAINING = "draining"
     FINISHED = "finished"
@@ -44,12 +45,15 @@ TRANSITIONS = {
     (Phase.RECONCILING, Phase.OBSERVING): Transition(),
     (Phase.RECONCILING, Phase.EXECUTING): Transition(frozenset({"decision", "preflight"})),
     (Phase.RECONCILING, Phase.WAITING_INPUT): Transition(frozenset({"secure_target", "preflight"})),
+    (Phase.RECONCILING, Phase.WAITING_CHOICE): Transition(frozenset({"decision", "preflight"})),
     (Phase.RECONCILING, Phase.VERIFYING): Transition(frozenset({"decision"})),
     (Phase.EXECUTING, Phase.RECONCILING): Transition(),
     (Phase.WAITING_INPUT, Phase.RECONCILING): Transition(),
+    (Phase.WAITING_CHOICE, Phase.OBSERVING): Transition(),
+    (Phase.WAITING_CHOICE, Phase.RECONCILING): Transition(),
     (Phase.VERIFYING, Phase.OBSERVING): Transition(),
-    **{(phase, Phase.RECOVERING): Transition() for phase in (Phase.STARTING, Phase.PLANNING, Phase.VERIFYING, Phase.RECONCILING, Phase.EXECUTING, Phase.WAITING_INPUT)},
-    **{(Phase.RECOVERING, phase): Transition(frozenset({"recovered"})) for phase in (Phase.STARTING, Phase.PLANNING, Phase.VERIFYING, Phase.RECONCILING, Phase.EXECUTING)},
+    **{(phase, Phase.RECOVERING): Transition() for phase in (Phase.STARTING, Phase.PLANNING, Phase.VERIFYING, Phase.RECONCILING, Phase.EXECUTING, Phase.WAITING_INPUT, Phase.WAITING_CHOICE)},
+    **{(Phase.RECOVERING, phase): Transition(frozenset({"recovered"})) for phase in (Phase.STARTING, Phase.PLANNING, Phase.VERIFYING, Phase.RECONCILING, Phase.EXECUTING, Phase.WAITING_CHOICE)},
     **{(phase, Phase.DRAINING): Transition() for phase in Phase
        if phase not in {Phase.DRAINING, Phase.FINISHED}},
     (Phase.DRAINING, Phase.FINISHED): Transition(frozenset({"cleanup"})),
@@ -65,6 +69,7 @@ EFFECTS = {
     Phase.RECOVERING: frozenset({"connect", "read", "receipt"}),
     Phase.RECONCILING: frozenset({"observe", "read", "receipt"}),
     Phase.WAITING_INPUT: frozenset({"secure_input", "execute", "read"}),
+    Phase.WAITING_CHOICE: frozenset({"target_choice", "read", "receipt"}),
     Phase.VERIFYING: frozenset({"observe", "read", "verify", "complete"}),
     Phase.DRAINING: frozenset({"cleanup"}),
     Phase.FINISHED: frozenset(),
@@ -156,6 +161,12 @@ class TaskContext:
     pending_task_control: dict | None = None
     working_document: dict | None = None
     working_document_update_handler: Any = None
+    target_choice_key: Any = None
+    pending_target_choice: dict | None = None
+    target_binding_revision: int = 0
+    target_bindings: list[dict] = field(default_factory=list)
+    target_choice_inspections: set[str] = field(default_factory=set)
+    target_choice_fingerprint: str = ""
     machine: ExecutionMachine = field(default_factory=ExecutionMachine)
     ledger: Any = None
     runtime_state: Any = None

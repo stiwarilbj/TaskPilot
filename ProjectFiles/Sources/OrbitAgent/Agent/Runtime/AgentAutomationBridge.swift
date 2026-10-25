@@ -68,7 +68,7 @@ final class AgentAutomationBridge {
                 throw BridgeError.invalidRequest("Missing or invalid working-document revision")
             }
             let method = request["method"] as? String ?? ""
-            if method != "bind_working_document" {
+            if method != "bind_working_document" && method != "bind_task_target_choice" {
                 try lease.validateInstructionRevision(instructionRevision)
                 try lease.validateWorkingDocumentRevision(workingDocumentRevision,
                     allowDispatchedReceipt: method == "act")
@@ -96,9 +96,16 @@ final class AgentAutomationBridge {
         defer { withExtendedLifetime(runtimePermit) {} }
         var magnifierActionTitle: String?
         do {
-            try await lease.checkpoint()
             guard let method = request["method"] as? String else {
                 throw BridgeError.invalidRequest("Missing bridge method")
+            }
+            // A target selection is a local binding update. It is safe to
+            // accept while paused, but it must never resume the task. All
+            // actual observations and actions still wait at the checkpoint.
+            if method == "bind_task_target_choice" || method == "bind_working_document" {
+                try TaskOwnership.check()
+            } else {
+                try await lease.checkpoint()
             }
             let params = request["params"] as? [String: Any] ?? [:]
             if method == "act", let root = lease.managedRuntimeRoot {
@@ -145,6 +152,91 @@ final class AgentAutomationBridge {
                                 "working_document": (accessibility.workingDocumentInfo(generationID: lease.id) as Any?) ?? NSNull()]]
                 }
             }
+            if method == "bind_task_target_choice" {
+                guard Self.exactRevision(params["protocol_version"]) == UInt64(AgentTargetChoiceProtocol.version),
+                      let choiceID = params["choice_id"] as? String,
+                      UUID(uuidString: choiceID)?.uuidString.lowercased() == choiceID,
+                      let candidateID = params["candidate_id"] as? String,
+                      let bindingRevision = Self.exactRevision(params["binding_revision"]),
+                      let scope = params["scope"] as? String,
+                      ["source", "destination", "document"].contains(scope),
+                      let reference = params["reference"] as? String,
+                      !reference.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      reference.utf8.count <= 240,
+                      let requirementID = params["requirement_id"] as? String,
+                      requirementID.range(of: #"^r[1-9][0-9]{0,3}$"#, options: .regularExpression) != nil,
+                      let label = params["label"] as? String, !label.isEmpty, label.utf8.count <= 160,
+                      let detail = params["detail"] as? String, detail.utf8.count <= 480,
+                      let candidate = params["candidate"] as? [String: Any],
+                      let kind = candidate["kind"] as? String,
+                      candidate["id"] == nil else {
+                    throw BridgeError.invalidRequest("Malformed target choice binding")
+                }
+                let allowedKind = scope == "document" ? kind == "document" : ["file", "folder"].contains(kind)
+                guard allowedKind else {
+                    throw BridgeError.invalidRequest("Target candidate does not match its source, destination, or document scope")
+                }
+                if kind == "document" {
+                    guard Set(candidate.keys) == Set(["kind", "selection_id"]),
+                          candidate["selection_id"] as? String == candidateID,
+                          UUID(uuidString: candidateID)?.uuidString.lowercased() == candidateID else {
+                        throw BridgeError.invalidRequest("Malformed open-document candidate")
+                    }
+                } else {
+                    guard Set(candidate.keys) == Set(["kind", "path", "identity"]),
+                          let path = candidate["path"] as? String, path.hasPrefix("/"),
+                          let identity = candidate["identity"] as? [String: Any],
+                          Set(identity.keys) == Set(["device", "inode", "mode", "size", "mtime_ns"]) else {
+                        throw BridgeError.invalidRequest("Malformed file or folder candidate")
+                    }
+                    _ = path
+                }
+                let alreadyApplied = lease.appliedTargetChoiceRevision(id: choiceID) == bindingRevision
+                guard bindingRevision == lease.currentTargetBindingRevision + 1 || alreadyApplied else {
+                    return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
+                            "ok": true, "result": ["applied": false]]
+                }
+                let bindingRecord: [String: Any] = [
+                    "reference": reference, "requirement_id": requirementID, "scope": scope,
+                    "candidate_id": candidateID, "kind": kind, "binding": candidate,
+                    "binding_revision": bindingRevision,
+                    "label": label,
+                    "detail": detail
+                ]
+                let selectedDocument: [String: Any]?
+                do {
+                    selectedDocument = try lease.applyTargetChoice(id: choiceID, candidateID: candidateID,
+                    instructionRevision: instructionRevision,
+                    workingDocumentRevision: workingDocumentRevision,
+                    revision: bindingRevision, bindingRecord: bindingRecord) { nextDocumentRevision in
+                        if kind == "document" {
+                            let selectionID = candidate["selection_id"] as? String
+                            let nativeBinding = try accessibility.prepareWorkingDocumentBinding(
+                                selectionID: selectionID, generationID: lease.id,
+                                revision: nextDocumentRevision
+                            )
+                            guard let nativeBinding else { throw WorkingDocumentUpdateError.unavailable }
+                            accessibility.installWorkingDocumentBinding(nativeBinding, generationID: lease.id)
+                            let selectedDocument = accessibility.workingDocumentInfo(generationID: lease.id)
+                            guard selectedDocument?["state"] as? String == "active" else {
+                                throw WorkingDocumentUpdateError.unavailable
+                            }
+                            return selectedDocument
+                        }
+                        return nil
+                    }
+                } catch TargetChoiceError.stale {
+                    return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
+                            "ok": true, "result": ["applied": false]]
+                } catch WorkingDocumentUpdateError.unavailable {
+                    return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
+                            "ok": true, "result": ["applied": false]]
+                }
+                var choiceResult: [String: Any] = ["applied": true]
+                if let selectedDocument { choiceResult["working_document"] = selectedDocument }
+                return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
+                        "ok": true, "result": choiceResult]
+            }
             if method == "inspect_command" {
                 guard let action = params["action"] as? [String: Any] else { throw BridgeError.invalidRequest("Missing command inspection payload") }
                 let result = try await taskTools.inspectCommand(action: action)
@@ -163,7 +255,8 @@ final class AgentAutomationBridge {
                 return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
                         "ok": true, "result": ["accepted": gate.accepted,
                             "pending_correction": gate.pendingCorrection,
-                            "pending_working_document": gate.pendingWorkingDocument]]
+                            "pending_working_document": gate.pendingWorkingDocument,
+                            "pending_target_choice": gate.pendingTargetChoice]]
             }
             if method == "wait_file_effect" {
                 guard let input = params["check"] else { throw BridgeError.invalidRequest("Missing expected effect check") }
@@ -364,6 +457,12 @@ final class AgentAutomationBridge {
                     "result_destinations": snapshot.resultDestinations,
                     "save_panel_destinations": snapshot.savePanelDestinations,
                     "installed_applications": snapshot.installedApplications,
+                    "working_document_candidates": self.accessibility.workingDocumentCandidates(on: observationDisplay).map { candidate in
+                        var row: [String: Any] = ["selection_id": candidate.selectionID, "kind": "document",
+                                                  "title": candidate.title, "application": candidate.applicationName]
+                        if let location = candidate.location { row["location"] = location }
+                        return row
+                    },
                     "system_context": snapshot.systemContext,
                     "elements": snapshot.elements,
                     "working_document": snapshot.workingDocument ?? NSNull(),
@@ -391,11 +490,28 @@ final class AgentAutomationBridge {
                 let action = validatedAction!
                 let kind = ActionKind(rawValue: action["type"] as! String)!
                 if params["private_input"] as? Bool == true { accessibility.clearActionMagnifier() }
+                let rawIntendedTarget = params["intended_target"]
+                let intendedTarget = rawIntendedTarget as? String
+                guard let targetBindingRevision = Self.exactRevision(params["target_binding_revision"]),
+                      let targetBindings = params["target_bindings"] as? [[String: Any]],
+                      let targetRequirementIDs = params["target_requirement_ids"] as? [String],
+                      targetRequirementIDs.count <= 32,
+                      Set(targetRequirementIDs).count == targetRequirementIDs.count,
+                      targetRequirementIDs.allSatisfy({ $0.range(of: #"^r[1-9][0-9]{0,3}$"#, options: .regularExpression) != nil }),
+                      (rawIntendedTarget == nil || (intendedTarget?.utf8.count ?? Int.max) <= 240) else {
+                    throw TargetChoiceError.superseded
+                }
                 let boundaryCheck: ([String: Any], [StopBoundaryRecord]) throws -> Void = { action, boundaries in
                     try self.accessibility.validateStopBoundary(action: action, on: display, boundaries: boundaries)
                 }
+                let targetChoiceCheck: ([String: Any]) throws -> Void = { action in
+                    try lease.validateTargetBindings(revision: targetBindingRevision,
+                        supplied: targetBindings, action: action,
+                        requirementIDs: targetRequirementIDs, intendedTarget: intendedTarget)
+                }
                 result = try await TaskOwnership.$actionReceipt.withValue(receiptToken) {
                     try await TaskOwnership.$stopBoundaryPreflight.withValue(boundaryCheck) {
+                    try await TaskOwnership.$targetChoicePreflight.withValue(targetChoiceCheck) {
                     if kind.owner == .task_tool {
                         return try await taskTools.perform(action: action, commandBindingID: params["command_inspection_id"] as? String)
                     } else {
@@ -410,6 +526,7 @@ final class AgentAutomationBridge {
                                 try await self.verifyTextTarget(action, display: display, lease: lease,
                                     revision: params["observation_revision"] as? String ?? "")
                             })
+                    }
                     }
                     }
                 }
@@ -474,6 +591,7 @@ final class AgentAutomationBridge {
         if error is ActionContract.ValidationError { return "invalid_action" }
         if error is WorkingDocumentUpdateError { return "working_document_superseded" }
         if error is TaskInstructionCorrectionError { return "instruction_superseded" }
+        if let choice = error as? TargetChoiceError { return choice.code }
         if let receipt = error as? ActionReceiptStore.ReceiptError { return receipt.code }
         if let accessibility = error as? AccessibilityActionError { return accessibility.code }
         if let taskTool = error as? TaskToolError { return taskTool.code }

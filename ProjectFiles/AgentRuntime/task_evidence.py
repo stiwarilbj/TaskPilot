@@ -500,7 +500,7 @@ def validate_metadata(value: dict, purpose: str, ledger: TaskEvidenceLedger | No
                 if not any(ledger.requirement_matches(proof["requirement_id"], ledger.evidence[ref], semantic=True) for ref in refs):
                     fail(path + ".evidence_ids", "do not prove the requirement's target and outcome")
     if ledger is None: return
-    if purpose == "planning" and not ledger.requirements and value.get("status") in {"act", "done"}:
+    if purpose == "planning" and not ledger.requirements and value.get("status") in {"act", "done", "needs_choice"}:
         if not value.get("requirements"): fail("requirements", "must enumerate the original request's requirements on the first decision")
     if purpose == "verification" and value.get("verified") is True:
         if type(value.get("coverage_complete")) is not bool:

@@ -82,6 +82,9 @@ from task_action_boundaries import (STOP_BOUNDARY_POLICY_VERSION, BoundaryViolat
 from command_intents import explicit_operation
 from evidence_consistency import EvidenceConsistency, EVIDENCE_CONSISTENCY_VERSION
 from recovery_cycles import RecoveryCycles, RECOVERY_CYCLE_VERSION
+from target_choices import (PROTOCOL_VERSION as TARGET_CHOICE_PROTOCOL_VERSION,
+                            grounded_candidates, native_candidate_payload,
+                            candidate_fingerprint)
 
 from response_validation import (
     VALIDATION_VERSION, ResponseValidationError, extract_json_object, bind_command_outcomes,
@@ -143,6 +146,7 @@ _instruction_revision = 0
 _instruction_correction_key = None
 _working_document_revision = 0
 _working_document_update_key = None
+_target_choice_protocol_version = 0
 _continuation_checkpoint: dict[str, Any] | None = None
 _observation_keywords: list[str] = []
 _exact_input_references: list[dict[str, Any]] = []
@@ -164,6 +168,7 @@ def _task_value(name: str) -> Any:
     if name == "correction_key": return _instruction_correction_key
     if name == "working_document_revision": return _working_document_revision
     if name == "working_document_key": return _working_document_update_key
+    if name == "target_choice_key": return context.target_choice_key
     if name == "continuation_checkpoint": return _continuation_checkpoint
     return globals()["_" + name]
 
@@ -268,6 +273,40 @@ def receive_pending_task_control(timeout: float | None = 0) -> dict[str, Any]:
             raise RuntimeError("TaskPilot received a noncanonical working-document selection")
     return {"control_kind": "working_document_update", "id": canonical,
             "revision": message["binding_revision"], "selection_id": selection_id}
+
+
+def receive_target_choice_response(timeout: float | None = 0) -> dict[str, Any]:
+    context = current_task.get()
+    pending = context.pending_target_choice if context is not None else None
+    if context is None or not isinstance(pending, dict) or not context.target_choice_key:
+        raise RuntimeError("No target choice is waiting for a response")
+    try:
+        message = json.loads(runtime_inbox().take_target_choice(timeout))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("TaskPilot received malformed target-choice response data") from error
+    if (not isinstance(message, dict) or message.get("kind") != "target_choice_response" or
+            set(message) != {"kind", "version", "task_generation_id", "request_id", "instruction_revision",
+                             "working_document_revision", "binding_revision", "candidate_id", "inspect_again"} or
+            type(message.get("version")) is not int or
+            message["version"] != TARGET_CHOICE_PROTOCOL_VERSION or
+            message.get("task_generation_id") != context.generation or
+            message.get("request_id") != pending["request_id"] or
+            type(message.get("instruction_revision")) is not int or
+            message["instruction_revision"] != context.instruction_revision or
+            type(message.get("working_document_revision")) is not int or
+            message["working_document_revision"] != pending["working_document_revision"] or
+            type(message.get("binding_revision")) is not int or
+            message["binding_revision"] != pending["binding_revision"] or
+            type(message.get("inspect_again")) is not bool):
+        raise RuntimeError("TaskPilot received a target choice for another task or revision")
+    if message["inspect_again"]:
+        if message.get("candidate_id") is not None:
+            raise RuntimeError("Inspect Again cannot include a target candidate")
+        return {"inspect_again": True}
+    candidate_id = message.get("candidate_id")
+    if not isinstance(candidate_id, str) or candidate_id not in pending["candidate_map"]:
+        raise RuntimeError("TaskPilot received a candidate that was not offered for this question")
+    return {"inspect_again": False, "candidate_id": candidate_id}
 
 
 def receive_instruction_correction(timeout: float | None = 0) -> dict[str, Any]:
@@ -887,7 +926,8 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
         effect = {"act": "execute", "observe": "observe", "action_receipt": "receipt",
                   "check_effect": "read", "wait_file_effect": "read", "recheck": "read",
                   "inspect_command": "read", "wait_for_change": "read",
-                  "completion_gate": "complete", "bind_working_document": "read"}.get(method)
+                  "completion_gate": "complete", "bind_working_document": "read",
+                  "bind_task_target_choice": "target_choice"}.get(method)
         if effect is None: raise ExecutionStateError("Unknown task bridge operation")
         context.machine.require(effect)
     timeout = params.pop("_reply_timeout", None)
@@ -904,6 +944,16 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
         elif isinstance(params["action_id"], str):
             params["action_id"] = params["action_id"].lower()
         if context is not None:
+            params["target_binding_revision"] = context.target_binding_revision
+            params["target_bindings"] = list(context.target_bindings)
+            params["target_requirement_ids"] = (
+                context.ledger.action_requirements(context.decision)
+                if context.ledger is not None and isinstance(context.decision, dict) else []
+            )
+            params["intended_target"] = (
+                context.decision.get("intended_target")
+                if isinstance(context.decision, dict) else None
+            )
             action_type = params.get("action", {}).get("type")
             context.presentation_action_id = params["action_id"] if action_type in {"press", "click", "double_click", "scroll"} else None
             context.current_action_receipt_id = params["action_id"]
@@ -2102,6 +2152,8 @@ def complete_from_decision(decision: dict[str, Any], fallback: str, ledger: Task
     if not ledger.can_complete(message):
         raise RuntimeError("TaskPilot cannot complete without evidence for every requested requirement")
     context = current_task.get()
+    if context is not None and context.pending_target_choice is not None:
+        raise RuntimeError("TaskPilot cannot complete while a consequential target choice is unresolved")
     if context is not None and has_unresolved_stop_boundary_action(history or [], context.stop_boundaries):
         raise RuntimeError("TaskPilot cannot claim the stop-before boundary was preserved until the uncertain action is reconciled")
     if context is not None:
@@ -2165,6 +2217,33 @@ def compact_observation(observation: dict[str, Any], task: str = "") -> dict[str
             for key in ("state", "application", "title", "location", "revision")
             if key in working_document
         }
+    context = current_task.get()
+    if context is not None and context.ledger is not None:
+        candidates = grounded_candidates(observation, context.ledger)
+        if candidates:
+            compact["target_choice_candidates"] = [
+                {key: candidate[key] for key in ("id", "kind", "label", "detail")}
+                for candidate in candidates
+            ]
+    if context is not None and context.target_bindings:
+        compact["selected_targets"] = [
+            {
+                "reference": binding.get("reference"),
+                "requirement_id": binding.get("requirement_id"),
+                "scope": binding.get("scope"),
+                "kind": binding.get("kind"),
+                "label": binding.get("label"),
+                "detail": binding.get("detail"),
+                "path": (binding.get("binding") or {}).get("path"),
+            }
+            for binding in context.target_bindings
+        ]
+        compact["selected_target_rule"] = (
+            "Use a selected target only for its listed requirement. Preserve its exact identity. "
+            "Include the matching requirement_id in each related action's requirement_ids and name the selected target in intended_target. "
+            "Do not apply it to unrelated requirements or substitute a similarly named target. "
+            "File operations must use the matching selected path; opaque commands cannot stand in for it."
+        )
     text = prompt_text_recognition(observation)
     if text is not None: compact['text_recognition'] = text
     installed = observation.get("installed_applications")
@@ -3278,7 +3357,11 @@ def desktop_instruction(
         # history projection as the evidence section (no native snapshots).
         condition = {**condition, "failed_action": recent[-1].get("action"), "result": recent[-1].get("result")}
     rules = decision_rules(bool(observation.get("elements")), condition,
-                           bool(observation.get('text_recognition', {}).get('targets')))
+                           bool(observation.get('text_recognition', {}).get('targets')),
+                           len(grounded_candidates(observation, ledger)) if ledger is not None else 0)
+    if re.search(r"sign in|log ?in|password|verification code|secret", task, re.I) or any(
+            element.get("role") == "AXSecureTextField" for element in fields):
+        rules += "Ask through needs_user for local credential entry without sending it to you; never expose credential values.\n"
     if task_context is not None and task_context.stop_boundaries:
         rules += stop_boundary_guidance(task_context.stop_boundaries)
     if context.get("working_document"):
@@ -3741,6 +3824,9 @@ def routed_json_prompt(
     image = screenshot_buffer(screenshot_path, (observation or {}).get("observation_revision"))
     identity = (STATE_FINGERPRINT_VERSION, STOP_BOUNDARY_POLICY_VERSION, _task_value('generation'),
         context.instruction_revision if context is not None else 0, VALIDATION_VERSION, CONTRACT_HASH,
+        TARGET_CHOICE_PROTOCOL_VERSION,
+        context.target_binding_revision if context is not None else 0,
+        json.dumps(context.target_bindings, sort_keys=True, separators=(",", ":")) if context is not None else None,
         context.working_document_revision if context is not None else 0,
         json.dumps(context.working_document, sort_keys=True, separators=(",", ":")) if context is not None and context.working_document else None,
         CHECKLIST_VERSION, BATCH_PROGRESS_VERSION, EXPECTED_EFFECT_VERSION, LOCAL_CHANGE_VERSION, COMMAND_CAPABILITY_VERSION,
@@ -3874,7 +3960,8 @@ class TaskExecution:
             handlers = {
                 Phase.OBSERVING: self.observe, Phase.PLANNING: self.plan,
                 Phase.RECONCILING: self.reconcile, Phase.EXECUTING: self.execute,
-                Phase.WAITING_INPUT: self.secure_input, Phase.VERIFYING: self.verify,
+                Phase.WAITING_INPUT: self.secure_input, Phase.WAITING_CHOICE: self.resolve_target_choice,
+                Phase.VERIFYING: self.verify,
             }
             while c.machine.phase != Phase.DRAINING:
                 handlers[c.machine.phase]()
@@ -4179,6 +4266,10 @@ class TaskExecution:
             c.input_target = decision_user_input_target(c.decision)
             c.machine.transition(Phase.WAITING_INPUT, secure_target=True, preflight=True)
             return
+        if status == "needs_choice":
+            self.begin_target_choice()
+            c.machine.transition(Phase.WAITING_CHOICE, decision=True, preflight=True)
+            return
         if status == "blocked":
             reason = str(c.decision.get("reason") or c.decision.get("summary") or "OpenClaw is blocked")
             if re.search(r"credential|password|verification code|permission denied|not authorized|cancelled|destructive|irreversible", reason, re.I):
@@ -4261,6 +4352,137 @@ class TaskExecution:
         publish_task_wait("executing", expected_wait_description(c.decision),
                           operation_key=f"action:{c.step}:{action_type}", ledger=c.ledger)
         c.machine.transition(Phase.EXECUTING, decision=True, preflight=True)
+
+    def begin_target_choice(self) -> None:
+        c = self.c
+        choice = c.decision.get("choice")
+        if not isinstance(choice, dict):
+            raise RuntimeError("A target choice is missing its validated request")
+        candidates = grounded_candidates(c.observation or {}, c.ledger)
+        by_id = {candidate["id"]: candidate for candidate in candidates}
+        identifiers = choice.get("candidate_ids")
+        selected = [by_id.get(identifier) for identifier in identifiers] if isinstance(identifiers, list) else []
+        if len(selected) < 2 or len(selected) > 8 or any(candidate is None for candidate in selected):
+            raise RuntimeError("The target candidates changed before TaskPilot could ask you to choose")
+        compatible_kinds = {"document"} if choice["scope"] == "document" else {"file", "folder"}
+        # Inspection is bounded per unchanged ambiguity, not per model-selected
+        # subset. A model cannot evade the one-inspection limit by returning a
+        # different subset of the same native candidates on its next decision.
+        fingerprint = candidate_fingerprint(
+            choice["reference"], choice["scope"],
+            [candidate for candidate in candidates if candidate["kind"] in compatible_kinds],
+        )
+        request_id = str(uuid.uuid4()).lower()
+        key = runtime_inbox().register_target_choice(request_id, c.generation)
+        c.target_choice_key = key
+        c.target_choice_fingerprint = fingerprint
+        c.pending_target_choice = {
+            "request_id": request_id, "instruction_revision": c.instruction_revision,
+            "working_document_revision": c.working_document_revision,
+            "binding_revision": c.target_binding_revision + 1,
+            "reference": choice["reference"], "requirement_id": choice["requirement_id"],
+            "scope": choice["scope"], "candidate_ids": list(identifiers),
+            "candidate_map": {candidate["id"]: candidate for candidate in selected},
+            "fingerprint": fingerprint,
+        }
+        publish_task_wait("reconciling", "Choose which target to use",
+                          operation_key=f"target-choice:{request_id}", ledger=c.ledger)
+        emit("status", message=f"Waiting for you to choose: {choice['reference']}")
+        emit("target_choice_required", version=TARGET_CHOICE_PROTOCOL_VERSION,
+             request_id=request_id, instruction_revision=c.instruction_revision,
+             working_document_revision=c.working_document_revision,
+             binding_revision=c.target_binding_revision + 1, reference=choice["reference"],
+             requirement_id=choice["requirement_id"], scope=choice["scope"],
+             candidates=public_candidates(candidates, identifiers),
+             inspect_again_allowed=fingerprint not in c.target_choice_inspections)
+
+    def resolve_target_choice(self) -> None:
+        c = self.c
+        pending = c.pending_target_choice
+        if not isinstance(pending, dict):
+            raise RuntimeError("TaskPilot entered target-choice wait without an owned request")
+        publish_task_wait("reconciling", "Waiting for your target choice",
+                          operation_key=f"target-choice:{pending['request_id']}", ledger=c.ledger)
+        while True:
+            if instruction_correction_pending():
+                control = receive_pending_task_control(timeout=0)
+                c.pending_target_choice = None
+                runtime_inbox().clear_target_choice()
+                if control.get("control_kind") == "working_document_update":
+                    self.apply_working_document_update(control)
+                else:
+                    c.pending_task_control = control
+                    self.apply_pending_correction()
+                return
+            try:
+                response = receive_target_choice_response(timeout=0.25)
+                break
+            except TimeoutError:
+                continue
+        if response["inspect_again"]:
+            c.target_choice_inspections.add(pending["fingerprint"])
+            c.pending_target_choice = None
+            c.target_choice_fingerprint = ""
+            runtime_inbox().clear_target_choice()
+            c.decision = None
+            c.machine.transition(Phase.OBSERVING)
+            return
+
+        candidate_id = response["candidate_id"]
+        candidate = pending["candidate_map"][candidate_id]
+        result = bridge_call(
+            "bind_task_target_choice", c.display_id,
+            protocol_version=TARGET_CHOICE_PROTOCOL_VERSION,
+            choice_id=pending["request_id"], candidate_id=candidate_id,
+            binding_revision=pending["binding_revision"], scope=pending["scope"],
+            reference=pending["reference"], requirement_id=pending["requirement_id"],
+            label=candidate["label"], detail=candidate["detail"],
+            candidate=candidate["binding"],
+        )
+        if result.get("applied") is not True:
+            emit("target_choice_rejected", version=TARGET_CHOICE_PROTOCOL_VERSION,
+                 request_id=pending["request_id"],
+                 instruction_revision=pending["instruction_revision"],
+                 working_document_revision=pending["working_document_revision"],
+                 binding_revision=pending["binding_revision"],
+                 message="That target changed before it could be selected. Inspect again or choose another candidate.")
+            c.pending_target_choice = None
+            c.target_choice_fingerprint = ""
+            runtime_inbox().clear_target_choice()
+            c.decision = None
+            c.machine.transition(Phase.OBSERVING)
+            return
+
+        binding = {
+            "reference": pending["reference"], "requirement_id": pending["requirement_id"],
+            "scope": pending["scope"], "candidate_id": candidate_id,
+            "label": candidate["label"], "detail": candidate["detail"],
+            "kind": candidate["kind"], "binding": candidate["binding"],
+            "binding_revision": pending["binding_revision"],
+        }
+        c.target_bindings = [item for item in c.target_bindings
+                             if not (item.get("reference") == binding["reference"] and
+                                     item.get("scope") == binding["scope"] and
+                                     item.get("requirement_id") == binding["requirement_id"])]
+        c.target_bindings.append(binding)
+        c.target_binding_revision = pending["binding_revision"]
+        if candidate["kind"] == "document":
+            c.working_document = result.get("working_document")
+            c.working_document_revision = int((c.working_document or {}).get("revision", c.working_document_revision))
+        emit("target_choice_applied", version=TARGET_CHOICE_PROTOCOL_VERSION,
+             request_id=pending["request_id"], instruction_revision=c.instruction_revision,
+             working_document_revision=c.working_document_revision,
+             candidate_id=candidate_id, binding_revision=pending["binding_revision"],
+             label=candidate["label"], detail=candidate["detail"],
+             **({"working_document": c.working_document} if candidate["kind"] == "document" else {}))
+        c.pending_target_choice = None
+        c.target_choice_fingerprint = ""
+        runtime_inbox().clear_target_choice()
+        c.decision = c.action = c.result = None
+        if c.client is not None:
+            c.client.decision_cache = {}
+        c.bridge_observation_revision = None
+        c.machine.transition(Phase.OBSERVING)
 
     def secure_input(self) -> None:
         c = self.c
@@ -4475,6 +4697,7 @@ class TaskExecution:
         TaskInputBindings(revised_task, exact_input_references=references)
         c.task = revised_task
         c.exact_input_references = references
+        c.target_bindings.clear()
         c.stop_boundaries = detect_stop_boundaries(revised_task, references)
         c.instruction_revision = correction["revision"]
         global _instruction_revision
@@ -4528,6 +4751,8 @@ class TaskExecution:
         if binding is not None and (not isinstance(binding, dict) or binding.get("state") != "active"):
             raise RuntimeError("The selected document could not be bound safely; choose it again in Live View")
         c.working_document_revision = update["revision"]
+        c.target_bindings = [binding for binding in c.target_bindings
+                             if binding.get("scope") != "document"]
         global _working_document_revision
         _working_document_revision = update["revision"]
         c.working_document = binding
@@ -4584,7 +4809,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_runtime_configuration(require_generation: bool = False) -> str:
-    global _task_generation_id, _instruction_revision, _bridge_observation_revision, _observation_keywords, _exact_input_references, _instruction_correction_key, _working_document_revision, _working_document_update_key, _continuation_checkpoint
+    global _task_generation_id, _instruction_revision, _bridge_observation_revision, _observation_keywords, _exact_input_references, _instruction_correction_key, _working_document_revision, _working_document_update_key, _continuation_checkpoint, _target_choice_protocol_version
     _task_generation_id = None
     _instruction_revision = 0
     _bridge_observation_revision = None
@@ -4593,6 +4818,7 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
     _instruction_correction_key = None
     _working_document_revision = 0
     _working_document_update_key = None
+    _target_choice_protocol_version = 0
     _continuation_checkpoint = None
     raw_line = runtime_line()
     try:
@@ -4651,6 +4877,9 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
         _exact_input_references = references
         if type(configuration.get("working_document_protocol_version")) is not int or configuration["working_document_protocol_version"] != WORKING_DOCUMENT_PROTOCOL_VERSION:
             raise RuntimeError("TaskPilot working-document protocol does not match; rebuild the bundled components together")
+        if type(configuration.get("target_choice_protocol_version")) is not int or configuration["target_choice_protocol_version"] != TARGET_CHOICE_PROTOCOL_VERSION:
+            raise RuntimeError("TaskPilot target-choice protocol does not match; rebuild the bundled components together")
+        _target_choice_protocol_version = TARGET_CHOICE_PROTOCOL_VERSION
         _instruction_correction_key = runtime_inbox().register_instruction_corrections(generation)
         _working_document_update_key = runtime_inbox().register_working_document_updates(generation)
     api_key = configuration.get("gemini_api_key")

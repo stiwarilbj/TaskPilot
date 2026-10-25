@@ -10,14 +10,16 @@ from expected_effects import validate_expectation, ExpectedEffectError
 from command_intents import explicit_operation, matches_explicit_request
 from local_text_recognition import coordinate_text_target, TextRecognitionError
 from task_inputs import InputReferenceError, reject_unbound_references
+from task_evidence import project_requirements
 from evidence_consistency import validate_disagreement
+from target_choices import validate_choice_shape
 
 from action_contract_generated import (
     CONTRACT_HASH, CONTRACT_VERSION, VALID_ACTIONS, KEYS,
     ActionContractError, validate_action,
 )
 
-VALIDATION_VERSION = 12
+VALIDATION_VERSION = 13
 
 
 class ResponseValidationError(RuntimeError):
@@ -147,15 +149,18 @@ def validate_response(value: dict[str, Any], purpose: str, observation: dict[str
     if "finish_after_action" in result and type(result["finish_after_action"]) is not bool: fail("finish_after_action", "must be a boolean")
     for key, choices in (("selected_capability", {"file_read", "file_write", "shell", "browser", "app_automation", "mixed"}), ("output_kind", {"answer", "result", "completion"}), ("kind", {"answer", "result", "completion"})):
         if key in result and (not isinstance(result[key], str) or result[key] not in choices): fail(key, "must be a supported value")
-    if "status" in result and (not isinstance(result["status"], str) or result["status"] not in {"act", "done", "needs_user", "blocked"}):
-        fail("status", "must be act, done, needs_user, or blocked")
+    statuses = {"act", "done", "needs_user", "needs_choice", "blocked"}
+    if "status" in result and (not isinstance(result["status"], str) or result["status"] not in statuses):
+        fail("status", "must be act, done, needs_user, needs_choice, or blocked")
     if result.get("status") == "act" and "action" not in result:
         fail("action", "is required when status is act")
+    if result.get("status") == "needs_choice" and "action" in result:
+        fail("action", "must be omitted while waiting for a target choice")
     if purpose == "verification":
         if type(result.get("verified")) is not bool: fail("verified", "must be a boolean")
     else:
         status = result.get("status")
-        if not isinstance(status, str) or status not in {"act", "done", "needs_user", "blocked"}: fail("status", "must be act, done, needs_user, or blocked")
+        if not isinstance(status, str) or status not in statuses: fail("status", "must be act, done, needs_user, needs_choice, or blocked")
         if purpose == "readiness" and (status != "done" or result.get("check") != "TASKPILOT_READY"): fail("check", "must equal TASKPILOT_READY with status done")
     if "action" in result:
         result["action"] = normalize_action(result["action"], observation)
@@ -179,8 +184,35 @@ def validate_response(value: dict[str, Any], purpose: str, observation: dict[str
                 fail("action.element_id", "must reference an observed text input for secure input")
             if element.get("enabled") is False:
                 fail("action.element_id", "must reference an enabled secure input target")
+    if result.get("status") == "needs_choice":
+        if purpose != "planning":
+            fail("status", "needs_choice is valid only during planning")
+        if "choice" not in result:
+            fail("choice", "is required when status is needs_choice")
+        if observation is None or ledger is None:
+            fail("choice", "requires the current native observation and task checklist")
     try:
         validate_metadata(result, purpose, ledger, observation)
     except EvidenceValidationError as error:
         raise ResponseValidationError(str(error)) from error
+    if result.get("status") == "needs_choice":
+        proposed = dict(ledger.requirements)
+        if isinstance(result.get("requirements"), list):
+            try:
+                entries = ledger.canonical_entries(result["requirements"], observation)
+                proposed = project_requirements(proposed, entries, ledger.task)
+            except EvidenceValidationError as error:
+                raise ResponseValidationError(str(error)) from error
+        active_requirement_ids = {identifier for identifier, item in proposed.items()
+                                  if item.get("state") != "superseded" and
+                                  item.get("scope", "outcome") != "prerequisite"}
+        try:
+            result["choice"] = validate_choice_shape(result["choice"], observation, ledger, fail,
+                                                      active_requirement_ids)
+        except (ValueError, OSError) as error:
+            if isinstance(error, ResponseValidationError):
+                raise
+            raise ResponseValidationError(str(error)) from error
+        if ledger.batch_declaration_required_for() and "batch" not in result:
+            fail("batch", "is required before resolving a target used by per-input work")
     return result

@@ -65,6 +65,12 @@ enum RuntimeEvent {
     case diagnostics(AgentRequestMetrics)
     case output(AgentTaskOutput)
     case userInputRequired(AgentUserInputRequest)
+    case targetChoiceRequired(AgentTargetChoiceRequest)
+    case targetChoiceApplied(requestID: String, candidateID: String, label: String, detail: String,
+                             taskGenerationID: String, bindingRevision: UInt64,
+                             workingDocumentRevision: UInt64, workingDocument: [String: Any]?)
+    case targetChoiceRejected(requestID: String, taskGenerationID: String, bindingRevision: UInt64,
+                              instructionRevision: UInt64, workingDocumentRevision: UInt64, message: String)
     case taskProgress(AgentTaskProgressSnapshot)
     case taskContinuationCheckpoint(AgentTaskContinuationCheckpoint)
     case taskWait(AgentTaskWaitSnapshot)
@@ -155,6 +161,11 @@ final class AgentRuntimeProcess {
         var correctionIDs: Set<String> = []
         var corrections: [String: TaskInstructionCorrection] = [:]
         var workingDocumentIDs: Set<String> = []
+        var pendingTargetChoice: AgentTargetChoiceRequest?
+        var targetChoiceCandidates: Set<String> = []
+        var pendingTargetChoiceApplying = false
+        var resolvedTargetChoiceIDs: [String: UInt64] = [:]
+        var resolvedTargetChoiceOrder: [String] = []
         var terminalDelivered = false
         var drainStarted: ContinuousClock.Instant?
         var drainReported = false
@@ -287,6 +298,7 @@ final class AgentRuntimeProcess {
                 "instruction_revision": lease.currentInstructionRevision,
                 "stop_boundary_policy_version": StopBoundaryPolicy.version,
                 "working_document_protocol_version": WorkingDocumentUpdate.protocolVersion,
+                "target_choice_protocol_version": AgentTargetChoiceProtocol.version,
                 "task_protocol_version": ActionContract.taskProtocolVersion,
                 "exact_input_reference_version": AgentTaskInputReferenceProtocol.version,
                 "exact_input_references": exactInputReferences.map(\.wireValue),
@@ -396,6 +408,43 @@ final class AgentRuntimeProcess {
         return true
     }
 
+    @discardableResult
+    func submitTargetChoice(request: AgentTargetChoiceRequest, candidateID: String? = nil,
+                            inspectAgain: Bool = false) -> Bool {
+        let run = ioQueue.sync { () -> Invocation? in
+            guard let run = invocation, run.pendingTargetChoice?.id == request.id,
+                  run.lease.accepts(request.taskGenerationID),
+                  request.taskGenerationID == run.lease.id,
+                  request.instructionRevision == run.lease.currentInstructionRevision,
+                  request.workingDocumentRevision == run.lease.currentWorkingDocumentRevision,
+                  request.bindingRevision == run.lease.currentTargetBindingRevision + 1,
+                  !run.lease.hasPendingInstructionCorrection,
+                  !run.lease.hasPendingWorkingDocumentUpdate,
+                  run.lease.state == .running || run.lease.state == .paused else { return nil }
+            if inspectAgain {
+                guard candidateID == nil, request.inspectAgainAllowed,
+                      run.lease.cancelTargetChoice(id: request.id, revision: request.bindingRevision) else { return nil }
+                rememberResolvedTargetChoice(request, for: run)
+                run.pendingTargetChoice = nil
+                run.targetChoiceCandidates.removeAll()
+                run.pendingTargetChoiceApplying = false
+            } else {
+                guard !run.pendingTargetChoiceApplying,
+                      let candidateID, run.targetChoiceCandidates.contains(candidateID) else { return nil }
+                run.pendingTargetChoiceApplying = true
+            }
+            return run
+        }
+        guard let run else { return false }
+        send(["kind": "target_choice_response", "version": AgentTargetChoiceProtocol.version,
+              "task_generation_id": run.lease.id, "request_id": request.id,
+              "instruction_revision": request.instructionRevision,
+              "working_document_revision": request.workingDocumentRevision,
+              "binding_revision": request.bindingRevision,
+              "candidate_id": candidateID as Any? ?? NSNull(), "inspect_again": inspectAgain], for: run)
+        return true
+    }
+
     func prepareInstructionCorrection(_ correction: TaskInstructionCorrection, generationID: String) throws {
         let run = try ioQueue.sync { () throws -> Invocation in
             guard let run = invocation, run.lease.id == generationID,
@@ -459,6 +508,10 @@ final class AgentRuntimeProcess {
                 throw WorkingDocumentUpdateError.stale
             }
             try run.lease.beginWorkingDocumentUpdate(id: update.id, revision: update.revision)
+            if let choice = run.pendingTargetChoice { rememberResolvedTargetChoice(choice, for: run) }
+            run.pendingTargetChoice = nil
+            run.targetChoiceCandidates.removeAll()
+            run.pendingTargetChoiceApplying = false
             run.workingDocumentIDs.insert(update.id)
         }
     }
@@ -696,6 +749,154 @@ final class AgentRuntimeProcess {
                 ) ?? .password
             )
             emit(.userInputRequired(request), for: run)
+        case "target_choice_required":
+            let requiredKeys: Set<String> = ["kind", "task_generation_id", "instruction_revision",
+                "working_document_revision", "version", "request_id", "binding_revision",
+                "reference", "requirement_id", "scope", "candidates", "inspect_again_allowed"]
+            guard Set(message.keys) == requiredKeys,
+                  exactRevision(message["version"]) == UInt64(AgentTargetChoiceProtocol.version),
+                  let requestID = message["request_id"] as? String,
+                  let requestUUID = UUID(uuidString: requestID), requestUUID.uuidString.lowercased() == requestID,
+                  let instructionRevision = exactRevision(message["instruction_revision"]),
+                  let documentRevision = exactRevision(message["working_document_revision"]),
+                  let bindingRevision = exactRevision(message["binding_revision"]) else {
+                failTransport("transport_malformed_frame", for: run); return
+            }
+            guard message["task_generation_id"] as? String == run.lease.id else { return }
+            if run.resolvedTargetChoiceIDs[requestID] == bindingRevision { return }
+            if let pending = run.pendingTargetChoice, pending.id == requestID {
+                let duplicate = AgentTargetChoiceRequest.parse(message, generationID: run.lease.id,
+                    instructionRevision: pending.instructionRevision,
+                    workingDocumentRevision: pending.workingDocumentRevision,
+                    targetBindingRevision: pending.bindingRevision - 1)
+                guard duplicate == pending else { failTransport("target_choice_revision_mismatch", for: run); return }
+                return
+            }
+            // Late frames from a superseded instruction, document or binding
+            // are discarded without disturbing the current task.
+            if instructionRevision < run.lease.currentInstructionRevision ||
+                documentRevision < run.lease.currentWorkingDocumentRevision ||
+                bindingRevision <= run.lease.currentTargetBindingRevision { return }
+            guard let request = AgentTargetChoiceRequest.parse(
+                message, generationID: run.lease.id,
+                instructionRevision: run.lease.currentInstructionRevision,
+                workingDocumentRevision: run.lease.currentWorkingDocumentRevision,
+                targetBindingRevision: run.lease.currentTargetBindingRevision) else {
+                failTransport("transport_malformed_frame", for: run); return
+            }
+            guard run.pendingTargetChoice == nil else {
+                failTransport("target_choice_revision_mismatch", for: run); return
+            }
+            do {
+                try run.lease.beginTargetChoice(id: request.id, instructionRevision: request.instructionRevision,
+                                                workingDocumentRevision: request.workingDocumentRevision,
+                                                revision: request.bindingRevision,
+                                                candidateIDs: Set(request.candidates.map(\.id)),
+                                                reference: request.reference, requirementID: request.requirementID,
+                                                scope: request.scope)
+            } catch {
+                failTransport("target_choice_revision_mismatch", for: run); return
+            }
+            run.pendingTargetChoice = request
+            run.targetChoiceCandidates = Set(request.candidates.map(\.id))
+            run.pendingTargetChoiceApplying = false
+            emit(.targetChoiceRequired(request), for: run)
+        case "target_choice_applied":
+            guard message["task_generation_id"] as? String == run.lease.id,
+                  let requestID = message["request_id"] as? String,
+                  let request = run.pendingTargetChoice, request.id == requestID else { return }
+            // A document selection advances the working-document revision as
+            // part of the native commit. Compare against that expected next
+            // revision before treating an acknowledgement as stale.
+            guard let candidateID = message["candidate_id"] as? String,
+                  let selectedCandidate = request.candidates.first(where: { $0.id == candidateID }),
+                  exactRevision(message["instruction_revision"]) == request.instructionRevision,
+                  exactRevision(message["binding_revision"]) == request.bindingRevision,
+                  let reportedDocumentRevision = exactRevision(message["working_document_revision"]) else {
+                failTransport("transport_malformed_frame", for: run); return
+            }
+            let isDocumentChoice = selectedCandidate.kind == .document
+            let expectedDocumentRevision = request.workingDocumentRevision + (isDocumentChoice ? 1 : 0)
+            var expectedKeys: Set<String> = ["kind", "task_generation_id", "instruction_revision",
+                "working_document_revision", "version", "request_id", "candidate_id",
+                "binding_revision", "label", "detail"]
+            if isDocumentChoice { expectedKeys.insert("working_document") }
+            guard Set(message.keys) == expectedKeys,
+                  exactRevision(message["version"]) == UInt64(AgentTargetChoiceProtocol.version),
+                  message["label"] as? String == selectedCandidate.label,
+                  message["detail"] as? String == selectedCandidate.detail,
+                  reportedDocumentRevision == expectedDocumentRevision else {
+                failTransport("transport_malformed_frame", for: run); return
+            }
+            if request.instructionRevision != run.lease.currentInstructionRevision ||
+                expectedDocumentRevision != run.lease.currentWorkingDocumentRevision ||
+                request.bindingRevision != run.lease.currentTargetBindingRevision {
+                if !run.lease.hasPendingTargetChoice {
+                    rememberResolvedTargetChoice(request, for: run)
+                    run.pendingTargetChoice = nil
+                    run.targetChoiceCandidates.removeAll()
+                    run.pendingTargetChoiceApplying = false
+                }
+                return
+            }
+            guard Set(message.keys) == expectedKeys,
+                  run.pendingTargetChoiceApplying,
+                  run.targetChoiceCandidates.contains(candidateID),
+                  let revision = exactRevision(message["binding_revision"]), revision == request.bindingRevision,
+                  run.lease.appliedTargetChoiceRevision(id: requestID) == revision,
+                  let workingDocumentRevision = exactRevision(message["working_document_revision"]),
+                  workingDocumentRevision == run.lease.currentWorkingDocumentRevision else {
+                failTransport("transport_malformed_frame", for: run); return
+            }
+            let workingDocument = message["working_document"] as? [String: Any]
+            if selectedCandidate.kind == .document {
+                guard workingDocumentRevision == request.workingDocumentRevision + 1,
+                      workingDocument?["state"] as? String == "active",
+                      exactRevision(workingDocument?["revision"]) == workingDocumentRevision,
+                      workingDocument?["application"] as? String != nil,
+                      workingDocument?["title"] as? String != nil else { return }
+            } else {
+                guard workingDocumentRevision == request.workingDocumentRevision,
+                      workingDocument == nil else { return }
+            }
+            run.pendingTargetChoice = nil
+            run.targetChoiceCandidates.removeAll()
+            run.pendingTargetChoiceApplying = false
+            rememberResolvedTargetChoice(request, for: run)
+            emit(.targetChoiceApplied(requestID: requestID, candidateID: candidateID,
+                label: selectedCandidate.label, detail: selectedCandidate.detail,
+                taskGenerationID: run.lease.id, bindingRevision: revision,
+                workingDocumentRevision: workingDocumentRevision, workingDocument: workingDocument), for: run)
+        case "target_choice_rejected":
+            guard message["task_generation_id"] as? String == run.lease.id,
+                  let requestID = message["request_id"] as? String,
+                  let request = run.pendingTargetChoice, request.id == requestID else { return }
+            if request.instructionRevision != run.lease.currentInstructionRevision ||
+                request.workingDocumentRevision != run.lease.currentWorkingDocumentRevision {
+                rememberResolvedTargetChoice(request, for: run)
+                run.pendingTargetChoice = nil
+                run.targetChoiceCandidates.removeAll()
+                run.pendingTargetChoiceApplying = false
+                return
+            }
+            guard Set(message.keys) == Set(["kind", "task_generation_id", "instruction_revision",
+                    "working_document_revision", "version", "request_id", "binding_revision", "message"]),
+                  exactRevision(message["version"]) == UInt64(AgentTargetChoiceProtocol.version),
+                  exactRevision(message["instruction_revision"]) == request.instructionRevision,
+                  exactRevision(message["working_document_revision"]) == request.workingDocumentRevision,
+                  let revision = exactRevision(message["binding_revision"]), revision == request.bindingRevision,
+                  let rejection = message["message"] as? String, rejection.utf8.count <= 240,
+                  run.lease.cancelTargetChoice(id: requestID, revision: revision) else {
+                failTransport("transport_malformed_frame", for: run); return
+            }
+            run.pendingTargetChoice = nil
+            run.targetChoiceCandidates.removeAll()
+            run.pendingTargetChoiceApplying = false
+            rememberResolvedTargetChoice(request, for: run)
+            emit(.targetChoiceRejected(requestID: requestID, taskGenerationID: run.lease.id,
+                bindingRevision: revision, instructionRevision: request.instructionRevision,
+                workingDocumentRevision: request.workingDocumentRevision,
+                message: String(rejection.prefix(240))), for: run)
         case "task_progress":
             guard let progress = AgentTaskProgressSnapshot.parse(message, generationID: run.lease.id),
                   progress.revision > run.progressRevision else { return }
@@ -726,6 +927,10 @@ final class AgentRuntimeProcess {
             do {
                 guard let correction = run.corrections[id] else { throw TaskInstructionCorrectionError.stale }
                 try run.lease.applyInstructionCorrection(id: id, revision: revision, correction: correction)
+                if let choice = run.pendingTargetChoice { rememberResolvedTargetChoice(choice, for: run) }
+                run.pendingTargetChoice = nil
+                run.targetChoiceCandidates.removeAll()
+                run.pendingTargetChoiceApplying = false
                 if run.pendingUserInputRevision != revision {
                     run.pendingUserInputID = nil
                     run.pendingUserInputRevision = nil
@@ -821,6 +1026,20 @@ final class AgentRuntimeProcess {
               number.doubleValue.isFinite, number.doubleValue >= 0,
               number.doubleValue.rounded(.towardZero) == number.doubleValue else { return nil }
         return UInt64(number.stringValue)
+    }
+
+    /// Remember a bounded set of completed choice request IDs so duplicate
+    /// required/acknowledgement frames cannot reopen or overwrite a binding.
+    /// Call only on the invocation's serial I/O queue.
+    private func rememberResolvedTargetChoice(_ request: AgentTargetChoiceRequest, for run: Invocation) {
+        if run.resolvedTargetChoiceIDs[request.id] == nil {
+            run.resolvedTargetChoiceOrder.append(request.id)
+        }
+        run.resolvedTargetChoiceIDs[request.id] = request.bindingRevision
+        while run.resolvedTargetChoiceOrder.count > 64 {
+            let oldest = run.resolvedTargetChoiceOrder.removeFirst()
+            run.resolvedTargetChoiceIDs.removeValue(forKey: oldest)
+        }
     }
 
     private func send(_ object: [String: Any], for run: Invocation, bridgeSpan: BackendTelemetry.Span? = nil) {

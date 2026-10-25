@@ -1,3 +1,5 @@
+import CoreFoundation
+import Darwin
 import Foundation
 
 /// One immutable capability for a task. Revocation is serialized with native
@@ -24,6 +26,17 @@ final class TaskLease: @unchecked Sendable {
     private var workingDocumentRevision: UInt64 = 0
     private var pendingWorkingDocument: (id: String, revision: UInt64)?
     private var appliedWorkingDocumentUpdates: [String: UInt64] = [:]
+    private var targetBindingRevision: UInt64 = 0
+    private var pendingTargetChoice: (id: String, instructionRevision: UInt64, workingDocumentRevision: UInt64,
+                                      revision: UInt64, candidateIDs: Set<String>, reference: String,
+                                      requirementID: String, scope: String)?
+    private var appliedTargetChoices: [String: UInt64] = [:]
+    private var appliedTargetChoiceInstructionRevisions: [String: UInt64] = [:]
+    private var appliedTargetChoiceWorkingDocumentRevisions: [String: UInt64] = [:]
+    private var appliedTargetChoiceFingerprints: [String: Data] = [:]
+    private var appliedTargetChoiceDocuments: [String: [String: Any]] = [:]
+    private var appliedTargetChoiceOrder: [String] = []
+    private var targetBindings: [[String: Any]] = []
     private var completionClaimed = false
     let permitsPersistentProcesses: Bool
     private var closePersistentProcesses: Bool
@@ -80,6 +93,8 @@ final class TaskLease: @unchecked Sendable {
     var activeStopBoundaries: [StopBoundaryRecord] { lock.lock(); defer { lock.unlock() }; return stopBeforeBoundaries }
     var hasPendingInstructionCorrection: Bool { lock.lock(); defer { lock.unlock() }; return pendingCorrection != nil }
     var currentWorkingDocumentRevision: UInt64 { lock.lock(); defer { lock.unlock() }; return workingDocumentRevision }
+    var currentTargetBindingRevision: UInt64 { lock.lock(); defer { lock.unlock() }; return targetBindingRevision }
+    var hasPendingTargetChoice: Bool { lock.lock(); defer { lock.unlock() }; return pendingTargetChoice != nil }
     var hasPendingWorkingDocumentUpdate: Bool { lock.lock(); defer { lock.unlock() }; return pendingWorkingDocument != nil }
     func appliedWorkingDocumentRevision(id: String) -> UInt64? {
         lock.lock(); defer { lock.unlock() }
@@ -93,6 +108,10 @@ final class TaskLease: @unchecked Sendable {
               revision == workingDocumentRevision + 1, UUID(uuidString: id) != nil else {
             throw WorkingDocumentUpdateError.stale
         }
+        // A newer explicit document selection supersedes the pending question
+        // immediately, but retain the existing document binding until the
+        // selected window has passed native validation and is installed.
+        pendingTargetChoice = nil
         pendingWorkingDocument = (id.lowercased(), revision)
     }
 
@@ -113,6 +132,7 @@ final class TaskLease: @unchecked Sendable {
         try install()
         workingDocumentRevision = revision
         pendingWorkingDocument = nil
+        targetBindings.removeAll { $0["scope"] as? String == "document" }
         appliedWorkingDocumentUpdates[normalizedID] = revision
     }
 
@@ -134,6 +154,9 @@ final class TaskLease: @unchecked Sendable {
               !completionClaimed, revision == instructionRevision + 1, UUID(uuidString: id) != nil else {
             throw TaskInstructionCorrectionError.stale
         }
+        // Keep the current question and bindings intact until persistence and
+        // correction acknowledgement succeed. The pending-correction barrier
+        // already prevents target selections and action delivery.
         pendingCorrection = (id.lowercased(), revision)
     }
 
@@ -167,7 +190,257 @@ final class TaskLease: @unchecked Sendable {
         }
         instructionRevision = revision
         pendingCorrection = nil
+        pendingTargetChoice = nil
+        targetBindings.removeAll()
         appliedCorrections[normalizedID] = revision
+    }
+
+    func beginTargetChoice(id: String, instructionRevision: UInt64, workingDocumentRevision: UInt64,
+                           revision: UInt64, candidateIDs: Set<String>, reference: String,
+                           requirementID: String, scope: String) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard (value == .running || value == .paused), pendingCorrection == nil,
+              pendingWorkingDocument == nil, pendingTargetChoice == nil, !completionClaimed,
+              instructionRevision == self.instructionRevision,
+              workingDocumentRevision == self.workingDocumentRevision,
+              revision == targetBindingRevision + 1,
+              UUID(uuidString: id)?.uuidString.lowercased() == id.lowercased(),
+              (2...8).contains(candidateIDs.count),
+              !reference.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              reference.utf8.count <= 240,
+              requirementID.range(of: #"^r[1-9][0-9]{0,3}$"#, options: .regularExpression) != nil,
+              ["source", "destination", "document"].contains(scope) else {
+            throw TargetChoiceError.stale
+        }
+        pendingTargetChoice = (id.lowercased(), instructionRevision, workingDocumentRevision,
+                               revision, candidateIDs, reference, requirementID, scope)
+    }
+
+    @discardableResult
+    func cancelTargetChoice(id: String, revision: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard pendingTargetChoice?.id == id.lowercased(), pendingTargetChoice?.revision == revision else { return false }
+        pendingTargetChoice = nil
+        return true
+    }
+
+    func applyTargetChoice(id: String, candidateID: String, instructionRevision: UInt64,
+                           workingDocumentRevision: UInt64, revision: UInt64,
+                           bindingRecord: [String: Any],
+                           install: (UInt64) throws -> [String: Any]?) throws -> [String: Any]? {
+        lock.lock(); defer { lock.unlock() }
+        let normalizedID = id.lowercased()
+        guard let fingerprint = Self.canonicalJSON(["candidate_id": candidateID, "binding": bindingRecord]) else {
+            throw TargetChoiceError.stale
+        }
+        if let appliedRevision = appliedTargetChoices[normalizedID] {
+            guard appliedRevision == revision,
+                  appliedTargetChoiceInstructionRevisions[normalizedID] == instructionRevision,
+                  appliedTargetChoiceWorkingDocumentRevisions[normalizedID] == workingDocumentRevision,
+                  appliedTargetChoiceFingerprints[normalizedID] == fingerprint else {
+                throw TargetChoiceError.stale
+            }
+            return appliedTargetChoiceDocuments[normalizedID]
+        }
+        guard (value == .running || value == .paused), !completionClaimed,
+              pendingCorrection == nil, pendingWorkingDocument == nil,
+              let pending = pendingTargetChoice, pending.id == normalizedID,
+              pending.instructionRevision == instructionRevision,
+              pending.workingDocumentRevision == workingDocumentRevision,
+              pending.revision == revision, pending.candidateIDs.contains(candidateID),
+              pending.reference == (bindingRecord["reference"] as? String),
+              pending.requirementID == (bindingRecord["requirement_id"] as? String),
+              pending.scope == (bindingRecord["scope"] as? String),
+              instructionRevision == self.instructionRevision,
+              workingDocumentRevision == self.workingDocumentRevision,
+              revision == targetBindingRevision + 1 else { throw TargetChoiceError.stale }
+        guard bindingRecord["candidate_id"] as? String == candidateID,
+              bindingRecord["reference"] as? String != nil,
+              bindingRecord["requirement_id"] as? String != nil,
+              let scope = bindingRecord["scope"] as? String,
+              ["source", "destination", "document"].contains(scope),
+              let kind = bindingRecord["kind"] as? String,
+              ["file", "folder", "document"].contains(kind),
+              Self.integer(bindingRecord["binding_revision"]) == Int64(revision),
+              bindingRecord["binding"] is [String: Any],
+              let label = bindingRecord["label"] as? String,
+              !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              label.utf8.count <= 160,
+              let detail = bindingRecord["detail"] as? String,
+              detail.utf8.count <= 480 else { throw TargetChoiceError.stale }
+        if (scope == "document" && kind != "document") ||
+            (scope == "destination" && !["file", "folder"].contains(kind)) ||
+            (scope == "source" && kind == "document") { throw TargetChoiceError.stale }
+        if kind == "file" || kind == "folder" {
+            guard Self.fileIdentityMatches(bindingRecord["binding"] as? [String: Any] ?? [:], kind: kind) else {
+                throw TargetChoiceError.stale
+            }
+        }
+        let installedDocumentRevision = bindingRecord["scope"] as? String == "document"
+            ? workingDocumentRevision + 1 : workingDocumentRevision
+        let installedDocument = try install(installedDocumentRevision)
+        if bindingRecord["scope"] as? String == "document" {
+            guard installedDocument?["state"] as? String == "active",
+                  installedDocument?["revision"] as? Int == Int(installedDocumentRevision) else {
+                throw WorkingDocumentUpdateError.unavailable
+            }
+            self.workingDocumentRevision = installedDocumentRevision
+            appliedWorkingDocumentUpdates[normalizedID] = installedDocumentRevision
+        }
+        targetBindings.removeAll {
+            $0["scope"] as? String == bindingRecord["scope"] as? String &&
+            $0["reference"] as? String == bindingRecord["reference"] as? String &&
+            $0["requirement_id"] as? String == bindingRecord["requirement_id"] as? String
+        }
+        targetBindings.append(bindingRecord)
+        targetBindingRevision = revision
+        pendingTargetChoice = nil
+        if appliedTargetChoices[normalizedID] == nil { appliedTargetChoiceOrder.append(normalizedID) }
+        appliedTargetChoices[normalizedID] = revision
+        appliedTargetChoiceInstructionRevisions[normalizedID] = instructionRevision
+        appliedTargetChoiceWorkingDocumentRevisions[normalizedID] = workingDocumentRevision
+        appliedTargetChoiceFingerprints[normalizedID] = fingerprint
+        if let installedDocument { appliedTargetChoiceDocuments[normalizedID] = installedDocument }
+        while appliedTargetChoiceOrder.count > 64 {
+            let oldest = appliedTargetChoiceOrder.removeFirst()
+            appliedTargetChoices.removeValue(forKey: oldest)
+            appliedTargetChoiceInstructionRevisions.removeValue(forKey: oldest)
+            appliedTargetChoiceWorkingDocumentRevisions.removeValue(forKey: oldest)
+            appliedTargetChoiceFingerprints.removeValue(forKey: oldest)
+            appliedTargetChoiceDocuments.removeValue(forKey: oldest)
+        }
+        return installedDocument
+    }
+
+    func appliedTargetChoiceRevision(id: String) -> UInt64? {
+        lock.lock(); defer { lock.unlock() }
+        return appliedTargetChoices[id.lowercased()]
+    }
+
+    /// Check the exact choice projection and its current filesystem identity at
+    /// the same serialized boundary as native action dispatch.
+    func validateTargetBindings(revision: UInt64, supplied: [[String: Any]],
+                                action: [String: Any], requirementIDs: [String],
+                                intendedTarget: String?) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard value == .running || value == .paused else { throw CancellationError() }
+        guard pendingTargetChoice == nil, pendingCorrection == nil, pendingWorkingDocument == nil,
+              revision == targetBindingRevision,
+              let expected = Self.canonicalJSON(targetBindings),
+              let actual = Self.canonicalJSON(supplied), expected == actual else {
+            throw TargetChoiceError.superseded
+        }
+        guard requirementIDs.count <= 32,
+              Set(requirementIDs).count == requirementIDs.count,
+              requirementIDs.allSatisfy({ $0.range(of: #"^r[1-9][0-9]{0,3}$"#, options: .regularExpression) != nil }) else {
+            throw TargetChoiceError.conflict
+        }
+        if !targetBindings.isEmpty && requirementIDs.isEmpty {
+            throw TargetChoiceError.conflict
+        }
+        for record in targetBindings where requirementIDs.contains(record["requirement_id"] as? String ?? "") {
+            let scope = record["scope"] as? String ?? ""
+            let kind = record["kind"] as? String ?? ""
+            let binding = record["binding"] as? [String: Any] ?? [:]
+            let path = binding["path"] as? String
+            let operands = Self.actionPathOperands(action, scope: scope)
+            if !operands.isEmpty, let path,
+               !operands.contains(where: { Self.pathMatches($0, candidate: path, kind: kind, scope: scope) }) {
+                throw TargetChoiceError.conflict
+            }
+            let labels = [record["label"] as? String, record["reference"] as? String]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+            let target = intendedTarget?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            guard !target.isEmpty, labels.contains(where: { target.contains($0) }) else {
+                throw TargetChoiceError.conflict
+            }
+            if kind == "file" || kind == "folder" {
+                guard Self.fileIdentityMatches(binding, kind: kind) else { throw TargetChoiceError.stale }
+                if action["type"] as? String == "run_command" {
+                    // Arbitrary shell source/argv cannot be proven to use the
+                    // selected operand. Only typed deterministic operations
+                    // participate in a file/folder binding.
+                    guard let operation = action["operation"] as? [String: Any] else {
+                        throw TargetChoiceError.opaqueCommand
+                    }
+                    let commandOperands = Self.actionPathOperands(operation, scope: scope)
+                    guard !commandOperands.isEmpty else { throw TargetChoiceError.opaqueCommand }
+                    let path = binding["path"] as? String ?? ""
+                    guard commandOperands.contains(where: { Self.pathMatches($0, candidate: path, kind: kind, scope: scope) }) else {
+                        throw TargetChoiceError.conflict
+                    }
+                }
+            } else if kind == "document" {
+                if action["type"] as? String == "run_command" {
+                    throw TargetChoiceError.opaqueCommand
+                }
+                // A document binding identifies a window, not an arbitrary
+                // filesystem operand. Such operands need their own grounded
+                // file/folder binding and may not silently redirect the work.
+                if !operands.isEmpty { throw TargetChoiceError.conflict }
+            }
+        }
+    }
+
+    private static func canonicalJSON(_ value: Any) -> Data? {
+        try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .fragmentsAllowed])
+    }
+
+    private static func actionPathOperands(_ action: [String: Any], scope: String) -> [String] {
+        let keys: Set<String> = scope == "destination"
+            ? ["path", "destination", "output_path"]
+            : ["path", "source", "input_path"]
+        var values: [String] = []
+        for key in keys {
+            if let value = action[key] as? String,
+               !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { values.append(value) }
+        }
+        return values
+    }
+
+    private static func pathMatches(_ operand: String, candidate: String, kind: String, scope: String) -> Bool {
+        let expanded = (operand as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else { return false }
+        let operandURL = URL(fileURLWithPath: expanded).standardizedFileURL
+        let candidateURL = URL(fileURLWithPath: candidate).standardizedFileURL
+        if scope == "destination" {
+            if kind == "file" { return operandURL.path == candidateURL.path }
+            let parent = operandURL.deletingLastPathComponent().path
+            return parent == candidateURL.path || parent.hasPrefix(candidateURL.path.hasSuffix("/") ? candidateURL.path : candidateURL.path + "/")
+        }
+        if operandURL.path == candidateURL.path { return true }
+        return kind == "folder" && operandURL.path.hasPrefix(candidateURL.path.hasSuffix("/") ? candidateURL.path : candidateURL.path + "/")
+    }
+
+    private static func fileIdentityMatches(_ binding: [String: Any], kind: String) -> Bool {
+        guard let rawPath = binding["path"] as? String, rawPath.hasPrefix("/"),
+              let identity = binding["identity"] as? [String: Any],
+              let expectedDevice = integer(identity["device"]),
+              let expectedInode = integer(identity["inode"]),
+              let expectedMode = integer(identity["mode"]) else { return false }
+        let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        var metadata = stat()
+        guard Darwin.lstat(path, &metadata) == 0,
+              metadata.st_mode & S_IFMT == mode_t(expectedMode),
+              (kind == "folder" ? metadata.st_mode & S_IFMT == S_IFDIR : metadata.st_mode & S_IFMT == S_IFREG),
+              Int64(metadata.st_dev) == expectedDevice, Int64(metadata.st_ino) == expectedInode else { return false }
+        if kind == "file" {
+            guard let expectedSize = integer(identity["size"]), let expectedModified = integer(identity["mtime_ns"]) else { return false }
+            let actualModified = Int64(metadata.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(metadata.st_mtimespec.tv_nsec)
+            return Int64(metadata.st_size) == expectedSize && actualModified == expectedModified
+        }
+        return true
+    }
+
+    static func isCurrentFileChoice(binding: [String: Any], kind: String) -> Bool {
+        fileIdentityMatches(binding, kind: kind)
+    }
+
+    private static func integer(_ value: Any?) -> Int64? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite, number.doubleValue.rounded(.towardZero) == number.doubleValue else { return nil }
+        return Int64(number.stringValue)
     }
 
     func stopBoundaries(for revision: UInt64) throws -> [StopBoundaryRecord] {
@@ -196,7 +469,7 @@ final class TaskLease: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         if completionClaimed { return revision == instructionRevision }
         guard (value == .running || value == .paused), pendingCorrection == nil,
-              pendingWorkingDocument == nil,
+              pendingWorkingDocument == nil, pendingTargetChoice == nil,
               revision == instructionRevision, !completionClaimed else { return false }
         completionClaimed = true
         return true
@@ -206,16 +479,16 @@ final class TaskLease: @unchecked Sendable {
     /// pending state from this same critical section prevents a rollback from
     /// being mistaken for a permanently rejected completion.
     func claimCompletionGate(instructionRevision revision: UInt64)
-        -> (accepted: Bool, pendingCorrection: Bool, pendingWorkingDocument: Bool) {
+        -> (accepted: Bool, pendingCorrection: Bool, pendingWorkingDocument: Bool, pendingTargetChoice: Bool) {
         lock.lock(); defer { lock.unlock() }
-        if completionClaimed { return (revision == instructionRevision, false, false) }
-        guard value == .running || value == .paused else { return (false, false, false) }
-        if pendingCorrection != nil || pendingWorkingDocument != nil {
-            return (false, pendingCorrection != nil, pendingWorkingDocument != nil)
+        if completionClaimed { return (revision == instructionRevision, false, false, false) }
+        guard value == .running || value == .paused else { return (false, false, false, false) }
+        if pendingCorrection != nil || pendingWorkingDocument != nil || pendingTargetChoice != nil {
+            return (false, pendingCorrection != nil, pendingWorkingDocument != nil, pendingTargetChoice != nil)
         }
-        guard revision == instructionRevision else { return (false, false, false) }
+        guard revision == instructionRevision else { return (false, false, false, false) }
         completionClaimed = true
-        return (true, false, false)
+        return (true, false, false, false)
     }
     func pause() { lock.lock(); defer { lock.unlock() }; if value == .running { value = .paused; suspensions += 1 } }
     func resume() {
@@ -355,6 +628,7 @@ enum TaskOwnership {
     @TaskLocal static var instructionRevision: UInt64?
     @TaskLocal static var workingDocumentRevision: UInt64?
     @TaskLocal static var stopBoundaryPreflight: (([String: Any], [StopBoundaryRecord]) throws -> Void)?
+    @TaskLocal static var targetChoicePreflight: (([String: Any]) throws -> Void)?
     static func check() throws { try current?.check(); try LocalOperationBudget.check(); try Task.checkCancellation() }
     static func checkpoint() async throws {
         try LocalOperationBudget.check(); try await current?.checkpoint(); try LocalOperationBudget.check()
@@ -391,6 +665,9 @@ enum TaskOwnership {
                             try stopBoundaryPreflight(action, boundaries)
                         }
                     }
+                    if !alreadyDispatched, let targetChoicePreflight, let action = actionReceipt.action {
+                        try targetChoicePreflight(action)
+                    }
                     // Receipt dispatch and delivery share the lease's atomic
                     // boundary. Failed delivery after this point is uncertain.
                     try actionReceipt.dispatched()
@@ -416,6 +693,35 @@ enum TaskInstructionCorrectionError: LocalizedError {
         switch self {
         case .stale: "This correction is no longer current."
         case .superseded: "This action was planned before the latest instruction update."
+        }
+    }
+}
+
+enum TargetChoiceError: LocalizedError {
+    case stale
+    case superseded
+    case conflict
+    case opaqueCommand
+
+    var code: String {
+        switch self {
+        case .stale: "target_choice_stale"
+        case .superseded: "instruction_superseded"
+        case .conflict: "target_choice_conflict"
+        case .opaqueCommand: "target_choice_opaque_command"
+        }
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .stale:
+            return "The selected target changed. Inspect again before continuing."
+        case .superseded:
+            return "The target choice was superseded by a newer task instruction or document selection."
+        case .conflict:
+            return "This action conflicts with the target selected for its requirement. Inspect the operands and reconsider."
+        case .opaqueCommand:
+            return "This command cannot be tied to the selected target safely. Use an inspectable operation or reconsider the target."
         }
     }
 }

@@ -29,11 +29,12 @@ class ExecutionGraphTests(unittest.TestCase):
             'starting': {'observing', 'recovering', 'draining'},
             'observing': {'planning', 'waiting_input', 'reconciling', 'executing', 'verifying', 'draining'},
             'planning': {'reconciling', 'recovering', 'draining'},
-            'reconciling': {'observing', 'executing', 'waiting_input', 'verifying', 'recovering', 'draining'},
+            'reconciling': {'observing', 'executing', 'waiting_input', 'waiting_choice', 'verifying', 'recovering', 'draining'},
             'executing': {'reconciling', 'recovering', 'draining'},
             'waiting_input': {'reconciling', 'recovering', 'draining'},
+            'waiting_choice': {'observing', 'reconciling', 'recovering', 'draining'},
             'verifying': {'observing', 'recovering', 'draining'},
-            'recovering': {'starting', 'planning', 'verifying', 'reconciling', 'executing', 'draining'},
+            'recovering': {'starting', 'planning', 'verifying', 'reconciling', 'executing', 'waiting_choice', 'draining'},
             'draining': {'finished'}, 'finished': set(),
         }
         for source, destination in itertools.product(Phase, repeat=2):

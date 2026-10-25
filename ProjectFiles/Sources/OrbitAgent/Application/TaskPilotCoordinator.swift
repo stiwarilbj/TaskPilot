@@ -35,6 +35,7 @@ final class TaskPilotCoordinator: ObservableObject {
         case running
         case paused
         case waitingForUser
+        case waitingForChoice
         case takingOver
         case stopping
         case failed
@@ -113,6 +114,8 @@ final class TaskPilotCoordinator: ObservableObject {
     @Published private(set) var taskOutput: AgentTaskOutput?
     @Published private(set) var userInputRequest: AgentUserInputRequest?
     @Published var userInputDraft = ""
+    @Published private(set) var targetChoiceRequest: AgentTargetChoiceRequest?
+    @Published private(set) var targetChoiceNotice: String?
     @Published private(set) var queuedTasks: [QueuedAgentTask] = []
     @Published private(set) var queuedTaskEditSession: QueuedTaskEditSession?
     @Published private(set) var requestedQueueTaskID: UUID?
@@ -183,6 +186,7 @@ final class TaskPilotCoordinator: ObservableObject {
     private var lastTaskProgressRevision: UInt64 = 0
     private var lastTaskWaitRevision: UInt64 = 0
     private var correctionNoticeTask: Task<Void, Never>?
+    private var targetChoiceNoticeTask: Task<Void, Never>?
 
     // MARK: - Derived readiness
 
@@ -285,7 +289,7 @@ final class TaskPilotCoordinator: ObservableObject {
     }
 
     var isActive: Bool {
-        [.running, .paused, .waitingForUser, .takingOver, .stopping].contains(runState)
+        [.running, .paused, .waitingForUser, .waitingForChoice, .takingOver, .stopping].contains(runState)
     }
 
     var canSelectWorkingDocument: Bool {
@@ -1387,6 +1391,9 @@ final class TaskPilotCoordinator: ObservableObject {
         currentTaskRequest = request
         workingDocumentPresentation = nil
         workingDocumentNotice = nil
+        targetChoiceRequest = nil
+        targetChoiceNotice = nil
+        targetChoiceNoticeTask?.cancel()
         pendingWorkingDocumentUpdateID = nil
         workingDocumentPresentationBeforeUpdate = nil
         currentTaskStartedAt = authorization.startedAt
@@ -1509,11 +1516,27 @@ final class TaskPilotCoordinator: ObservableObject {
         case .paused:
             runtime.resume()
             agentCursor.hide()
-            runState = .running
-            updateTaskWaitLocally(phase: .observing, waitingFor: "Continuing the task",
-                                  attention: .none)
+            if targetChoiceRequest?.state == .pending || targetChoiceRequest?.state == .applying {
+                runState = .waitingForChoice
+                updateTaskWaitLocally(phase: .reconciling, waitingFor: "Waiting for your target choice",
+                                      attention: .none)
+                status = targetChoiceRequest?.state == .applying
+                    ? "Applying selection…" : "Waiting for your target choice"
+            } else {
+                runState = .running
+                updateTaskWaitLocally(phase: .observing, waitingFor: "Continuing the task",
+                                      attention: .none)
+                status = "Resuming on the agent screen…"
+            }
             setTaskProgressLifecycle(.running)
-            status = "Resuming on the agent screen…"
+        case .waitingForChoice:
+            runtime.pause()
+            agentCursor.hide()
+            runState = .paused
+            updateTaskWaitLocally(phase: .paused, waitingFor: "TaskPilot is paused",
+                                  attention: .resume)
+            setTaskProgressLifecycle(.paused)
+            status = "Paused — choose a target or resume when ready"
         default:
             break
         }
@@ -1565,6 +1588,145 @@ final class TaskPilotCoordinator: ObservableObject {
         (currentTaskAuthorization?.corrections ?? []).filter(\.applied)
     }
 
+    var canChooseTargetCandidate: Bool {
+        guard let request = targetChoiceRequest, request.state == .pending,
+              let lease = currentTaskLease, lease.id == request.taskGenerationID,
+              isActive, runState != .stopping,
+              lease.currentInstructionRevision == request.instructionRevision,
+              lease.currentWorkingDocumentRevision == request.workingDocumentRevision,
+              !lease.hasPendingInstructionCorrection,
+              !lease.hasPendingWorkingDocumentUpdate,
+              pendingWorkingDocumentUpdateID == nil,
+              lease.currentTargetBindingRevision + 1 == request.bindingRevision else { return false }
+        return lease.state == .running || lease.state == .paused
+    }
+
+    var canInspectTargetChoiceAgain: Bool {
+        guard let request = targetChoiceRequest, request.state == .pending,
+              request.inspectAgainAllowed, isActive, runState != .stopping,
+              currentTaskLease?.id == request.taskGenerationID,
+              currentTaskLease?.hasPendingInstructionCorrection == false,
+              currentTaskLease?.hasPendingWorkingDocumentUpdate == false,
+              pendingWorkingDocumentUpdateID == nil else { return false }
+        return currentTaskLease?.state == .running || currentTaskLease?.state == .paused
+    }
+
+    func chooseTargetCandidate(_ candidateID: String, requestID: String) {
+        guard canChooseTargetCandidate, var request = targetChoiceRequest,
+              request.id == requestID,
+              request.candidates.contains(where: { $0.id == candidateID }) else { return }
+        request.state = .applying
+        targetChoiceRequest = request
+        targetChoiceNotice = nil
+        if runState == .waitingForChoice { status = "Applying selection…" }
+        guard runtime.submitTargetChoice(request: request, candidateID: candidateID) else {
+            request.state = .pending
+            targetChoiceRequest = request
+            showTargetChoiceNotice("That choice is no longer current. Inspect the targets again.")
+            return
+        }
+    }
+
+    func inspectTargetChoiceAgain(requestID: String) {
+        guard let request = targetChoiceRequest, request.id == requestID,
+              request.state == .pending, canInspectTargetChoiceAgain,
+              runtime.submitTargetChoice(request: request, inspectAgain: true) else { return }
+        targetChoiceRequest = nil
+        if runState == .waitingForChoice {
+            runState = .running
+            updateTaskWaitLocally(phase: .observing, waitingFor: "Inspecting possible targets again",
+                                  attention: .none)
+            status = "Inspecting target again…"
+        } else if runState == .paused {
+            status = "Paused — refreshing possible targets locally"
+        }
+        showTargetChoiceNotice("Inspecting possible targets again…")
+    }
+
+    private func showTargetChoiceNotice(_ message: String) {
+        targetChoiceNoticeTask?.cancel()
+        targetChoiceNotice = message
+        let generationID = currentTaskLease?.id
+        targetChoiceNoticeTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(4))
+            guard let self, !Task.isCancelled, self.currentTaskLease?.id == generationID,
+                  self.targetChoiceNotice == message else { return }
+            self.targetChoiceNotice = nil
+        }
+    }
+
+    private func clearTargetChoiceState() {
+        targetChoiceNoticeTask?.cancel()
+        targetChoiceNoticeTask = nil
+        targetChoiceRequest = nil
+        targetChoiceNotice = nil
+    }
+
+    private func acceptTargetChoice(requestID: String, candidateID: String, label: String, detail: String,
+                                    generationID: String, bindingRevision: UInt64,
+                                    workingDocumentRevision: UInt64, workingDocument: [String: Any]?) {
+        guard var request = targetChoiceRequest, request.id == requestID,
+              request.taskGenerationID == generationID, request.state == .applying,
+              request.bindingRevision == bindingRevision,
+              request.instructionRevision == currentTaskLease?.currentInstructionRevision,
+              currentTaskLease?.currentTargetBindingRevision == bindingRevision,
+              currentTaskLease?.currentWorkingDocumentRevision == workingDocumentRevision,
+              let candidate = request.candidates.first(where: { $0.id == candidateID }) else { return }
+        if candidate.kind == .document {
+            guard let workingDocument,
+                  workingDocument["state"] as? String == "active",
+                  (workingDocument["revision"] as? Int) == Int(workingDocumentRevision),
+                  let application = workingDocument["application"] as? String,
+                  let title = workingDocument["title"] as? String,
+                  title == candidate.label,
+                  candidate.detail == application + ((workingDocument["location"] as? String).map { " — \($0)" } ?? "") else {
+                status = "The selected document could not be confirmed. Stopping safely."
+                stop()
+                return
+            }
+            workingDocumentPresentation = WorkingDocumentPresentation(
+                generationID: generationID, revision: workingDocumentRevision,
+                application: application, title: title,
+                location: workingDocument["location"] as? String, state: .active)
+            workingDocumentNotice = nil
+        } else {
+            guard workingDocument == nil else {
+                status = "The selected file or folder response did not match. Stopping safely."
+                stop()
+                return
+            }
+        }
+        request.state = .applied
+        request.appliedLabel = label
+        request.appliedDetail = detail
+        request.notice = "Using \(label) — \(detail)"
+        targetChoiceRequest = request
+        targetChoiceNotice = request.notice
+        targetChoiceNoticeTask?.cancel()
+        if runState == .waitingForChoice {
+            runState = .running
+            updateTaskWaitLocally(phase: .observing, waitingFor: "Continuing with the selected target",
+                                  attention: .none)
+            setTaskProgressLifecycle(.running)
+            status = request.notice ?? "Target selected"
+        } else if runState == .paused {
+            status = "Paused — target selection saved; resume when ready"
+        } else if runState == .takingOver {
+            status = "Manual control remains active; target selection is ready"
+        } else if runState == .waitingForUser {
+            status = "Secure input is still required; target selection is ready"
+        }
+        let success = request.notice
+        targetChoiceNoticeTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(4))
+            guard let self, !Task.isCancelled, self.currentTaskLease?.id == generationID,
+                  self.targetChoiceRequest?.id == requestID,
+                  self.targetChoiceRequest?.state == .applied else { return }
+            self.targetChoiceRequest = nil
+            if self.targetChoiceNotice == success { self.targetChoiceNotice = nil }
+        }
+    }
+
     func openTaskCorrection() {
         guard canOpenTaskCorrection, let lease = currentTaskLease else { return }
         if taskCorrectionSession?.generationID == lease.id { return }
@@ -1590,6 +1752,8 @@ final class TaskPilotCoordinator: ObservableObject {
             return
         }
         workingDocumentPresentationBeforeUpdate = workingDocumentPresentation
+        targetChoiceRequest = nil
+        targetChoiceNotice = nil
         pendingWorkingDocumentUpdateID = update.id
         if let candidate {
             workingDocumentPresentation = WorkingDocumentPresentation(
@@ -1656,6 +1820,7 @@ final class TaskPilotCoordinator: ObservableObject {
         }
         pendingWorkingDocumentUpdateID = nil
         workingDocumentPresentationBeforeUpdate = nil
+        targetChoiceRequest = nil
         if var request = userInputRequest, request.taskGenerationID == generationID {
             request.workingDocumentRevision = revision
             userInputRequest = request
@@ -1744,6 +1909,9 @@ final class TaskPilotCoordinator: ObservableObject {
                   $0.id.uuidString.lowercased() == id && $0.revision == revision
               }) else { return }
         let wasWaitingForSecureInput = runState == .waitingForUser
+        targetChoiceRequest = nil
+        targetChoiceNotice = nil
+        targetChoiceNoticeTask?.cancel()
         authorization.corrections?[index].applied = true
         currentTaskAuthorization = authorization
         taskProgressMap?.originalRequest = authorization.effectiveSubmission.request
@@ -1830,11 +1998,11 @@ final class TaskPilotCoordinator: ObservableObject {
             return
         }
         guard let display = backgroundAgentDisplay else { return }
-        if runState == .running { runtime.pause() }
+        if runState == .running || runState == .waitingForChoice { runtime.pause() }
         agentCursor.hide()
         takeoverPlacements = accessibility.moveWindowsForTakeover(from: display)
         windowsPresentedOnMain = !takeoverPlacements.isEmpty
-        if runState == .running || runState == .paused {
+        if runState == .running || runState == .paused || runState == .waitingForChoice {
             runState = .takingOver
             updateTaskWaitLocally(phase: .paused, waitingFor: "TaskPilot is paused",
                                   attention: .resume)
@@ -1899,6 +2067,51 @@ final class TaskPilotCoordinator: ObservableObject {
             acceptTaskWait(snapshot)
         case .taskDestination(let snapshot):
             acceptTaskDestination(snapshot)
+        case .targetChoiceRequired(let request):
+            guard let lease = currentTaskLease,
+                  lease.id == request.taskGenerationID,
+                  lease.state == .running || lease.state == .paused,
+                  request.instructionRevision == lease.currentInstructionRevision,
+                  request.workingDocumentRevision == lease.currentWorkingDocumentRevision,
+                  request.bindingRevision == lease.currentTargetBindingRevision + 1,
+                  pendingWorkingDocumentUpdateID == nil,
+                  taskCorrectionSession?.state != .pending,
+                  runState != .stopping else { return }
+            targetChoiceRequest = request
+            targetChoiceNotice = nil
+            targetChoiceNoticeTask?.cancel()
+            if runState == .running {
+                runState = .waitingForChoice
+                updateTaskWaitLocally(phase: .reconciling, waitingFor: "Waiting for your target choice",
+                                      attention: .none)
+                status = "Which target should I use?"
+            }
+        case let .targetChoiceApplied(requestID, candidateID, label, detail, generationID,
+                                      bindingRevision, workingDocumentRevision, workingDocument):
+            acceptTargetChoice(requestID: requestID, candidateID: candidateID, label: label, detail: detail,
+                generationID: generationID, bindingRevision: bindingRevision,
+                workingDocumentRevision: workingDocumentRevision, workingDocument: workingDocument)
+        case let .targetChoiceRejected(requestID, generationID, bindingRevision,
+                                       instructionRevision, workingDocumentRevision, message):
+            guard let request = targetChoiceRequest, request.id == requestID,
+                  request.taskGenerationID == generationID,
+                  request.bindingRevision == bindingRevision,
+                  request.instructionRevision == instructionRevision,
+                  request.workingDocumentRevision == workingDocumentRevision,
+                  currentTaskLease?.id == generationID,
+                  currentTaskLease?.currentInstructionRevision == instructionRevision,
+                  currentTaskLease?.currentWorkingDocumentRevision == workingDocumentRevision,
+                  currentTaskLease?.currentTargetBindingRevision == bindingRevision - 1 else { return }
+            targetChoiceRequest = nil
+            showTargetChoiceNotice(message)
+            if runState == .waitingForChoice {
+                runState = .running
+                updateTaskWaitLocally(phase: .observing, waitingFor: "Rechecking the selected target",
+                                      attention: .none)
+                status = "Rechecking possible targets…"
+            } else if runState == .paused {
+                status = "Paused — the target changed; resume to inspect again"
+            }
         case let .instructionCorrectionApplied(id, generationID, revision):
             acceptInstructionCorrection(id: id, generationID: generationID, revision: revision)
         case let .workingDocumentApplied(id, generationID, revision, document):
@@ -1922,6 +2135,10 @@ final class TaskPilotCoordinator: ObservableObject {
             pendingWorkingDocumentUpdateID = nil
             workingDocumentPresentation = workingDocumentPresentationBeforeUpdate
             workingDocumentPresentationBeforeUpdate = nil
+            // The document update superseded any in-flight target question.
+            // Its rejection does not restore stale candidates; normal planning
+            // may ask again from a fresh observation.
+            targetChoiceRequest = nil
             workingDocumentNotice = message
         case .userInputRequired(let request):
             agentCursor.hide()
@@ -1955,6 +2172,7 @@ final class TaskPilotCoordinator: ObservableObject {
                 }
             }
         case .completed(let message):
+            clearTargetChoiceState()
             taskNotification?.cancel(); taskNotification = nil
             agentCursor.hide()
             userInputRequest = nil
@@ -1998,6 +2216,7 @@ final class TaskPilotCoordinator: ObservableObject {
             )
             advanceQueueAfterTerminalTask()
         case .failed(let message):
+            clearTargetChoiceState()
             taskNotification?.cancel(); taskNotification = nil
             geminiAPIKeyVerified = false
             for index in geminiModelChecks.indices {
@@ -2036,6 +2255,7 @@ final class TaskPilotCoordinator: ObservableObject {
             }
             advanceQueueAfterTerminalTask()
         case .stopped:
+            clearTargetChoiceState()
             taskNotification?.cancel(); taskNotification = nil
             agentCursor.hide()
             viewer.clearActionMagnifier()
@@ -2105,7 +2325,7 @@ final class TaskPilotCoordinator: ObservableObject {
     private func acceptTaskWait(_ snapshot: AgentTaskWaitSnapshot) {
         guard currentTaskLease?.id == snapshot.generationID,
               snapshot.revision > lastTaskWaitRevision,
-              [.running, .paused, .waitingForUser, .takingOver, .stopping].contains(runState) else { return }
+              [.running, .paused, .waitingForUser, .waitingForChoice, .takingOver, .stopping].contains(runState) else { return }
         lastTaskWaitRevision = snapshot.revision
         switch runState {
         case .paused, .takingOver:
@@ -2114,6 +2334,9 @@ final class TaskPilotCoordinator: ObservableObject {
         case .waitingForUser:
             updateTaskWaitLocally(phase: .secureInput, waitingFor: "Secure input in TaskPilot",
                                   attention: .secureInput, basedOn: snapshot)
+        case .waitingForChoice:
+            updateTaskWaitLocally(phase: .reconciling, waitingFor: "Waiting for your target choice",
+                                  attention: .none, basedOn: snapshot)
         case .stopping:
             updateTaskWaitLocally(phase: .draining, waitingFor: "Finishing the task safely",
                                   attention: .none, basedOn: snapshot)
@@ -2125,7 +2348,7 @@ final class TaskPilotCoordinator: ObservableObject {
     private func acceptTaskDestination(_ snapshot: AgentTaskDestinationSnapshot) {
         guard currentTaskLease?.id == snapshot.generationID,
               snapshot.instructionRevision == currentTaskLease?.currentInstructionRevision,
-              [.running, .paused, .waitingForUser, .takingOver, .stopping].contains(runState) else { return }
+              [.running, .paused, .waitingForUser, .waitingForChoice, .takingOver, .stopping].contains(runState) else { return }
         if let current = taskDestination, current.generationID == snapshot.generationID,
            snapshot.revision <= current.revision { return }
         taskDestination = snapshot.state == .cleared ? nil : snapshot

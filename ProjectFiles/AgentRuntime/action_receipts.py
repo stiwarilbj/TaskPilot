@@ -28,6 +28,7 @@ class RuntimeInbox:
         self.transport.register(('runtime_configuration', None, None))
         self._instruction_correction_key = None
         self._working_document_update_key = None
+        self._target_choice_key = None
         self._started = False
         self._start_lock = threading.Lock()
 
@@ -80,6 +81,29 @@ class RuntimeInbox:
             raise TransportFailure('transport_unknown_request')
         return self.transport.get(self._working_document_update_key, timeout)
 
+    def register_target_choice(self, request_id, generation):
+        key = ('target_choice_response', request_id, generation)
+        if self._target_choice_key is None:
+            self.transport.register(key)
+            self._target_choice_key = key
+        elif self._target_choice_key != key:
+            raise TransportFailure('transport_generation_mismatch')
+        return key
+
+    @property
+    def target_choice_key(self):
+        return self._target_choice_key
+
+    def take_target_choice(self, timeout=None):
+        if not self._target_choice_key:
+            raise TransportFailure('transport_unknown_request')
+        return self.transport.get(self._target_choice_key, timeout)
+
+    def clear_target_choice(self):
+        key, self._target_choice_key = self._target_choice_key, None
+        if key is not None:
+            self.transport.unregister(key)
+
     def start(self):
         with self._start_lock:
             if not self._started:
@@ -120,6 +144,14 @@ class RuntimeInbox:
             if key != ('working_document_update', None, generation):
                 return
             self.transport.put(key, line + '\n', size=len(frame), terminal=False)
+            return
+        elif kind == 'target_choice_response':
+            if not isinstance(generation, str) or not generation or not isinstance(request_id, str):
+                return
+            key = self._target_choice_key
+            if key != ('target_choice_response', request_id, generation):
+                return
+            self.transport.put(key, line + '\n', size=len(frame), terminal=True)
             return
         elif isinstance(kind, str) and isinstance(request_id, str) and (generation is None or isinstance(generation, str)):
             key = (kind, request_id, generation)

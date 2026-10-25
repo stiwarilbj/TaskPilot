@@ -162,7 +162,7 @@ def response_error(response: str | dict[str, Any]) -> dict[str, Any] | None:
     try: value = json.loads(response) if isinstance(response, str) else response
     except (ValueError, RecursionError): return None
     if not isinstance(value, dict) or any(k in value for k in ('action', 'verified', 'check')): return None
-    if isinstance(value.get('status'), str) and value['status'] in {'act', 'done', 'blocked', 'needs_user'}: return None
+    if isinstance(value.get('status'), str) and value['status'] in {'act', 'done', 'blocked', 'needs_user', 'needs_choice'}: return None
     if isinstance(value.get('error'), (dict, str)): return value
     if value.get('name') == 'FailoverError' or value.get('type') == 'error': return value
     return None

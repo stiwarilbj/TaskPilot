@@ -397,6 +397,30 @@ struct TaskPilotMainView: View {
                 }
             }
 
+            if let choice = model.targetChoiceRequest,
+               choice.taskGenerationID == model.currentTaskGenerationID {
+                TargetChoiceAttentionCardView(
+                    request: choice,
+                    canChoose: model.canChooseTargetCandidate,
+                    canInspectAgain: model.canInspectTargetChoiceAgain,
+                    surface: theme.surfaceColor,
+                    border: theme.borderColor,
+                    accent: accent,
+                    choose: { candidateID in
+                        model.chooseTargetCandidate(candidateID, requestID: choice.id)
+                    },
+                    inspectAgain: { model.inspectTargetChoiceAgain(requestID: choice.id) }
+                )
+                .accessibilityIdentifier("target-choice-attention-card")
+            }
+            if let notice = model.targetChoiceNotice, model.targetChoiceRequest == nil {
+                Label(notice, systemImage: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("target-choice-notice")
+            }
+
             if let destination = model.taskDestination,
                destination.generationID == model.currentTaskGenerationID {
                 TaskDestinationAddressView(snapshot: destination)
@@ -807,6 +831,10 @@ struct TaskPilotMainView: View {
                 .font(.system(size: 18))
         case .waitingForUser:
             Image(systemName: "key.fill")
+                .foregroundStyle(.orange)
+                .font(.system(size: 17))
+        case .waitingForChoice:
+            Image(systemName: "questionmark.folder.fill")
                 .foregroundStyle(.orange)
                 .font(.system(size: 17))
         case .completed:
