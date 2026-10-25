@@ -445,7 +445,7 @@ struct TaskPilotMainView: View {
                             Divider()
                             Menu("Applied corrections") {
                                 ForEach(corrections) { correction in
-                                    Text(correction.request).lineLimit(3)
+                                    Text(correction.displaySummary).lineLimit(3)
                                 }
                             }
                         }
@@ -476,11 +476,45 @@ struct TaskPilotMainView: View {
     }
 
     private func currentRequestText(_ request: String) -> some View {
-        Text(request)
-            .font(.callout.weight(.medium))
-            .lineLimit(2)
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        let progress = model.taskProgressMap
+        guard let progress, progress.generationID == model.currentTaskGenerationID,
+              !progress.exactInputReferences.isEmpty else {
+            return AnyView(Text(request)
+                .font(.callout.weight(.medium))
+                .lineLimit(2)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading))
+        }
+        let generationID = progress.generationID
+        var draft = TaskComposerDraft(submission: AgentTaskSubmission(
+            request: progress.originalRequest, exactInputReferences: progress.exactInputReferences))
+        draft.segments = draft.segments.map { segment in
+            guard case .reference(let reference) = segment,
+                  let occurrenceID = reference.occurrenceID,
+                  let assignment = progress.inputRoles[occurrenceID] else { return segment }
+            let pending = model.pendingTaskInputRoleCorrection
+            return .reference(TaskComposerReference(id: reference.id, kind: reference.kind, value: reference.value,
+                userRole: reference.userRole, presentedRole: assignment.role,
+                roleOrigin: assignment.origin == .user ? .chosen : assignment.origin == .inferred ? .inferred : .unresolved,
+                pendingRole: pending?.generationID == progress.generationID && pending?.occurrenceID == occurrenceID
+                    ? pending?.desiredRole : nil,
+                roleCorrectionPending: pending?.generationID == progress.generationID && pending?.occurrenceID == occurrenceID,
+                occurrenceID: occurrenceID))
+        }
+        return AnyView(TaskRequestComposer(
+            draft: .constant(draft),
+            fontSize: TaskPilotAppearancePreferences.clampedInputFontSize(inputFontSize),
+            focusRequested: false,
+            onFocusChanged: { _ in },
+            accessibilityLabel: "Current task request with exact input purposes",
+            isReadOnly: true,
+            canChangeRole: model.canApplyInputRoleCorrection,
+            hasExistingCorrection: model.hasExistingTaskCorrection,
+            onRoleCorrection: { occurrenceID, role in
+                model.applyTaskInputRoleCorrection(generationID: generationID, occurrenceID: occurrenceID, role: role)
+            },
+            onContinueCorrection: { model.openTaskCorrection() }
+        ).frame(minHeight: 38, maxHeight: 72))
     }
 
     private func workingDocumentReference(_ document: WorkingDocumentPresentation) -> some View {

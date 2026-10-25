@@ -72,6 +72,7 @@ enum RuntimeEvent {
     case targetChoiceRejected(requestID: String, taskGenerationID: String, bindingRevision: UInt64,
                               instructionRevision: UInt64, workingDocumentRevision: UInt64, message: String)
     case taskProgress(AgentTaskProgressSnapshot)
+    case taskInputRoles(AgentTaskInputRolesSnapshot)
     case taskContinuationCheckpoint(AgentTaskContinuationCheckpoint)
     case taskWait(AgentTaskWaitSnapshot)
     case taskDestination(AgentTaskDestinationSnapshot)
@@ -142,6 +143,9 @@ final class AgentRuntimeProcess {
         var transportFailure: String?
         var receiptIDs: Set<String> = []
         var progressRevision: UInt64 = 0
+        var inputRolesRevision: UInt64 = 0
+        var exactInputReferences: [AgentTaskInputReference]
+        var taskRequest: String
         var continuationRevision: UInt64 = 0
         var waitRevision: UInt64 = 0
         var destinationRevision: UInt64 = 0
@@ -170,8 +174,12 @@ final class AgentRuntimeProcess {
         var terminalDelivered = false
         var drainStarted: ContinuousClock.Instant?
         var drainReported = false
-        init(lease: TaskLease, process: SubprocessSupervisor, input: Pipe, handler: (@MainActor (RuntimeEvent) -> Void)?) {
+        init(lease: TaskLease, process: SubprocessSupervisor, input: Pipe,
+             taskRequest: String, exactInputReferences: [AgentTaskInputReference],
+             handler: (@MainActor (RuntimeEvent) -> Void)?) {
             self.lease = lease; self.process = process; self.input = input; self.handler = handler
+            self.taskRequest = taskRequest
+            self.exactInputReferences = exactInputReferences
             // Decode only on the owning runtime's serialized I/O queue.
             metricsDecoder = JSONDecoder()
             metricsDecoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -239,7 +247,8 @@ final class AgentRuntimeProcess {
         process.standardOutput = output
         process.standardError = error
 
-        let run = Invocation(lease: lease, process: process, input: input, handler: onEvent)
+        let run = Invocation(lease: lease, process: process, input: input,
+                             taskRequest: task, exactInputReferences: exactInputReferences, handler: onEvent)
         run.startupSpan = startup
         startupTransferred = true
         ioQueue.sync {
@@ -911,6 +920,13 @@ final class AgentRuntimeProcess {
                   progress.revision > run.progressRevision else { return }
             run.progressRevision = progress.revision
             emit(.taskProgress(progress), for: run)
+        case "task_input_roles":
+            guard let roles = AgentTaskInputRolesSnapshot.parse(message, generationID: run.lease.id,
+                  instructionRevision: run.lease.currentInstructionRevision,
+                  exactReferences: run.exactInputReferences),
+                  roles.revision > run.inputRolesRevision else { return }
+            run.inputRolesRevision = roles.revision
+            emit(.taskInputRoles(roles), for: run)
         case "task_continuation_checkpoint":
             guard let checkpoint = AgentTaskContinuationCheckpoint.parse(message, generationID: run.lease.id),
                   checkpoint.instructionRevision == run.lease.currentInstructionRevision,
@@ -936,6 +952,33 @@ final class AgentRuntimeProcess {
             do {
                 guard let correction = run.corrections[id] else { throw TaskInstructionCorrectionError.stale }
                 try run.lease.applyInstructionCorrection(id: id, revision: revision, correction: correction)
+                var updatedReferences = run.exactInputReferences
+                if let amendment = correction.roleAmendment {
+                    guard let index = updatedReferences.firstIndex(where: { $0.id == amendment.occurrenceID &&
+                        $0.kind == amendment.kind && $0.utf8Start == amendment.utf8Start &&
+                        $0.utf8Length == amendment.utf8Length && $0.value == amendment.value }) else {
+                        throw TaskInstructionCorrectionError.stale
+                    }
+                    let reference = updatedReferences[index]
+                    updatedReferences[index] = AgentTaskInputReference(kind: reference.kind,
+                        utf8Start: reference.utf8Start, utf8Length: reference.utf8Length,
+                        value: reference.value, userRole: amendment.role)
+                }
+                var updatedRequest = run.taskRequest
+                if !correction.request.isEmpty || !correction.exactInputReferences.isEmpty {
+                    let correctionHeader = "\n\nUser correction: "
+                    let correctionStart = run.taskRequest.utf8.count + correctionHeader.utf8.count
+                    updatedReferences.append(contentsOf: correction.exactInputReferences.map {
+                        AgentTaskInputReference(version: $0.version, kind: $0.kind,
+                            utf8Start: correctionStart + $0.utf8Start, utf8Length: $0.utf8Length,
+                            value: $0.value, userRole: $0.userRole)
+                    })
+                    updatedRequest += correctionHeader + correction.request
+                }
+                try AgentTaskSubmission(request: updatedRequest, exactInputReferences: updatedReferences)
+                    .validateExactInputReferences()
+                run.taskRequest = updatedRequest
+                run.exactInputReferences = updatedReferences
                 if let choice = run.pendingTargetChoice { rememberResolvedTargetChoice(choice, for: run) }
                 run.pendingTargetChoice = nil
                 run.targetChoiceCandidates.removeAll()
@@ -1141,6 +1184,7 @@ final class AgentRuntimeProcess {
         case .modelHealth(let model, let state, let detail): bytes = model.utf8.count + state.utf8.count + detail.utf8.count
         case .userInputRequired(let request): bytes = request.title.utf8.count + request.message.utf8.count
         case .taskProgress(let progress): bytes = progress.estimatedByteCount
+        case .taskInputRoles(let roles): bytes = roles.estimatedByteCount
         case .taskContinuationCheckpoint(let checkpoint): bytes = checkpoint.estimatedByteCount
         case .taskWait(let wait):
             bytes = wait.lastConfirmed.utf8.count + wait.waitingFor.utf8.count + 256
@@ -1151,6 +1195,7 @@ final class AgentRuntimeProcess {
             // Progress is a replaceable presentation projection. Dropping it
             // under pressure must never turn into a task transport failure.
             if case .taskProgress = event { return }
+            if case .taskInputRoles = event { return }
             if case .taskWait = event { return }
             failTransport("transport_event_limit", for: run); return
         }

@@ -126,6 +126,8 @@ final class TaskPilotCoordinator: ObservableObject {
     @Published private(set) var currentTaskRequest: String?
     @Published private(set) var taskCorrectionSession: TaskCorrectionSession?
     @Published private(set) var taskProgressMap: TaskProgressMap?
+    @Published private(set) var taskInputRolesSnapshot: AgentTaskInputRolesSnapshot?
+    @Published private(set) var pendingTaskInputRoleCorrection: PendingTaskInputRoleCorrection?
     @Published private(set) var taskChangeLensSnapshots: [String: AgentTaskChangeLensSnapshot] = [:]
     @Published private(set) var taskWaitDetails: AgentTaskWaitSnapshot?
     @Published private(set) var taskDestination: AgentTaskDestinationSnapshot?
@@ -1434,6 +1436,8 @@ final class TaskPilotCoordinator: ObservableObject {
         pendingContinuationCheckpoint = nil
         taskProgressMap = TaskProgressMap(request: request, generationID: lease.id,
                                           exactInputReferences: submission.exactInputReferences)
+        taskInputRolesSnapshot = nil
+        pendingTaskInputRoleCorrection = nil
         lastTaskProgressRevision = 0
         viewer.beginTask(lease.id)
         accessibility.beginTaskResourceTracking(on: display, lease: lease)
@@ -1903,19 +1907,70 @@ final class TaskPilotCoordinator: ObservableObject {
     }
 
     func applyTaskCorrection(_ submission: AgentTaskSubmission) {
-        guard var session = taskCorrectionSession, session.state == .editing,
+        guard let session = taskCorrectionSession, session.state == .editing else { return }
+        submitTaskCorrection(submission, roleAmendment: nil, session: session)
+    }
+
+    var hasExistingTaskCorrection: Bool {
+        guard let session = taskCorrectionSession,
+              session.generationID == currentTaskLease?.id else { return false }
+        return session.state == .pending || !session.draft.isEmpty
+    }
+
+    var canApplyInputRoleCorrection: Bool {
+        guard canOpenTaskCorrection, let lease = currentTaskLease,
+              !lease.hasPendingInstructionCorrection, !lease.hasPendingWorkingDocumentUpdate else { return false }
+        if let session = taskCorrectionSession, session.generationID == lease.id,
+           session.state == .pending || !session.draft.isEmpty { return false }
+        return true
+    }
+
+    @discardableResult
+    func applyTaskInputRoleCorrection(generationID: String, occurrenceID: String, role: AgentTaskInputRole?) -> Bool {
+        guard canApplyInputRoleCorrection, let lease = currentTaskLease,
+              lease.id == generationID,
+              let authorization = currentTaskAuthorization,
+              authorization.id == UUID(uuidString: lease.id),
+              let reference = authorization.effectiveSubmission.exactInputReferences.first(where: { $0.id == occurrenceID }) else {
+            return false
+        }
+        let amendment = AgentTaskInputRoleAmendment(occurrenceID: reference.id, kind: reference.kind,
+            utf8Start: reference.utf8Start, utf8Length: reference.utf8Length, value: reference.value, role: role)
+        let submission = AgentTaskSubmission(request: "", exactInputReferences: [])
+        let session = taskCorrectionSession?.generationID == lease.id
+            ? taskCorrectionSession!
+            : TaskCorrectionSession(generationID: lease.id, draft: TaskComposerDraft())
+        submitTaskCorrection(submission, roleAmendment: amendment, session: session)
+        return taskCorrectionSession?.state == .pending
+    }
+
+    private func submitTaskCorrection(_ submission: AgentTaskSubmission,
+                                      roleAmendment: AgentTaskInputRoleAmendment?,
+                                      session originalSession: TaskCorrectionSession) {
+        guard var session = taskCorrectionSession?.generationID == originalSession.generationID
+                ? taskCorrectionSession : originalSession,
+              session.state == .editing,
               canOpenTaskCorrection, let lease = currentTaskLease,
               session.generationID == lease.id,
               let authorization = currentTaskAuthorization else { return }
         let corrected = submission.trimmedForSubmission()
-        guard !corrected.request.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        guard validateSubmission(corrected) else {
+        guard roleAmendment != nil || !corrected.request.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard corrected.request.isEmpty || validateSubmission(corrected) else {
             session.errorMessage = requestSubmissionError
             taskCorrectionSession = session
             return
         }
+        if let amendment = roleAmendment {
+            guard authorization.effectiveSubmission.exactInputReferences.contains(where: { $0.id == amendment.occurrenceID &&
+                $0.kind == amendment.kind && $0.utf8Start == amendment.utf8Start &&
+                $0.utf8Length == amendment.utf8Length && $0.value == amendment.value }) else {
+                session.errorMessage = "This input occurrence changed. Close the menu and inspect the current task inputs."
+                taskCorrectionSession = session
+                return
+            }
+        }
         let correction = TaskInstructionCorrection(revision: lease.currentInstructionRevision + 1,
-                                                   submission: corrected)
+            submission: corrected, roleAmendment: roleAmendment)
         do {
             try authorization.effectiveSubmission.includingCorrections([correction])
                 .validateExactInputReferences()
@@ -1948,7 +2003,13 @@ final class TaskPilotCoordinator: ObservableObject {
         session.correctionID = correction.id
         session.revision = correction.revision
         session.errorMessage = nil
-        session.notice = "Correction pending"
+        if let amendment = roleAmendment {
+            pendingTaskInputRoleCorrection = PendingTaskInputRoleCorrection(generationID: lease.id,
+                occurrenceID: amendment.occurrenceID, desiredRole: amendment.role)
+            session.notice = "Role correction pending"
+        } else {
+            session.notice = "Correction pending"
+        }
         taskCorrectionSession = session
         do {
             try runtime.sendInstructionCorrection(correction, generationID: lease.id)
@@ -2060,6 +2121,15 @@ final class TaskPilotCoordinator: ObservableObject {
         currentTaskAuthorization = authorization
         taskProgressMap?.originalRequest = authorization.effectiveSubmission.request
         taskProgressMap?.exactInputReferences = authorization.effectiveSubmission.exactInputReferences
+        taskProgressMap?.inputRoles = Dictionary(uniqueKeysWithValues:
+            authorization.effectiveSubmission.exactInputReferences.map { reference in
+                (reference.id, AgentTaskInputRoleAssignment(role: reference.userRole,
+                    origin: reference.userRole == nil ? .unresolved : .user))
+            })
+        taskInputRolesSnapshot = nil
+        if pendingTaskInputRoleCorrection?.generationID == generationID {
+            pendingTaskInputRoleCorrection = nil
+        }
         do {
             try taskLedgerStore.save(queue: queuedTasks, history: taskHistory, activeTask: authorization)
         } catch {
@@ -2205,6 +2275,8 @@ final class TaskPilotCoordinator: ObservableObject {
             taskOutput = output
         case .taskProgress(let snapshot):
             acceptTaskProgress(snapshot)
+        case .taskInputRoles(let snapshot):
+            acceptTaskInputRoles(snapshot)
         case .taskContinuationCheckpoint(let checkpoint):
             acceptTaskContinuationCheckpoint(checkpoint)
         case .taskWait(let snapshot):
@@ -2453,6 +2525,9 @@ final class TaskPilotCoordinator: ObservableObject {
         lastTaskProgressRevision = snapshot.revision
         var map = TaskProgressMap(request: request, snapshot: snapshot,
                                   exactInputReferences: taskProgressMap?.exactInputReferences ?? [])
+        map.inputRoles = taskInputRolesSnapshot?.generationID == snapshot.generationID &&
+            taskInputRolesSnapshot?.instructionRevision == currentTaskLease?.currentInstructionRevision
+            ? (taskInputRolesSnapshot?.assignments ?? map.inputRoles) : map.inputRoles
         switch runState {
         case .paused, .takingOver: map.lifecycle = .paused
         case .waitingForUser: map.lifecycle = .waitingForUser
@@ -2462,6 +2537,16 @@ final class TaskPilotCoordinator: ObservableObject {
         default: break
         }
         taskProgressMap = map
+    }
+
+    private func acceptTaskInputRoles(_ snapshot: AgentTaskInputRolesSnapshot) {
+        guard let lease = currentTaskLease, lease.id == snapshot.generationID,
+              lease.currentInstructionRevision == snapshot.instructionRevision,
+              taskProgressMap?.generationID == snapshot.generationID,
+              Set(snapshot.assignments.keys) == Set((taskProgressMap?.exactInputReferences ?? []).map(\.id)),
+              snapshot.revision > (taskInputRolesSnapshot?.revision ?? 0) else { return }
+        taskInputRolesSnapshot = snapshot
+        taskProgressMap?.inputRoles = snapshot.assignments
     }
 
     private func acceptTaskChangeLens(_ snapshot: AgentTaskChangeLensSnapshot) {

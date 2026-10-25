@@ -8,8 +8,23 @@ enum AgentTaskInputKind: String, Codable, Equatable {
     case text
 }
 
+enum AgentTaskInputRole: String, Codable, CaseIterable, Equatable, Identifiable {
+    case source
+    case destination
+    case referenceExample = "reference_example"
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .source: "Source"
+        case .destination: "Destination"
+        case .referenceExample: "Reference example"
+        }
+    }
+}
+
 enum AgentTaskInputReferenceProtocol {
-    static let version = 2
+    static let version = 3
 }
 
 /// An exact occurrence in the submitted UTF-8 request. Offsets are measured
@@ -20,21 +35,43 @@ struct AgentTaskInputReference: Codable, Equatable, Identifiable {
     let utf8Start: Int
     let utf8Length: Int
     let value: String
+    var userRole: AgentTaskInputRole? = nil
 
     init(version: Int = AgentTaskInputReferenceProtocol.version,
-         kind: AgentTaskInputKind, utf8Start: Int, utf8Length: Int, value: String) {
+         kind: AgentTaskInputKind, utf8Start: Int, utf8Length: Int, value: String,
+         userRole: AgentTaskInputRole? = nil) {
         self.version = version
         self.kind = kind
         self.utf8Start = utf8Start
         self.utf8Length = utf8Length
         self.value = value
+        self.userRole = userRole
     }
 
     var id: String { "\(utf8Start):\(utf8Length):\(kind.rawValue)" }
 
     var wireValue: [String: Any] {
-        ["version": version, "kind": kind.rawValue, "utf8_start": utf8Start,
+        var result: [String: Any] = ["version": version, "kind": kind.rawValue, "utf8_start": utf8Start,
          "utf8_length": utf8Length, "value": value]
+        if let userRole { result["role_override"] = userRole.rawValue }
+        return result
+    }
+}
+
+struct AgentTaskInputRoleAmendment: Codable, Equatable {
+    let occurrenceID: String
+    let kind: AgentTaskInputKind
+    let utf8Start: Int
+    let utf8Length: Int
+    let value: String
+    let role: AgentTaskInputRole?
+
+    var wireValue: [String: Any] {
+        var result: [String: Any] = ["occurrence_id": occurrenceID, "kind": kind.rawValue,
+                                     "utf8_start": utf8Start, "utf8_length": utf8Length, "value": value]
+        if let role { result["role"] = role.rawValue }
+        else { result["role"] = NSNull() }
+        return result
     }
 }
 
@@ -68,7 +105,7 @@ struct AgentTaskSubmission: Codable, Equatable {
         let trimmed = String(decoding: bytes[leading..<end], as: UTF8.self)
         let adjusted = references.map {
             AgentTaskInputReference(version: $0.version, kind: $0.kind, utf8Start: $0.utf8Start - leading,
-                                    utf8Length: $0.utf8Length, value: $0.value)
+                                    utf8Length: $0.utf8Length, value: $0.value, userRole: $0.userRole)
         }
         return AgentTaskSubmission(request: trimmed, exactInputReferences: adjusted)
     }
@@ -78,12 +115,22 @@ struct AgentTaskSubmission: Codable, Equatable {
         var request = self.request
         var references = exactInputReferences
         for correction in corrections.sorted(by: { $0.revision < $1.revision }) {
+            if let amendment = correction.roleAmendment,
+               let index = references.firstIndex(where: { $0.id == amendment.occurrenceID &&
+                   $0.kind == amendment.kind && $0.utf8Start == amendment.utf8Start &&
+                   $0.utf8Length == amendment.utf8Length && $0.value == amendment.value }) {
+                let reference = references[index]
+                references[index] = AgentTaskInputReference(kind: reference.kind,
+                    utf8Start: reference.utf8Start, utf8Length: reference.utf8Length,
+                    value: reference.value, userRole: amendment.role)
+            }
+            guard !correction.request.isEmpty || !correction.exactInputReferences.isEmpty else { continue }
             let header = "\n\nUser correction: "
             let start = request.utf8.count + header.utf8.count
             request += header + correction.request
             references.append(contentsOf: correction.exactInputReferences.map {
                 AgentTaskInputReference(version: $0.version, kind: $0.kind,
-                    utf8Start: start + $0.utf8Start, utf8Length: $0.utf8Length, value: $0.value)
+                    utf8Start: start + $0.utf8Start, utf8Length: $0.utf8Length, value: $0.value, userRole: $0.userRole)
             })
         }
         return AgentTaskSubmission(request: request, exactInputReferences: references)
@@ -96,10 +143,11 @@ struct AgentTaskSubmission: Codable, Equatable {
         let bytes = Array(request.utf8)
         var previousEnd = 0
         for (index, reference) in exactInputReferences.enumerated() {
-            guard reference.version == 1 || reference.version == 2 else {
+            guard (1...AgentTaskInputReferenceProtocol.version).contains(reference.version) else {
                 throw AgentTaskSubmissionError.invalidReference(index)
             }
-            guard reference.version == 2 || reference.kind != .text,
+            guard reference.version >= 2 || reference.kind != .text,
+                  reference.userRole == nil || reference.version >= 3,
                   reference.utf8Start >= previousEnd,
                   reference.utf8Length > 0,
                   reference.utf8Start <= bytes.count,

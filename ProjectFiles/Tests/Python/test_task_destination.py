@@ -48,6 +48,26 @@ class TaskDestinationTests(unittest.TestCase):
         self.assertEqual(planned_destination(ledger_with_reference(
             "Export the report as October.pdf", "text", "October.pdf")), (None, "October.pdf"))
 
+    def test_per_occurrence_roles_override_text_heuristics_for_same_reference(self):
+        path = "/Users/test/Reports/October.pdf"
+        task = f"Summarize {path} and save the report to {path}."
+        encoded = task.encode()
+        first = encoded.index(path.encode())
+        second = encoded.index(path.encode(), first + 1)
+        references = [
+            {"version": 3, "kind": "file", "utf8_start": first, "utf8_length": len(path.encode()),
+             "value": path, "role_override": "source"},
+            {"version": 3, "kind": "file", "utf8_start": second, "utf8_length": len(path.encode()),
+             "value": path, "role_override": "destination"},
+        ]
+        ledger = TaskEvidenceLedger(task, exact_input_references=references)
+        self.assertEqual(planned_destination(ledger), (path, "October.pdf"))
+        self.assertEqual([entry.value for entry in ledger.batch_source_candidates()], [path])
+
+        source_only = TaskEvidenceLedger(task, exact_input_references=[
+            dict(references[0], role_override="source"), dict(references[1], role_override="source")])
+        self.assertEqual(planned_destination(source_only), (None, None))
+
     def test_instruction_requires_one_clear_explicit_policy(self):
         self.assertEqual(explicit_destination_instruction("Create a new copy of the report."),
                          "Create a new copy")

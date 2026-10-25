@@ -343,14 +343,14 @@ struct TaskQueueHistoryView: View {
                             Text(correction.applied ? "Applied correction" : "Correction not confirmed")
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(correction.applied ? .orange : .secondary)
-                            Text(correction.request)
+                            Text(correction.displaySummary)
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
                         }
                     }
                     .accessibilityElement(children: .combine)
-                    .accessibilityLabel("\(correction.applied ? "Applied correction" : "Correction not confirmed"): \(correction.request)")
+                    .accessibilityLabel("\(correction.applied ? "Applied correction" : "Correction not confirmed"): \(correction.displaySummary)")
                 }
                 Spacer()
                 Text(entry.finishedAt.formatted(date: .omitted, time: .shortened))

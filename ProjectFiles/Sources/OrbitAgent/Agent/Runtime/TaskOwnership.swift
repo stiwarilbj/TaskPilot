@@ -178,13 +178,27 @@ final class TaskLease: @unchecked Sendable {
             guard correction.id.uuidString.lowercased() == normalizedID,
                   correction.revision == revision else { throw TaskInstructionCorrectionError.stale }
             try correction.submission.validateExactInputReferences()
-            let header = "\n\nUser correction: "
-            let start = boundaryRequest.utf8.count + header.utf8.count
-            boundaryRequest += header + correction.request
-            boundaryReferences.append(contentsOf: correction.exactInputReferences.map {
-                AgentTaskInputReference(version: $0.version, kind: $0.kind,
-                    utf8Start: start + $0.utf8Start, utf8Length: $0.utf8Length, value: $0.value)
-            })
+            if let amendment = correction.roleAmendment {
+                guard let index = boundaryReferences.firstIndex(where: { $0.id == amendment.occurrenceID &&
+                    $0.kind == amendment.kind && $0.utf8Start == amendment.utf8Start &&
+                    $0.utf8Length == amendment.utf8Length && $0.value == amendment.value }) else {
+                    throw TaskInstructionCorrectionError.stale
+                }
+                let reference = boundaryReferences[index]
+                boundaryReferences[index] = AgentTaskInputReference(kind: reference.kind,
+                    utf8Start: reference.utf8Start, utf8Length: reference.utf8Length,
+                    value: reference.value, userRole: amendment.role)
+            }
+            if !correction.request.isEmpty || !correction.exactInputReferences.isEmpty {
+                let header = "\n\nUser correction: "
+                let start = boundaryRequest.utf8.count + header.utf8.count
+                boundaryRequest += header + correction.request
+                boundaryReferences.append(contentsOf: correction.exactInputReferences.map {
+                    AgentTaskInputReference(version: $0.version, kind: $0.kind,
+                        utf8Start: start + $0.utf8Start, utf8Length: $0.utf8Length, value: $0.value,
+                        userRole: $0.userRole)
+                })
+            }
             stopBeforeBoundaries = StopBoundaryPolicy.detect(in: boundaryRequest,
                                                               exactInputReferences: boundaryReferences)
         }

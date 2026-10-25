@@ -184,6 +184,8 @@ class TaskContext:
     progress_active_requirement_ids: list[str] = field(default_factory=list)
     progress_revision: int = 0
     progress_fingerprint: str = ""
+    input_roles_revision: int = 0
+    input_roles_fingerprint: str = ""
     continuation_fingerprint: str = ""
     continuation_revision: int = 0
     continuation_uncertain_receipt_ids: set[str] = field(default_factory=set)

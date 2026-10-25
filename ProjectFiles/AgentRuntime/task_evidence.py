@@ -70,8 +70,10 @@ def requests_per_input_work(task: str) -> bool:
     return bool(_PER_INPUT_TERMS.search(task) or _ALL_RESOURCE_TERMS.search(task))
 
 
-def is_output_destination(task: str, entry: Any) -> bool:
+def is_output_destination(task: str, entry: Any, role: str | None = None) -> bool:
     """Recognize plainly phrased output locations without probing the filesystem."""
+    if role == "destination": return True
+    if role in {"source", "reference_example"}: return False
     destination_prefix = re.compile(
         r"\b(?:save|export|write|put|store|place|deliver|download|copy|move|create|output|convert|transform|process)\b"
         r"[^!?\n]{0,180}\b(?:to|in|into|under|beside|at|as)\s*$",
@@ -112,7 +114,7 @@ def validate_batch_declaration(value: Any, ledger: "TaskEvidenceLedger", propose
             any(not isinstance(identifier, str) for identifier in source_ids) or
             len(set(source_ids)) != len(source_ids) or any(identifier not in by_id for identifier in source_ids)):
         fail(path + ".source_input_ids", "must list unique resource input IDs from this task")
-    if any(is_output_destination(ledger.task, by_id[identifier]) for identifier in source_ids):
+    if any(ledger.input_is_output_destination(by_id[identifier]) for identifier in source_ids):
         fail(path + ".source_input_ids", "cannot include a stated output destination as a source input")
     excluded_values = value.get("excluded_inputs")
     if not isinstance(excluded_values, list) or len(excluded_values) > len(resources):
@@ -130,14 +132,14 @@ def validate_batch_declaration(value: Any, ledger: "TaskEvidenceLedger", propose
             fail(field + ".input_id", "must be unique")
         if not isinstance(reason, str) or reason not in {"output_destination", "incidental"}:
             fail(field + ".reason", "must be output_destination or incidental")
-        if reason == "output_destination" and not is_output_destination(ledger.task, by_id[identifier]):
+        if reason == "output_destination" and not ledger.input_is_output_destination(by_id[identifier]):
             fail(field + ".reason", "may identify only an output destination stated in the request")
         if reason == "incidental" and requests_per_input_work(ledger.task):
             fail(field + ".reason", "cannot omit a supplied input from explicitly per-input work")
         excluded.append({"input_id": identifier, "reason": reason})
         excluded_ids.append(identifier)
     for identifier in excluded_ids:
-        if is_output_destination(ledger.task, by_id[identifier]) and next(
+        if ledger.input_is_output_destination(by_id[identifier]) and next(
                 item["reason"] for item in excluded if item["input_id"] == identifier) != "output_destination":
             fail(path + ".excluded_inputs", "a stated output destination must use reason output_destination")
     if set(source_ids) & set(excluded_ids) or set(source_ids) | set(excluded_ids) != set(by_id):
@@ -540,6 +542,7 @@ class TaskEvidenceLedger:
         self.task, self.generation = task, generation
         self.inputs = TaskInputBindings(task, scope=input_scope,
                                         exact_input_references=exact_input_references)
+        self.input_role_proposals: dict[str, dict] = {}
         self.requirements: dict[str, dict] = {}
         self.instruction_revision = 0
         self.evidence: dict[str, dict] = {}
@@ -837,6 +840,11 @@ class TaskEvidenceLedger:
                 encoded = str(part).encode("utf-8")
                 digest_value.update(len(encoded).to_bytes(8, "big"))
                 digest_value.update(encoded)
+        for occurrence in self.inputs.reference_occurrences:
+            for part in occurrence:
+                encoded = str(part).encode("utf-8")
+                digest_value.update(len(encoded).to_bytes(8, "big"))
+                digest_value.update(encoded)
         return digest_value.hexdigest()
 
     def _has_historical_proof(self, identifier: str) -> bool:
@@ -875,8 +883,72 @@ class TaskEvidenceLedger:
 
     def accept_plan(self, decision: dict, observation: dict | None = None) -> None:
         self.add_requirements(decision.get("requirements", []), observation)
+        if "input_roles" in decision:
+            self.accept_input_roles(decision["input_roles"])
         if "batch" in decision:
             self.accept_batch(decision["batch"])
+
+    def accept_input_roles(self, proposals: list[dict]) -> None:
+        """Keep only this plan's inferred roles; explicit user choices take precedence."""
+        self.input_role_proposals = {
+            item["occurrence_id"]: {"role": item["role"], "source_quote": item["source_quote"]}
+            for item in proposals if isinstance(item, dict)
+        }
+
+    def input_role_state(self) -> list[dict]:
+        result = []
+        for occurrence_id, _kind, _start, _length, _value, _user_role in self.inputs.reference_occurrences:
+            role, origin = self.role_for_occurrence(occurrence_id)
+            result.append({"occurrence_id": occurrence_id, "role": role, "origin": origin})
+        return result
+
+    def role_for_occurrence(self, occurrence_id: str) -> tuple[str | None, str]:
+        for identifier, _kind, _start, _length, _value, user_role in self.inputs.reference_occurrences:
+            if identifier != occurrence_id:
+                continue
+            if user_role:
+                return user_role, "user"
+            inferred = self.input_role_proposals.get(identifier)
+            if inferred:
+                return inferred["role"], "inferred"
+            return None, "unresolved"
+        return None, "unresolved"
+
+    def roles_for_input_value(self, value: str) -> set[str]:
+        return {role for occurrence_id, _kind, _start, _length, item_value, _user_role in self.inputs.reference_occurrences
+                if item_value == value for role, _origin in [self.role_for_occurrence(occurrence_id)] if role is not None}
+
+    def has_role_assignment(self, value: str) -> bool:
+        return any(item_value == value and (user_role is not None or occurrence_id in self.input_role_proposals)
+                   for occurrence_id, _kind, _start, _length, item_value, user_role in self.inputs.reference_occurrences)
+
+    def has_input_role(self, value: str, role: str) -> bool:
+        return role in self.roles_for_input_value(value)
+
+    def input_is_output_destination(self, entry: TaskInput) -> bool:
+        """Resolve a resource-level destination without collapsing occurrence roles."""
+        roles = self.roles_for_input_value(entry.value)
+        if "source" in roles:
+            return False
+        if self.has_role_assignment(entry.value):
+            unresolved = any(item_value == entry.value and self.role_for_occurrence(identifier)[1] == "unresolved"
+                             for identifier, _kind, _start, _length, item_value, _user_role
+                             in self.inputs.reference_occurrences)
+            return roles == {"destination"} and not unresolved
+        return is_output_destination(self.task, entry)
+
+    def role_for_input_value(self, value: str) -> str | None:
+        roles: set[str] = set()
+        unresolved = False
+        for occurrence_id, _kind, _start, _length, item_value, user_role in self.inputs.reference_occurrences:
+            if item_value != value:
+                continue
+            role, _origin = self.role_for_occurrence(occurrence_id)
+            if role is None:
+                unresolved = True
+            else:
+                roles.add(role)
+        return next(iter(roles)) if len(roles) == 1 and not unresolved else None
 
     def batch_declaration_required_for(self, proposed: dict | None = None) -> bool:
         if len(self.batch_source_candidates()) < 2 or not requests_per_input_work(self.task):
@@ -893,8 +965,23 @@ class TaskEvidenceLedger:
 
     def batch_source_candidates(self):
         """Resource references not plainly described as output destinations."""
-        return tuple(entry for entry in self.inputs.resource_inputs
-                     if not is_output_destination(self.task, entry))
+        candidates = []
+        for entry in self.inputs.resource_inputs:
+            roles = self.roles_for_input_value(entry.value)
+            if "source" in roles:
+                candidates.append(entry)
+            elif self.has_role_assignment(entry.value):
+                # An established non-source role excludes an item only when
+                # every occurrence agrees. Mixed or unresolved occurrences
+                # stay visible for planning instead of being silently omitted.
+                if roles and roles.issubset({"destination", "reference_example"}) and not any(
+                        role is None and item_value == entry.value and self.role_for_occurrence(identifier)[1] == "unresolved"
+                        for identifier, _kind, _start, _length, item_value, _user_role in self.inputs.reference_occurrences):
+                    continue
+                candidates.append(entry)
+            elif not is_output_destination(self.task, entry):
+                candidates.append(entry)
+        return tuple(candidates)
 
     def batch_declaration(self) -> dict:
         items = []
@@ -966,6 +1053,7 @@ class TaskEvidenceLedger:
         self.task = task
         self.instruction_revision += 1
         self.inputs = TaskInputBindings(task, exact_input_references=exact_input_references)
+        self.input_role_proposals = {}
         current_resources = self.batch_source_candidates()
         self.batch_items = []
         for entry in current_resources:
@@ -1479,6 +1567,8 @@ class TaskEvidenceLedger:
                  "requirements": bounded(requirements), "superseded_requirements": bounded(superseded),
                  "evidence": {key: {**bounded(e["fact"]), **({"origin": e["origin"]} if e["origin"] else {})}
                               for key, e in self.evidence.items() if e["valid"]}}
+        if self.inputs.reference_occurrences:
+            state["input_roles"] = self.input_role_state()
         if batch_prompt is not None:
             state["batch"] = batch_prompt
         if self.continuation_checkpoint is not None:

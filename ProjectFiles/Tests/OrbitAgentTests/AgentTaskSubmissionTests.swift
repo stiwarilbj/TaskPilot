@@ -53,6 +53,58 @@ final class AgentTaskSubmissionTests: XCTestCase {
         XCTAssertNil(decoded.exactInputReferences)
     }
 
+    func testUserRolesRemainPerOccurrenceThroughDraftQueueAndRoleCorrections() throws {
+        let path = "/tmp/report.txt"
+        let request = "Summarize \(path) then save the result to \(path)."
+        let first = request.range(of: path)!
+        let second = request.range(of: path, range: first.upperBound..<request.endIndex)!
+        let firstStart = request[..<first.lowerBound].utf8.count
+        let secondStart = request[..<second.lowerBound].utf8.count
+        let references = [
+            AgentTaskInputReference(kind: .file, utf8Start: firstStart, utf8Length: path.utf8.count,
+                                    value: path, userRole: .source),
+            AgentTaskInputReference(kind: .file, utf8Start: secondStart, utf8Length: path.utf8.count,
+                                    value: path, userRole: .destination)
+        ]
+        let submission = AgentTaskSubmission(request: request, exactInputReferences: references)
+        try submission.validateExactInputReferences()
+        let restored = TaskComposerDraft(submission: submission)
+        XCTAssertEqual(restored.references.map(\.userRole), [.source, .destination])
+        XCTAssertEqual(restored.submission().exactInputReferences.map(\.userRole), [.source, .destination])
+
+        let amendment = AgentTaskInputRoleAmendment(occurrenceID: references[1].id, kind: .file,
+            utf8Start: references[1].utf8Start, utf8Length: references[1].utf8Length,
+            value: path, role: nil)
+        let correction = TaskInstructionCorrection(revision: 1,
+            submission: AgentTaskSubmission(request: ""), roleAmendment: amendment)
+        let decodedCorrection = try JSONDecoder().decode(TaskInstructionCorrection.self,
+            from: JSONEncoder().encode(correction))
+        XCTAssertEqual(decodedCorrection, correction)
+        let amended = submission.includingCorrections([correction])
+        XCTAssertEqual(amended.request, request)
+        XCTAssertEqual(amended.exactInputReferences.map(\.userRole), [.source, nil])
+        try amended.validateExactInputReferences()
+        let roleCorrectionRecord = TaskInstructionCorrection(revision: 1,
+            submission: AgentTaskSubmission(request: ""), applied: true, roleAmendment: amendment)
+        let history = AgentTaskHistoryEntry(request: request, exactInputReferences: references,
+            responseTitle: "Stopped", response: "Partial", outcome: .stopped,
+            startedAt: Date(timeIntervalSince1970: 10), wasQueued: false, corrections: [roleCorrectionRecord])
+        let decodedHistory = try JSONDecoder().decode(AgentTaskHistoryEntry.self,
+            from: JSONEncoder().encode(history))
+        XCTAssertEqual(decodedHistory.effectiveSubmission.request, request)
+        XCTAssertEqual(decodedHistory.effectiveSubmission.exactInputReferences.map(\.userRole), [.source, nil])
+
+        let queued = QueuedAgentTask(request: submission.request, exactInputReferences: submission.exactInputReferences)
+        let decoded = try JSONDecoder().decode(QueuedAgentTask.self, from: JSONEncoder().encode(queued))
+        XCTAssertEqual(decoded.exactInputReferences?.map(\.userRole), [.source, .destination])
+
+        let queuedHistory = AgentTaskHistoryEntry(request: submission.request,
+            exactInputReferences: submission.exactInputReferences, responseTitle: "Completed", response: "Done",
+            outcome: .completed, startedAt: Date(timeIntervalSince1970: 10), wasQueued: true)
+        let decodedQueuedHistory = try JSONDecoder().decode(AgentTaskHistoryEntry.self, from: JSONEncoder().encode(queuedHistory))
+        XCTAssertEqual(decodedQueuedHistory.exactInputReferences?.map(\.userRole), [.source, .destination])
+    }
+
     func testReferenceParserAcceptsOnlyStandaloneLocalPathsAndHTTPDestinations() throws {
         let pastedURL = "https://example.test/a%20b?q=x%2Fy#part"
         let web = try XCTUnwrap(TaskComposerReferenceParser.standalonePaste(pastedURL))

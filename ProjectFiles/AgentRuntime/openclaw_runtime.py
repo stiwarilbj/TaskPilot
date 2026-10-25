@@ -351,26 +351,50 @@ def receive_instruction_correction(timeout: float | None = 0) -> dict[str, Any]:
         raise RuntimeError("TaskPilot received a noncanonical correction ID")
     request = correction.get("request")
     references = correction.get("exact_input_references")
+    amendment = correction.get("role_amendment")
     for applied in context.instruction_corrections:
         if applied.get("id") != identifier:
             continue
         if (applied.get("revision") == correction.get("instruction_revision") and
                 applied.get("request") == request and
-                applied.get("exact_input_references") == references):
+                applied.get("exact_input_references") == references and
+                applied.get("role_amendment") == amendment):
             return {"id": identifier, "revision": correction["instruction_revision"],
-                    "request": request, "exact_input_references": references,
+                    "request": request, "exact_input_references": references, "role_amendment": amendment,
                     "duplicate": True}
         raise RuntimeError("TaskPilot received a correction ID with conflicting contents")
     if correction["instruction_revision"] != context.instruction_revision + 1:
         raise RuntimeError("TaskPilot received a stale or skipped correction revision")
-    if (not isinstance(request, str) or not request.strip() or len(request.encode("utf-8")) > 32768 or
+    if (not isinstance(request, str) or (not request.strip() and amendment is None) or len(request.encode("utf-8")) > 32768 or
             type(references) is not list or len(references) > 128):
         raise RuntimeError("TaskPilot received invalid correction text or exact inputs")
     # Validate every UTF-8 range against the corrected source before changing
     # task bindings or invalidating current evidence.
     TaskInputBindings(request, exact_input_references=references)
+    if amendment is not None:
+        required = {"occurrence_id", "kind", "utf8_start", "utf8_length", "value", "role"}
+        if type(amendment) is not dict or set(amendment) != required:
+            raise RuntimeError("TaskPilot received malformed input-role amendment data")
+        if (not isinstance(amendment.get("occurrence_id"), str) or
+                not isinstance(amendment.get("kind"), str) or
+                amendment.get("kind") not in {"file", "folder", "url", "text"} or
+                type(amendment.get("utf8_start")) is not int or amendment["utf8_start"] < 0 or
+                type(amendment.get("utf8_length")) is not int or amendment["utf8_length"] <= 0 or
+                not isinstance(amendment.get("value"), str) or not amendment["value"]):
+            raise RuntimeError("TaskPilot received malformed input-role target metadata")
+        role = amendment.get("role")
+        if role is not None and (not isinstance(role, str) or role not in {"source", "destination", "reference_example"}):
+            raise RuntimeError("TaskPilot received an unsupported input role")
+        current = TaskInputBindings(context.task, exact_input_references=context.exact_input_references)
+        target = (amendment.get("occurrence_id"), amendment.get("kind"), amendment.get("utf8_start"),
+                  amendment.get("utf8_length"), amendment.get("value"))
+        matches = [item for item in current.reference_occurrences if item[:5] == target]
+        if len(matches) != 1:
+            raise RuntimeError("TaskPilot input-role amendment does not match one current exact input occurrence")
+    elif correction.get("role_amendment") is not None:
+        raise RuntimeError("TaskPilot received an invalid input-role amendment")
     return {"id": identifier, "revision": correction["instruction_revision"],
-            "request": request, "exact_input_references": references}
+            "request": request, "exact_input_references": references, "role_amendment": amendment}
 
 
 class ActionRejected(RuntimeError):
@@ -614,6 +638,7 @@ def publish_task_progress(ledger: TaskEvidenceLedger | None, *, lifecycle: str |
     if active_requirement_ids is not None:
         context.progress_active_requirement_ids = list(dict.fromkeys(active_requirement_ids))[:512]
     try:
+        publish_task_input_roles(ledger)
         snapshot = ledger.presentation_state(context.progress_active_requirement_ids, context.progress_lifecycle)
         publish_task_continuation_checkpoint(ledger)
         fingerprint = hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"),
@@ -631,6 +656,31 @@ def publish_task_progress(ledger: TaskEvidenceLedger | None, *, lifecycle: str |
     except Exception:
         # The progress projection is optional UI state. Its failure must not
         # change planning, execution, evidence, or completion behavior.
+        return
+
+
+def publish_task_input_roles(ledger: TaskEvidenceLedger | None) -> None:
+    """Publish only bounded role labels; exact values remain in the request itself."""
+    context = current_task.get()
+    if context is None or ledger is None or context.generation is None:
+        return
+    try:
+        if not ledger.inputs.reference_occurrences:
+            return
+        roles = ledger.input_role_state()
+        if len(roles) > 128:
+            return
+        snapshot = {"version": 1, "task_generation_id": context.generation,
+                    "instruction_revision": context.instruction_revision, "roles": roles}
+        fingerprint = hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"),
+                                        ensure_ascii=True).encode()).hexdigest()
+        if fingerprint == context.input_roles_fingerprint:
+            return
+        context.input_roles_fingerprint = fingerprint
+        context.input_roles_revision += 1
+        emit("task_input_roles", revision=context.input_roles_revision, **snapshot)
+    except Exception:
+        # This view-only projection cannot affect execution or evidence.
         return
 
 
@@ -3450,6 +3500,9 @@ def desktop_instruction(
     inputs = ledger.inputs if ledger is not None and ledger.inputs.entries else None
     if inputs:
         rules += input_reference_rules()
+        if inputs.reference_occurrences:
+            rules += ("Optional input_roles: [{occurrence_id,role,source_quote}]. Quote exact nearby wording; use only clear "
+                      "source/destination/reference_example roles. Omit ambiguity and user overrides.\n")
         recent = [inputs.project(entry) for entry in recent]
         if condition:
             condition = {**condition, "failed_action": recent[-1].get("action")}
@@ -4229,6 +4282,8 @@ class TaskExecution:
         if c.reconcile_reason == "correction":
             return
         c.ledger.accept_plan(c.decision, c.observation)
+        publish_task_input_roles(c.ledger)
+        publish_planned_destination(c.ledger)
         active_ids = c.ledger.action_requirements(c.decision) if effective_decision_status(c.decision) == "act" else []
         publish_task_progress(c.ledger, lifecycle="running", active_requirement_ids=active_ids)
         publish_task_wait("reconciling", "Preparing the next step",
@@ -4758,18 +4813,40 @@ class TaskExecution:
         correction = control
         if correction.get("duplicate") is True:
             return
-        header = "\n\nUser correction: "
-        source_start = len(c.task.encode("utf-8")) + len(header.encode("utf-8"))
         request = correction["request"]
         references = list(c.exact_input_references)
-        for reference in correction["exact_input_references"]:
-            references.append({**reference, "utf8_start": source_start + reference["utf8_start"]})
-        revised_task = c.task + header + request
+        amendment = correction.get("role_amendment")
+        if amendment is not None:
+            matches = []
+            for index, reference in enumerate(references):
+                kind, start, length, value = reference.get("kind"), reference.get("utf8_start"), reference.get("utf8_length"), reference.get("value")
+                if (f"{start}:{length}:{kind}" == amendment["occurrence_id"] and kind == amendment["kind"] and
+                        start == amendment["utf8_start"] and length == amendment["utf8_length"] and
+                        value == amendment["value"]):
+                    matches.append(index)
+            if len(matches) != 1:
+                raise RuntimeError("The exact input occurrence changed before its role correction could be applied")
+            updated = dict(references[matches[0]])
+            updated["version"] = EXACT_INPUT_REFERENCE_VERSION
+            if amendment["role"] is None:
+                updated.pop("role_override", None)
+            else:
+                updated["role_override"] = amendment["role"]
+            references[matches[0]] = updated
+        revised_task = c.task
+        if request or correction["exact_input_references"]:
+            header = "\n\nUser correction: "
+            source_start = len(c.task.encode("utf-8")) + len(header.encode("utf-8"))
+            for reference in correction["exact_input_references"]:
+                references.append({**reference, "utf8_start": source_start + reference["utf8_start"]})
+            revised_task = c.task + header + request
         if len(references) > 128:
             raise RuntimeError("The correction exceeds the task’s limit of 128 exact inputs")
         TaskInputBindings(revised_task, exact_input_references=references)
         c.task = revised_task
         c.exact_input_references = references
+        global _exact_input_references
+        _exact_input_references = references
         c.target_bindings.clear()
         c.stop_boundaries = detect_stop_boundaries(revised_task, references)
         c.instruction_revision = correction["revision"]
@@ -4777,6 +4854,7 @@ class TaskExecution:
         _instruction_revision = correction["revision"]
         c.instruction_corrections.append(correction)
         c.ledger.apply_instruction_revision(revised_task, references)
+        publish_task_input_roles(c.ledger)
         publish_planned_destination(c.ledger)
         c.observation_keywords = sorted(w for w in words(revised_task) if len(w) <= 64 and w.isalnum())[:48]
         c.bridge_observation_revision = None

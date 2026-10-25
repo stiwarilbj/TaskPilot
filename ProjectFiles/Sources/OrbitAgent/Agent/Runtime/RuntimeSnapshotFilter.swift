@@ -8,6 +8,7 @@ struct RuntimeSnapshotFilter {
     private var diagnostics: AgentRequestMetrics?
     private var taskWait: AgentTaskWaitSnapshot?
     private var taskDestination: AgentTaskDestinationSnapshot?
+    private var taskInputRoles: AgentTaskInputRolesSnapshot?
     private var continuationCheckpoint: (generationID: String, revision: UInt64, fingerprint: String)?
 
     mutating func shouldSchedule(_ event: RuntimeEvent) -> Bool {
@@ -44,6 +45,12 @@ struct RuntimeSnapshotFilter {
                 return false
             }
             taskDestination = value
+        case .taskInputRoles(let value):
+            if let current = taskInputRoles,
+               current.generationID == value.generationID,
+               current.instructionRevision == value.instructionRevision,
+               current.assignments == value.assignments { return false }
+            taskInputRoles = value
         case .taskContinuationCheckpoint(let value):
             let fingerprint = value.taskSHA256 + ":" + String(value.isEligible) + ":" +
                 String(value.priorVerifiedRequirementCount) + ":" + String(value.unresolvedReceiptCount)

@@ -88,11 +88,15 @@ def planned_destination(ledger: Any) -> tuple[str | None, str | None]:
     from task_evidence import is_output_destination
 
     candidates = [entry for entry in ledger.inputs.resource_inputs
-                  if is_output_destination(ledger.task, entry)]
+                  if (ledger.has_input_role(entry.value, "destination") or
+                      (not ledger.has_role_assignment(entry.value) and
+                       is_output_destination(ledger.task, entry)))]
     values = list(dict.fromkeys(entry.value for entry in candidates))
     direct_matches = list(_OUTPUT_PATH.finditer(ledger.task))
     direct_values = list(dict.fromkeys(_trim_path_punctuation(match.group("path"))
-                                       for match in direct_matches))
+                                       for match in direct_matches
+                                       if (not ledger.has_role_assignment(_trim_path_punctuation(match.group("path"))) or
+                                           ledger.has_input_role(_trim_path_punctuation(match.group("path")), "destination"))))
     if len(values) > 1 or len(direct_values) > 1:
         return None, None
     if values and direct_values and values[0] != direct_values[0]:

@@ -16,9 +16,10 @@ import uuid
 
 from action_contract_generated import CONTRACT
 
-TASK_INPUT_VERSION = 4
-EXACT_INPUT_REFERENCE_VERSION = 2
+TASK_INPUT_VERSION = 5
+EXACT_INPUT_REFERENCE_VERSION = 3
 LEGACY_EXACT_INPUT_REFERENCE_VERSION = 1
+PREVIOUS_EXACT_INPUT_REFERENCE_VERSION = 2
 MAX_INPUTS = 128
 PREVIEW_LENGTH = 160
 REFERENCE_PATTERN = re.compile(r"\binput_[0-9a-f]{16}_[1-9][0-9]*\b")
@@ -129,6 +130,7 @@ class TaskInput:
 class TaskInputBindings:
     entries: tuple[TaskInput, ...]
     exact_references: tuple[tuple[str, int, int, str], ...]
+    reference_occurrences: tuple[tuple[str, str, int, int, str, str | None], ...]
     _by_id: MappingProxyType
     omitted: int
 
@@ -141,6 +143,7 @@ class TaskInputBindings:
         unique: dict[str, list[tuple[int, int]]] = {}
         explicit_resource_kinds: dict[str, set[str]] = {}
         exact_occurrences: list[tuple[str, int, int, str]] = []
+        reference_occurrences: list[tuple[str, str, int, int, str, str | None]] = []
         omitted = 0
         explicit_spans: list[tuple[int, int]] = []
         encoded_task = task.encode("utf-8")
@@ -150,19 +153,29 @@ class TaskInputBindings:
             previous_end = 0
             for index, reference in enumerate(exact_input_references):
                 field = f"exact_input_references[{index}]"
-                if type(reference) is not dict or set(reference) != {"version", "kind", "utf8_start", "utf8_length", "value"}:
-                    fail(field, "must contain version, kind, utf8_start, utf8_length, and value")
+                base_keys = {"version", "kind", "utf8_start", "utf8_length", "value"}
+                if type(reference) is not dict or not base_keys.issubset(reference) or set(reference) - base_keys - {"role_override"}:
+                    fail(field, "must contain only version, kind, UTF-8 range, value, and optional role_override")
                 if type(reference["version"]) is not int or reference["version"] not in {
-                    LEGACY_EXACT_INPUT_REFERENCE_VERSION, EXACT_INPUT_REFERENCE_VERSION
+                    LEGACY_EXACT_INPUT_REFERENCE_VERSION, PREVIOUS_EXACT_INPUT_REFERENCE_VERSION,
+                    EXACT_INPUT_REFERENCE_VERSION
                 }:
                     fail(field + ".version", "does not match the exact-input reference protocol")
+                if "role_override" in reference:
+                    if reference["version"] < EXACT_INPUT_REFERENCE_VERSION:
+                        fail(field + ".role_override", "requires exact-input reference version 3")
+                    if not isinstance(reference["role_override"], str) or reference["role_override"] not in {
+                        "source", "destination", "reference_example"
+                    }:
+                        fail(field + ".role_override", "must be source, destination, or reference_example")
+                role_override = reference.get("role_override")
                 kind = reference["kind"]
                 start, length, value = reference["utf8_start"], reference["utf8_length"], reference["value"]
                 allowed_kinds = {"file", "folder", "url"}
-                if reference["version"] == EXACT_INPUT_REFERENCE_VERSION:
+                if reference["version"] >= PREVIOUS_EXACT_INPUT_REFERENCE_VERSION:
                     allowed_kinds.add("text")
                 if not isinstance(kind, str) or kind not in allowed_kinds:
-                    fail(field + ".kind", "must be file, folder, url, or text for version 2")
+                    fail(field + ".kind", "must be file, folder, url, or text for reference version 2 or later")
                 if type(start) is not int or start < 0:
                     fail(field + ".utf8_start", "must be a nonnegative integer")
                 if type(length) is not int or length <= 0:
@@ -193,6 +206,8 @@ class TaskInputBindings:
                     explicit_resource_kinds.setdefault(value, set()).add(kind)
                 explicit_spans.append((codepoint_start, codepoint_end))
                 exact_occurrences.append((kind, start, length, value))
+                occurrence_id = f"{start}:{length}:{kind}"
+                reference_occurrences.append((occurrence_id, kind, start, length, value, role_override))
                 unique.setdefault(value, []).append((codepoint_start, codepoint_end))
                 previous_end = end
         for start, end in literal_spans(task):
@@ -217,6 +232,7 @@ class TaskInputBindings:
                         for index, (value, sources) in enumerate(unique.items(), 1))
         object.__setattr__(self, "entries", entries)
         object.__setattr__(self, "exact_references", tuple(exact_occurrences))
+        object.__setattr__(self, "reference_occurrences", tuple(reference_occurrences))
         object.__setattr__(self, "_by_id", MappingProxyType({entry.identifier: entry for entry in entries}))
         object.__setattr__(self, "omitted", omitted)
 
@@ -229,6 +245,11 @@ class TaskInputBindings:
             if entry.resource_kind is not None:
                 resource_inputs.append({"input_id": entry.identifier, "kind": entry.resource_kind})
         state = {"version": TASK_INPUT_VERSION, "values": values,
+                 **({"reference_occurrences": [{"occurrence_id": identifier, "input_id": next(
+                     entry.identifier for entry in self.entries if entry.value == value),
+                     "kind": kind, "user_role": role}
+                     for identifier, kind, _start, _length, value, role in self.reference_occurrences]}
+                    if self.reference_occurrences else {}),
                  **({"resource_inputs": resource_inputs} if include_resource_inputs and len(resource_inputs) >= 2 else {}),
                  **({"omitted": self.omitted} if self.omitted else {})}
         return state
@@ -244,6 +265,7 @@ class TaskInputBindings:
     @cached_property
     def _canonical(self) -> str:
         return json.dumps([TASK_INPUT_VERSION, EXACT_INPUT_REFERENCE_VERSION, self.exact_references,
+                           self.reference_occurrences,
                            [(e.identifier, e.value, e.sources, e.resource_kind) for e in self.entries],
                            self.omitted], ensure_ascii=True)
 
@@ -326,7 +348,5 @@ def literal_slots(response: dict) -> set[tuple]:
 
 
 def input_reference_rules(*, completion=False) -> str:
-    fields = 'checklist/check/output values' if completion else 'literal action/argv/checklist/check values'
-    return ('Exact inputs: {"input_ref":"<supplied ID>"} for whole ' + fields + '; never IDs/PIDs. '
-            'No transforms/interpolation; argv for shell operands. '
-            'Inputs give no permission or completion proof; strings still valid.\n')
+    return ('Exact inputs: use {"input_ref":"ID"} for supplied values. Never invent IDs/PIDs, transform or interpolate inputs. '
+            'No permission or completion proof.\n')

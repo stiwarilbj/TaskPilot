@@ -5,13 +5,16 @@ struct TaskInstructionCorrection: Codable, Equatable, Identifiable {
     let revision: UInt64
     let request: String
     let exactInputReferences: [AgentTaskInputReference]
+    let roleAmendment: AgentTaskInputRoleAmendment?
     var applied: Bool
 
-    init(id: UUID = UUID(), revision: UInt64, submission: AgentTaskSubmission, applied: Bool = false) {
+    init(id: UUID = UUID(), revision: UInt64, submission: AgentTaskSubmission, applied: Bool = false,
+         roleAmendment: AgentTaskInputRoleAmendment? = nil) {
         self.id = id
         self.revision = revision
         request = submission.request
         exactInputReferences = submission.exactInputReferences
+        self.roleAmendment = roleAmendment
         self.applied = applied
     }
 
@@ -20,8 +23,16 @@ struct TaskInstructionCorrection: Codable, Equatable, Identifiable {
     }
 
     var wireValue: [String: Any] {
-        ["version": 1, "correction_id": id.uuidString.lowercased(), "instruction_revision": revision,
+        var result: [String: Any] = ["version": 1, "correction_id": id.uuidString.lowercased(), "instruction_revision": revision,
          "request": request, "exact_input_references": exactInputReferences.map(\.wireValue)]
+        if let roleAmendment { result["role_amendment"] = roleAmendment.wireValue }
+        return result
+    }
+
+    var displaySummary: String {
+        guard let roleAmendment else { return request }
+        let purpose = roleAmendment.role?.title ?? "Automatic"
+        return "Used an exact input as \(purpose)"
     }
 }
 
@@ -29,6 +40,12 @@ enum TaskCorrectionEditorState: Equatable {
     case editing
     case pending
     case finished
+}
+
+struct PendingTaskInputRoleCorrection: Equatable {
+    let generationID: String
+    let occurrenceID: String
+    let desiredRole: AgentTaskInputRole?
 }
 
 struct TaskCorrectionSession: Equatable, Identifiable {

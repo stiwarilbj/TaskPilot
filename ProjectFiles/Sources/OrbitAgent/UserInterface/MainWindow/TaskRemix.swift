@@ -19,7 +19,7 @@ struct TaskRemixSession: Equatable, Identifiable {
 }
 
 struct TaskRemixInputChange: Equatable, Identifiable {
-    enum Kind: Equatable { case replaced, added, removed }
+    enum Kind: Equatable { case replaced, added, removed, roleChanged }
 
     let id: UUID
     let kind: Kind
@@ -46,6 +46,9 @@ struct TaskRemixReview: Equatable {
             usedNew.insert(new.id)
             if old.kind != new.kind || old.value != new.value {
                 changes.append(TaskRemixInputChange(id: old.id, kind: .replaced,
+                                                    oldReference: old, newReference: new))
+            } else if old.userRole != new.userRole {
+                changes.append(TaskRemixInputChange(id: old.id, kind: .roleChanged,
                                                     oldReference: old, newReference: new))
             }
         }
@@ -105,7 +108,8 @@ extension TaskComposerDraft {
             let start16 = String(decoding: bytes[..<item.utf8Start], as: UTF8.self).utf16.count
             let end16 = String(decoding: bytes[..<end], as: UTF8.self).utf16.count
             let range = NSRange(location: start16, length: end16 - start16)
-            spans.append((range, TaskComposerReference(kind: item.kind, value: item.value)))
+            spans.append((range, TaskComposerReference(kind: item.kind, value: item.value,
+                                                       userRole: item.userRole)))
             excluded.append(range)
         }
 
@@ -232,6 +236,8 @@ struct TaskRemixReviewView: View {
     private func exactValueRow(title: String, reference: TaskComposerReference) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(title).font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+            Text("Used as: \(reference.userRole?.title ?? "Automatic")")
+                .font(.caption2).foregroundStyle(.secondary)
             Text(reference.value)
                 .font(.system(.caption2, design: .monospaced))
                 .textSelection(.enabled)
@@ -247,6 +253,7 @@ private extension TaskRemixInputChange.Kind {
         case .replaced: "Replaced"
         case .added: "Added"
         case .removed: "Removed"
+        case .roleChanged: "Role changed"
         }
     }
 }

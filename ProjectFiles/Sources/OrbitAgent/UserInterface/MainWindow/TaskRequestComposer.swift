@@ -3,15 +3,36 @@ import QuickLookUI
 import SwiftUI
 import UniformTypeIdentifiers
 
+enum TaskComposerRoleOrigin: Equatable {
+    case chosen
+    case inferred
+    case unresolved
+}
+
 struct TaskComposerReference: Equatable, Identifiable {
     let id: UUID
     let kind: AgentTaskInputKind
     let value: String
+    var userRole: AgentTaskInputRole?
+    var presentedRole: AgentTaskInputRole?
+    var roleOrigin: TaskComposerRoleOrigin
+    var pendingRole: AgentTaskInputRole?
+    var roleCorrectionPending: Bool
+    var occurrenceID: String?
 
-    init(id: UUID = UUID(), kind: AgentTaskInputKind, value: String) {
+    init(id: UUID = UUID(), kind: AgentTaskInputKind, value: String,
+         userRole: AgentTaskInputRole? = nil, presentedRole: AgentTaskInputRole? = nil,
+         roleOrigin: TaskComposerRoleOrigin? = nil, pendingRole: AgentTaskInputRole? = nil,
+         roleCorrectionPending: Bool = false, occurrenceID: String? = nil) {
         self.id = id
         self.kind = kind
         self.value = value
+        self.userRole = userRole
+        self.presentedRole = presentedRole ?? userRole
+        self.roleOrigin = roleOrigin ?? (userRole == nil ? .unresolved : .chosen)
+        self.pendingRole = pendingRole
+        self.roleCorrectionPending = roleCorrectionPending
+        self.occurrenceID = occurrenceID
     }
 }
 
@@ -124,7 +145,9 @@ struct TaskComposerDraft: Equatable {
             if cursor < reference.utf8Start {
                 result.append(.text(String(decoding: bytes[cursor..<reference.utf8Start], as: UTF8.self)))
             }
-            result.append(.reference(TaskComposerReference(kind: reference.kind, value: reference.value)))
+            result.append(.reference(TaskComposerReference(id: Self.stableReferenceID(reference),
+                kind: reference.kind, value: reference.value,
+                userRole: reference.userRole, occurrenceID: reference.id)))
             cursor = end
         }
         if cursor < bytes.count { result.append(.text(String(decoding: bytes[cursor...], as: UTF8.self))) }
@@ -152,7 +175,7 @@ struct TaskComposerDraft: Equatable {
                 let start = text.utf8.count
                 text += reference.value
                 references.append(AgentTaskInputReference(kind: reference.kind, utf8Start: start,
-                    utf8Length: reference.value.utf8.count, value: reference.value))
+                    utf8Length: reference.value.utf8.count, value: reference.value, userRole: reference.userRole))
             }
         }
         return AgentTaskSubmission(request: text, exactInputReferences: references)
@@ -211,6 +234,15 @@ struct TaskComposerDraft: Equatable {
         }
         return result
     }
+
+    private static func stableReferenceID(_ reference: AgentTaskInputReference) -> UUID {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in "\(reference.utf8Start):\(reference.utf8Length):\(reference.kind.rawValue)".utf8 {
+            hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211
+        }
+        let suffix = String(format: "%012llx", hash & 0x0000_FFFF_FFFF_FFFF)
+        return UUID(uuidString: "00000000-0000-4000-8000-\(suffix)")!
+    }
 }
 
 struct TaskRequestComposer: NSViewRepresentable {
@@ -219,6 +251,11 @@ struct TaskRequestComposer: NSViewRepresentable {
     let focusRequested: Bool
     let onFocusChanged: (Bool) -> Void
     let accessibilityLabel: String
+    var isReadOnly = false
+    var canChangeRole = false
+    var hasExistingCorrection = false
+    var onRoleCorrection: ((String, AgentTaskInputRole?) -> Bool)? = nil
+    var onContinueCorrection: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
@@ -233,7 +270,7 @@ struct TaskRequestComposer: NSViewRepresentable {
         let textView = TaskComposerTextView(frame: .zero)
         textView.isRichText = true
         textView.allowsUndo = true
-        textView.isEditable = true
+        textView.isEditable = !isReadOnly
         textView.isSelectable = true
         textView.drawsBackground = false
         textView.backgroundColor = .clear
@@ -249,7 +286,9 @@ struct TaskRequestComposer: NSViewRepresentable {
         textView.composerCoordinator = context.coordinator
         textView.registerForDraggedTypes([.fileURL, .URL])
         textView.setAccessibilityLabel(accessibilityLabel)
-        textView.setAccessibilityHelp("File and web address chips are editable references. Press Return or Space beside a chip to inspect it. Delete removes one reference.")
+        textView.setAccessibilityHelp(isReadOnly
+            ? "Exact input references are shown as read-only chips. Press Return or Space beside a chip to inspect its purpose."
+            : "File and web address chips are editable references. Press Return or Space beside a chip to inspect it. Delete removes one reference.")
         scrollView.documentView = textView
         context.coordinator.textView = textView
         context.coordinator.render(draft, in: textView)
@@ -263,10 +302,12 @@ struct TaskRequestComposer: NSViewRepresentable {
         textView.setFrameSize(NSSize(width: contentWidth, height: max(scrollView.contentSize.height, textView.frame.height)))
         textView.textContainer?.containerSize = NSSize(width: contentWidth, height: CGFloat.greatestFiniteMagnitude)
         textView.setAccessibilityLabel(accessibilityLabel)
+        textView.isEditable = !isReadOnly
         context.coordinator.applyFont(fontSize, to: textView)
         if context.coordinator.lastRenderedDraft != draft {
             context.coordinator.render(draft, in: textView)
         }
+        context.coordinator.refreshActivePopover(using: draft, in: textView)
         if focusRequested, textView.window?.firstResponder !== textView {
             textView.window?.makeFirstResponder(textView)
         } else if !focusRequested, textView.window?.firstResponder === textView {
@@ -280,7 +321,11 @@ struct TaskRequestComposer: NSViewRepresentable {
         weak var textView: TaskComposerTextView?
         var lastRenderedDraft: TaskComposerDraft?
         private var popover: NSPopover?
+        private var popoverHost: NSHostingController<TaskComposerReferencePopover>?
         private var activePopoverReferenceID: UUID?
+        private var lastPopoverReference: TaskComposerReference?
+        private var lastPopoverCanChangeRole: Bool?
+        private var lastPopoverHasExistingCorrection: Bool?
 
         init(parent: TaskRequestComposer) { self.parent = parent }
 
@@ -344,8 +389,39 @@ struct TaskRequestComposer: NSViewRepresentable {
             popover.behavior = .transient
             popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
             popover.contentSize = NSSize(width: 360, height: 280)
-            popover.contentViewController = NSHostingController(rootView: TaskComposerReferencePopover(
+            let host = NSHostingController(rootView: makePopoverContent(reference, in: textView))
+            popover.contentViewController = host
+            self.popoverHost = host
+            lastPopoverReference = reference
+            lastPopoverCanChangeRole = parent.canChangeRole
+            lastPopoverHasExistingCorrection = parent.hasExistingCorrection
+            self.popover = popover
+            popover.show(relativeTo: anchor, of: textView, preferredEdge: .maxY)
+        }
+
+        func refreshActivePopover(using draft: TaskComposerDraft, in textView: TaskComposerTextView) {
+            guard let activePopoverReferenceID,
+                  let popoverHost,
+                  let reference = draft.segments.compactMap({ segment -> TaskComposerReference? in
+                      if case .reference(let reference) = segment { return reference }
+                      return nil
+                  }).first(where: { $0.id == activePopoverReferenceID }) else { return }
+            guard lastPopoverReference != reference ||
+                    lastPopoverCanChangeRole != parent.canChangeRole ||
+                    lastPopoverHasExistingCorrection != parent.hasExistingCorrection else { return }
+            popoverHost.rootView = makePopoverContent(reference, in: textView)
+            lastPopoverReference = reference
+            lastPopoverCanChangeRole = parent.canChangeRole
+            lastPopoverHasExistingCorrection = parent.hasExistingCorrection
+        }
+
+        private func makePopoverContent(_ reference: TaskComposerReference,
+                                        in textView: TaskComposerTextView) -> TaskComposerReferencePopover {
+            TaskComposerReferencePopover(
                 reference: reference,
+                isReadOnly: parent.isReadOnly,
+                canChangeRole: parent.canChangeRole,
+                hasExistingCorrection: parent.hasExistingCorrection,
                 onReplace: { [weak self, weak textView] updated in
                     guard let self, let textView else { return }
                     self.replace(reference.id, with: updated, in: textView)
@@ -355,10 +431,21 @@ struct TaskRequestComposer: NSViewRepresentable {
                     guard let self, let textView else { return }
                     self.remove(reference.id, from: textView)
                     self.popover?.close()
-                }
-            ))
-            self.popover = popover
-            popover.show(relativeTo: anchor, of: textView, preferredEdge: .maxY)
+                },
+                onRoleCorrection: { [weak self, weak textView] role in
+                    guard let self, let occurrenceID = reference.occurrenceID else { return false }
+                    if self.parent.isReadOnly {
+                        return self.parent.onRoleCorrection?(occurrenceID, role) ?? false
+                    }
+                    guard let textView else { return false }
+                    self.replace(reference.id, with: TaskComposerReference(id: reference.id,
+                        kind: reference.kind, value: reference.value, userRole: role,
+                        presentedRole: role, roleOrigin: role == nil ? .unresolved : .chosen,
+                        occurrenceID: reference.occurrenceID), in: textView)
+                    return true
+                },
+                onContinueCorrection: parent.onContinueCorrection
+            )
         }
 
         func remove(_ id: UUID, from textView: TaskComposerTextView) {
@@ -368,7 +455,10 @@ struct TaskRequestComposer: NSViewRepresentable {
 
         func replace(_ id: UUID, with reference: TaskComposerReference, in textView: TaskComposerTextView) {
             guard let range = Self.attachmentRange(id: id, in: textView.attributedString()) else { return }
-            let updated = TaskComposerReference(id: id, kind: reference.kind, value: reference.value)
+            let updated = TaskComposerReference(id: id, kind: reference.kind, value: reference.value,
+                userRole: reference.userRole, presentedRole: reference.presentedRole,
+                roleOrigin: reference.roleOrigin, pendingRole: reference.pendingRole,
+                roleCorrectionPending: reference.roleCorrectionPending, occurrenceID: reference.occurrenceID)
             let attachment = TaskComposerTextAttachment(reference: updated,
                 label: parent.draft.displayLabel(for: updated))
             textView.insertText(NSAttributedString(attachment: attachment), replacementRange: range)
@@ -385,7 +475,7 @@ struct TaskRequestComposer: NSViewRepresentable {
             let customType = NSPasteboard.PasteboardType("com.taskpilot.exact-input-fragment")
             pasteboard.declareTypes([.string, customType], owner: nil)
             pasteboard.setString(plain, forType: .string)
-            if let data = try? JSONEncoder().encode(TaskComposerClipboard(version: 1, pieces: pieces)) {
+            if let data = try? JSONEncoder().encode(TaskComposerClipboard(version: 2, pieces: pieces)) {
                 pasteboard.setData(data, forType: customType)
             }
             if cut { textView.insertText("", replacementRange: selection) }
@@ -396,7 +486,7 @@ struct TaskRequestComposer: NSViewRepresentable {
             let customType = NSPasteboard.PasteboardType("com.taskpilot.exact-input-fragment")
             if let data = pasteboard.data(forType: customType),
                let fragment = try? JSONDecoder().decode(TaskComposerClipboard.self, from: data),
-               fragment.version == 1,
+               (fragment.version == 1 || fragment.version == 2),
                let value = Self.attributedString(from: fragment) {
                 textView.insertText(value, replacementRange: textView.selectedRange())
                 return
@@ -466,7 +556,8 @@ struct TaskRequestComposer: NSViewRepresentable {
             for segment in draft(from: attributed).segments {
                 switch segment {
                 case .text(let text): pieces.append(.init(text: text))
-                case .reference(let reference): pieces.append(.init(kind: reference.kind.rawValue, value: reference.value))
+                case .reference(let reference):
+                    pieces.append(.init(kind: reference.kind.rawValue, value: reference.value, role: reference.userRole))
                 }
             }
             return pieces
@@ -479,7 +570,9 @@ struct TaskRequestComposer: NSViewRepresentable {
                     result.append(NSAttributedString(string: text))
                 } else if piece.text == nil, let rawKind = piece.kind, let kind = AgentTaskInputKind(rawValue: rawKind),
                           let value = piece.value,
-                          let reference = TaskComposerReferenceParser.restored(kind: kind, value: value) {
+                          let restored = TaskComposerReferenceParser.restored(kind: kind, value: value) {
+                    let reference = TaskComposerReference(kind: restored.kind, value: restored.value,
+                                                         userRole: piece.role)
                     result.append(NSAttributedString(attachment: TaskComposerTextAttachment(reference: reference,
                         label: displayLabel(reference))))
                 } else { return nil }
@@ -514,8 +607,13 @@ private struct TaskComposerClipboard: Codable {
         var text: String? = nil
         var kind: String? = nil
         var value: String? = nil
+        var role: AgentTaskInputRole? = nil
         init(text: String) { self.text = text }
-        init(kind: String, value: String) { self.kind = kind; self.value = value }
+        init(kind: String, value: String, role: AgentTaskInputRole?) {
+            self.kind = kind
+            self.value = value
+            self.role = role
+        }
     }
     let version: Int
     let pieces: [Piece]
@@ -657,13 +755,21 @@ final class TaskComposerTextView: NSTextView {
 
 private struct TaskComposerReferencePopover: View {
     let reference: TaskComposerReference
+    let isReadOnly: Bool
+    let canChangeRole: Bool
+    let hasExistingCorrection: Bool
     let onReplace: (TaskComposerReference) -> Void
     let onRemove: () -> Void
+    let onRoleCorrection: (AgentTaskInputRole?) -> Bool
+    let onContinueCorrection: (() -> Void)?
     @State private var showQuickLook = false
     @State private var localDetails: String?
     @State private var previewUnavailable = false
     @State private var replacementValue = ""
     @State private var replacementError: String?
+    @State private var selectedRole: AgentTaskInputRole?
+    @State private var roleCorrectionError: String?
+    @State private var rolePickerReady = false
 
     private var localURL: URL? {
         guard reference.kind == .file || reference.kind == .folder else { return nil }
@@ -680,8 +786,10 @@ private struct TaskComposerReferencePopover: View {
                 Text(reference.kind == .url ? "Web address" : reference.kind == .folder ? "Folder reference" : reference.kind == .text ? "Exact text" : "File reference")
                     .font(.headline)
                 Spacer()
-                Button("Remove", role: .destructive, action: onRemove)
-                    .keyboardShortcut(.delete, modifiers: [])
+                if !isReadOnly {
+                    Button("Remove", role: .destructive, action: onRemove)
+                        .keyboardShortcut(.delete, modifiers: [])
+                }
             }
             Text(reference.value)
                 .font(.system(.caption, design: .monospaced))
@@ -694,6 +802,54 @@ private struct TaskComposerReferencePopover: View {
             if previewUnavailable {
                 Text("This reference is currently unavailable.").font(.caption).foregroundStyle(.secondary)
             }
+            Divider()
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Used as").font(.caption.weight(.semibold))
+                HStack(spacing: 6) {
+                    Text(reference.presentedRole?.title ?? "Not established yet")
+                        .font(.subheadline.weight(.medium))
+                    Spacer(minLength: 4)
+                    Text(roleOriginLabel).font(.caption2).foregroundStyle(.secondary)
+                }
+                if reference.roleCorrectionPending {
+                    Text("Role correction pending · requested: \(reference.pendingRole?.title ?? "Automatic")")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                Picker("Used as role", selection: $selectedRole) {
+                    Text("Automatic").tag(Optional<AgentTaskInputRole>.none)
+                    ForEach(AgentTaskInputRole.allCases) { role in
+                        Text(role.title).tag(Optional(role))
+                    }
+                }
+                .labelsHidden()
+                .accessibilityLabel("Used as role")
+                .disabled(isReadOnly && (hasExistingCorrection || !canChangeRole || reference.roleCorrectionPending))
+                if isReadOnly {
+                    Text("Source is acted on; Destination is an intended output; Reference example guides style, structure, or content.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    if hasExistingCorrection {
+                        Button("Continue existing correction") { onContinueCorrection?() }
+                            .buttonStyle(.bordered)
+                    } else {
+                        Button("Apply role correction") {
+                            if !onRoleCorrection(selectedRole) {
+                                roleCorrectionError = "The role could not be applied. Continue any open correction or try again."
+                            } else {
+                                roleCorrectionError = nil
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!canChangeRole || reference.roleCorrectionPending)
+                    }
+                    if let roleCorrectionError {
+                        Text(roleCorrectionError).font(.caption).foregroundStyle(.orange)
+                    }
+                } else {
+                    Text("A source is acted on; a destination is an intended output; a reference example guides style or structure.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            if !isReadOnly {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Replace exact input")
                     .font(.caption.weight(.semibold))
@@ -714,6 +870,7 @@ private struct TaskComposerReferencePopover: View {
                     Text(replacementError).font(.caption).foregroundStyle(.red)
                 }
             }
+            }
             if reference.kind == .file, !previewUnavailable {
                 Button(showQuickLook ? "Hide Quick Look" : "Quick Look") { showQuickLook.toggle() }
                     .buttonStyle(.bordered)
@@ -725,7 +882,23 @@ private struct TaskComposerReferencePopover: View {
         .padding(14)
         .frame(width: 360, alignment: .leading)
         .task(id: reference.id) { await inspectLocalReference() }
-        .onAppear { replacementValue = reference.value }
+        .onAppear {
+            replacementValue = reference.value
+            selectedRole = reference.roleCorrectionPending ? reference.pendingRole : (reference.userRole ?? reference.presentedRole)
+            DispatchQueue.main.async { rolePickerReady = true }
+        }
+        .onChange(of: selectedRole) { _, role in
+            guard rolePickerReady, !isReadOnly, role != reference.userRole else { return }
+            _ = onRoleCorrection(role)
+        }
+    }
+
+    private var roleOriginLabel: String {
+        switch reference.roleOrigin {
+        case .chosen: "Chosen by you"
+        case .inferred: "Inferred for this run"
+        case .unresolved: "Not established yet"
+        }
     }
 
     private func chooseLocalReference() {
@@ -756,7 +929,9 @@ private struct TaskComposerReferencePopover: View {
                 return
             }
         }
-        onReplace(TaskComposerReference(id: reference.id, kind: reference.kind, value: replacementValue))
+        onReplace(TaskComposerReference(id: reference.id, kind: reference.kind, value: replacementValue,
+            userRole: reference.userRole, presentedRole: reference.presentedRole,
+            roleOrigin: reference.roleOrigin, occurrenceID: reference.occurrenceID))
     }
 
     @MainActor

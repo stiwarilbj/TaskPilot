@@ -101,6 +101,7 @@ class CanonicalStateTests(unittest.TestCase):
     def test_immutable_task_inputs_keep_the_existing_identity_and_encode_once(self):
         inputs = TaskInputBindings('Read file "/fixture/a.txt"', scope="0123456789abcdef")
         expected = hashlib.sha256(json.dumps([TASK_INPUT_VERSION, EXACT_INPUT_REFERENCE_VERSION, inputs.exact_references,
+            inputs.reference_occurrences,
             [(e.identifier, e.value, e.sources, e.resource_kind) for e in inputs.entries], inputs.omitted], ensure_ascii=True).encode()).hexdigest()
         with mock.patch.object(evidence.json, "dumps", wraps=json.dumps) as encode, \
              mock.patch.object(evidence.hashlib, "sha256", wraps=hashlib.sha256) as digest:

@@ -120,6 +120,38 @@ class OpenClawRuntimeTests(unittest.TestCase):
         finally:
             runtime.current_task.reset(token)
 
+    def test_role_only_correction_changes_one_occurrence_without_rewriting_request(self):
+        generation = "00000000-0000-4000-8000-000000000019"
+        request = "Summarize /fixture/report.txt"
+        value = "/fixture/report.txt"
+        start = len("Summarize ".encode())
+        reference = {"version": 3, "kind": "file", "utf8_start": start,
+                     "utf8_length": len(value.encode()), "value": value, "role_override": "source"}
+        occurrence_id = f"{start}:{len(value.encode())}:file"
+        correction_id = "00000000-0000-4000-8000-000000000020"
+        context = runtime.TaskContext(request, 1, generation)
+        context.exact_input_references = [reference]
+        context.correction_key = True
+        amendment = {"occurrence_id": occurrence_id, "kind": "file", "utf8_start": start,
+                     "utf8_length": len(value.encode()), "value": value, "role": "destination"}
+        context.pending_correction_message = {
+            "kind": "instruction_correction", "task_generation_id": generation, "instruction_revision": 1,
+            "correction": {"version": 1, "correction_id": correction_id, "instruction_revision": 1,
+                           "request": "", "exact_input_references": [], "role_amendment": amendment}}
+        token = runtime.current_task.set(context)
+        try:
+            accepted = runtime.receive_instruction_correction(0)
+            self.assertEqual(accepted["request"], "")
+            self.assertEqual(accepted["role_amendment"], amendment)
+            context.pending_correction_message = {
+                "kind": "instruction_correction", "task_generation_id": generation, "instruction_revision": 1,
+                "correction": {"version": 1, "correction_id": "00000000-0000-4000-8000-000000000021",
+                               "instruction_revision": 1, "request": "", "exact_input_references": []}}
+            with self.assertRaisesRegex(RuntimeError, "invalid correction text"):
+                runtime.receive_instruction_correction(0)
+        finally:
+            runtime.current_task.reset(token)
+
     def test_blocker_can_launch_the_requested_app_once(self):
         observation = {"installed_applications": [{"name": "Google Chrome", "bundle_id": "com.google.Chrome"}],
                        "applications": []}

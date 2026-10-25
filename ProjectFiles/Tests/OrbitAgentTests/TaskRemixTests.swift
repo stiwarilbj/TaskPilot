@@ -90,6 +90,20 @@ final class TaskRemixTests: XCTestCase {
         XCTAssertEqual(review.changes[0].newReference?.value, replaced.value)
     }
 
+    func testRemixComparisonReportsAnOccurrenceSpecificRoleOnlyChange() {
+        let original = TaskComposerReference(kind: .file, value: "/tmp/budget.xlsx", userRole: .source)
+        let baseline = TaskComposerDraft(segments: [.text("Summarize "), .reference(original)])
+        let changed = TaskComposerReference(id: original.id, kind: original.kind, value: original.value,
+                                           userRole: .referenceExample)
+        let current = TaskComposerDraft(segments: [.text("Summarize "), .reference(changed)])
+
+        let review = TaskRemixReview.make(baseline: baseline, current: current)
+
+        XCTAssertEqual(review.changes.map(\.kind), [.roleChanged])
+        XCTAssertEqual(review.changes.first?.oldReference?.userRole, .source)
+        XCTAssertEqual(review.changes.first?.newReference?.userRole, .referenceExample)
+    }
+
     func testReferenceReorderingAloneDoesNotShowChangedInputs() {
         let first = TaskComposerReference(kind: .file, value: "/tmp/a.pdf")
         let second = TaskComposerReference(kind: .folder, value: "/tmp/Reports")

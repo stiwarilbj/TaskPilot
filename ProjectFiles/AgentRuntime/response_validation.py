@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any
 from task_evidence import EvidenceValidationError, validate_metadata
 from observation_context import coordinates_are_ambiguous, observation_indexes
@@ -19,7 +20,7 @@ from action_contract_generated import (
     ActionContractError, validate_action,
 )
 
-VALIDATION_VERSION = 13
+VALIDATION_VERSION = 16
 
 
 class ResponseValidationError(RuntimeError):
@@ -81,6 +82,101 @@ def string(value: Any, path: str, nonempty: bool = False) -> None:
     except UnicodeEncodeError: fail(path, "must contain valid UTF-8 text")
 
 
+def _role_quote_is_grounded(task: str, occurrence: tuple, role: str, quote: str,
+                           occurrences: tuple[tuple, ...]) -> bool:
+    """Require a nearby exact clause whose wording clearly supports the role."""
+    encoded = task.encode("utf-8")
+    masked = bytearray(encoded)
+    for _identifier, _kind, start, length, _value, _user_role in occurrences:
+        masked[start:start + length] = b" " * length
+    quote_bytes = quote.encode("utf-8")
+    quote_positions = []
+    cursor = 0
+    while True:
+        found = encoded.find(quote_bytes, cursor)
+        if found < 0:
+            break
+        end = found + len(quote_bytes)
+        if not any(found < right and end > left for left, right in
+                   ((item[2], item[2] + item[3]) for item in occurrences)):
+            quote_positions.append((found, end))
+        cursor = found + 1
+    target_start, target_end = occurrence[2], occurrence[2] + occurrence[3]
+    nearby = False
+    for quote_start, quote_end in quote_positions:
+        distance = min(abs(target_start - quote_end), abs(quote_start - target_end))
+        if distance > 240:
+            continue
+        between_start, between_end = sorted((quote_end, target_start)) if quote_end <= target_start else sorted((target_end, quote_start))
+        if any(byte in b".!?;\n\r" for byte in masked[between_start:between_end]):
+            continue
+        nearby = True
+        break
+    if not nearby:
+        return False
+
+    text = quote.casefold()
+    example = bool(re.search(r"\b(?:reference|example|template|style|format|sample)\b", text))
+    destination = bool(
+        re.search(r"\b(?:save|export|write|put|store|place|deliver|download|create|generate|output|copy|move)\b"
+                  r"[^.!?;\n]{0,100}\b(?:to|in|into|under|beside|at|as)\s*$", text) or
+        re.search(r"\b(?:destination|output\s+(?:folder|file|location)|save\s+location|target\s+folder)\b", text)
+    )
+    source = bool(re.search(r"\b(?:summari[sz]e|analy[sz]e|read|review|edit|modify|change|convert|process|"
+                            r"compare|merge|translate|transcribe|extract|open|source|input|from|using)\b", text))
+    supported = {name for name, matched in (("reference_example", example), ("destination", destination),
+                                             ("source", source)) if matched}
+    return supported == {role}
+
+
+def validate_input_roles(value: Any, ledger) -> list[dict[str, str]]:
+    if not isinstance(value, list) or len(value) > 128:
+        fail("input_roles", "must be a list of at most 128 role proposals")
+    if ledger is None:
+        fail("input_roles", "requires task-owned exact input references")
+    occurrences = ledger.inputs.reference_occurrences
+    by_id = {item[0]: item for item in occurrences}
+    known = set(by_id)
+    submitted = ledger.task.encode("utf-8")
+    protected = [(item[2], item[2] + item[3]) for item in ledger.inputs.reference_occurrences]
+    seen: set[str] = set()
+    normalized = []
+    for index, item in enumerate(value):
+        path = f"input_roles[{index}]"
+        if not isinstance(item, dict) or set(item) != {"occurrence_id", "role", "source_quote"}:
+            fail(path, "requires occurrence_id, role, and source_quote only")
+        identifier, role, quote = item["occurrence_id"], item["role"], item["source_quote"]
+        if not isinstance(identifier, str) or identifier not in known:
+            fail(path + ".occurrence_id", "must reference an exact input occurrence from this task")
+        if identifier in seen:
+            fail(path + ".occurrence_id", "must be unique")
+        occurrence = by_id[identifier]
+        if occurrence[5] is not None:
+            fail(path + ".occurrence_id", "must omit a reference with a user-selected role")
+        if not isinstance(role, str) or role not in {"source", "destination", "reference_example"}:
+            fail(path + ".role", "must be source, destination, or reference_example")
+        string(quote, path + ".source_quote", nonempty=True)
+        if not quote.strip() or len(quote.encode("utf-8")) > 240:
+            fail(path + ".source_quote", "must be a nonempty exact user quotation of at most 240 UTF-8 bytes")
+        quote_bytes = quote.encode("utf-8")
+        positions = []
+        start = 0
+        while True:
+            found = submitted.find(quote_bytes, start)
+            if found < 0: break
+            end = found + len(quote_bytes)
+            if not any(found < right and end > left for left, right in protected):
+                positions.append(found)
+            start = found + 1
+        if not positions:
+            fail(path + ".source_quote", "must exactly quote unbound user wording, not an input value")
+        if not _role_quote_is_grounded(ledger.task, occurrence, role, quote, occurrences):
+            fail(path, "must use nearby wording that clearly supports this role")
+        seen.add(identifier)
+        normalized.append({"occurrence_id": identifier, "role": role, "source_quote": quote})
+    return normalized
+
+
 def normalize_action(value: Any, observation: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
         action = validate_action(value)
@@ -136,6 +232,9 @@ def validate_response(value: dict[str, Any], purpose: str, observation: dict[str
         else: reject_unbound_references(value)
     except InputReferenceError as error: raise ResponseValidationError(str(error)) from error
     result = dict(value)
+    if "input_roles" in result:
+        if purpose != "planning": fail("input_roles", "is valid only during planning")
+        result["input_roles"] = validate_input_roles(result["input_roles"], ledger)
     if 'evidence_disagreement' in result:
         validate_disagreement(result['evidence_disagreement'], observation, ledger, fail)
     for key in ("summary", "context_used", "visual_evidence", "intended_target", "output", "output_title", "reason", "message", "title", "check"):

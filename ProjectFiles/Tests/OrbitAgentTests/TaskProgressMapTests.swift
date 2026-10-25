@@ -107,6 +107,33 @@ final class TaskProgressMapTests: XCTestCase {
         XCTAssertNil(AgentTaskProgressSnapshot.parse(secret, generationID: "generation"))
     }
 
+    func testInputRoleSnapshotIsGenerationRevisionAndOccurrenceBound() throws {
+        let path = "/tmp/budget.xlsx"
+        let reference = AgentTaskInputReference(kind: .file, utf8Start: 0,
+            utf8Length: path.utf8.count, value: path, userRole: .source)
+        let base: [String: Any] = [
+            "kind": "task_input_roles", "task_generation_id": "generation",
+            "instruction_revision": 2, "revision": 4, "version": 1,
+            "roles": [["occurrence_id": reference.id, "role": "source", "origin": "user"]]
+        ]
+        let parsed = try XCTUnwrap(AgentTaskInputRolesSnapshot.parse(base, generationID: "generation",
+            instructionRevision: 2, exactReferences: [reference]))
+        XCTAssertEqual(parsed.assignments[reference.id]?.role, .source)
+        XCTAssertEqual(parsed.assignments[reference.id]?.origin, .user)
+        XCTAssertNil(AgentTaskInputRolesSnapshot.parse(base, generationID: "other",
+            instructionRevision: 2, exactReferences: [reference]))
+        XCTAssertNil(AgentTaskInputRolesSnapshot.parse(base, generationID: "generation",
+            instructionRevision: 1, exactReferences: [reference]))
+
+        var forged = base
+        forged["roles"] = [["occurrence_id": reference.id, "role": "destination", "origin": "user"]]
+        XCTAssertNil(AgentTaskInputRolesSnapshot.parse(forged, generationID: "generation",
+            instructionRevision: 2, exactReferences: [reference]))
+        forged["roles"] = [["occurrence_id": "other", "role": "source", "origin": "inferred"]]
+        XCTAssertNil(AgentTaskInputRolesSnapshot.parse(forged, generationID: "generation",
+            instructionRevision: 2, exactReferences: [reference]))
+    }
+
     func testBatchSnapshotRequiresTaskOwnedInputsAndCurrentRequirementAssociations() throws {
         let base: [String: Any] = [
             "kind": "task_progress", "task_generation_id": "generation", "revision": 5,

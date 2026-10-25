@@ -14,8 +14,8 @@ from evidence_fixtures import VerificationSessions
 import prompt_compiler
 from task_inputs import (TaskInputBindings, InputReferenceError, MAX_INPUTS, TASK_INPUT_VERSION,
                          EXACT_INPUT_REFERENCE_VERSION)
-from task_evidence import TaskEvidenceLedger
-from response_validation import ResponseValidationError, validate_response
+from task_evidence import TaskEvidenceLedger, validate_batch_declaration
+from response_validation import ResponseValidationError, validate_input_roles, validate_response
 
 SCOPE = '0123456789abcdef'
 PATH = "/fixture/O'Brien $HOME report.txt"
@@ -39,6 +39,87 @@ def requirement(task, check):
 
 
 class TaskInputTests(unittest.TestCase):
+    def test_role_overrides_are_versioned_per_occurrence_and_part_of_fingerprint(self):
+        value = "/fixture/report.txt"
+        task = f"Summarize {value} and save the output to {value}."
+        first_start = len("Summarize ".encode())
+        second_start = len((f"Summarize {value} and save the output to ").encode())
+        base = {"version": 3, "kind": "file", "utf8_length": len(value.encode()), "value": value}
+        references = [dict(base, utf8_start=first_start, role_override="source"),
+                      dict(base, utf8_start=second_start, role_override="destination")]
+        ledger = TaskEvidenceLedger(task, input_scope=SCOPE, exact_input_references=references)
+        occurrences = ledger.inputs.reference_occurrences
+        self.assertNotEqual(occurrences[0][0], occurrences[1][0])
+        self.assertEqual([item["role"] for item in ledger.input_role_state()], ["source", "destination"])
+        self.assertEqual(ledger.roles_for_input_value(value), {"source", "destination"})
+        self.assertIsNone(ledger.role_for_input_value(value))
+        self.assertNotEqual(ledger.inputs.fingerprint(), TaskInputBindings(task, scope=SCOPE,
+            exact_input_references=[dict(base, utf8_start=first_start), dict(base, utf8_start=second_start)]).fingerprint())
+        with self.assertRaisesRegex(InputReferenceError, "version 3"):
+            TaskInputBindings(task, exact_input_references=[dict(references[0], version=2)])
+        with self.assertRaisesRegex(InputReferenceError, "role_override"):
+            TaskInputBindings(task, exact_input_references=[dict(references[0], role_override="input")])
+
+    def test_same_value_can_be_source_and_destination_without_disappearing_from_batch_inputs(self):
+        shared, other = "/fixture/shared.txt", "/fixture/other.txt"
+        task = f"Process each file separately: summarize {shared}, save the result to {shared}, then summarize {other}."
+        encoded = task.encode()
+        occurrences = []
+        cursor = 0
+        for value, role in ((shared, "source"), (shared, "destination"), (other, "source")):
+            start = encoded.index(value.encode(), cursor)
+            occurrences.append({"version": 3, "kind": "file", "utf8_start": start,
+                                "utf8_length": len(value.encode()), "value": value,
+                                "role_override": role})
+            cursor = start + len(value.encode())
+        ledger = TaskEvidenceLedger(task, input_scope=SCOPE, exact_input_references=occurrences)
+        shared_entry = next(entry for entry in ledger.inputs.resource_inputs if entry.value == shared)
+        self.assertFalse(ledger.input_is_output_destination(shared_entry))
+        self.assertEqual({entry.value for entry in ledger.batch_source_candidates()}, {shared, other})
+        resources = ledger.inputs.resource_inputs
+        proposed = {
+            "r1": {"state": "pending", "scope": "outcome"},
+            "r2": {"state": "pending", "scope": "outcome"},
+        }
+        declaration = {"mode": "per_input", "source_input_ids": [item.identifier for item in resources],
+            "items": [{"input_id": resources[0].identifier, "requirement_ids": ["r1"]},
+                      {"input_id": resources[1].identifier, "requirement_ids": ["r2"]}],
+            "excluded_inputs": [], "global_requirement_ids": []}
+        self.assertEqual(validate_batch_declaration(declaration, ledger, proposed)["source_input_ids"],
+                         [item.identifier for item in resources])
+
+    def test_role_proposals_need_a_nearby_exact_quote_that_supports_the_role(self):
+        path, folder = "/fixture/budget.xlsx", "/fixture/Reports"
+        task = f"Summarize {path}. The report should be ready; save the report in {folder}."
+        encoded = task.encode()
+        references = [
+            {"version": 3, "kind": "file", "utf8_start": encoded.index(path.encode()),
+             "utf8_length": len(path.encode()), "value": path},
+            {"version": 3, "kind": "folder", "utf8_start": encoded.index(folder.encode()),
+             "utf8_length": len(folder.encode()), "value": folder},
+        ]
+        ledger = TaskEvidenceLedger(task, input_scope=SCOPE, exact_input_references=references)
+        file_id, folder_id = [item[0] for item in ledger.inputs.reference_occurrences]
+        proposals = [
+            {"occurrence_id": file_id, "role": "source", "source_quote": "Summarize "},
+            {"occurrence_id": folder_id, "role": "destination", "source_quote": "save the report in "},
+        ]
+        self.assertEqual(validate_input_roles(proposals, ledger), proposals)
+        ledger.accept_plan({"input_roles": proposals})
+        self.assertEqual([(item["role"], item["origin"]) for item in ledger.input_role_state()],
+                         [("source", "inferred"), ("destination", "inferred")])
+        ledger.accept_plan({})
+        self.assertEqual([(item["role"], item["origin"]) for item in ledger.input_role_state()],
+                         [("source", "inferred"), ("destination", "inferred")])
+        invalid = [dict(proposals[0], source_quote="The report should be ready"), proposals[1]]
+        with self.assertRaisesRegex(ResponseValidationError, "nearby wording"):
+            validate_input_roles(invalid, ledger)
+        wrong_role = [dict(proposals[0], role="destination"), proposals[1]]
+        with self.assertRaisesRegex(ResponseValidationError, "clearly supports this role"):
+            validate_input_roles(wrong_role, ledger)
+        with self.assertRaisesRegex(ResponseValidationError, "must be unique"):
+            validate_input_roles([proposals[0], proposals[0]], ledger)
+
     def test_remix_literal_fixture_matches_task_input_binding(self):
         fixture_path = Path(__file__).resolve().parents[1] / 'Fixtures' / 'remix-input-cases.json'
         fixture = json.loads(fixture_path.read_text(encoding='utf-8'))

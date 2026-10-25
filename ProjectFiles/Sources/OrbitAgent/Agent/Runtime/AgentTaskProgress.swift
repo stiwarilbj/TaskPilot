@@ -61,6 +61,63 @@ struct AgentTaskProgressRequirement: Equatable, Identifiable {
     let evidence: [AgentTaskProgressEvidence]
 }
 
+enum AgentTaskInputRoleOrigin: String, Equatable {
+    case user
+    case inferred
+    case unresolved
+}
+
+struct AgentTaskInputRoleAssignment: Equatable {
+    let role: AgentTaskInputRole?
+    let origin: AgentTaskInputRoleOrigin
+}
+
+struct AgentTaskInputRolesSnapshot: Equatable {
+    let generationID: String
+    let instructionRevision: UInt64
+    let revision: UInt64
+    let assignments: [String: AgentTaskInputRoleAssignment]
+
+    var estimatedByteCount: Int { 256 + assignments.reduce(0) { $0 + $1.key.utf8.count + 64 } }
+
+    static func parse(_ message: [String: Any], generationID: String, instructionRevision: UInt64,
+                      exactReferences: [AgentTaskInputReference]) -> Self? {
+        guard Set(message.keys) == ["kind", "task_generation_id", "instruction_revision", "revision", "version", "roles"],
+              message["kind"] as? String == "task_input_roles",
+              message["task_generation_id"] as? String == generationID,
+              exactUnsigned(message["instruction_revision"]) == instructionRevision,
+              let revision = exactUnsigned(message["revision"]), revision > 0,
+              exactUnsigned(message["version"]) == 1,
+              let values = message["roles"] as? [[String: Any]], values.count == exactReferences.count,
+              values.count <= 128 else { return nil }
+        let known = Set(exactReferences.map(\.id))
+        var assignments: [String: AgentTaskInputRoleAssignment] = [:]
+        for value in values {
+            guard Set(value.keys) == ["occurrence_id", "role", "origin"],
+                  let identifier = value["occurrence_id"] as? String, known.contains(identifier),
+                  assignments[identifier] == nil,
+                  let originValue = value["origin"] as? String,
+                  let origin = AgentTaskInputRoleOrigin(rawValue: originValue) else { return nil }
+            let role: AgentTaskInputRole?
+            if value["role"] is NSNull { role = nil }
+            else if let rawRole = value["role"] as? String, let parsed = AgentTaskInputRole(rawValue: rawRole) { role = parsed }
+            else { return nil }
+            guard (origin == .unresolved) == (role == nil),
+                  origin != .user || exactReferences.first(where: { $0.id == identifier })?.userRole == role else { return nil }
+            assignments[identifier] = AgentTaskInputRoleAssignment(role: role, origin: origin)
+        }
+        guard Set(assignments.keys) == known else { return nil }
+        return Self(generationID: generationID, instructionRevision: instructionRevision,
+                    revision: revision, assignments: assignments)
+    }
+}
+
+private func exactUnsigned(_ value: Any?) -> UInt64? {
+    guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+          number.doubleValue >= 0, number.doubleValue.rounded(.towardZero) == number.doubleValue else { return nil }
+    return UInt64(number.stringValue)
+}
+
 struct AgentTaskProgressSnapshot: Equatable {
     let generationID: String
     let revision: UInt64
@@ -303,6 +360,7 @@ struct TaskProgressMap: Equatable {
     var requirements: [AgentTaskProgressRequirement]
     var resultObjects: [AgentTaskResultObject]
     var batch: AgentTaskBatchProgress?
+    var inputRoles: [String: AgentTaskInputRoleAssignment]
 
     var stopBoundaries: [StopBoundaryRecord] {
         StopBoundaryPolicy.detect(in: originalRequest, exactInputReferences: exactInputReferences)
@@ -319,6 +377,9 @@ struct TaskProgressMap: Equatable {
         requirements = []
         resultObjects = []
         batch = nil
+        inputRoles = Dictionary(uniqueKeysWithValues: exactInputReferences.compactMap { reference in
+            reference.userRole.map { (reference.id, AgentTaskInputRoleAssignment(role: $0, origin: .user)) }
+        })
     }
 
     init(request: String, snapshot: AgentTaskProgressSnapshot,
@@ -333,5 +394,8 @@ struct TaskProgressMap: Equatable {
         requirements = snapshot.requirements
         resultObjects = snapshot.resultObjects
         batch = snapshot.batch
+        inputRoles = Dictionary(uniqueKeysWithValues: exactInputReferences.compactMap { reference in
+            reference.userRole.map { (reference.id, AgentTaskInputRoleAssignment(role: $0, origin: .user)) }
+        })
     }
 }
