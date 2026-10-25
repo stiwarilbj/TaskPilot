@@ -312,4 +312,38 @@ final class TaskResultShelfTests: XCTestCase {
         hostingView.cacheDisplay(in: hostingView.bounds, to: bitmap)
         XCTAssertGreaterThan(try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).count, 2_000)
     }
+
+    @MainActor
+    func testRendersVerifiedChangeComparisonInNarrowPreviewFixture() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("change-lens-view-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("report.md")
+        let before = "# Introduction\nOld opening.\n# Body\nKeep this.\n"
+        let after = "# Introduction\nNew opening.\n# Body\nKeep this.\n"
+        try Data(after.utf8).write(to: url)
+        let current = try BoundFileOperation(url).read(limit: 1_024)
+        let item = AgentTaskResultObject(id: AgentTaskResultObject.resultID(kind: .file, target: url.path),
+            kind: .file, state: .verified, name: url.lastPathComponent,
+            location: url.deletingLastPathComponent().path, path: url.path, url: nil,
+            fileIdentity: current.identity.object, fileVersion: current.identity.version,
+            parentIdentity: current.parent.object)
+        let snapshot = AgentTaskChangeLensSnapshot(generationID: "fixture", instructionRevision: 0,
+            actionID: UUID().uuidString.lowercased(), path: url.path,
+            fileIdentity: current.identity.object, fileVersion: current.identity.version,
+            parentIdentity: current.parent.object, beforeVersion: String(repeating: "a", count: 64),
+            beforeText: before, afterText: after, requirementIDs: [], created: false, chainReset: false)
+        let view = TaskResultPreviewSheetView(url: url, result: item, snapshot: snapshot,
+            taskRequest: "Change only the introduction.", requirements: [],
+            originatingInstruction: "Change only the introduction.", taskIsActive: false,
+            surface: Color(nsColor: .windowBackgroundColor), border: Color(nsColor: .separatorColor),
+            accent: .blue, onCorrect: nil, initiallyShowingChanges: true)
+            .frame(width: 420, height: 480)
+        let hostingView = NSHostingView(rootView: view)
+        hostingView.frame = NSRect(x: 0, y: 0, width: 420, height: 480)
+        hostingView.layoutSubtreeIfNeeded()
+        let bitmap = try XCTUnwrap(hostingView.bitmapImageRepForCachingDisplay(in: hostingView.bounds))
+        hostingView.cacheDisplay(in: hostingView.bounds, to: bitmap)
+        XCTAssertGreaterThan(try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).count, 2_000)
+    }
 }

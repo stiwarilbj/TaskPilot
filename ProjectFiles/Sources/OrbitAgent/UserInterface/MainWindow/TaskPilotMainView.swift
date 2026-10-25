@@ -694,9 +694,18 @@ struct TaskPilotMainView: View {
 
             if let progressMap = model.taskProgressMap, !progressMap.resultObjects.isEmpty {
                 TaskResultShelfView(results: progressMap.resultObjects,
+                                    changeSnapshots: model.taskChangeLensSnapshots,
+                                    taskRequest: progressMap.originalRequest,
+                                    requirements: progressMap.requirements,
+                                    taskIsActive: model.isActive,
                                     surface: theme.surfaceColor,
                                     border: theme.borderColor,
-                                    accent: accent)
+                                    accent: accent,
+                                    changeCorrectionHandler: { snapshot, passage, beforeAnchor, afterAnchor, instruction, correction in
+                                        model.submitFocusedChangeCorrection(snapshot: snapshot, passage: passage,
+                                            beforeAnchor: beforeAnchor, afterAnchor: afterAnchor,
+                                            originatingInstruction: instruction, correction: correction)
+                                    })
                     .id(progressMap.generationID)
             }
 

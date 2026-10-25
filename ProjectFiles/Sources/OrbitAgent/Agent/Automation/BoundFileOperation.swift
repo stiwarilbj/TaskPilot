@@ -25,6 +25,16 @@ final class BoundFileOperation {
         let parent: Identity
         var fields: [String: Any] { ["file_identity": identity.object, "file_version": identity.version, "parent_identity": parent.object] }
     }
+    struct TextEditSnapshot {
+        let beforeData: Data?
+        let afterData: Data
+        let beforeVersion: String?
+        let beforeSHA256: String?
+        let fileIdentity: String
+        let fileVersion: String
+        let parentIdentity: String
+        let created: Bool
+    }
     enum Boundary { case bound, staged, beforeCommit, delivering, committed, inspected }
     typealias Hook = (Boundary) throws -> Void
     let input: URL
@@ -129,6 +139,10 @@ final class BoundFileOperation {
         }
     }
     private static func copyAndHash(_ fd: Int32, to destination: Int32? = nil) throws -> String {
+        var unused: Data?
+        return try copyAndHash(fd, to: destination, capture: &unused)
+    }
+    private static func copyAndHash(_ fd: Int32, to destination: Int32?, capture: inout Data?) throws -> String {
         var hash = SHA256(), offset: Int64 = 0
         let size = try identity(fd).info.st_size
         while offset < size {
@@ -137,6 +151,7 @@ final class BoundFileOperation {
             guard !bytes.isEmpty else { throw Conflict(delivered: false, detail: "the file shrank during inspection") }
             hash.update(data: bytes)
             if let destination { try write(destination, bytes) }
+            if capture != nil { capture!.append(bytes) }
             offset += Int64(bytes.count)
         }
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
@@ -179,6 +194,20 @@ final class BoundFileOperation {
         return (kind != "file_contents" || snapshot.data == expected!, snapshot.fields)
     }
     func replace(with data: Data, append: Bool, mustBeAbsent: Bool) throws -> (Int, [String: Any]) {
+        let result = try replaceInternal(with: data, append: append, mustBeAbsent: mustBeAbsent,
+                                         captureText: false)
+        return (result.size, result.fields)
+    }
+
+    func replaceCapturingText(with data: Data, append: Bool, mustBeAbsent: Bool)
+        throws -> (Int, [String: Any], TextEditSnapshot?) {
+        let result = try replaceInternal(with: data, append: append, mustBeAbsent: mustBeAbsent,
+                                         captureText: true)
+        return (result.size, result.fields, result.textSnapshot)
+    }
+
+    private func replaceInternal(with data: Data, append: Bool, mustBeAbsent: Bool, captureText: Bool)
+        throws -> (size: Int, fields: [String: Any], textSnapshot: TextEditSnapshot?) {
         try checkParent()
         let initial = try entry(name)
         guard !mustBeAbsent || initial == nil else { throw conflict("the destination must still be absent") }
@@ -203,8 +232,14 @@ final class BoundFileOperation {
         }
         cleanupObject = try Self.identity(staged).object
         var originalHash: String?
+        let maximumTextBytes = 128 * 1024
+        let expectedFinalSize = (append ? (initial?.info.st_size ?? 0) : 0) + Int64(data.count)
+        let maximumTextSize = Int64(maximumTextBytes)
+        let canCaptureText = captureText && expectedFinalSize <= maximumTextSize &&
+            (initial == nil || (initial?.info.st_size ?? (maximumTextSize + 1)) <= maximumTextSize)
+        var originalBytes: Data? = canCaptureText && initial != nil ? Data() : nil
         if let original {
-            originalHash = try Self.copyAndHash(original, to: append ? staged : nil)
+            originalHash = try Self.copyAndHash(original, to: append ? staged : nil, capture: &originalBytes)
             guard try Self.identity(original) == initial else { throw conflict("the original file changed while staging") }
             guard fcopyfile(original, staged, nil, copyfile_flags_t(COPYFILE_ACL | COPYFILE_XATTR)) == 0 else { throw Self.systemError("preserve file metadata") }
             guard fchmod(staged, initial!.info.st_mode & 0o777) == 0 else { throw Self.systemError("preserve permissions") }
@@ -266,7 +301,38 @@ final class BoundFileOperation {
             // Only discard the displaced original after all verification has
             // succeeded. A post-delivery conflict preserves it for inspection.
             retainDisplaced = false
-            return (Int(committed.info.st_size), Snapshot(data: Data(), identity: committed, parent: parentIdentity).fields.merging(["file_sha256": stagedHash]) { _, new in new })
+            var textSnapshot: TextEditSnapshot?
+            if canCaptureText {
+                let afterBytes: Data?
+                if append, let originalBytes {
+                    var combined = originalBytes
+                    combined.append(data)
+                    afterBytes = combined
+                } else if initial == nil || !append {
+                    afterBytes = data
+                } else {
+                    afterBytes = nil
+                }
+                if let afterBytes, afterBytes.count <= maximumTextBytes,
+                   SHA256.hash(data: afterBytes).map({ String(format: "%02x", $0) }).joined() == stagedHash,
+                   let afterText = String(data: afterBytes, encoding: .utf8),
+                   !afterText.unicodeScalars.contains(where: { $0.value == 0 }),
+                   (initial == nil || (originalBytes.flatMap { String(data: $0, encoding: .utf8) } != nil)) {
+                    textSnapshot = TextEditSnapshot(
+                        beforeData: originalBytes,
+                        afterData: afterBytes,
+                        beforeVersion: initial?.version,
+                        beforeSHA256: originalHash,
+                        fileIdentity: committed.object,
+                        fileVersion: committed.version,
+                        parentIdentity: parentIdentity.object,
+                        created: initial == nil
+                    )
+                }
+            }
+            let fields = Snapshot(data: Data(), identity: committed, parent: parentIdentity).fields
+                .merging(["file_sha256": stagedHash]) { _, new in new }
+            return (Int(committed.info.st_size), fields, textSnapshot)
         } catch {
             if error is CancellationError { throw error }
             if delivered { throw conflict(error.localizedDescription + (retainDisplaced ? " Displaced data remains at \(parentURL.appendingPathComponent(temporary).path)" : ""), delivered: true) }

@@ -93,6 +93,7 @@ final class AgentAutomationBridge {
                                                    workingDocumentRevision: UInt64) async -> [String: Any] {
         var receiptToken: ActionReceiptStore.Token?
         var runtimePermit: ManagedRuntimePermit?
+        var changeLensCandidate: [String: Any]?
         defer { withExtendedLifetime(runtimePermit) {} }
         var magnifierActionTitle: String?
         do {
@@ -513,7 +514,13 @@ final class AgentAutomationBridge {
                     try await TaskOwnership.$stopBoundaryPreflight.withValue(boundaryCheck) {
                     try await TaskOwnership.$targetChoicePreflight.withValue(targetChoiceCheck) {
                     if kind.owner == .task_tool {
-                        return try await taskTools.perform(action: action, commandBindingID: params["command_inspection_id"] as? String)
+                        let result = try await taskTools.perform(action: action,
+                            commandBindingID: params["command_inspection_id"] as? String,
+                            targetRequirementIDs: targetRequirementIDs)
+                        if let actionID = receiptToken?.id {
+                            changeLensCandidate = taskTools.takeChangeLensCandidate(actionID: actionID)
+                        }
+                        return result
                     } else {
                         guard kind.owner == .desktop else {
                             throw BridgeError.invalidRequest("Runtime-local actions cannot be dispatched to the native bridge")
@@ -542,7 +549,11 @@ final class AgentAutomationBridge {
             }
             try TaskOwnership.check()
             if let receiptToken {
-                return try receiptResponse(receiptToken.receipt, requestID: requestID, generation: lease.id)
+                var response = try receiptResponse(receiptToken.receipt, requestID: requestID, generation: lease.id)
+                if response["ok"] as? Bool == true, let changeLensCandidate {
+                    response["change_lens_candidate"] = changeLensCandidate
+                }
+                return response
             }
             return [
                 "task_generation_id": lease.id,
@@ -552,6 +563,7 @@ final class AgentAutomationBridge {
                 "result": result
             ]
         } catch {
+            if let actionID = receiptToken?.id { _ = taskTools.takeChangeLensCandidate(actionID: actionID) }
             let code = failureCode(for: error)
             receiptToken?.fail(error, code: code)
             if let title = magnifierActionTitle, let receiptToken {

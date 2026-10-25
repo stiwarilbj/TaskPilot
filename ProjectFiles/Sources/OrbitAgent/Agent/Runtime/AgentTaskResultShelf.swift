@@ -300,27 +300,42 @@ private enum TaskResultFileIdentity {
 
 struct TaskResultShelfView: View {
     typealias ActionHandler = @MainActor (TaskResultShelfAction, AgentTaskResultObject) -> TaskResultShelfActionOutcome
+    typealias ChangeCorrectionHandler = @MainActor (AgentTaskChangeLensSnapshot, String, String, String, String, String) -> AgentTaskChangeCorrectionOutcome
 
     let results: [AgentTaskResultObject]
+    let changeSnapshots: [String: AgentTaskChangeLensSnapshot]
+    let taskRequest: String
+    let requirements: [AgentTaskProgressRequirement]
+    let taskIsActive: Bool
     let surface: Color
     let border: Color
     let accent: Color
     let actionHandler: ActionHandler?
+    let changeCorrectionHandler: ChangeCorrectionHandler?
+    @State private var previewResult: AgentTaskResultObject?
     @State private var previewURL: URL?
-    @State private var previewTitle = ""
+    @State private var previewSnapshot: AgentTaskChangeLensSnapshot?
+    @State private var previewInstruction = ""
     @State private var presentedStack: TaskResultShelfEntry?
-    @State private var pendingPreview: (url: URL, title: String)?
+    @State private var pendingPreview: (url: URL, result: AgentTaskResultObject)?
     @State private var actionMessages: [String: String] = [:]
 
     private var entries: [TaskResultShelfEntry] { TaskResultShelfEntry.grouped(results) }
 
-    init(results: [AgentTaskResultObject], surface: Color, border: Color, accent: Color,
-         actionHandler: ActionHandler? = nil) {
+    init(results: [AgentTaskResultObject], changeSnapshots: [String: AgentTaskChangeLensSnapshot] = [:],
+         taskRequest: String = "", requirements: [AgentTaskProgressRequirement] = [],
+         taskIsActive: Bool = false, surface: Color, border: Color, accent: Color,
+         actionHandler: ActionHandler? = nil, changeCorrectionHandler: ChangeCorrectionHandler? = nil) {
         self.results = results
+        self.changeSnapshots = changeSnapshots
+        self.taskRequest = taskRequest
+        self.requirements = requirements
+        self.taskIsActive = taskIsActive
         self.surface = surface
         self.border = border
         self.accent = accent
         self.actionHandler = actionHandler
+        self.changeCorrectionHandler = changeCorrectionHandler
     }
 
     var body: some View {
@@ -348,6 +363,11 @@ struct TaskResultShelfView: View {
         .onChange(of: entries) { _, updatedEntries in
             let currentResultIDs = Set(updatedEntries.flatMap(\.results).map(\.id))
             actionMessages = actionMessages.filter { currentResultIDs.contains($0.key) }
+            if let previewResult, !currentResultIDs.contains(previewResult.id) {
+                self.previewURL = nil
+                self.previewResult = nil
+                self.previewSnapshot = nil
+            }
             if let presentedStack {
                 self.presentedStack = updatedEntries.first { $0.id == presentedStack.id && $0.isFolderStack }
             }
@@ -355,15 +375,26 @@ struct TaskResultShelfView: View {
         .onChange(of: presentedStack) { oldValue, newValue in
             guard oldValue != nil, newValue == nil, let pendingPreview else { return }
             self.pendingPreview = nil
-            previewTitle = pendingPreview.title
+            preparePreview(pendingPreview.result)
             previewURL = pendingPreview.url
         }
         .sheet(isPresented: Binding(get: { previewURL != nil }, set: { if !$0 { previewURL = nil } })) {
-            if let previewURL {
-                TaskResultQuickLookView(url: previewURL)
-                    .frame(minWidth: 620, minHeight: 440)
-                    .padding(12)
-                    .accessibilityLabel("Quick Look preview of \(previewTitle)")
+            if let previewURL, let previewResult {
+                TaskResultPreviewSheetView(
+                    url: previewURL,
+                    result: previewResult,
+                    snapshot: previewSnapshot,
+                    taskRequest: taskRequest,
+                    requirements: requirements,
+                    originatingInstruction: previewInstruction,
+                    taskIsActive: taskIsActive,
+                    surface: surface,
+                    border: border,
+                    accent: accent,
+                    onCorrect: changeCorrectionHandler
+                )
+                .frame(minWidth: 360, idealWidth: 720, minHeight: 360, idealHeight: 520)
+                .padding(12)
             }
         }
         .popover(item: $presentedStack, arrowEdge: .top) { entry in
@@ -542,15 +573,33 @@ struct TaskResultShelfView: View {
         case .preview(let url):
             actionMessages[result.id] = nil
             if fromStack {
-                pendingPreview = (url, result.name)
+                pendingPreview = (url, result)
                 presentedStack = nil
             } else {
+                preparePreview(result)
                 previewURL = url
-                previewTitle = result.name
             }
         case .unavailable(let message):
             actionMessages[result.id] = message
         }
+    }
+
+    private func preparePreview(_ result: AgentTaskResultObject) {
+        previewResult = result
+        let snapshot = changeSnapshots[result.id]
+        previewSnapshot = snapshot
+        guard let snapshot else {
+            previewInstruction = taskRequest
+            return
+        }
+        let bytes = Array(taskRequest.utf8)
+        let phrases = requirements.filter { snapshot.requirementIDs.contains($0.id) }.flatMap { requirement in
+            requirement.sourceRanges.compactMap { range -> String? in
+                guard range.lowerBound >= 0, range.upperBound <= bytes.count, range.lowerBound < range.upperBound else { return nil }
+                return String(bytes: bytes[range.lowerBound..<range.upperBound], encoding: .utf8)
+            }
+        }
+        previewInstruction = phrases.isEmpty ? taskRequest : phrases.joined(separator: "\n")
     }
 }
 

@@ -43,6 +43,8 @@ final class TaskToolExecutor {
     private var commandCancelled = false
     private var commandPaused = false
     private let capabilityLock = NSLock()
+    private let changeLensLock = NSLock()
+    private var pendingChangeLensCandidates: [String: [String: Any]] = [:]
     private var commandBindings: [String: CommandCapabilities.Binding] = [:]
     private var helpCache: [String: (created: TimeInterval, result: [String: Any])] = [:]
     private var helpCacheEpoch: UInt64 = 0
@@ -94,20 +96,27 @@ final class TaskToolExecutor {
         } onCancel: { lease?.wakePausedWorkers(); self.cancelActiveCommand() }
     }
 
-    func perform(action input: [String: Any], commandBindingID: String? = nil) async throws -> [String: Any] {
+    func perform(action input: [String: Any], commandBindingID: String? = nil,
+                 targetRequirementIDs: [String] = []) async throws -> [String: Any] {
         try await TaskOwnership.withCancellationWakeup {
-            try await performOwned(action: input, commandBindingID: commandBindingID)
+            try await performOwned(action: input, commandBindingID: commandBindingID,
+                                   targetRequirementIDs: targetRequirementIDs)
         }
     }
 
-    private func performOwned(action input: [String: Any], commandBindingID: String?) async throws -> [String: Any] {
+    func takeChangeLensCandidate(actionID: String) -> [String: Any]? {
+        changeLensLock.withLock { pendingChangeLensCandidates.removeValue(forKey: actionID) }
+    }
+
+    private func performOwned(action input: [String: Any], commandBindingID: String?,
+                              targetRequirementIDs: [String]) async throws -> [String: Any] {
         try await TaskOwnership.checkpoint()
         let action: [String: Any]
         do { action = try ActionContract.validate(input) }
         catch { throw TaskToolError.invalidAction(error.localizedDescription) }
         switch ActionKind(rawValue: action["type"] as! String)! {
         case .read_file: return try readFile(action)
-        case .write_file: return try writeFile(action)
+        case .write_file: return try writeFile(action, requirementIDs: targetRequirementIDs)
         case .run_command:
             return try await withTaskCancellationHandler {
                 try runCommand(action, bindingID: commandBindingID)
@@ -221,7 +230,7 @@ final class TaskToolExecutor {
         ].merging(snapshot.fields) { _, new in new }
     }
 
-    private func writeFile(_ action: [String: Any]) throws -> [String: Any] {
+    private func writeFile(_ action: [String: Any], requirementIDs: [String]) throws -> [String: Any] {
         let url = try Self.fileURL(from: action)
         guard let content = action["content"] as? String else {
             throw TaskToolError.invalidAction("write_file requires content")
@@ -251,8 +260,31 @@ final class TaskToolExecutor {
         }
         let createParents = action["create_parents"] as? Bool ?? ActionContract.defaultValue(.write_file, "create_parents") as! Bool
         let operation = try BoundFileOperation(url, createParents: createParents)
-        let (finalSize, identity) = try operation.replace(with: data, append: mode == "append",
-            mustBeAbsent: action["precondition"] as? String == "absent")
+        let (finalSize, identity, textSnapshot) = try operation.replaceCapturingText(with: data,
+            append: mode == "append", mustBeAbsent: action["precondition"] as? String == "absent")
+
+        if let textSnapshot, let actionID = TaskOwnership.actionReceipt?.id,
+           requirementIDs.count <= 32, Set(requirementIDs).count == requirementIDs.count {
+            var candidate: [String: Any] = [
+                "action_id": actionID,
+                "path": url.standardizedFileURL.path,
+                "file_identity": textSnapshot.fileIdentity,
+                "file_version": textSnapshot.fileVersion,
+                "parent_identity": textSnapshot.parentIdentity,
+                "after_data": textSnapshot.afterData,
+                "requirement_ids": requirementIDs,
+                "created": textSnapshot.created
+            ]
+            candidate["before_data"] = textSnapshot.beforeData as Any? ?? NSNull()
+            candidate["before_version"] = textSnapshot.beforeVersion as Any? ?? NSNull()
+            candidate["before_sha256"] = textSnapshot.beforeSHA256 as Any? ?? NSNull()
+            changeLensLock.withLock {
+                pendingChangeLensCandidates[actionID] = candidate
+                while pendingChangeLensCandidates.count > 8 {
+                    if let oldest = pendingChangeLensCandidates.keys.first { pendingChangeLensCandidates.removeValue(forKey: oldest) }
+                }
+            }
+        }
 
         return [
             "action_type": "write_file", "verification_scope": "file_write",

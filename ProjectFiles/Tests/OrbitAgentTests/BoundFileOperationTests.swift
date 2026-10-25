@@ -34,6 +34,46 @@ final class BoundFileOperationTests: XCTestCase {
         XCTAssertEqual(second.1["file_identity"] as? String, check.1["file_identity"] as? String)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: file.deletingLastPathComponent().path), ["result"])
     }
+    func testCapturesCompleteUTF8VersionsDuringTheDescriptorBoundWritePass() throws {
+        let file = try root().appendingPathComponent("change.txt")
+        let created = try BoundFileOperation(file).replaceCapturingText(with: Data("first\n".utf8),
+            append: false, mustBeAbsent: true)
+        XCTAssertEqual(created.0, 6)
+        XCTAssertEqual(created.2?.beforeData, nil)
+        XCTAssertEqual(created.2?.afterData, Data("first\n".utf8))
+        XCTAssertEqual(created.2?.fileVersion, created.1["file_version"] as? String)
+        XCTAssertTrue(created.2?.created == true)
+
+        let appended = try BoundFileOperation(file).replaceCapturingText(with: Data("second\n".utf8),
+            append: true, mustBeAbsent: false)
+        XCTAssertEqual(appended.2?.beforeData, Data("first\n".utf8))
+        XCTAssertEqual(appended.2?.afterData, Data("first\nsecond\n".utf8))
+        XCTAssertNotNil(appended.2?.beforeVersion)
+        XCTAssertFalse(appended.2?.created ?? true)
+        XCTAssertEqual(try contents(file), "first\nsecond\n")
+    }
+    func testBinaryAndOversizedFilesDoNotProducePartialTextSnapshots() throws {
+        let binary = try root().appendingPathComponent("binary.dat")
+        let binaryResult = try BoundFileOperation(binary).replaceCapturingText(with: Data([0xff, 0x00, 0x01]),
+            append: false, mustBeAbsent: true)
+        XCTAssertNil(binaryResult.2)
+
+        let oversized = try root().appendingPathComponent("large.txt")
+        let large = Data(repeating: 0x61, count: 128 * 1024 + 1)
+        let largeResult = try BoundFileOperation(oversized).replaceCapturingText(with: large,
+            append: false, mustBeAbsent: true)
+        XCTAssertNil(largeResult.2)
+    }
+    func testUnverifiedPostCommitMutationCannotProduceTextSnapshot() throws {
+        let file = try root().appendingPathComponent("report.txt")
+        try put("before", file)
+        let operation = try BoundFileOperation(file, hook: {
+            if $0 == .committed { try self.put("external", file) }
+        })
+        XCTAssertThrowsError(try operation.replaceCapturingText(with: Data("after".utf8),
+            append: false, mustBeAbsent: false))
+        XCTAssertEqual(try contents(file), "external")
+    }
     func testAbsentPreconditionRejectsExistingAndLateContender() throws {
         let file = try root().appendingPathComponent("result")
         try put("existing", file)

@@ -75,6 +75,7 @@ enum RuntimeEvent {
     case taskContinuationCheckpoint(AgentTaskContinuationCheckpoint)
     case taskWait(AgentTaskWaitSnapshot)
     case taskDestination(AgentTaskDestinationSnapshot)
+    case taskChangeLens(AgentTaskChangeLensSnapshot)
     case instructionCorrectionApplied(id: String, taskGenerationID: String, revision: UInt64)
     case workingDocumentApplied(id: String, taskGenerationID: String, revision: UInt64, document: [String: Any]?)
     case workingDocumentNeedsReselection(taskGenerationID: String, revision: UInt64, application: String, title: String)
@@ -710,9 +711,17 @@ final class AgentRuntimeProcess {
                     }
                     }
                 }
+                let changeLensCandidate = response.removeValue(forKey: "change_lens_candidate") as? [String: Any]
                 response["instruction_revision"] = message["instruction_revision"]
                 response["working_document_revision"] = message["working_document_revision"]
                 self.ioQueue.async {
+                    if let changeLensCandidate,
+                       let snapshot = AgentTaskChangeLensSnapshot.validatedCandidate(
+                        changeLensCandidate, response: response, request: message, generationID: run.lease.id,
+                        instructionRevision: instructionRevision, knownActionIDs: run.receiptIDs
+                       ) {
+                        self.emit(.taskChangeLens(snapshot), for: run)
+                    }
                     self.send(response, for: run, bridgeSpan: bridgeSpan)
                     run.operations.removeValue(forKey: operationID)
                     run.pendingBridgeBytes -= requestBytes
@@ -1132,6 +1141,7 @@ final class AgentRuntimeProcess {
         case .taskContinuationCheckpoint(let checkpoint): bytes = checkpoint.estimatedByteCount
         case .taskWait(let wait):
             bytes = wait.lastConfirmed.utf8.count + wait.waitingFor.utf8.count + 256
+        case .taskChangeLens(let snapshot): bytes = snapshot.estimatedByteCount + 512
         default: bytes = 1024
         }
         guard terminal || (run.queuedEventCount < 4096 && run.queuedEventBytes + bytes <= 8 * 1024 * 1024) else {
