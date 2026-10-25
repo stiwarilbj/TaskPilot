@@ -25,6 +25,7 @@ from observation_context import coordinate_targets, observation_indexes
 
 CHECKLIST_VERSION = 11
 BATCH_PROGRESS_VERSION = 1
+CONTINUATION_CHECKPOINT_VERSION = 1
 RESULT_BROWSER_BUNDLE_IDS = frozenset({
     "com.apple.Safari", "com.apple.SafariTechnologyPreview",
     "com.google.Chrome", "com.google.Chrome.beta", "com.google.Chrome.canary", "com.google.Chrome.dev",
@@ -561,6 +562,14 @@ class TaskEvidenceLedger:
         self.batch_global_requirement_ids: list[str] = []
         self.batch_initialized = False
         self.batch_needs_declaration = False
+        self.continuation_checkpoint: dict | None = None
+        self.continuation_prior_verified_ids: set[str] = set()
+        self.continuation_rechecked_ids: set[str] = set()
+        self.continuation_omitted_sources: list[str] = []
+        self.continuation_unresolved_receipts = 0
+        self.continuation_observation_targets: dict[str, dict] = {}
+        self.continuation_expected_identities: dict[str, dict] = {}
+        self.continuation_expected_web_destinations: dict[str, str] = {}
         read = re.fullmatch(READ_PATTERN, task, re.I)
         if read:
             self.local_complete_grammar = True
@@ -570,6 +579,278 @@ class TaskEvidenceLedger:
             self.local_complete_grammar = True
             self.add_requirements([{"source": task, "description": "Return the exact largest top-level Downloads file and size",
                                     "check": {"type": "answer", "expected": task}}])
+
+    def initialize_continuation(self, checkpoint: dict) -> None:
+        """Start from checkpoint definitions, never historical evidence or actions."""
+        if (not isinstance(checkpoint, dict) or checkpoint.get("version") != CONTINUATION_CHECKPOINT_VERSION or
+                checkpoint.get("eligible") is not True or
+                type(checkpoint.get("instruction_revision")) is not int or checkpoint["instruction_revision"] < 0 or
+                type(checkpoint.get("revision")) is not int or checkpoint["revision"] < 1 or
+                type(checkpoint.get("unresolved_receipts")) is not int or checkpoint["unresolved_receipts"] != 0 or
+                checkpoint.get("task_sha256") != hashlib.sha256(self.task.encode("utf-8")).hexdigest() or
+                checkpoint.get("input_references_sha256") != self._input_reference_fingerprint()):
+            raise EvidenceValidationError("Continuation checkpoint is stale or malformed")
+        if set(checkpoint) - {
+            "version", "eligible", "task_sha256", "input_references_sha256", "source_task_generation_id",
+            "instruction_revision", "revision", "requirements", "observation_targets",
+            "expected_file_identities", "expected_web_destinations", "batch", "result_summaries",
+            "unresolved_receipts",
+        }:
+            raise EvidenceValidationError("Continuation checkpoint contains unsupported fields")
+        source_generation = checkpoint.get("source_task_generation_id")
+        if (not isinstance(source_generation, str) or
+                not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", source_generation) or
+                source_generation == self.generation):
+            raise EvidenceValidationError("Continuation checkpoint source task is invalid")
+        requirements = checkpoint.get("requirements")
+        if not isinstance(requirements, list) or not 1 <= len(requirements) <= 512:
+            raise EvidenceValidationError("Continuation checkpoint requirements are invalid")
+        imported: dict[str, dict] = {}
+        prior_verified: set[str] = set()
+        for index, item in enumerate(requirements):
+            field_path = f"continuation.requirements[{index}]"
+            if not isinstance(item, dict) or set(item) - {
+                "id", "source", "description", "check", "depends_on", "scope", "previously_proven", "superseded_by"
+            }:
+                raise EvidenceValidationError(f"{field_path} has unsupported fields")
+            if type(item.get("previously_proven")) is not bool:
+                raise EvidenceValidationError(f"{field_path}.previously_proven must be a boolean")
+            identifier = item.get("id")
+            if not isinstance(identifier, str) or not re.fullmatch(r"r[1-9][0-9]*", identifier) or identifier in imported:
+                raise EvidenceValidationError(f"{field_path}.id is invalid")
+            entry = validate_requirement({key: item[key] for key in ("source", "description", "check", "depends_on", "scope") if key in item},
+                                         self.task, field_path)
+            check_type = entry["check"].get("type")
+            # Checks that cannot be safely rebound to fresh local evidence stay
+            # as explicit unfinished visual requirements; old element IDs,
+            # command strings, and action sequences never cross the boundary.
+            if check_type in OBSERVATION_CHECKS - {"window_active"} or check_type in {
+                "command_executed", "command_operation", "stdout_equals", "file_written", "file_append"
+            }:
+                self.continuation_omitted_sources.append(entry["source"])
+                entry["check"] = {"type": "visual", "expected": entry["description"]}
+            previously_proven = item.get("previously_proven") is True
+            if previously_proven and check_type in FILE_CHECKS | {"window_active"}:
+                prior_verified.add(identifier)
+            if item.get("superseded_by") is not None:
+                replacement = item["superseded_by"]
+                if not isinstance(replacement, str) or not re.fullmatch(r"r[1-9][0-9]*", replacement):
+                    raise EvidenceValidationError(f"{field_path}.superseded_by is invalid")
+                entry["state"] = "superseded"
+                entry["superseded_by"] = replacement
+            else:
+                entry["state"] = "pending"
+            entry["evidence_ids"] = []
+            imported[identifier] = entry
+        for identifier, entry in imported.items():
+            for dependency in entry.get("depends_on", []):
+                if dependency not in imported:
+                    raise EvidenceValidationError(f"continuation.requirements.{identifier}.depends_on references an unknown requirement")
+        dependency_order(imported)
+        self.requirements = imported
+        self.evidence.clear()
+        self.coverage_complete = False
+        self.local_complete_grammar = False
+        self.batch_initialized = False
+        observation_targets = checkpoint.get("observation_targets", {})
+        if not isinstance(observation_targets, dict):
+            raise EvidenceValidationError("Continuation checkpoint targets are invalid")
+        self.continuation_observation_targets = deepcopy(observation_targets)
+        for identifier, target in self.continuation_observation_targets.items():
+            if (identifier not in imported or imported[identifier].get("check", {}).get("type") != "window_active" or
+                    not isinstance(target, dict) or set(target) - {"pid", "name", "bundle_id"} or
+                    type(target.get("pid")) is not int or target["pid"] <= 0 or
+                    not isinstance(target.get("bundle_id"), str) or not target["bundle_id"]):
+                raise EvidenceValidationError("Continuation checkpoint contains an invalid app/window identity")
+        for identifier in prior_verified:
+            if (self.requirements[identifier].get("check", {}).get("type") == "window_active" and
+                    identifier not in self.continuation_observation_targets):
+                raise EvidenceValidationError("Continuation checkpoint cannot safely rebind a prior window result")
+        expected_identities = checkpoint.get("expected_file_identities", {})
+        if not isinstance(expected_identities, dict) or set(expected_identities) - prior_verified:
+            raise EvidenceValidationError("Continuation checkpoint file identities are invalid")
+        for identifier, identity in expected_identities.items():
+            if (self.requirements[identifier].get("check", {}).get("type") not in FILE_CHECKS or
+                    not isinstance(identity, dict) or not identity or
+                    set(identity) - {"file_identity", "file_version", "parent_identity"} or
+                    any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+                        for value in identity.values())):
+                raise EvidenceValidationError("Continuation checkpoint contains an invalid file identity")
+        self.continuation_expected_identities = deepcopy(expected_identities)
+        expected_web_destinations = checkpoint.get("expected_web_destinations", {})
+        if not isinstance(expected_web_destinations, dict) or set(expected_web_destinations) - prior_verified:
+            raise EvidenceValidationError("Continuation checkpoint web destinations are invalid")
+        for identifier, fingerprint in expected_web_destinations.items():
+            if (self.requirements[identifier].get("check", {}).get("type") != "window_active" or
+                    not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint)):
+                raise EvidenceValidationError("Continuation checkpoint contains an invalid web destination fingerprint")
+        self.continuation_expected_web_destinations = deepcopy(expected_web_destinations)
+        for identifier, item in imported.items():
+            replacement = item.get("superseded_by")
+            if replacement is not None and (replacement not in imported or imported[replacement].get("state") == "superseded"):
+                raise EvidenceValidationError(f"continuation.requirements.{identifier}.superseded_by is invalid")
+        declaration = checkpoint.get("batch")
+        if declaration is not None:
+            normalized = validate_batch_declaration(declaration, self, imported)
+            self.accept_batch(normalized)
+            self.batch_initialized = True
+            self.batch_needs_declaration = False
+        self.continuation_prior_verified_ids = prior_verified
+        self.continuation_unresolved_receipts = checkpoint.get("unresolved_receipts", 0)
+        if type(self.continuation_unresolved_receipts) is not int or not 0 <= self.continuation_unresolved_receipts <= 4096:
+            raise EvidenceValidationError("Continuation checkpoint receipt state is invalid")
+        self.continuation_checkpoint = {
+            "version": CONTINUATION_CHECKPOINT_VERSION,
+            "result_summaries": checkpoint.get("result_summaries", []),
+            "omitted_sources": list(dict.fromkeys(self.continuation_omitted_sources))[:64],
+        }
+        summaries = checkpoint.get("result_summaries", [])
+        if (not isinstance(summaries, list) or len(summaries) > 64 or
+                any(not isinstance(item, dict) or set(item) - {"kind", "name", "location"} or
+                    item.get("kind") not in {"file", "folder", "web"} or
+                    any(not isinstance(item.get(key), str) or len(item[key].encode("utf-8")) > 512
+                        for key in ("name", "location")) for item in summaries)):
+            raise EvidenceValidationError("Continuation checkpoint result summaries are invalid")
+        self.continuation_checkpoint["result_summaries"] = deepcopy(summaries)
+        self.refresh()
+
+    def _rebind_continuation_observation_targets(self, observation: dict) -> None:
+        """Rebind only a unique app/window identity, never a title by itself."""
+        if not self.continuation_observation_targets:
+            return
+        indexes = observation_indexes(observation)
+        for identifier, identity in list(self.continuation_observation_targets.items()):
+            requirement = self.requirements.get(identifier)
+            if not requirement or requirement.get("check", {}).get("type") != "window_active":
+                continue
+            bundle_id = identity.get("bundle_id")
+            title = requirement["check"].get("title")
+            if not isinstance(bundle_id, str) or not isinstance(title, str):
+                continue
+            apps = [app for app in indexes.applications if app.get("bundle_id") == bundle_id and
+                    (not identity.get("name") or app.get("name") == identity.get("name"))]
+            if len(apps) != 1:
+                continue
+            app = apps[0]
+            windows = [window for window in app.get("windows", [])
+                       if isinstance(window, dict) and window.get("title") == title]
+            if not windows:
+                windows = [window for window in app.get("graphics_windows", [])
+                           if isinstance(window, dict) and window.get("title") == title]
+            if len(windows) != 1:
+                continue
+            requirement["check"]["pid"] = app["pid"]
+            self.continuation_observation_targets.pop(identifier, None)
+
+    def continuation_snapshot(self, *, instruction_revision: int, unresolved_receipts: int,
+                              revision: int) -> dict | None:
+        """Produce a bounded recovery capsule from current validated ledger state."""
+        self.refresh()
+        if (type(unresolved_receipts) is not int or unresolved_receipts != 0 or
+                type(revision) is not int or revision < 1):
+            return None
+        recheckable = FILE_CHECKS | {"window_active"}
+        prior_proven = {
+            identifier for identifier, item in self.requirements.items()
+            if item.get("state") != "superseded" and item.get("scope", "outcome") != "prerequisite" and
+            item.get("check", {}).get("type") in recheckable and self._has_historical_proof(identifier)
+        }
+        if not prior_proven or type(instruction_revision) is not int or instruction_revision < 0:
+            return None
+        projected_results = self._presentation_result_objects()
+        entries = []
+        targets: dict[str, dict] = {}
+        expected_file_identities: dict[str, dict] = {}
+        expected_web_destinations: dict[str, str] = {}
+        for identifier, item in self.requirements.items():
+            entry = {key: deepcopy(item[key]) for key in ("source", "description", "check", "depends_on", "scope", "superseded_by") if key in item}
+            check_type = entry["check"].get("type")
+            recheckable_observation = False
+            if check_type == "window_active":
+                pinned = self.observation_checks.get(identifier)
+                recheckable_observation = (isinstance(pinned, dict) and
+                                           type(pinned.get("pid")) is int and pinned["pid"] > 0 and
+                                           isinstance(pinned.get("bundle_id"), str) and bool(pinned.get("bundle_id")) and
+                                           isinstance(item.get("check", {}).get("title"), str))
+                if recheckable_observation:
+                    targets[identifier] = {key: pinned[key] for key in ("pid", "name", "bundle_id") if key in pinned}
+                else:
+                    entry["check"] = {"type": "visual", "expected": entry["description"]}
+                    self.continuation_omitted_sources.append(entry["source"])
+            elif check_type in OBSERVATION_CHECKS:
+                entry["check"] = {"type": "visual", "expected": entry["description"]}
+            elif check_type in {"command_executed", "command_operation", "stdout_equals", "file_written", "file_append"}:
+                entry["check"] = {"type": "visual", "expected": entry["description"]}
+            is_prior_recheckable = (identifier in prior_proven and
+                                    (check_type in FILE_CHECKS or recheckable_observation))
+            if is_prior_recheckable:
+                entry["previously_proven"] = True
+                if check_type in FILE_CHECKS:
+                    candidates = [evidence for evidence in self.evidence.values()
+                                  if evidence.get("generation") == self.generation and
+                                  self.requirement_matches(identifier, {**evidence, "valid": True})]
+                    if candidates:
+                        identity = {key: candidates[-1]["fact"][key] for key in
+                                    ("file_identity", "file_version", "parent_identity")
+                                    if isinstance(candidates[-1].get("fact", {}).get(key), str)}
+                        if identity:
+                            expected_file_identities[identifier] = identity
+                elif check_type == "window_active":
+                    web_result = next((result for result in self._result_object_cache.values()
+                                       if result.get("kind") == "web" and result.get("state") == "verified" and
+                                       result.get("_requirement_id") == identifier and
+                                       isinstance(result.get("url"), str)), None)
+                    if web_result is not None:
+                        expected_web_destinations[identifier] = hashlib.sha256(
+                            web_result["url"].encode("utf-8")).hexdigest()
+            else:
+                entry["previously_proven"] = False
+            entry["id"] = identifier
+            entries.append(entry)
+        summaries = [item for item in projected_results if item.get("state") in {"verified", "needs_recheck"}]
+        summaries = [{key: item[key] for key in ("kind", "name", "location") if isinstance(item.get(key), str)}
+                     for item in summaries[:64]]
+        capsule = {
+            "version": CONTINUATION_CHECKPOINT_VERSION,
+            "task_sha256": hashlib.sha256(self.task.encode("utf-8")).hexdigest(),
+            "input_references_sha256": self._input_reference_fingerprint(),
+            "source_task_generation_id": self.generation,
+            "instruction_revision": instruction_revision,
+            "revision": revision,
+            "requirements": entries,
+            "observation_targets": targets,
+            "expected_file_identities": expected_file_identities,
+            "expected_web_destinations": expected_web_destinations,
+            "batch": deepcopy(self.batch_declaration()) if self.batch_initialized else None,
+            "result_summaries": summaries,
+            "unresolved_receipts": unresolved_receipts,
+        }
+        encoded = json.dumps(capsule, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > 262_144 or len(entries) > 512:
+            return None
+        return capsule
+
+    def _input_reference_fingerprint(self) -> str:
+        digest_value = hashlib.sha256()
+        for kind, start, length, value in self.inputs.exact_references:
+            for part in (kind, start, length, value):
+                encoded = str(part).encode("utf-8")
+                digest_value.update(len(encoded).to_bytes(8, "big"))
+                digest_value.update(encoded)
+        return digest_value.hexdigest()
+
+    def _has_historical_proof(self, identifier: str) -> bool:
+        requirement = self.requirements.get(identifier)
+        if not requirement or requirement.get("state") == "superseded":
+            return False
+        if requirement.get("state") == "proven" and requirement.get("evidence_ids"):
+            return True
+        for evidence in self.evidence.values():
+            if evidence.get("generation") != self.generation:
+                continue
+            if self.requirement_matches(identifier, {**evidence, "valid": True}):
+                return True
+        return False
 
     def add_requirements(self, entries: list[dict], observation: dict | None = None, *, path="requirements") -> bool:
         previous_outcomes = {identifier for identifier, requirement in self.requirements.items()
@@ -802,11 +1083,28 @@ class TaskEvidenceLedger:
                 proven = (all(app.get(k) == v for k, v in pinned.items()) and
                           app.get("topmost_on_agent_screen") is True and len(windows) == 1 and
                           windows[0].get("topmost_on_agent_screen") is True)
+                expected_web_fingerprint = self.continuation_expected_web_destinations.get(identifier)
+                if proven and expected_web_fingerprint is not None:
+                    revision = observation.get("observation_revision")
+                    destinations = observation.get("result_destinations", [])
+                    matching_destinations = [destination for destination in destinations
+                                             if isinstance(destination, dict) and
+                                             destination.get("pid") == check["pid"] and
+                                             destination.get("window_title") == check["title"] and
+                                             destination.get("bundle_id") == app.get("bundle_id") and
+                                             destination.get("observation_revision") == revision]
+                    proven = any(
+                        (safe_destination := self._safe_web_destination(destination.get("url"))) is not None and
+                        hashlib.sha256(safe_destination[0].encode("utf-8")).hexdigest() == expected_web_fingerprint
+                        for destination in matching_destinations
+                    )
             if not proven: continue
             fact = {"type": "requirement_observed", "requirement_id": identifier,
                     "check_fingerprint": digest(check), "revision": observation["observation_revision"]}
             if not any(e["valid"] and e["fact"] == fact for e in self.evidence.values()):
                 self.add_evidence(fact, mutable=True)
+            if identifier in self.continuation_prior_verified_ids:
+                self.continuation_rechecked_ids.add(identifier)
 
     def requirement_matches(self, identifier: str, evidence: dict, *, semantic=False, current=False) -> bool:
         requirement = self.requirements[identifier]
@@ -913,6 +1211,7 @@ class TaskEvidenceLedger:
         self.invalidate(lambda e: e["fact"]["type"] == "observation")
         self.invalidate(lambda e: e["fact"]["type"] == "requirement_observed")
         self.current_observation = observation
+        self._rebind_continuation_observation_targets(observation)
         self.observation_id = self.add_evidence({"type": "observation", "revision": revision})
         self.bind_observation_checks(observation)
         self.record_observation_checks()
@@ -1033,6 +1332,13 @@ class TaskEvidenceLedger:
         except ActionContractError: return
         validate_native_payload('check_result', actual, 'check_result')
         if check.get('type') not in FILE_CHECKS: return
+        if action is None:
+            for requirement_id, expected in self.continuation_expected_identities.items():
+                requirement = self.requirements.get(requirement_id)
+                if requirement and requirement.get("check") == check and any(
+                    actual.get(key) != value for key, value in expected.items()
+                ):
+                    return
         if any(self.matches(check, evidence) for evidence in self.evidence.values()): return
         self.checks += 1
         self.readback = True
@@ -1040,6 +1346,12 @@ class TaskEvidenceLedger:
         self.record_check(check, actual, action)
         for identifier in set(self.evidence) - previous:
             self.evidence[identifier]['effect_check'] = deepcopy(check)
+        if actual.get("verified") is True:
+            for evidence_id in set(self.evidence) - previous:
+                evidence = self.evidence[evidence_id]
+                for requirement_id in self.continuation_prior_verified_ids:
+                    if requirement_id in self.requirements and self.requirement_matches(requirement_id, evidence):
+                        self.continuation_rechecked_ids.add(requirement_id)
 
     def matches(self, check: dict, evidence: dict, *, semantic=False) -> bool:
         if not evidence["valid"] or evidence["generation"] != self.generation: return False
@@ -1169,6 +1481,19 @@ class TaskEvidenceLedger:
                               for key, e in self.evidence.items() if e["valid"]}}
         if batch_prompt is not None:
             state["batch"] = batch_prompt
+        if self.continuation_checkpoint is not None:
+            self.refresh()
+            state["continuation"] = {
+                "mode": "recheck_then_continue",
+                "previous_results": self.continuation_checkpoint.get("result_summaries", []),
+                "rechecked_requirement_ids": sorted(self.continuation_rechecked_ids),
+                "unfinished_requirement_ids": [
+                    identifier for identifier, requirement in self.requirements.items()
+                    if requirement.get("state") != "superseded" and requirement.get("state") != "proven"
+                ],
+                "omitted_recheck_sources": self.continuation_checkpoint.get("omitted_sources", []),
+                "unresolved_prior_actions": self.continuation_unresolved_receipts,
+            }
         return state
 
     def presentation_state(self, active_requirement_ids: list[str] | None = None,

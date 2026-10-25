@@ -117,6 +117,8 @@ final class TaskPilotCoordinator: ObservableObject {
     @Published private(set) var queuedTaskEditSession: QueuedTaskEditSession?
     @Published private(set) var requestedQueueTaskID: UUID?
     @Published private(set) var taskHistory: [AgentTaskHistoryEntry] = []
+    @Published private(set) var continuationCandidate: AgentTaskContinuationCandidate?
+    @Published private(set) var continuationStartNotice: String?
     @Published private(set) var requestMetrics: AgentRequestMetrics?
     @Published private(set) var currentTaskRequest: String?
     @Published private(set) var taskCorrectionSession: TaskCorrectionSession?
@@ -126,6 +128,7 @@ final class TaskPilotCoordinator: ObservableObject {
     @Published private(set) var workingDocumentPresentation: WorkingDocumentPresentation?
     @Published private(set) var workingDocumentNotice: String?
     private var pendingWorkingDocumentUpdateID: String?
+    private var pendingContinuationCheckpoint: AgentTaskContinuationCheckpoint?
     private var workingDocumentPresentationBeforeUpdate: WorkingDocumentPresentation?
     @Published var showingSetup = false
     @Published private(set) var runsOnMainDisplay = UserDefaults.standard.bool(
@@ -1141,6 +1144,40 @@ final class TaskPilotCoordinator: ObservableObject {
         }
     }
 
+    func continueUnfinishedWork(historyEntryID: UUID) {
+        guard let candidate = continuationCandidate,
+              candidate.historyEntryID == historyEntryID,
+              taskHistory.first?.id == historyEntryID,
+              let source = taskHistory.first(where: { $0.id == historyEntryID }),
+              source.outcome == .failed || source.outcome == .stopped,
+              candidate.checkpoint.isEligible,
+              candidate.checkpoint.matches(candidate.submission),
+              !isActive else { return }
+        continuationStartNotice = nil
+        guard isReady, !windowsPresentedOnMain else {
+            continuationStartNotice = "The checkpoint is retained. Resolve TaskPilot readiness, then select Continue unfinished work again."
+            showingSetup = true
+            return
+        }
+        let started = startTask(submission: candidate.submission, queuedTask: nil,
+                                continuationCheckpoint: candidate.checkpoint)
+        if !started {
+            // A process-launch failure can create a new, no-work history row.
+            // Keep the original checkpoint available from that latest row
+            // when it is still the exact same authorized submission.
+            if let latest = taskHistory.first,
+               latest.outcome == .failed,
+               candidate.checkpoint.matches(latest.effectiveSubmission) {
+                continuationCandidate = AgentTaskContinuationCandidate(
+                    historyEntryID: latest.id,
+                    submission: candidate.submission,
+                    checkpoint: candidate.checkpoint
+                )
+            }
+            continuationStartNotice = "The previous results are still available. TaskPilot could not start the continuation; review readiness and try again."
+        }
+    }
+
     func removeQueuedTask(id: UUID) {
         guard queuedTasks.contains(where: { $0.id == id }) else { return }
         queuedTasks.removeAll { $0.id == id }
@@ -1264,11 +1301,17 @@ final class TaskPilotCoordinator: ObservableObject {
 
     func deleteHistoryEntry(id: UUID) {
         taskHistory.removeAll { $0.id == id }
+        if continuationCandidate?.historyEntryID == id {
+            continuationCandidate = nil
+            continuationStartNotice = nil
+        }
         persistTaskLedger()
     }
 
     func clearHistory() {
         taskHistory.removeAll()
+        continuationCandidate = nil
+        continuationStartNotice = nil
         persistTaskLedger()
     }
 
@@ -1300,7 +1343,8 @@ final class TaskPilotCoordinator: ObservableObject {
     @discardableResult
     private func startTask(
         submission: AgentTaskSubmission,
-        queuedTask: QueuedAgentTask?
+        queuedTask: QueuedAgentTask?,
+        continuationCheckpoint: AgentTaskContinuationCheckpoint? = nil
     ) -> Bool {
         guard validateSubmission(submission) else {
             if let queuedTask { queuedTasks.insert(queuedTask, at: 0) }
@@ -1368,10 +1412,12 @@ final class TaskPilotCoordinator: ObservableObject {
             recoveryJournal: recoveryJournal, recoveryTask: authorization.id)
         taskWaitDetails = AgentTaskWaitSnapshot(generationID: lease.id, revision: 0, operationID: 0,
             phase: .starting, lastConfirmed: "No confirmed result yet.",
-            waitingFor: "Connecting to the app", attention: .none)
+            waitingFor: continuationCheckpoint == nil ? "Connecting to the app" : "Checking previous results…",
+            attention: .none)
         taskDestination = nil
         lastTaskWaitRevision = 0
         currentTaskLease = lease
+        pendingContinuationCheckpoint = nil
         taskProgressMap = TaskProgressMap(request: request, generationID: lease.id,
                                           exactInputReferences: submission.exactInputReferences)
         lastTaskProgressRevision = 0
@@ -1392,8 +1438,11 @@ final class TaskPilotCoordinator: ObservableObject {
                 openClawURL: openClawExecutableURL,
                 geminiAPIKey: savedGeminiAPIKey,
                 exactInputReferences: submission.exactInputReferences,
+                continuationCheckpoint: continuationCheckpoint,
                 lease: lease
             )
+            continuationCandidate = nil
+            continuationStartNotice = nil
             return true
         } catch {
             lease.revoke()
@@ -1844,6 +1893,8 @@ final class TaskPilotCoordinator: ObservableObject {
             taskOutput = output
         case .taskProgress(let snapshot):
             acceptTaskProgress(snapshot)
+        case .taskContinuationCheckpoint(let checkpoint):
+            acceptTaskContinuationCheckpoint(checkpoint)
         case .taskWait(let snapshot):
             acceptTaskWait(snapshot)
         case .taskDestination(let snapshot):
@@ -2041,6 +2092,16 @@ final class TaskPilotCoordinator: ObservableObject {
         taskProgressMap = map
     }
 
+    private func acceptTaskContinuationCheckpoint(_ checkpoint: AgentTaskContinuationCheckpoint) {
+        guard currentTaskLease?.id == checkpoint.generationID,
+              currentTaskAuthorization != nil,
+              checkpoint.instructionRevision == currentTaskLease?.currentInstructionRevision,
+              let submission = currentTaskAuthorization?.effectiveSubmission,
+              checkpoint.matches(submission),
+              checkpoint.revision > (pendingContinuationCheckpoint?.revision ?? 0) else { return }
+        pendingContinuationCheckpoint = checkpoint.isEligible ? checkpoint : nil
+    }
+
     private func acceptTaskWait(_ snapshot: AgentTaskWaitSnapshot) {
         guard currentTaskLease?.id == snapshot.generationID,
               snapshot.revision > lastTaskWaitRevision,
@@ -2108,6 +2169,22 @@ final class TaskPilotCoordinator: ObservableObject {
         )
         taskHistory.append(entry)
         taskHistory.sort { $0.finishedAt > $1.finishedAt }
+        if (outcome == .failed || outcome == .stopped),
+           let checkpoint = pendingContinuationCheckpoint,
+           checkpoint.isEligible,
+           checkpoint.generationID == currentTaskLease?.id,
+           checkpoint.instructionRevision == currentTaskLease?.currentInstructionRevision,
+           checkpoint.matches(entry.effectiveSubmission) {
+            continuationCandidate = AgentTaskContinuationCandidate(
+                historyEntryID: entry.id,
+                submission: entry.effectiveSubmission,
+                checkpoint: checkpoint
+            )
+        } else {
+            continuationCandidate = nil
+        }
+        pendingContinuationCheckpoint = nil
+        continuationStartNotice = nil
         if wasQueued {
             completedQueuedTaskCount += 1
         }

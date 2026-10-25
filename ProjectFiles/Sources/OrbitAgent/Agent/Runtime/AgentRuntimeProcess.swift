@@ -66,6 +66,7 @@ enum RuntimeEvent {
     case output(AgentTaskOutput)
     case userInputRequired(AgentUserInputRequest)
     case taskProgress(AgentTaskProgressSnapshot)
+    case taskContinuationCheckpoint(AgentTaskContinuationCheckpoint)
     case taskWait(AgentTaskWaitSnapshot)
     case taskDestination(AgentTaskDestinationSnapshot)
     case instructionCorrectionApplied(id: String, taskGenerationID: String, revision: UInt64)
@@ -134,6 +135,7 @@ final class AgentRuntimeProcess {
         var transportFailure: String?
         var receiptIDs: Set<String> = []
         var progressRevision: UInt64 = 0
+        var continuationRevision: UInt64 = 0
         var waitRevision: UInt64 = 0
         var destinationRevision: UInt64 = 0
         var queuedEventBytes = 0
@@ -188,6 +190,7 @@ final class AgentRuntimeProcess {
         openClawURL: URL,
         geminiAPIKey: String,
         exactInputReferences: [AgentTaskInputReference] = [],
+        continuationCheckpoint: AgentTaskContinuationCheckpoint? = nil,
         lease: TaskLease = TaskLease()
     ) throws {
         guard ioQueue.sync(execute: { invocation == nil || invocation?.lease.state == .retired }) else { throw RuntimeProcessError.alreadyRunning }
@@ -275,7 +278,7 @@ final class AgentRuntimeProcess {
             // Pass the secret through the already-private controller pipe,
             // never through arguments, environment variables, or logs. The
             // runtime consumes this first line before it begins bridge calls.
-            var configuration = try telemetry.encodeJSON([
+            var configurationFields: [String: Any] = [
                 "kind": "runtime_configuration",
                 "gemini_api_key": geminiAPIKey,
                 "action_contract_hash": ActionContract.fingerprint,
@@ -287,13 +290,18 @@ final class AgentRuntimeProcess {
                 "task_protocol_version": ActionContract.taskProtocolVersion,
                 "exact_input_reference_version": AgentTaskInputReferenceProtocol.version,
                 "exact_input_references": exactInputReferences.map(\.wireValue),
+                "continuation_checkpoint_version": AgentTaskContinuationCheckpoint.protocolVersion,
                 "coordinate_mapping_version": ScreenCoordinateMapping.version,
                 "observation_completeness_version": ObservationCollection<Int>.version,
                 "text_recognition_version": LocalTextRecognition.version,
                 "evidence_consistency_version": ControlEvidencePolicy.version,
                 "command_capability_version": CommandCapabilities.version,
                 "wait_presentation_version": AgentTaskWaitSnapshot.version
-            ], recordSize: false) // Credential-bearing frames expose timing only.
+            ]
+            if let continuationCheckpoint {
+                configurationFields["continuation_checkpoint"] = continuationCheckpoint.startupPayload
+            }
+            var configuration = try telemetry.encodeJSON(configurationFields, recordSize: false)
             configuration.append(0x0A)
             let sendSpan = telemetry.begin(.ipcSend)
             ioQueue.sync {
@@ -693,6 +701,12 @@ final class AgentRuntimeProcess {
                   progress.revision > run.progressRevision else { return }
             run.progressRevision = progress.revision
             emit(.taskProgress(progress), for: run)
+        case "task_continuation_checkpoint":
+            guard let checkpoint = AgentTaskContinuationCheckpoint.parse(message, generationID: run.lease.id),
+                  checkpoint.instructionRevision == run.lease.currentInstructionRevision,
+                  checkpoint.revision > run.continuationRevision else { return }
+            run.continuationRevision = checkpoint.revision
+            emit(.taskContinuationCheckpoint(checkpoint), for: run)
         case "task_wait":
             guard let wait = AgentTaskWaitSnapshot.parse(message, generationID: run.lease.id),
                   wait.revision > run.waitRevision else { return }
@@ -896,6 +910,7 @@ final class AgentRuntimeProcess {
         case .modelHealth(let model, let state, let detail): bytes = model.utf8.count + state.utf8.count + detail.utf8.count
         case .userInputRequired(let request): bytes = request.title.utf8.count + request.message.utf8.count
         case .taskProgress(let progress): bytes = progress.estimatedByteCount
+        case .taskContinuationCheckpoint(let checkpoint): bytes = checkpoint.estimatedByteCount
         case .taskWait(let wait):
             bytes = wait.lastConfirmed.utf8.count + wait.waitingFor.utf8.count + 256
         default: bytes = 1024
@@ -912,7 +927,10 @@ final class AgentRuntimeProcess {
             guard let self else { return }
             let delivery = self.ioQueue.sync {
                 run.queuedEventCount -= 1; run.queuedEventBytes -= bytes
-                return (self.invocation === run && (terminal || !run.requestedStop), retireAfterDelivery && run.requestedStop)
+                let checkpointDuringDrain: Bool
+                if case .taskContinuationCheckpoint = event { checkpointDuringDrain = true }
+                else { checkpointDuringDrain = false }
+                return (self.invocation === run && (terminal || checkpointDuringDrain || !run.requestedStop), retireAfterDelivery && run.requestedStop)
             }
             guard delivery.0 else { return }
             run.handler?(delivery.1 ? .stopped : event)

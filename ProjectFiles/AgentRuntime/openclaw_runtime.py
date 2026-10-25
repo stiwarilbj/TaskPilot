@@ -71,6 +71,7 @@ from observation_completeness import (OBSERVATION_COMPLETENESS_VERSION, Observat
 from local_text_recognition import (TEXT_RECOGNITION_VERSION, TextRecognitionError,
                                     validate_text_recognition, prompt_text_recognition, detail_images)
 from task_evidence import (TaskEvidenceLedger, RevisionedJSONState, CHECKLIST_VERSION, BATCH_PROGRESS_VERSION,
+                           CONTINUATION_CHECKPOINT_VERSION,
                            requests_per_input_work,
                            LARGEST_PATTERN, digest as evidence_digest)
 from expected_effects import ExpectedEffect, EXPECTED_EFFECT_VERSION, FILE_EFFECTS, path_key
@@ -142,6 +143,7 @@ _instruction_revision = 0
 _instruction_correction_key = None
 _working_document_revision = 0
 _working_document_update_key = None
+_continuation_checkpoint: dict[str, Any] | None = None
 _observation_keywords: list[str] = []
 _exact_input_references: list[dict[str, Any]] = []
 _runtime_inbox: RuntimeInbox | None = None
@@ -162,6 +164,7 @@ def _task_value(name: str) -> Any:
     if name == "correction_key": return _instruction_correction_key
     if name == "working_document_revision": return _working_document_revision
     if name == "working_document_key": return _working_document_update_key
+    if name == "continuation_checkpoint": return _continuation_checkpoint
     return globals()["_" + name]
 
 
@@ -534,6 +537,20 @@ def latest_confirmed_status(ledger: TaskEvidenceLedger | None) -> str:
     return ledger.latest_confirmed_status()
 
 
+def mark_continuation_receipt_uncertain(action: dict[str, Any] | None = None,
+                                        action_id: str | None = None) -> None:
+    """Prevent continuation from replaying a mutation whose effect is unknown."""
+    context = current_task.get()
+    if context is None:
+        return
+    kind = action.get("type") if isinstance(action, dict) else None
+    if kind in {"none", "wait", "read_file"}:
+        return
+    identifier = action_id or context.current_action_receipt_id
+    if isinstance(identifier, str) and identifier:
+        context.continuation_uncertain_receipt_ids.add(identifier)
+
+
 def publish_task_progress(ledger: TaskEvidenceLedger | None, *, lifecycle: str | None = None,
                           active_requirement_ids: list[str] | None = None, force: bool = False) -> None:
     """Publish a bounded, content-safe projection of current task evidence."""
@@ -546,6 +563,7 @@ def publish_task_progress(ledger: TaskEvidenceLedger | None, *, lifecycle: str |
         context.progress_active_requirement_ids = list(dict.fromkeys(active_requirement_ids))[:512]
     try:
         snapshot = ledger.presentation_state(context.progress_active_requirement_ids, context.progress_lifecycle)
+        publish_task_continuation_checkpoint(ledger)
         fingerprint = hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"),
                                         ensure_ascii=True).encode()).hexdigest()
         if not force and fingerprint == context.progress_fingerprint:
@@ -561,6 +579,52 @@ def publish_task_progress(ledger: TaskEvidenceLedger | None, *, lifecycle: str |
     except Exception:
         # The progress projection is optional UI state. Its failure must not
         # change planning, execution, evidence, or completion behavior.
+        return
+
+
+def publish_task_continuation_checkpoint(ledger: TaskEvidenceLedger) -> None:
+    """Publish a bounded in-memory recovery capsule, never execution history."""
+    context = current_task.get()
+    if context is None or context.generation is None:
+        return
+    try:
+        # A terminal delivery without an established effect must not make an
+        # old mutation replayable from a continuation checkpoint. Keep only
+        # opaque action IDs in task memory; the checkpoint exposes a count.
+        unresolved_receipts = max(
+            _task_value("receipt_metrics").get("receipt_unresolved", 0),
+            len(context.continuation_uncertain_receipt_ids),
+        )
+        snapshot = ledger.continuation_snapshot(
+            instruction_revision=_task_value("instruction_revision"),
+            unresolved_receipts=unresolved_receipts,
+            revision=1,
+        )
+        payload = snapshot or {
+            "version": 1,
+            "eligible": False,
+            "task_sha256": hashlib.sha256(ledger.task.encode("utf-8")).hexdigest(),
+            "input_references_sha256": ledger._input_reference_fingerprint(),
+            "source_task_generation_id": context.generation,
+            "instruction_revision": _task_value("instruction_revision"),
+            "revision": 1,
+            "requirements": [], "observation_targets": {}, "batch": None,
+            "expected_file_identities": {}, "expected_web_destinations": {}, "result_summaries": [],
+            "unresolved_receipts": unresolved_receipts,
+        }
+        stable = dict(payload)
+        stable.pop("revision", None)
+        fingerprint = hashlib.sha256(json.dumps(stable, sort_keys=True, separators=(",", ":"),
+                                                  ensure_ascii=True).encode()).hexdigest()
+        if fingerprint == context.continuation_fingerprint:
+            return
+        context.continuation_fingerprint = fingerprint
+        context.continuation_revision += 1
+        payload["eligible"] = snapshot is not None
+        payload["revision"] = context.continuation_revision
+        emit("task_continuation_checkpoint", **payload, task_generation_id=context.generation)
+    except Exception:
+        # Recovery presentation is optional; proof and execution remain authoritative.
         return
 
 
@@ -842,6 +906,7 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
         if context is not None:
             action_type = params.get("action", {}).get("type")
             context.presentation_action_id = params["action_id"] if action_type in {"press", "click", "double_click", "scroll"} else None
+            context.current_action_receipt_id = params["action_id"]
         timeout = 30.0
         if params.get("action", {}).get("type") == "run_command":
             timeout += float(params["action"].get("timeout_seconds", action_default("run_command", "timeout_seconds")))
@@ -891,6 +956,7 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
         if context is not None: context.machine.reconcile()
         if not error.connected:
             _task_value('receipt_metrics')["receipt_unresolved"] += 1
+            mark_continuation_receipt_uncertain(params.get("action"), params.get("action_id"))
             raise
         if error.code:
             emit('status', message=f'Native transport failure ({error.code}); checking the action receipt without repeating it…')
@@ -3404,6 +3470,14 @@ def verification_checklist_instruction(ledger: TaskEvidenceLedger) -> str:
             "outcome requirements have currently valid matching evidence, and report any omitted or unverified input as "
             "uncovered. A successful whole-request coverage claim cannot skip an item.\n"
         )
+    if ledger.continuation_checkpoint is not None:
+        instruction += (
+            "\nThis is a fresh continuation run. Previous result summaries are hints only. "
+            "TaskPilot has locally rechecked only requirements listed as rechecked in the continuation state; "
+            "all other requirements remain unfinished. Use fresh observations and new evidence IDs, never reuse "
+            "a prior click, command, receipt, or completion claim. Inspect uncertain prior work before any overlapping mutation, "
+            "and finish by auditing the complete request, corrections, dependencies, and every batch item.\n"
+        )
     return instruction
 
 
@@ -3712,7 +3786,8 @@ def run_task(task: str, display_id: int, openclaw_path: str | None, api_key: str
                           original_task=task, original_input_references=list(_exact_input_references),
                           correction_key=_task_value('correction_key'),
                           working_document_revision=_task_value('working_document_revision'),
-                          working_document_key=_task_value('working_document_key'))
+                          working_document_key=_task_value('working_document_key'),
+                          continuation_checkpoint=_task_value('continuation_checkpoint'))
     token = current_task.set(context)
     try:
         with screenshot_buffer_scope():
@@ -3745,16 +3820,20 @@ class TaskExecution:
         try:
             c.ledger = TaskEvidenceLedger(c.task, c.generation,
                                           exact_input_references=c.exact_input_references)
+            if c.continuation_checkpoint is not None:
+                c.ledger.initialize_continuation(c.continuation_checkpoint)
             publish_planned_destination(c.ledger)
-            publish_task_wait("starting", "Connecting to the app",
-                              operation_key="task-startup", ledger=c.ledger)
+            publish_task_wait("starting",
+                              "Checking previous results…" if c.continuation_checkpoint is not None else "Connecting to the app",
+                              operation_key="continuation-checking" if c.continuation_checkpoint is not None else "task-startup",
+                              ledger=c.ledger)
             publish_task_progress(c.ledger, force=True)
             c.recovery = ActionRecovery()
             c.recovery_cycles = RecoveryCycles(rejection_limit=MAX_IDENTICAL_ACTIONS)
             c.evidence_guard = EvidenceConsistency()
             c.machine.require("configure")
             resolved = find_openclaw(openclaw_path)
-            if is_largest_downloads_file_task(c.task) or c.ledger.local_complete_grammar:
+            if c.continuation_checkpoint is None and (is_largest_downloads_file_task(c.task) or c.ledger.local_complete_grammar):
                 c.runtime_state = prepare_runtime(resolved, api_key)
                 api_key = ""
                 try:
@@ -3878,6 +3957,12 @@ class TaskExecution:
         if c.step > MAX_STEPS:
             raise RuntimeError(f"{PRODUCT_NAME} reached its {MAX_STEPS}-step safety limit")
         c.decision = c.action = c.result = c.recovered_result = c.input_target = c.failure = None
+        if c.continuation_checkpoint is not None and not c.continuation_recheck_started:
+            publish_task_wait("observing", "Checking previous results…",
+                              operation_key="continuation-recheck", ledger=c.ledger)
+            self.recheck_continuation_file_results()
+            c.continuation_recheck_started = True
+            publish_task_progress(c.ledger, active_requirement_ids=[])
         publish_task_wait("observing", "Checking the current screen",
                           operation_key=f"observation:{c.step}", ledger=c.ledger)
         discard_observation_image(c.observation)
@@ -3934,6 +4019,32 @@ class TaskExecution:
                 return
             c.loading_pid, c.loading_waits = None, 0
         c.machine.transition(Phase.PLANNING, observation=True)
+
+    def recheck_continuation_file_results(self) -> None:
+        c = self.c
+        ledger = c.ledger
+        if ledger is None:
+            return
+        for identifier in sorted(ledger.continuation_prior_verified_ids):
+            requirement = ledger.requirements.get(identifier)
+            if not requirement or requirement.get("state") == "superseded":
+                continue
+            check = requirement.get("check", {})
+            if check.get("type") not in FILE_CHECKS:
+                continue
+            try:
+                raw = bridge_call("check_effect", c.display_id, check=check)
+                checks = raw.get("checks", []) if isinstance(raw, dict) else []
+                if (raw.get("outcome") == "verified" and raw.get("verified") is True and
+                        len(checks) == 1 and isinstance(checks[0], dict)):
+                    ledger.record_effect(check, checks[0])
+            except ActionRejected as error:
+                if error.code in {"cancelled", "permission_denied", "protected_target", "secure_input"}:
+                    raise
+            except (RuntimeError, ValueError):
+                # An unavailable or changed result stays unfinished; it is
+                # never recreated from the old action or receipt.
+                continue
 
     def plan(self) -> None:
         c = self.c
@@ -4260,6 +4371,8 @@ class TaskExecution:
         c.router.metrics["action_rejections"] += 1
         c.failure = {"message": str(error), "outcome": "delivered_unconfirmed" if uncertain else "rejected",
                      "error_code": error.code, "recovery": action_failure_recovery(code), **error.details}
+        if uncertain:
+            mark_continuation_receipt_uncertain(c.action)
         publisher = current_task.get().destination_publisher if current_task.get() else None
         if not uncertain and publisher and publisher.current and publisher.current.get("state") == "preparing":
             publish_planned_destination(c.ledger)
@@ -4297,6 +4410,12 @@ class TaskExecution:
 
     def record_result(self) -> None:
         c = self.c
+        if isinstance(c.result, dict):
+            expected_effect = c.result.get("expected_effect")
+            uncertain_effect = (c.result.get("outcome") == "delivered_unconfirmed" or
+                                isinstance(expected_effect, dict) and expected_effect.get("outcome") == "delivered_unconfirmed")
+            if uncertain_effect:
+                mark_continuation_receipt_uncertain(c.action)
         c.history.append({"step": c.step, "visual_evidence": str(c.decision.get("visual_evidence") or ""),
             "action": c.action, "result": c.result, **action_history_context(c.decision, c.action, c.observation),
             "completed_requirements": c.decision.get("completed_requirements") or [],
@@ -4465,7 +4584,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_runtime_configuration(require_generation: bool = False) -> str:
-    global _task_generation_id, _instruction_revision, _bridge_observation_revision, _observation_keywords, _exact_input_references, _instruction_correction_key, _working_document_revision, _working_document_update_key
+    global _task_generation_id, _instruction_revision, _bridge_observation_revision, _observation_keywords, _exact_input_references, _instruction_correction_key, _working_document_revision, _working_document_update_key, _continuation_checkpoint
     _task_generation_id = None
     _instruction_revision = 0
     _bridge_observation_revision = None
@@ -4474,6 +4593,7 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
     _instruction_correction_key = None
     _working_document_revision = 0
     _working_document_update_key = None
+    _continuation_checkpoint = None
     raw_line = runtime_line()
     try:
         configuration = json.loads(raw_line)
@@ -4512,6 +4632,19 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
             raise RuntimeError('TaskPilot command inspection versions do not match; rebuild the bundled components together')
         if type(configuration.get("exact_input_reference_version")) is not int or configuration["exact_input_reference_version"] != EXACT_INPUT_REFERENCE_VERSION:
             raise RuntimeError("TaskPilot exact-input reference versions do not match; rebuild the bundled components together")
+        if (type(configuration.get("continuation_checkpoint_version")) is not int or
+                configuration["continuation_checkpoint_version"] != CONTINUATION_CHECKPOINT_VERSION):
+            raise RuntimeError("TaskPilot continuation checkpoint protocol does not match; rebuild the bundled components together")
+        continuation = configuration.get("continuation_checkpoint")
+        if continuation is not None:
+            if (not isinstance(continuation, dict) or continuation.get("eligible") is not True or
+                    continuation.get("version") != CONTINUATION_CHECKPOINT_VERSION or
+                    type(continuation.get("instruction_revision")) is not int or
+                    type(continuation.get("revision")) is not int or
+                    not isinstance(continuation.get("task_sha256"), str) or
+                    not re.fullmatch(r"[0-9a-f]{64}", continuation["task_sha256"])):
+                raise RuntimeError("TaskPilot provided a stale or malformed continuation checkpoint")
+            _continuation_checkpoint = continuation
         references = configuration.get("exact_input_references")
         if type(references) is not list or len(references) > 128:
             raise RuntimeError("TaskPilot provided invalid exact-input reference metadata")

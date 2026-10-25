@@ -8,6 +8,7 @@ struct RuntimeSnapshotFilter {
     private var diagnostics: AgentRequestMetrics?
     private var taskWait: AgentTaskWaitSnapshot?
     private var taskDestination: AgentTaskDestinationSnapshot?
+    private var continuationCheckpoint: (generationID: String, revision: UInt64, fingerprint: String)?
 
     mutating func shouldSchedule(_ event: RuntimeEvent) -> Bool {
         switch event {
@@ -43,6 +44,15 @@ struct RuntimeSnapshotFilter {
                 return false
             }
             taskDestination = value
+        case .taskContinuationCheckpoint(let value):
+            let fingerprint = value.taskSHA256 + ":" + String(value.isEligible) + ":" +
+                String(value.priorVerifiedRequirementCount) + ":" + String(value.unresolvedReceiptCount)
+            if continuationCheckpoint?.generationID == value.generationID,
+               continuationCheckpoint?.revision == value.revision,
+               continuationCheckpoint?.fingerprint == fingerprint {
+                return false
+            }
+            continuationCheckpoint = (value.generationID, value.revision, fingerprint)
         case .userInputRequired:
             // The input handoff changes status outside the runtime channel.
             invalidateStatus()

@@ -401,6 +401,20 @@ struct TaskQueueHistoryView: View {
                 }
                 .buttonStyle(.borderedProminent)
 
+                if let candidate = model.continuationCandidate,
+                   candidate.historyEntryID == entry.id,
+                   model.taskHistory.first?.id == entry.id,
+                   candidate.checkpoint.isEligible {
+                    Button {
+                        model.continueUnfinishedWork(historyEntryID: entry.id)
+                    } label: {
+                        Label("Continue unfinished work", systemImage: "arrow.clockwise.circle")
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Recheck the previous run’s verified results, then continue requirements that still need work")
+                    .accessibilityHint(candidate.checkpoint.explanation)
+                }
+
                 Button {
                     if model.beginHistoryRemix(id: entry.id) {
                         openWindow(id: "controller")
@@ -415,6 +429,16 @@ struct TaskQueueHistoryView: View {
                 Button("Delete", role: .destructive) {
                     model.deleteHistoryEntry(id: entry.id)
                 }
+            }
+            if let candidate = model.continuationCandidate,
+               candidate.historyEntryID == entry.id,
+               model.taskHistory.first?.id == entry.id,
+               candidate.checkpoint.isEligible {
+                Text(model.continuationStartNotice ?? candidate.checkpoint.explanation)
+                    .font(.caption)
+                    .foregroundStyle(model.continuationStartNotice == nil ? Color.secondary : Color.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityLabel("Continue unfinished work. \(model.continuationStartNotice ?? candidate.checkpoint.explanation)")
             }
         }
         .padding(14)

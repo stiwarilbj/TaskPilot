@@ -14,9 +14,35 @@ sys.path.insert(0, str(RUNTIME_DIRECTORY))
 
 from evidence_fixtures import native_result, native_failure
 import openclaw_runtime as runtime
+from task_evidence import TaskEvidenceLedger
 
 
 class OpenClawRuntimeTests(unittest.TestCase):
+    def test_uncertain_mutation_receipt_suppresses_continuation_checkpoint(self):
+        generation = "00000000-0000-4000-8000-000000000001"
+        task = "Create /fixture/result.txt with verified contents."
+        ledger = TaskEvidenceLedger(task, generation)
+        ledger.add_requirements([{
+            "source": task, "description": "Create the verified result",
+            "check": {"type": "file_contents", "path": "/fixture/result.txt", "content": "ready"},
+        }])
+        action = {"type": "write_file", "path": "/fixture/result.txt", "content": "ready"}
+        ledger.record_action(action, native_result(action))
+        context = runtime.TaskContext(task, 1, generation)
+        context.current_action_receipt_id = "opaque-action-id"
+        token = runtime.current_task.set(context)
+        try:
+            runtime.mark_continuation_receipt_uncertain({"type": "click"})
+            with mock.patch.object(runtime, "emit") as emitted:
+                runtime.publish_task_continuation_checkpoint(ledger)
+            payload = emitted.call_args.kwargs
+            self.assertEqual(emitted.call_args.args[0], "task_continuation_checkpoint")
+            self.assertFalse(payload["eligible"])
+            self.assertEqual(payload["unresolved_receipts"], 1)
+            self.assertNotIn("opaque-action-id", json.dumps(payload))
+        finally:
+            runtime.current_task.reset(token)
+
     def test_element_double_click_and_coordinate_free_scroll(self):
         self.assertEqual(runtime.normalized_action({"type": "double_click", "element_id": "current:e1"}),
                          {"type": "double_click", "element_id": "current:e1"})

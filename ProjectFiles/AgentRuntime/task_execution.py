@@ -141,6 +141,8 @@ class TaskContext:
     display_id: int
     generation: str | None
     exact_input_references: list[dict] = field(default_factory=list)
+    continuation_checkpoint: dict | None = None
+    continuation_recheck_started: bool = False
     stop_boundaries: list[dict] = field(default_factory=list)
     original_task: str = ""
     original_input_references: list[dict] = field(default_factory=list)
@@ -171,6 +173,10 @@ class TaskContext:
     progress_active_requirement_ids: list[str] = field(default_factory=list)
     progress_revision: int = 0
     progress_fingerprint: str = ""
+    continuation_fingerprint: str = ""
+    continuation_revision: int = 0
+    continuation_uncertain_receipt_ids: set[str] = field(default_factory=set)
+    current_action_receipt_id: str | None = None
     wait_publisher: Any = None
     destination_publisher: Any = None
     wait_request_sequence: int = 0
