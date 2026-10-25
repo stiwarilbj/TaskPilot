@@ -88,6 +88,7 @@ struct AgentTaskSubmission: Codable, Equatable {
     }
 
     func trimmedForSubmission() -> AgentTaskSubmission {
+        guard (try? validateExactInputReferences()) != nil else { return self }
         let bytes = Array(request.utf8)
         guard !bytes.isEmpty else { return self }
         let references = exactInputReferences.sorted { $0.utf8Start < $1.utf8Start }

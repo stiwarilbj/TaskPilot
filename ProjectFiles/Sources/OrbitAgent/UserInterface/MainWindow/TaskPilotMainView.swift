@@ -498,6 +498,7 @@ struct TaskPilotMainView: View {
                 userRole: chosenRole,
                 presentedRole: chosenRole ?? assignment.role,
                 roleOrigin: chosenRole != nil ? .chosen : assignment.origin == .inferred ? .inferred : .unresolved,
+                inferredRole: assignment.origin == .inferred ? assignment.role : nil,
                 pendingRole: pending?.generationID == progress.generationID && pending?.occurrenceID == occurrenceID
                     ? pending?.desiredRole : nil,
                 roleCorrectionPending: pending?.generationID == progress.generationID && pending?.occurrenceID == occurrenceID,

@@ -147,6 +147,39 @@ final class AgentTaskSubmissionTests: XCTestCase {
         let draft = TaskComposerDraft(segments: [.reference(first), .text(" and "), .reference(second)])
         XCTAssertEqual(draft.displayLabel(for: first), "Finance/budget.xlsx")
         XCTAssertEqual(draft.displayLabel(for: second), "Planning/budget.xlsx")
+
+        let repeatedFirst = TaskComposerReference(kind: .file, value: first.value)
+        let repeatedSecond = TaskComposerReference(kind: .file, value: first.value)
+        let repeated = TaskComposerDraft(segments: [.reference(repeatedFirst), .reference(repeatedSecond)])
+        XCTAssertEqual(repeated.displayLabels()[repeatedFirst.id], "budget.xlsx")
+        XCTAssertEqual(repeated.displayLabels()[repeatedSecond.id], "budget.xlsx")
+
+        let deepFirst = TaskComposerReference(kind: .file, value: "/Users/one/Finance/2026/budget.xlsx")
+        let deepSecond = TaskComposerReference(kind: .file, value: "/Users/two/Finance/2026/budget.xlsx")
+        let deep = TaskComposerDraft(segments: [.reference(deepFirst), .reference(deepSecond)])
+        XCTAssertNotEqual(deep.displayLabel(for: deepFirst), deep.displayLabel(for: deepSecond))
+    }
+
+    func testInvalidRestoredRangesRemainRejectedWithoutOverflow() throws {
+        let malformed = [
+            AgentTaskInputReference(kind: .file, utf8Start: Int.max, utf8Length: 1, value: "/tmp/a"),
+            AgentTaskInputReference(kind: .file, utf8Start: -1, utf8Length: 1, value: "/tmp/a"),
+            AgentTaskInputReference(kind: .file, utf8Start: 0, utf8Length: Int.max, value: "/tmp/a")
+        ]
+
+        for reference in malformed {
+            let original = AgentTaskSubmission(request: "keep this request", exactInputReferences: [reference])
+            let restored = TaskComposerDraft(submission: original)
+            XCTAssertEqual(restored.expandedText, original.request)
+            XCTAssertEqual(restored.submission(), original)
+            XCTAssertEqual(original.trimmedForSubmission(), original)
+            XCTAssertThrowsError(try restored.submission().validateExactInputReferences())
+
+            var edited = restored
+            edited.segments = [.text("reviewed request")]
+            XCTAssertEqual(edited.submission().request, "reviewed request")
+            XCTAssertTrue(edited.submission().exactInputReferences.isEmpty)
+        }
     }
 
     func testInferredRoleDoesNotBecomeAnExplicitPickerOverride() {
@@ -253,6 +286,355 @@ final class AgentTaskSubmissionTests: XCTestCase {
         XCTAssertEqual(replaced.id, reference.id)
         XCTAssertEqual(replaced.userRole, .destination)
         XCTAssertEqual(replaced.value, "/tmp/replacement.xlsx")
+        withExtendedLifetime(window) {}
+    }
+
+    @MainActor
+    func testAutomaticRoleRestoresOnlyARealInferenceAndUsesCurrentAttachment() throws {
+        let inferred = TaskComposerReference(kind: .file, value: "/tmp/inferred.xlsx",
+            presentedRole: .source, roleOrigin: .inferred)
+        let chosenOnly = TaskComposerReference(kind: .file, value: "/tmp/chosen.xlsx")
+        let draft = TaskComposerDraft(segments: [.reference(inferred), .text(" "), .reference(chosenOnly)])
+        let composer = TaskRequestComposer(draft: .constant(draft), fontSize: 14, focusRequested: false,
+            onFocusChanged: { _ in }, accessibilityLabel: "Test request")
+        let coordinator = TaskRequestComposer.Coordinator(parent: composer)
+        let textView = TaskComposerTextView(frame: NSRect(x: 0, y: 0, width: 500, height: 100))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 100),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = textView
+        coordinator.render(draft, in: textView)
+
+        XCTAssertTrue(coordinator.applyRoleCorrection(.destination, to: inferred, in: textView))
+        let inferredAfterChoice = try XCTUnwrap(TaskRequestComposer.Coordinator.draft(from: textView.attributedString()).references.first)
+        XCTAssertEqual(inferredAfterChoice.userRole, .destination)
+        XCTAssertEqual(inferredAfterChoice.inferredRole, .source)
+        XCTAssertTrue(coordinator.applyRoleCorrection(nil, to: inferredAfterChoice, in: textView))
+        let resetInference = try XCTUnwrap(TaskRequestComposer.Coordinator.draft(from: textView.attributedString()).references.first)
+        XCTAssertNil(resetInference.userRole)
+        XCTAssertEqual(resetInference.presentedRole, .source)
+        XCTAssertEqual(resetInference.roleOrigin, .inferred)
+
+        XCTAssertTrue(coordinator.applyRoleCorrection(.source, to: chosenOnly, in: textView))
+        let currentChosen = try XCTUnwrap(TaskRequestComposer.Coordinator.draft(from: textView.attributedString()).references.last)
+        XCTAssertTrue(coordinator.applyRoleCorrection(nil, to: currentChosen, in: textView))
+        let resetChosen = try XCTUnwrap(TaskRequestComposer.Coordinator.draft(from: textView.attributedString()).references.last)
+        XCTAssertNil(resetChosen.userRole)
+        XCTAssertNil(resetChosen.presentedRole)
+        XCTAssertEqual(resetChosen.roleOrigin, .unresolved)
+
+        // A stale reference snapshot must not hide a real update to the live attachment.
+        XCTAssertTrue(coordinator.applyRoleCorrection(.destination, to: chosenOnly, in: textView))
+        let updated = try XCTUnwrap(TaskRequestComposer.Coordinator.draft(from: textView.attributedString()).references.last)
+        XCTAssertEqual(updated.userRole, .destination)
+        withExtendedLifetime(window) {}
+    }
+
+    @MainActor
+    func testStandaloneReferencePasteReplacesSelectedTextAndChips() throws {
+        let original = TaskComposerReference(kind: .file, value: "/tmp/old.xlsx")
+        let draft = TaskComposerDraft(segments: [.text("before "), .reference(original), .text(" after")])
+        let composer = TaskRequestComposer(draft: .constant(draft), fontSize: 14, focusRequested: false,
+            onFocusChanged: { _ in }, accessibilityLabel: "Test request")
+        let coordinator = TaskRequestComposer.Coordinator(parent: composer)
+        let textView = TaskComposerTextView(frame: NSRect(x: 0, y: 0, width: 500, height: 100))
+        textView.isRichText = true
+        textView.isEditable = true
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 100),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = textView
+        coordinator.render(draft, in: textView)
+
+        let selection = NSRange(location: "before ".utf16.count,
+            length: 1 + " after".utf16.count)
+        textView.setSelectedRange(selection)
+        let pasteboard = NSPasteboard.withUniqueName()
+        pasteboard.clearContents()
+        pasteboard.setString("https://example.test/new%20report?q=1", forType: .string)
+        coordinator.paste(into: textView, from: pasteboard)
+
+        let result = TaskRequestComposer.Coordinator.draft(from: textView.attributedString())
+        XCTAssertEqual(result.expandedText, "before https://example.test/new%20report?q=1")
+        XCTAssertEqual(result.references.map(\.value), ["https://example.test/new%20report?q=1"])
+        XCTAssertEqual(result.submission().exactInputReferences.first?.utf8Start, "before ".utf8.count)
+
+        let pastedURL = result.references[0].value
+        textView.setSelectedRange(NSRange(location: "before ".utf16.count, length: pastedURL.utf16.count))
+        pasteboard.setString("/tmp/new report.pdf", forType: .string)
+        coordinator.paste(into: textView, from: pasteboard)
+        let pathResult = TaskRequestComposer.Coordinator.draft(from: textView.attributedString())
+        XCTAssertEqual(pathResult.expandedText, "before /tmp/new report.pdf")
+        XCTAssertEqual(pathResult.references.map(\.kind), [.file])
+        XCTAssertEqual(pathResult.references.map(\.value), ["/tmp/new report.pdf"])
+        pasteboard.releaseGlobally()
+        withExtendedLifetime(window) {}
+    }
+
+    @MainActor
+    func testChipClipboardRoundTripIsolatedPasteboardAndUndoRedo() throws {
+        let source = TaskComposerReference(kind: .file, value: "/tmp/Finance/budget.xlsx", userRole: .source)
+        let comparison = TaskComposerReference(kind: .file, value: "/tmp/Planning/budget.xlsx", userRole: .referenceExample)
+        let draft = TaskComposerDraft(segments: [.text("Summarize "), .reference(source), .text(" then compare "),
+            .reference(comparison), .text(" carefully")])
+        let composer = TaskRequestComposer(draft: .constant(draft), fontSize: 14, focusRequested: false,
+            onFocusChanged: { _ in }, accessibilityLabel: "Test request")
+        let coordinator = TaskRequestComposer.Coordinator(parent: composer)
+        let textView = TaskComposerTextView(frame: NSRect(x: 0, y: 0, width: 500, height: 100))
+        textView.isRichText = true
+        textView.allowsUndo = true
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 100),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = textView
+        _ = window.makeFirstResponder(textView)
+        coordinator.render(draft, in: textView)
+
+        let initialLength = textView.attributedString().length
+        let pasteboard = NSPasteboard.withUniqueName()
+        textView.setSelectedRange(NSRange(location: 0, length: initialLength))
+        coordinator.copySelection(from: textView, cut: false, to: pasteboard)
+        XCTAssertEqual(pasteboard.string(forType: .string),
+            "Summarize /tmp/Finance/budget.xlsx then compare /tmp/Planning/budget.xlsx carefully")
+
+        textView.setSelectedRange(NSRange(location: initialLength, length: 0))
+        coordinator.paste(into: textView, from: pasteboard)
+        var result = TaskRequestComposer.Coordinator.draft(from: textView.attributedString())
+        XCTAssertEqual(result.references.count, 4)
+        XCTAssertEqual(result.references.map(\.userRole), [.source, .referenceExample, .source, .referenceExample])
+        XCTAssertEqual(result.expandedText,
+            "Summarize /tmp/Finance/budget.xlsx then compare /tmp/Planning/budget.xlsx carefully" +
+            "Summarize /tmp/Finance/budget.xlsx then compare /tmp/Planning/budget.xlsx carefully")
+        let labels = result.displayLabels()
+        XCTAssertEqual(labels[result.references[0].id], "Finance/budget.xlsx")
+        XCTAssertEqual(labels[result.references[1].id], "Planning/budget.xlsx")
+        XCTAssertEqual(labels[result.references[2].id], "Finance/budget.xlsx")
+        XCTAssertEqual(labels[result.references[3].id], "Planning/budget.xlsx")
+        textView.undoManager?.undo()
+        result = TaskRequestComposer.Coordinator.draft(from: textView.attributedString())
+        XCTAssertEqual(result.references.count, 2)
+        textView.undoManager?.redo()
+        result = TaskRequestComposer.Coordinator.draft(from: textView.attributedString())
+        XCTAssertEqual(result.references.count, 4)
+
+        let copiedSecond = try XCTUnwrap(result.references.last)
+        var secondRange: NSRange?
+        textView.attributedString().enumerateAttribute(.attachment,
+            in: NSRange(location: 0, length: textView.attributedString().length)) { value, range, _ in
+                guard let attachment = value as? TaskComposerTextAttachment,
+                      attachment.reference.id == copiedSecond.id else { return }
+                secondRange = range
+            }
+        textView.setSelectedRange(try XCTUnwrap(secondRange))
+        coordinator.copySelection(from: textView, cut: true, to: pasteboard)
+        XCTAssertEqual(TaskRequestComposer.Coordinator.draft(from: textView.attributedString()).references.count, 3)
+        textView.undoManager?.undo()
+        XCTAssertEqual(TaskRequestComposer.Coordinator.draft(from: textView.attributedString()).references.count, 4)
+
+        pasteboard.releaseGlobally()
+        withExtendedLifetime(window) {}
+    }
+
+    @MainActor
+    func testEditableSpaceTypesBesideChipAndHitTestingRejectsNearbyWhitespace() throws {
+        let reference = TaskComposerReference(kind: .text, value: "budget.xlsx")
+        let draft = TaskComposerDraft(segments: [.reference(reference), .text("report")])
+        let composer = TaskRequestComposer(draft: .constant(draft), fontSize: 14, focusRequested: false,
+            onFocusChanged: { _ in }, accessibilityLabel: "Test request")
+        let coordinator = TaskRequestComposer.Coordinator(parent: composer)
+        let textView = TaskComposerTextView(frame: NSRect(x: 0, y: 0, width: 500, height: 100))
+        textView.isRichText = true
+        textView.isEditable = true
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 100),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = textView
+        coordinator.render(draft, in: textView)
+        _ = window.makeFirstResponder(textView)
+        textView.setSelectedRange(NSRange(location: 1, length: 0))
+        let space = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: " ",
+            charactersIgnoringModifiers: " ", isARepeat: false, keyCode: 49))
+
+        textView.keyDown(with: space)
+        XCTAssertEqual(TaskRequestComposer.Coordinator.draft(from: textView.attributedString()).expandedText,
+            "budget.xlsx report")
+
+        coordinator.render(draft, in: textView)
+        textView.setSelectedRange(NSRange(location: 0, length: 1))
+        textView.keyDown(with: space)
+        XCTAssertEqual(TaskRequestComposer.Coordinator.draft(from: textView.attributedString()).expandedText,
+            " report")
+
+        let optionReturn = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero,
+            modifierFlags: [.option], timestamp: 0, windowNumber: window.windowNumber, context: nil,
+            characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
+        coordinator.render(draft, in: textView)
+        textView.setSelectedRange(NSRange(location: 0, length: 1))
+        XCTAssertEqual(textView.chipInspectionTarget(for: optionReturn)?.0.id, reference.id)
+        textView.setSelectedRange(NSRange(location: 0, length: 1))
+        textView.setMarkedText("候補", selectedRange: NSRange(location: 0, length: 0), replacementRange: NSRange(location: 0, length: 1))
+        XCTAssertNil(textView.chipInspectionTarget(for: optionReturn))
+        textView.unmarkText()
+        coordinator.render(draft, in: textView)
+
+        let returnKey = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: "\r",
+            charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
+        textView.setSelectedRange(NSRange(location: 0, length: 1))
+        textView.keyDown(with: returnKey)
+        XCTAssertEqual(TaskRequestComposer.Coordinator.draft(from: textView.attributedString()).expandedText,
+            "\nreport")
+        coordinator.render(draft, in: textView)
+
+        textView.layoutManager?.ensureLayout(for: try XCTUnwrap(textView.textContainer))
+        let glyphRange = try XCTUnwrap(textView.layoutManager).glyphRange(forCharacterRange: NSRange(location: 0, length: 1),
+            actualCharacterRange: nil)
+        let glyphRect = try XCTUnwrap(textView.layoutManager).boundingRect(forGlyphRange: glyphRange,
+            in: try XCTUnwrap(textView.textContainer)).offsetBy(dx: textView.textContainerOrigin.x,
+                dy: textView.textContainerOrigin.y)
+        let inside = textView.convert(NSPoint(x: glyphRect.midX, y: glyphRect.midY), to: nil)
+        let outside = textView.convert(NSPoint(x: glyphRect.maxX + 8, y: glyphRect.midY), to: nil)
+        XCTAssertNotNil(textView.attachment(at: inside))
+        XCTAssertNil(textView.attachment(at: outside))
+        withExtendedLifetime(window) {}
+    }
+
+    @MainActor
+    func testLabelIndexAndChipMeasurementsAreReused() throws {
+        let references = (0..<128).map { index in
+            TaskComposerReference(kind: .file,
+                value: "/tmp/Reports/Project\(index)/Archive/2026/report.md")
+        }
+        let draft = TaskComposerDraft(segments: references.map { .reference($0) })
+        let composer = TaskRequestComposer(draft: .constant(draft), fontSize: 14, focusRequested: false,
+            onFocusChanged: { _ in }, accessibilityLabel: "Test request")
+        let coordinator = TaskRequestComposer.Coordinator(parent: composer)
+        let textView = TaskComposerTextView(frame: NSRect(x: 0, y: 0, width: 500, height: 100))
+        coordinator.render(draft, in: textView)
+        XCTAssertEqual(coordinator.labelIndexBuildCount, 1)
+        coordinator.refreshLabels(in: textView, draft: draft)
+        XCTAssertEqual(coordinator.labelIndexBuildCount, 1)
+
+        let roleOnly = TaskComposerDraft(segments: references.enumerated().map { index, reference in
+            .reference(TaskComposerReference(id: reference.id, kind: reference.kind, value: reference.value,
+                userRole: index == 0 ? .source : nil, presentedRole: index == 0 ? .source : nil,
+                roleOrigin: index == 0 ? .chosen : .unresolved))
+        })
+        _ = coordinator.labelIndex(for: roleOnly)
+        XCTAssertEqual(coordinator.labelIndexBuildCount, 1)
+        let proseOnly = TaskComposerDraft(segments: [.text("edited prose")] + references.map { .reference($0) })
+        _ = coordinator.labelIndex(for: proseOnly)
+        XCTAssertEqual(coordinator.labelIndexBuildCount, 1)
+        let changedReference = TaskComposerReference(id: references[0].id, kind: .file,
+            value: "/tmp/Reports/Changed/Archive/2026/report.md")
+        let changedDraft = TaskComposerDraft(segments: [.reference(changedReference)] + references.dropFirst().map { .reference($0) })
+        _ = coordinator.labelIndex(for: changedDraft)
+        XCTAssertEqual(coordinator.labelIndexBuildCount, 2)
+
+        let attachment = TaskComposerTextAttachment(reference: references[0], label: "report.md")
+        let cell = try XCTUnwrap(attachment.attachmentCell as? TaskComposerChipCell)
+        _ = cell.cellSize()
+        _ = cell.cellSize()
+        XCTAssertEqual(cell.sizeMeasurementCount, 1)
+        cell.update(reference: references[0], label: "A longer report.md")
+        _ = cell.cellSize()
+        XCTAssertEqual(cell.sizeMeasurementCount, 2)
+        cell.update(reference: references[0], label: "A longer report.md", fontSize: 14)
+        _ = cell.cellSize()
+        XCTAssertEqual(cell.sizeMeasurementCount, 3)
+        cell.update(reference: references[0], label: "A longer report.md", fontSize: 14)
+        _ = cell.cellSize()
+        XCTAssertEqual(cell.sizeMeasurementCount, 3)
+
+        let renderedAttachment = try XCTUnwrap(textView.attributedString().attribute(.attachment, at: 0,
+            effectiveRange: nil) as? TaskComposerTextAttachment)
+        let renderedCell = try XCTUnwrap(renderedAttachment.attachmentCell as? TaskComposerChipCell)
+        _ = renderedCell.cellSize()
+        let priorMeasurements = renderedCell.sizeMeasurementCount
+        coordinator.applyFont(16, to: textView)
+        _ = renderedCell.cellSize()
+        XCTAssertEqual(renderedCell.sizeMeasurementCount, priorMeasurements + 1)
+        let changedFontMeasurements = renderedCell.sizeMeasurementCount
+        coordinator.applyFont(16, to: textView)
+        _ = renderedCell.cellSize()
+        XCTAssertEqual(renderedCell.sizeMeasurementCount, changedFontMeasurements)
+
+        _ = coordinator.labelIndex(for: draft)
+        let stableBuildCount = coordinator.labelIndexBuildCount
+        let benchmarkStart = DispatchTime.now().uptimeNanoseconds
+        for _ in 0..<5 { _ = coordinator.labelIndex(for: draft) }
+        let benchmarkElapsed = DispatchTime.now().uptimeNanoseconds - benchmarkStart
+        XCTAssertEqual(coordinator.labelIndexBuildCount, stableBuildCount)
+        print("Composer label benchmark: 128-chip fixture, 5 cached passes, \(Double(benchmarkElapsed) / 1_000_000) ms, index builds \(stableBuildCount)")
+    }
+
+    @MainActor
+    func testReadOnlyComposerRetainsChipInspectionAndRejectsStaleRoleCallbacks() throws {
+        let reference = TaskComposerReference(kind: .file, value: "/tmp/report.xlsx", occurrenceID: "0:17:file")
+        let draft = TaskComposerDraft(segments: [.text("Open "), .reference(reference)])
+        var roleCorrectionCount = 0
+        let composer = TaskRequestComposer(draft: .constant(draft), fontSize: 14, focusRequested: false,
+            onFocusChanged: { _ in }, accessibilityLabel: "Current task", isReadOnly: true,
+            onRoleCorrection: { _, _ in roleCorrectionCount += 1; return true })
+        let coordinator = TaskRequestComposer.Coordinator(parent: composer)
+        let textView = TaskComposerTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 100))
+        textView.isRichText = true
+        textView.isEditable = false
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 100),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = textView
+        coordinator.render(draft, in: textView)
+        textView.setSelectedRange(NSRange(location: textView.attributedString().length - 1, length: 0))
+
+        let space = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: " ",
+            charactersIgnoringModifiers: " ", isARepeat: false, keyCode: 49))
+        let returnKey = try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: "\r",
+            charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36))
+        XCTAssertEqual(textView.chipInspectionTarget(for: space)?.0.id, reference.id)
+        XCTAssertEqual(textView.chipInspectionTarget(for: returnKey)?.0.id, reference.id)
+        XCTAssertTrue(coordinator.applyRoleCorrection(.source, to: reference, in: textView))
+        XCTAssertEqual(roleCorrectionCount, 1)
+
+        textView.textStorage?.deleteCharacters(in: NSRange(location: textView.attributedString().length - 1, length: 1))
+        XCTAssertFalse(coordinator.applyRoleCorrection(.destination, to: reference, in: textView))
+        XCTAssertEqual(roleCorrectionCount, 1)
+        withExtendedLifetime(window) {}
+    }
+
+    @MainActor
+    func testComposerRendersWrappedChipsInNarrowDarkAppearanceWithAccessibilityText() throws {
+        let source = TaskComposerReference(kind: .file, value: "/tmp/Finance/Quarterly Budget Review.xlsx",
+            userRole: .source)
+        let destination = TaskComposerReference(kind: .folder, value: "/tmp/Reports/October Results",
+            userRole: .destination)
+        let draft = TaskComposerDraft(segments: [.text("Summarize "), .reference(source),
+            .text(" and save the result in "), .reference(destination)])
+        let composer = TaskRequestComposer(draft: .constant(draft), fontSize: 14, focusRequested: false,
+            onFocusChanged: { _ in }, accessibilityLabel: "Task request")
+        let coordinator = TaskRequestComposer.Coordinator(parent: composer)
+        let textView = TaskComposerTextView(frame: NSRect(x: 0, y: 0, width: 175, height: 120))
+        textView.isRichText = true
+        textView.isEditable = true
+        textView.setAccessibilityLabel("Task request")
+        textView.setAccessibilityHelp("Type spaces normally. Press Option-Return beside or on an input chip to inspect it.")
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 175, height: 120),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.appearance = NSAppearance(named: .darkAqua)
+        textView.appearance = window.appearance
+        window.contentView = textView
+        coordinator.render(draft, in: textView)
+
+        let layoutManager = try XCTUnwrap(textView.layoutManager)
+        let textContainer = try XCTUnwrap(textView.textContainer)
+        layoutManager.ensureLayout(for: textContainer)
+        let glyphRange = layoutManager.glyphRange(for: textContainer)
+        var lineCount = 0
+        layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) { _, _, _, _, _ in lineCount += 1 }
+        XCTAssertGreaterThan(lineCount, 1)
+        XCTAssertEqual(window.appearance?.name, NSAppearance.Name.darkAqua)
+        XCTAssertEqual(textView.accessibilityLabel(), "Task request")
+        XCTAssertEqual(textView.accessibilityHelp(),
+            "Type spaces normally. Press Option-Return beside or on an input chip to inspect it.")
+        XCTAssertEqual(TaskRequestComposer.Coordinator.draft(from: textView.attributedString()), draft)
         withExtendedLifetime(window) {}
     }
 
