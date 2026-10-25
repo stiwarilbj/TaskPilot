@@ -1934,6 +1934,7 @@ final class TaskPilotCoordinator: ObservableObject {
               let reference = authorization.effectiveSubmission.exactInputReferences.first(where: { $0.id == occurrenceID }) else {
             return false
         }
+        guard Self.inputRoleOverrideChanges(from: reference.userRole, to: role) else { return true }
         let amendment = AgentTaskInputRoleAmendment(occurrenceID: reference.id, kind: reference.kind,
             utf8Start: reference.utf8Start, utf8Length: reference.utf8Length, value: reference.value, role: role)
         let submission = AgentTaskSubmission(request: "", exactInputReferences: [])
@@ -1942,6 +1943,10 @@ final class TaskPilotCoordinator: ObservableObject {
             : TaskCorrectionSession(generationID: lease.id, draft: TaskComposerDraft())
         submitTaskCorrection(submission, roleAmendment: amendment, session: session)
         return taskCorrectionSession?.state == .pending
+    }
+
+    static func inputRoleOverrideChanges(from current: AgentTaskInputRole?, to requested: AgentTaskInputRole?) -> Bool {
+        current != requested
     }
 
     private func submitTaskCorrection(_ submission: AgentTaskSubmission,

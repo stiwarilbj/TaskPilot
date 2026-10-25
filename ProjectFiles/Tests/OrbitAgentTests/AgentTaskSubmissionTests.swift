@@ -1,4 +1,6 @@
 import XCTest
+import AppKit
+import SwiftUI
 @testable import OrbitAgent
 
 final class AgentTaskSubmissionTests: XCTestCase {
@@ -145,5 +147,165 @@ final class AgentTaskSubmissionTests: XCTestCase {
         let draft = TaskComposerDraft(segments: [.reference(first), .text(" and "), .reference(second)])
         XCTAssertEqual(draft.displayLabel(for: first), "Finance/budget.xlsx")
         XCTAssertEqual(draft.displayLabel(for: second), "Planning/budget.xlsx")
+    }
+
+    func testInferredRoleDoesNotBecomeAnExplicitPickerOverride() {
+        let inferred = TaskComposerReference(kind: .file, value: "/tmp/budget.xlsx",
+            presentedRole: .source, roleOrigin: .inferred)
+        XCTAssertEqual(inferred.presentedRole, .source)
+        XCTAssertNil(inferred.userRole)
+        XCTAssertNil(inferred.rolePickerSelection)
+
+        let pending = TaskComposerReference(kind: .file, value: "/tmp/budget.xlsx",
+            userRole: .source, presentedRole: .source, pendingRole: .destination,
+            roleCorrectionPending: true)
+        XCTAssertEqual(pending.rolePickerSelection, .destination)
+        let acknowledged = TaskComposerReference(kind: .file, value: "/tmp/budget.xlsx",
+            userRole: .destination, presentedRole: .destination, roleOrigin: .chosen)
+        XCTAssertEqual(acknowledged.rolePickerSelection, .destination)
+    }
+
+    @MainActor
+    func testComposerExtractionPreservesUnicodeAndExactReferenceRanges() throws {
+        let before = "Summarize 🧾 cafe\u{301} 👩🏽‍💻  "
+        let value = "/tmp/预算.xlsx"
+        let after = "\nthen preserve 👨‍👩‍👧‍👦 and naïve text."
+        let reference = TaskComposerReference(kind: .file, value: value)
+        let attributed = NSMutableAttributedString(string: before)
+        attributed.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor,
+            range: NSRange(location: 0, length: "Summarize".utf16.count))
+        attributed.append(NSAttributedString(attachment: TaskComposerTextAttachment(reference: reference, label: "预算.xlsx")))
+        attributed.append(NSAttributedString(string: after))
+
+        let draft = TaskRequestComposer.Coordinator.draft(from: attributed)
+        XCTAssertEqual(draft.segments, [.text(before), .reference(reference), .text(after)])
+        let submission = draft.submission()
+        XCTAssertEqual(submission.request, before + value + after)
+        let input = try XCTUnwrap(submission.exactInputReferences.first)
+        XCTAssertEqual(input.utf8Start, before.utf8.count)
+        XCTAssertEqual(input.utf8Length, value.utf8.count)
+        let bytes = Array(submission.request.utf8)
+        XCTAssertEqual(String(bytes: bytes[input.utf8Start..<(input.utf8Start + input.utf8Length)], encoding: .utf8), value)
+    }
+
+    @MainActor
+    func testFreshChipRoleChangeKeepsAttachmentIdentityAndSelection() throws {
+        let draft = TaskComposerDraft(plainText: "Edit  carefully")
+        let composer = TaskRequestComposer(draft: .constant(draft), fontSize: 14, focusRequested: false,
+            onFocusChanged: { _ in }, accessibilityLabel: "Test request")
+        let coordinator = TaskRequestComposer.Coordinator(parent: composer)
+        let textView = TaskComposerTextView(frame: NSRect(x: 0, y: 0, width: 500, height: 100))
+        textView.isRichText = true
+        textView.allowsUndo = true
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 100),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = textView
+        _ = window.makeFirstResponder(textView)
+        coordinator.render(draft, in: textView)
+        textView.isEditable = true
+        coordinator.insertDropped([URL(fileURLWithPath: "/tmp/new-chip.xlsx")],
+            at: "Edit ".utf16.count, in: textView)
+        let droppedDraft = TaskRequestComposer.Coordinator.draft(from: textView.attributedString())
+        let reference = try XCTUnwrap(droppedDraft.references.first)
+        XCTAssertNil(reference.occurrenceID)
+        XCTAssertEqual(droppedDraft.segments, [.text("Edit "), .reference(reference), .text(" carefully")])
+        let attachmentOffset = "Edit ".utf16.count
+        let before = try XCTUnwrap(textView.attributedString().attribute(.attachment, at: attachmentOffset,
+            effectiveRange: nil) as? TaskComposerTextAttachment)
+        let selection = NSRange(location: 1, length: 2)
+        textView.setSelectedRange(selection)
+
+        XCTAssertTrue(coordinator.applyRoleCorrection(.source, to: reference, in: textView))
+
+        let after = try XCTUnwrap(textView.attributedString().attribute(.attachment, at: attachmentOffset,
+            effectiveRange: nil) as? TaskComposerTextAttachment)
+        XCTAssertTrue(before === after)
+        XCTAssertEqual(after.reference.userRole, .source)
+        XCTAssertEqual(textView.selectedRange(), selection)
+        XCTAssertTrue(coordinator.lastRenderedDraft?.hasSameContent(as: droppedDraft) == true)
+        XCTAssertEqual(TaskRequestComposer.Coordinator.draft(from: textView.attributedString()).submission()
+            .exactInputReferences.first?.userRole, .source)
+
+        let undoManager = try XCTUnwrap(textView.undoManager)
+        XCTAssertTrue(undoManager.canUndo)
+        undoManager.undo()
+        XCTAssertNil(after.reference.userRole)
+        XCTAssertEqual(textView.selectedRange(), selection)
+        XCTAssertTrue(undoManager.canRedo)
+        undoManager.redo()
+        XCTAssertEqual(after.reference.userRole, .source)
+        XCTAssertEqual(textView.selectedRange(), selection)
+
+        let roleOnly = TaskComposerDraft(segments: [.text("Edit "),
+            .reference(TaskComposerReference(id: reference.id, kind: reference.kind, value: reference.value,
+                userRole: .destination, presentedRole: .source, roleOrigin: .chosen)), .text(" carefully")])
+        XCTAssertTrue(droppedDraft.hasSameContent(as: roleOnly))
+        coordinator.update(roleOnly, in: textView)
+        let roleOnlyAttachment = try XCTUnwrap(textView.attributedString().attribute(.attachment, at: attachmentOffset,
+            effectiveRange: nil) as? TaskComposerTextAttachment)
+        XCTAssertTrue(after === roleOnlyAttachment)
+        XCTAssertEqual(textView.selectedRange(), selection)
+
+        coordinator.replace(reference.id, with: TaskComposerReference(id: reference.id,
+            kind: .file, value: "/tmp/replacement.xlsx", userRole: .destination,
+            presentedRole: .source, roleOrigin: .chosen), in: textView)
+        let replaced = try XCTUnwrap(TaskRequestComposer.Coordinator.draft(from: textView.attributedString()).references.first)
+        XCTAssertEqual(replaced.id, reference.id)
+        XCTAssertEqual(replaced.userRole, .destination)
+        XCTAssertEqual(replaced.value, "/tmp/replacement.xlsx")
+        withExtendedLifetime(window) {}
+    }
+
+    @MainActor
+    func testReadOnlyComposerRejectsEditIMEAndDropRoutes() throws {
+        let draft = TaskComposerDraft(plainText: "Read 🧾 only")
+        let composer = TaskRequestComposer(draft: .constant(draft), fontSize: 14, focusRequested: false,
+            onFocusChanged: { _ in }, accessibilityLabel: "Current task", isReadOnly: true)
+        let coordinator = TaskRequestComposer.Coordinator(parent: composer)
+        let textView = TaskComposerTextView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
+        textView.isRichText = true
+        textView.isEditable = false
+        coordinator.render(draft, in: textView)
+        let original = textView.attributedString().string
+        let selection = NSRange(location: 0, length: 4)
+        textView.setSelectedRange(selection)
+
+        textView.insertText("Changed", replacementRange: selection)
+        textView.setMarkedText("候補", selectedRange: NSRange(location: 0, length: 0), replacementRange: selection)
+        textView.deleteBackward(nil)
+        textView.deleteForward(nil)
+        textView.pasteAsPlainText(nil)
+        textView.pasteAsRichText(nil)
+        textView.pasteAndMatchStyle(nil)
+        textView.undo(nil)
+        textView.redo(nil)
+        coordinator.insertDropped([URL(fileURLWithPath: "/tmp/new-file")], at: 0, in: textView)
+
+        XCTAssertEqual(textView.attributedString().string, original)
+    }
+
+    @MainActor
+    func testUnchangedRoleOverrideDoesNotRequestARevision() {
+        XCTAssertFalse(TaskPilotCoordinator.inputRoleOverrideChanges(from: .source, to: .source))
+        XCTAssertFalse(TaskPilotCoordinator.inputRoleOverrideChanges(from: nil, to: nil))
+        XCTAssertTrue(TaskPilotCoordinator.inputRoleOverrideChanges(from: nil, to: .source))
+        XCTAssertTrue(TaskPilotCoordinator.inputRoleOverrideChanges(from: .source, to: nil))
+    }
+
+    @MainActor
+    func testLongComposerExtractionPreservesWholeTextRun() throws {
+        let prefix = String(repeating: "Project summary 🧾 cafe\u{301}. ", count: 1_576)
+        let reference = TaskComposerReference(kind: .text, value: "exact phrase")
+        let attributed = NSMutableAttributedString(string: prefix)
+        attributed.append(NSAttributedString(attachment: TaskComposerTextAttachment(reference: reference, label: "exact phrase")))
+        attributed.append(NSAttributedString(string: " done"))
+
+        let start = DispatchTime.now().uptimeNanoseconds
+        var extracted = TaskComposerDraft()
+        for _ in 0..<50 { extracted = TaskRequestComposer.Coordinator.draft(from: attributed) }
+        let elapsed = DispatchTime.now().uptimeNanoseconds - start
+        XCTAssertEqual(extracted.expandedText, prefix + reference.value + " done")
+        XCTAssertEqual(extracted.references.count, 1)
+        print("Composer extraction benchmark: 41K-character fixture, 50 passes, \(Double(elapsed) / 1_000_000) ms")
     }
 }

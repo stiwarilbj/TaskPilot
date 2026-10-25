@@ -493,9 +493,11 @@ struct TaskPilotMainView: View {
                   let occurrenceID = reference.occurrenceID,
                   let assignment = progress.inputRoles[occurrenceID] else { return segment }
             let pending = model.pendingTaskInputRoleCorrection
+            let chosenRole = assignment.origin == .user ? assignment.role : reference.userRole
             return .reference(TaskComposerReference(id: reference.id, kind: reference.kind, value: reference.value,
-                userRole: reference.userRole, presentedRole: assignment.role,
-                roleOrigin: assignment.origin == .user ? .chosen : assignment.origin == .inferred ? .inferred : .unresolved,
+                userRole: chosenRole,
+                presentedRole: chosenRole ?? assignment.role,
+                roleOrigin: chosenRole != nil ? .chosen : assignment.origin == .inferred ? .inferred : .unresolved,
                 pendingRole: pending?.generationID == progress.generationID && pending?.occurrenceID == occurrenceID
                     ? pending?.desiredRole : nil,
                 roleCorrectionPending: pending?.generationID == progress.generationID && pending?.occurrenceID == occurrenceID,
@@ -505,6 +507,7 @@ struct TaskPilotMainView: View {
             draft: .constant(draft),
             fontSize: TaskPilotAppearancePreferences.clampedInputFontSize(inputFontSize),
             focusRequested: false,
+            managesFocus: false,
             onFocusChanged: { _ in },
             accessibilityLabel: "Current task request with exact input purposes",
             isReadOnly: true,
