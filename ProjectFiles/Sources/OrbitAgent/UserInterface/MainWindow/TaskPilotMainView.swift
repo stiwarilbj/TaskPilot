@@ -493,9 +493,9 @@ struct TaskPilotMainView: View {
                     Text(document.summary)
                         .font(.caption.weight(.semibold))
                         .lineLimit(1)
-                    Text(document.stateLabel)
+                    Text(document.selectionStateLabel ?? document.stateLabel)
                         .font(.caption2)
-                        .foregroundStyle(document.state == .active ? Color.green : Color.orange)
+                        .foregroundStyle((document.selectionState ?? document.state) == .active ? Color.green : Color.orange)
                         .lineLimit(1)
                 }
             }
@@ -509,7 +509,7 @@ struct TaskPilotMainView: View {
             .contentShape(RoundedRectangle(cornerRadius: 9))
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(document.summary), \(document.stateLabel). Show working document details.")
+        .accessibilityLabel("\(document.summary), \(document.selectionStateLabel ?? document.stateLabel). Show working document details.")
         .popover(isPresented: $showingWorkingDocumentDetails, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 12) {
                 Label("Working document", systemImage: "doc.text.magnifyingglass")
@@ -531,6 +531,21 @@ struct TaskPilotMainView: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(document.state == .active ? .green : .orange)
 
+                if let selectionDescription = document.selectionDescription {
+                    Divider()
+                    Label("Work only in this selection", systemImage: "scope")
+                        .font(.callout.weight(.semibold))
+                    Text(selectionDescription)
+                        .font(.callout)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                    let selectionState = document.selectionState ?? .needsReselection
+                    Label(selectionState == .active ? "Active" : selectionState == .pending ? "Pending" : "Needs reselection",
+                          systemImage: selectionState == .active ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(selectionState == .active ? .green : .orange)
+                }
+
                 if let notice = model.workingDocumentNotice {
                     Text(notice)
                         .font(.caption)
@@ -539,7 +554,7 @@ struct TaskPilotMainView: View {
                 }
 
                 HStack {
-                    Button("Change") {
+                    Button(document.selectionDescription == nil ? "Change" : "Change selection") {
                         showingWorkingDocumentDetails = false
                         openWindow(id: "agent-viewer")
                         Task { @MainActor in
@@ -548,13 +563,22 @@ struct TaskPilotMainView: View {
                         }
                     }
                     .disabled(!model.canSelectWorkingDocument)
-                    .accessibilityLabel("Choose a different working document in Live View")
-                    Spacer()
-                    Button("Remove reference", role: .destructive) {
-                        showingWorkingDocumentDetails = false
-                        model.removeWorkingDocumentReference()
+                    .accessibilityLabel(document.selectionDescription == nil ? "Choose a different working document in Live View" : "Choose the working selection again in Live View")
+                    if document.selectionDescription != nil {
+                        Button("Remove selection limit", role: .destructive) {
+                            showingWorkingDocumentDetails = false
+                            model.removeWorkingSelectionLimit()
+                        }
+                        .disabled(!model.canSelectWorkingDocument)
+                        .accessibilityLabel("Remove selection limit and allow edits elsewhere in the working document")
+                    } else {
+                        Spacer()
+                        Button("Remove reference", role: .destructive) {
+                            showingWorkingDocumentDetails = false
+                            model.removeWorkingDocumentReference()
+                        }
+                        .disabled(!model.canSelectWorkingDocument)
                     }
-                    .disabled(!model.canSelectWorkingDocument)
                 }
             }
             .padding(16)

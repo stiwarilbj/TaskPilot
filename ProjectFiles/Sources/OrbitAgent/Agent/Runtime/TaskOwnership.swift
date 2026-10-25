@@ -627,6 +627,10 @@ enum TaskOwnership {
     @TaskLocal static var actionReceipt: ActionReceiptStore.Token?
     @TaskLocal static var instructionRevision: UInt64?
     @TaskLocal static var workingDocumentRevision: UInt64?
+    /// Narrow permission derived from the user's effective request. It lets
+    /// native preflight admit standard Save/Export controls while a selection
+    /// scope is active; it is never supplied by the model.
+    @TaskLocal static var allowWorkingSelectionSaveExport = false
     @TaskLocal static var stopBoundaryPreflight: (([String: Any], [StopBoundaryRecord]) throws -> Void)?
     @TaskLocal static var targetChoicePreflight: (([String: Any]) throws -> Void)?
     static func check() throws { try current?.check(); try LocalOperationBudget.check(); try Task.checkCancellation() }

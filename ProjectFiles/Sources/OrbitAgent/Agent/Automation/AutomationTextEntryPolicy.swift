@@ -26,7 +26,7 @@ struct AutomationTextEntryResult {
 }
 
 enum AutomationTextEntryPolicy {
-    static let inputRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSecureTextField"]
+    static let inputRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSecureTextField", "AXCell"]
 
     static func isSecure(role: String, subrole: String) -> Bool {
         role == "AXSecureTextField" || subrole == "AXSecureTextField"

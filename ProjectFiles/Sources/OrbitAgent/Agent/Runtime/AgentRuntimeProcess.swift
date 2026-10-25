@@ -78,7 +78,7 @@ enum RuntimeEvent {
     case taskChangeLens(AgentTaskChangeLensSnapshot)
     case instructionCorrectionApplied(id: String, taskGenerationID: String, revision: UInt64)
     case workingDocumentApplied(id: String, taskGenerationID: String, revision: UInt64, document: [String: Any]?)
-    case workingDocumentNeedsReselection(taskGenerationID: String, revision: UInt64, application: String, title: String)
+    case workingDocumentNeedsReselection(taskGenerationID: String, revision: UInt64, application: String, title: String, selection: Bool)
     case workingDocumentUpdateRejected(id: String, taskGenerationID: String, revision: UInt64, message: String)
     case actionPresentation(actionID: String, taskGenerationID: String, verificationScope: String)
     case completed(String)
@@ -963,7 +963,9 @@ final class AgentRuntimeProcess {
                       document["revision"] as? Int == Int(revision),
                       let application = document["application"] as? String,
                       let title = document["title"] as? String,
-                      Set(document.keys).isSubset(of: ["state", "application", "title", "location", "revision"]) else { return }
+                      Set(document.keys).isSubset(of: ["state", "application", "title", "location", "revision", "selection_state", "selection_description"]),
+                      (document["selection_state"] == nil || ["active", "needs_reselection"].contains(document["selection_state"] as? String ?? "")),
+                      (document["selection_description"] == nil || document["selection_description"] is String) else { return }
                 _ = application; _ = title
             } else if !(rawDocument is NSNull) { return }
             run.workingDocumentIDs.remove(id)
@@ -974,10 +976,11 @@ final class AgentRuntimeProcess {
                   exactRevision(message["binding_revision"]) == run.lease.currentWorkingDocumentRevision,
                   exactRevision(message["working_document_revision"]) == run.lease.currentWorkingDocumentRevision,
                   let application = message["application"] as? String,
-                  let title = message["title"] as? String else { return }
+                  let title = message["title"] as? String,
+                  let selection = message["selection"] as? Bool else { return }
             emit(.workingDocumentNeedsReselection(taskGenerationID: run.lease.id,
                 revision: run.lease.currentWorkingDocumentRevision,
-                application: String(application.prefix(120)), title: String(title.prefix(240))), for: run)
+                application: String(application.prefix(120)), title: String(title.prefix(240)), selection: selection), for: run)
         case "working_document_update_rejected":
             guard message["task_generation_id"] as? String == run.lease.id,
                   let id = message["update_id"] as? String,

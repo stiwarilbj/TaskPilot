@@ -25,6 +25,7 @@ final class AgentScreenViewerModel: ObservableObject {
     var workingDocumentCandidateProvider: ((DisplayDescriptor) -> [WorkingDocumentCandidate])?
     var canSelectWorkingDocument: (() -> Bool)?
     var onWorkingDocumentSelection: ((WorkingDocumentCandidate?) -> Void)?
+    var onWorkingSelectionRequest: ((WorkingDocumentCandidate) -> Void)?
 
     private let capture: ScreenCaptureService
     private var captureTask: Task<Void, Never>?
@@ -135,6 +136,12 @@ final class AgentScreenViewerModel: ObservableObject {
     func selectWorkingDocument(_ candidate: WorkingDocumentCandidate?) {
         guard canSelectWorkingDocument?() == true else { return }
         onWorkingDocumentSelection?(candidate)
+        showingWorkingDocumentPicker = false
+    }
+
+    func limitWorkingDocumentToSelection(_ candidate: WorkingDocumentCandidate) {
+        guard canSelectWorkingDocument?() == true, candidate.availableSelection != nil else { return }
+        onWorkingSelectionRequest?(candidate)
         showingWorkingDocumentPicker = false
     }
 
@@ -261,6 +268,21 @@ struct AgentScreenViewer: View {
                 }
                 .disabled(!model.workingDocumentSelectionEnabled)
                 .accessibilityLabel("Use focused document \(focused.title) from \(focused.applicationName) for the current request")
+                if let selection = focused.availableSelection {
+                    Button {
+                        model.limitWorkingDocumentToSelection(focused)
+                    } label: {
+                        Label("Work only in this selection · \(selection.description)", systemImage: "scope")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .disabled(!model.workingDocumentSelectionEnabled)
+                    .accessibilityLabel("Work only in \(selection.description) in \(focused.title), \(focused.applicationName)")
+                } else {
+                    Text("No supported single selection is available. It may be empty, disconnected, secure, oversized, or unsupported. Select one continuous text range, a rectangular cell range, or a supported section.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 Divider()
             }
             if model.workingDocumentCandidates.isEmpty {
@@ -271,23 +293,36 @@ struct AgentScreenViewer: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 2) {
                         ForEach(model.workingDocumentCandidates) { candidate in
-                            Button {
-                                model.selectWorkingDocument(candidate)
-                            } label: {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(candidate.menuTitle)
-                                        .font(.callout)
-                                        .lineLimit(2)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                    if let location = candidate.location {
-                                        Text(location).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Button {
+                                    model.selectWorkingDocument(candidate)
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(candidate.menuTitle)
+                                            .font(.callout)
+                                            .lineLimit(2)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                        if let location = candidate.location {
+                                            Text(location).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                                        }
                                     }
+                                    .padding(.vertical, 4)
                                 }
-                                .padding(.vertical, 5)
+                                .buttonStyle(.plain)
+                                .disabled(!model.workingDocumentSelectionEnabled)
+                                .accessibilityLabel("Use \(candidate.title.isEmpty ? "Untitled window" : candidate.title), \(candidate.applicationName)\(candidate.location.map { ", \($0)" } ?? "") as the working document")
+                                if let selection = candidate.availableSelection {
+                                    Button {
+                                        model.limitWorkingDocumentToSelection(candidate)
+                                    } label: {
+                                        Label("Work only in \(selection.description)", systemImage: "scope")
+                                            .font(.caption)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .disabled(!model.workingDocumentSelectionEnabled)
+                                    .accessibilityLabel("Work only in \(selection.description) in \(candidate.title), \(candidate.applicationName)")
+                                }
                             }
-                            .buttonStyle(.plain)
-                            .disabled(!model.workingDocumentSelectionEnabled)
-                            .accessibilityLabel("Select \(candidate.title.isEmpty ? "Untitled window" : candidate.title), \(candidate.applicationName)\(candidate.location.map { ", \($0)" } ?? "")")
                         }
                     }
                 }

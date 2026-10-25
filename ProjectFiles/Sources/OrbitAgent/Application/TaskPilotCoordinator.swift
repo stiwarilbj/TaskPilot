@@ -362,6 +362,7 @@ final class TaskPilotCoordinator: ObservableObject {
         }
         viewer.canSelectWorkingDocument = { [weak self] in self?.canSelectWorkingDocument == true }
         viewer.onWorkingDocumentSelection = { [weak self] candidate in self?.selectWorkingDocument(candidate) }
+        viewer.onWorkingSelectionRequest = { [weak self] candidate in self?.selectWorkingDocument(candidate, limitToSelection: true) }
     }
 
     // MARK: - Setup and readiness
@@ -1741,8 +1742,22 @@ final class TaskPilotCoordinator: ObservableObject {
         taskCorrectionSession = TaskCorrectionSession(generationID: lease.id, draft: TaskComposerDraft())
     }
 
-    func selectWorkingDocument(_ candidate: WorkingDocumentCandidate?) {
+    func selectWorkingDocument(_ candidate: WorkingDocumentCandidate?, limitToSelection: Bool = false,
+                               removeSelectionLimit: Bool = false) {
         guard canSelectWorkingDocument, let lease = currentTaskLease else { return }
+        guard !limitToSelection || candidate?.availableSelection != nil,
+              !removeSelectionLimit || candidate == nil else {
+            workingDocumentNotice = "A single current native selection could not be verified in that window."
+            return
+        }
+        if candidate == nil, !removeSelectionLimit, workingDocumentPresentation?.selectionDescription != nil {
+            workingDocumentNotice = "Remove the selection limit explicitly before removing the working document."
+            return
+        }
+        if candidate != nil, !limitToSelection, workingDocumentPresentation?.selectionDescription != nil {
+            workingDocumentNotice = "Choose a verified selection in the replacement document, or remove the selection limit first."
+            return
+        }
         guard candidate == nil || candidate?.displayID == agentDisplay?.id else {
             workingDocumentNotice = "Choose a window visible on the current Live View display."
             return
@@ -1750,7 +1765,9 @@ final class TaskPilotCoordinator: ObservableObject {
         if candidate == nil && workingDocumentPresentation == nil { return }
         let revision = lease.currentWorkingDocumentRevision + 1
         let update = WorkingDocumentUpdate(id: UUID().uuidString.lowercased(), generationID: lease.id,
-                                           revision: revision, candidate: candidate)
+            revision: revision, candidate: candidate,
+            selectionScopeID: limitToSelection ? candidate?.availableSelection?.selectionID : nil,
+            removeSelectionLimit: removeSelectionLimit)
         do {
             try runtime.prepareWorkingDocumentUpdate(update, generationID: lease.id)
         } catch {
@@ -1764,10 +1781,16 @@ final class TaskPilotCoordinator: ObservableObject {
         if let candidate {
             workingDocumentPresentation = WorkingDocumentPresentation(
                 generationID: lease.id, revision: revision, application: candidate.applicationName,
-                title: candidate.title, location: candidate.location, state: .pending)
+                title: candidate.title, location: candidate.location, state: .pending,
+                selectionDescription: limitToSelection ? candidate.availableSelection?.description : nil,
+                selectionState: limitToSelection ? .pending : nil)
         } else if var current = workingDocumentPresentation {
             current.revision = revision
             current.state = .pending
+            if removeSelectionLimit {
+                current.selectionDescription = nil
+                current.selectionState = .pending
+            }
             workingDocumentPresentation = current
         }
         workingDocumentNotice = nil
@@ -1786,6 +1809,11 @@ final class TaskPilotCoordinator: ObservableObject {
     func removeWorkingDocumentReference() {
         guard workingDocumentPresentation != nil else { return }
         selectWorkingDocument(nil)
+    }
+
+    func removeWorkingSelectionLimit() {
+        guard workingDocumentPresentation?.selectionDescription != nil else { return }
+        selectWorkingDocument(nil, removeSelectionLimit: true)
     }
 
     func requestWorkingDocumentPicker() {
@@ -1819,8 +1847,32 @@ final class TaskPilotCoordinator: ObservableObject {
             presentation.application = application
             presentation.title = title
             presentation.location = document["location"] as? String
+            let acknowledgedSelection = document["selection_description"] as? String
+            if let expectedSelection = presentation.selectionDescription, expectedSelection != acknowledgedSelection {
+                pendingWorkingDocumentUpdateID = nil
+                workingDocumentPresentationBeforeUpdate = nil
+                workingDocumentNotice = "The native selection did not match the requested region. The task is stopping safely."
+                stop()
+                return
+            }
+            presentation.selectionDescription = acknowledgedSelection
+            if acknowledgedSelection != nil {
+                switch document["selection_state"] as? String {
+                case "active": presentation.selectionState = .active
+                case "needs_reselection": presentation.selectionState = .needsReselection
+                default:
+                    pendingWorkingDocumentUpdateID = nil
+                    workingDocumentPresentationBeforeUpdate = nil
+                    workingDocumentNotice = "The selected region could not be confirmed. The task is stopping safely."
+                    stop()
+                    return
+                }
+            } else { presentation.selectionState = nil }
             presentation.state = .active
             workingDocumentPresentation = presentation
+            if presentation.selectionState == .needsReselection {
+                workingDocumentNotice = "Choose the working selection again before continuing."
+            }
         } else {
             workingDocumentPresentation = nil
         }
@@ -1831,7 +1883,9 @@ final class TaskPilotCoordinator: ObservableObject {
             request.workingDocumentRevision = revision
             userInputRequest = request
         }
-        workingDocumentNotice = nil
+        if workingDocumentPresentation?.selectionState != .needsReselection {
+            workingDocumentNotice = nil
+        }
     }
 
     func updateTaskCorrectionDraft(_ draft: TaskComposerDraft) {
@@ -2208,15 +2262,21 @@ final class TaskPilotCoordinator: ObservableObject {
             acceptInstructionCorrection(id: id, generationID: generationID, revision: revision)
         case let .workingDocumentApplied(id, generationID, revision, document):
             acceptWorkingDocumentUpdate(id: id, generationID: generationID, revision: revision, document: document)
-        case let .workingDocumentNeedsReselection(generationID, revision, application, title):
+        case let .workingDocumentNeedsReselection(generationID, revision, application, title, selection):
             guard currentTaskLease?.id == generationID,
                   workingDocumentPresentation?.revision == revision else { return }
-            workingDocumentPresentation?.state = .needsReselection
-            workingDocumentPresentation?.application = application
-            workingDocumentPresentation?.title = title
-            workingDocumentNotice = "Choose the working document again before continuing."
+            if selection {
+                workingDocumentPresentation?.selectionState = .needsReselection
+                workingDocumentNotice = "Choose the working selection again before continuing."
+            } else {
+                workingDocumentPresentation?.state = .needsReselection
+                workingDocumentPresentation?.application = application
+                workingDocumentPresentation?.title = title
+                workingDocumentNotice = "Choose the working document again before continuing."
+            }
             if runState != .paused && runState != .waitingForUser && runState != .takingOver {
-                status = "Waiting for the working document to be selected again"
+                status = selection ? "Waiting for the working selection to be selected again"
+                                   : "Waiting for the working document to be selected again"
             }
         case let .workingDocumentUpdateRejected(id, generationID, revision, message):
             guard currentTaskLease?.id == generationID,

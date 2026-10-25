@@ -120,14 +120,61 @@ final class TaskOwnershipTests: XCTestCase {
         let candidate = WorkingDocumentCandidate(selectionID: selectionID, displayID: 1, pid: 42,
             bundleID: "com.example.editor", processLaunchTime: 1, applicationName: "Editor",
             title: "Budget", location: "/Users/test/Budget.xlsx", documentURL: "file:///Users/test/Budget.xlsx",
-            accessibilityIdentity: "native-window-id", graphicsWindowID: 9, focused: true)
+            accessibilityIdentity: "native-window-id", graphicsWindowID: 9, focused: true,
+            availableSelection: WorkingSelectionCandidate(selectionID: UUID().uuidString.lowercased(),
+                kind: .cellRange, description: "Sheet 1 · B2:D4"))
         let update = WorkingDocumentUpdate(id: UUID().uuidString.lowercased(), generationID: "generation",
-                                           revision: 1, candidate: candidate)
+            revision: 1, candidate: candidate,
+            selectionScopeID: candidate.availableSelection?.selectionID)
         let wire = update.wireValue
-        XCTAssertEqual(Set(wire.keys), Set(["version", "update_id", "task_generation_id", "binding_revision", "selection_id"]))
+        XCTAssertEqual(Set(wire.keys), Set(["version", "update_id", "task_generation_id", "binding_revision", "selection_id", "selection_scope_id"]))
+        XCTAssertEqual(wire["version"] as? Int, 2)
         XCTAssertEqual(wire["selection_id"] as? String, selectionID)
+        XCTAssertEqual(wire["selection_scope_id"] as? String, candidate.availableSelection?.selectionID)
         XCTAssertFalse(wire.values.contains { String(describing: $0).contains("Budget") })
         XCTAssertFalse(wire.values.contains { String(describing: $0).contains("native-window-id") })
+    }
+
+    func testSelectionScopeUsesUTF16AndRejectsChangesOutsideTheOriginalRegion() {
+        let before = "A😀BC"
+        let range = NSRange(location: 1, length: 2)
+        XCTAssertTrue(WorkingSelectionScopePolicy.validTextRange(range, in: before))
+        XCTAssertEqual(WorkingSelectionScopePolicy.replacementPreservesOutsideRegion(
+            before: before, after: "A🙂BC", range: range, replacement: "🙂"), NSRange(location: 1, length: 2))
+        XCTAssertNil(WorkingSelectionScopePolicy.replacementPreservesOutsideRegion(
+            before: before, after: "X🙂BC", range: range, replacement: "🙂"))
+        XCTAssertFalse(WorkingSelectionScopePolicy.validTextRange(NSRange(location: 2, length: 1), in: before))
+        XCTAssertEqual(WorkingSelectionScopePolicy.replacementPreservesOutsideRegion(
+            before: "ABCD", after: "AD", range: NSRange(location: 1, length: 2), replacement: ""),
+            NSRange(location: 1, length: 0))
+    }
+
+    func testCellRegionMustBeOneRectangleAndOpaqueActionsFailClosed() {
+        XCTAssertEqual(WorkingSelectionScopePolicy.rectangularBounds([(1, 1), (1, 2), (2, 1), (2, 2)])?.rows, 1...2)
+        XCTAssertNil(WorkingSelectionScopePolicy.rectangularBounds([(1, 1), (1, 3)]))
+        let selectAll: [String: Any] = ["type": "key", "key": "a", "modifiers": ["command"]]
+        XCTAssertFalse(WorkingSelectionScopePolicy.permits(action: selectAll, scopeKind: .text,
+            targetMatchesScope: true, currentSelectionMatches: true))
+        let typed: [String: Any] = ["type": "type_text", "text": "replace"]
+        XCTAssertTrue(WorkingSelectionScopePolicy.permits(action: typed, scopeKind: .text,
+            targetMatchesScope: true, currentSelectionMatches: true))
+        XCTAssertTrue(WorkingSelectionScopePolicy.permits(action: typed, scopeKind: .cellRange,
+            targetMatchesScope: true, currentSelectionMatches: true, targetRole: "AXCell"))
+        XCTAssertFalse(WorkingSelectionScopePolicy.permits(action: ["type": "set_value"], scopeKind: .text,
+            targetMatchesScope: true, currentSelectionMatches: true))
+        let save: [String: Any] = ["type": "press"]
+        XCTAssertFalse(WorkingSelectionScopePolicy.permits(action: save, scopeKind: .text,
+            targetMatchesScope: true, currentSelectionMatches: true,
+            targetRole: "AXButton", targetLabel: "Save"))
+        XCTAssertTrue(WorkingSelectionScopePolicy.permits(action: save, scopeKind: .text,
+            targetMatchesScope: true, currentSelectionMatches: true,
+            targetRole: "AXButton", targetLabel: "Save", allowSaveExport: true))
+        XCTAssertTrue(WorkingSelectionScopePolicy.permits(action: ["type": "press"], scopeKind: .text,
+            targetMatchesScope: true, currentSelectionMatches: true,
+            targetRole: "AXMenuBarItem", targetLabel: "File"))
+        XCTAssertFalse(WorkingSelectionScopePolicy.permits(action: ["type": "key", "key": "a", "modifiers": ["command"]],
+            scopeKind: .text, targetMatchesScope: true, currentSelectionMatches: true,
+            allowSaveExport: true))
     }
     func testPauseRetainsGenerationAndWaitsUntilResume() async throws {
         let lease = TaskLease(), started = expectation(description: "Suspended worker")

@@ -138,8 +138,33 @@ final class AgentAutomationBridge {
                 }
                 do {
                     let selectionID = params["selection_id"] as? String
+                    let selectionScopeID = params["selection_scope_id"] as? String
+                    let rawRemoveSelectionLimit = params["remove_selection_limit"]
+                    let removeSelectionLimit: Bool
+                    if let rawRemoveSelectionLimit {
+                        guard let number = rawRemoveSelectionLimit as? NSNumber,
+                              CFGetTypeID(number) == CFBooleanGetTypeID() else {
+                            throw BridgeError.invalidRequest("Malformed working-selection removal")
+                        }
+                        removeSelectionLimit = number.boolValue
+                    } else { removeSelectionLimit = false }
+                    guard (selectionID.map { UUID(uuidString: $0)?.uuidString.lowercased() == $0 } ?? true),
+                          (selectionScopeID.map { selectionID != nil && UUID(uuidString: $0)?.uuidString.lowercased() == $0 } ?? true),
+                          !(removeSelectionLimit && (selectionID != nil || selectionScopeID != nil)) else {
+                        throw BridgeError.invalidRequest("Malformed working-selection update")
+                    }
+                    let currentDocument = accessibility.workingDocumentInfo(generationID: lease.id)
+                    if currentDocument?["selection_description"] is String,
+                       !removeSelectionLimit,
+                       (selectionID == nil || selectionScopeID == nil) {
+                        lease.cancelWorkingDocumentUpdate(id: updateID)
+                        return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
+                                "ok": true, "result": ["applied": false,
+                                    "working_document": currentDocument as Any? ?? NSNull()]]
+                    }
                     let binding = try accessibility.prepareWorkingDocumentBinding(selectionID: selectionID,
-                        generationID: lease.id, revision: bindingRevision)
+                        generationID: lease.id, revision: bindingRevision,
+                        selectionScopeID: selectionScopeID, removeSelectionLimit: removeSelectionLimit)
                     try lease.applyWorkingDocumentUpdate(id: updateID, revision: bindingRevision) {
                         accessibility.installWorkingDocumentBinding(binding, generationID: lease.id)
                     }
@@ -240,6 +265,7 @@ final class AgentAutomationBridge {
             }
             if method == "inspect_command" {
                 guard let action = params["action"] as? [String: Any] else { throw BridgeError.invalidRequest("Missing command inspection payload") }
+                try accessibility.validateTaskToolWithinWorkingSelection(["type": "inspect_command"])
                 let result = try await taskTools.inspectCommand(action: action)
                 try TaskOwnership.check()
                 return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
@@ -250,7 +276,14 @@ final class AgentAutomationBridge {
                 if workingDocument?["state"] as? String == "needs_reselection" {
                     return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
                             "ok": true, "result": ["accepted": false, "pending_correction": false,
-                                "pending_working_document": false, "needs_working_document": true]]
+                                "pending_working_document": false, "needs_working_document": true,
+                                "needs_working_selection": false]]
+                }
+                if workingDocument?["selection_state"] as? String == "needs_reselection" {
+                    return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
+                            "ok": true, "result": ["accepted": false, "pending_correction": false,
+                                "pending_working_document": false, "needs_working_document": false,
+                                "needs_working_selection": true]]
                 }
                 let gate = lease.claimCompletionGate(instructionRevision: instructionRevision)
                 return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
@@ -490,6 +523,15 @@ final class AgentAutomationBridge {
             case "act":
                 let action = validatedAction!
                 let kind = ActionKind(rawValue: action["type"] as! String)!
+                let rawSaveExportPermission = params["working_selection_save_export_allowed"]
+                let allowWorkingSelectionSaveExport: Bool
+                if let rawSaveExportPermission {
+                    guard let number = rawSaveExportPermission as? NSNumber,
+                          CFGetTypeID(number) == CFBooleanGetTypeID() else {
+                        throw BridgeError.invalidRequest("working_selection_save_export_allowed must be a boolean")
+                    }
+                    allowWorkingSelectionSaveExport = number.boolValue
+                } else { allowWorkingSelectionSaveExport = false }
                 if params["private_input"] as? Bool == true { accessibility.clearActionMagnifier() }
                 let rawIntendedTarget = params["intended_target"]
                 let intendedTarget = rawIntendedTarget as? String
@@ -510,10 +552,12 @@ final class AgentAutomationBridge {
                         supplied: targetBindings, action: action,
                         requirementIDs: targetRequirementIDs, intendedTarget: intendedTarget)
                 }
-                result = try await TaskOwnership.$actionReceipt.withValue(receiptToken) {
+                result = try await TaskOwnership.$allowWorkingSelectionSaveExport.withValue(allowWorkingSelectionSaveExport) {
+                try await TaskOwnership.$actionReceipt.withValue(receiptToken) {
                     try await TaskOwnership.$stopBoundaryPreflight.withValue(boundaryCheck) {
                     try await TaskOwnership.$targetChoicePreflight.withValue(targetChoiceCheck) {
                     if kind.owner == .task_tool {
+                        try self.accessibility.validateTaskToolWithinWorkingSelection(action)
                         let result = try await taskTools.perform(action: action,
                             commandBindingID: params["command_inspection_id"] as? String,
                             targetRequirementIDs: targetRequirementIDs)
@@ -536,6 +580,7 @@ final class AgentAutomationBridge {
                     }
                     }
                     }
+                }
                 }
                 try LocalOperationBudget.check()
                 try receiptToken?.complete(result)

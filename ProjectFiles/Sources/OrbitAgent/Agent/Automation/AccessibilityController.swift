@@ -104,6 +104,8 @@ enum AccessibilityActionError: LocalizedError {
     case ambiguousTarget
     case workingDocumentLost
     case workingDocumentTargetMismatch
+    case workingSelectionLost
+    case workingSelectionTargetMismatch
 
     var code: String {
         switch self {
@@ -119,6 +121,8 @@ enum AccessibilityActionError: LocalizedError {
         case .controllerProtected: return "protected_target"
         case .workingDocumentLost: return "working_document_lost"
         case .workingDocumentTargetMismatch: return "working_document_target_mismatch"
+        case .workingSelectionLost: return "working_selection_lost"
+        case .workingSelectionTargetMismatch: return "working_selection_target_mismatch"
         case .invalidAction: return "invalid_action"
         case .operationFailed: return "delivery_rejected"
         }
@@ -140,6 +144,8 @@ enum AccessibilityActionError: LocalizedError {
         case .ambiguousTarget: return "These coordinates match multiple controls; observe their app, window, and panel and select one complete element ID"
         case .workingDocumentLost: return "The selected document window disappeared or changed. Choose the working document again before continuing."
         case .workingDocumentTargetMismatch: return "This action targets a different window than the selected working document. Observe the current window and choose the intended document."
+        case .workingSelectionLost: return "The selected region changed or could not be mapped safely. Choose the working selection again before editing."
+        case .workingSelectionTargetMismatch: return "This action could affect content outside the selected region, so it was held. Choose a safe operation or select the intended region again."
         }
     }
 }
@@ -295,6 +301,7 @@ final class AccessibilityController {
         guard AXIsProcessTrusted() else { return [] }
         var candidates: [WorkingDocumentCandidate] = []
         let apps = orderedApplicationsForSnapshot(on: display)
+        let selectionDeadline = ProcessInfo.processInfo.systemUptime + 2.0
         for app in apps {
             let pid = app.processIdentifier
             guard pid != controllerPID, app.bundleIdentifier != Bundle.main.bundleIdentifier,
@@ -317,6 +324,13 @@ final class AccessibilityController {
                 let graphicsID = windowGraphics.flatMap {
                     Self.intersectionArea($0.frame, frame) > 0 ? $0.id : nil
                 }
+                // AX can retain the selected range while TaskPilot's Live View
+                // is frontmost. Read that native selection without activating
+                // or raising the external application.
+                let isFocusedWindow = focusedWindow.map { CFEqual($0, window) } == true
+                let availableSelection = isFocusedWindow
+                    ? captureWorkingSelection(window: window, application: appElement, pid: pid,
+                                              deadline: selectionDeadline) : nil
                 let selectionID = UUID().uuidString.lowercased()
                 let candidate = WorkingDocumentCandidate(
                     selectionID: selectionID,
@@ -330,11 +344,13 @@ final class AccessibilityController {
                     documentURL: documentURL?.absoluteString,
                     accessibilityIdentity: String(CFHash(window)),
                     graphicsWindowID: graphicsID,
-                    focused: focusedWindow.map { CFEqual($0, window) } == true && app.isActive
+                    focused: isFocusedWindow && app.isActive,
+                    availableSelection: availableSelection?.candidate
                 )
                 let record = WorkingDocumentSelectionRecord(candidate: candidate, window: window,
                     application: identity, documentURL: documentURL,
-                    expiresAt: ProcessInfo.processInfo.systemUptime + 90)
+                    expiresAt: ProcessInfo.processInfo.systemUptime + 90,
+                    availableSelection: availableSelection)
                 candidates.append(candidate)
                 lock.withLock {
                     workingDocumentSelections = workingDocumentSelections.filter {
@@ -353,8 +369,20 @@ final class AccessibilityController {
     }
 
     func prepareWorkingDocumentBinding(selectionID: String?, generationID: String,
-                                       revision: UInt64) throws -> WorkingDocumentNativeBinding? {
+                                       revision: UInt64, selectionScopeID: String? = nil,
+                                       removeSelectionLimit: Bool = false) throws -> WorkingDocumentNativeBinding? {
         guard lock.withLock({ taskGenerationID == generationID }) else { throw WorkingDocumentUpdateError.stale }
+        if selectionID == nil, removeSelectionLimit {
+            guard let current = lock.withLock({ workingDocumentBinding }), current.generationID == generationID,
+                  let refreshed = refreshWorkingDocumentBinding(current).binding else {
+                throw WorkingDocumentUpdateError.unavailable
+            }
+            return WorkingDocumentNativeBinding(generationID: generationID, revision: revision,
+                pid: refreshed.pid, application: refreshed.application, window: refreshed.window,
+                accessibilityIdentity: refreshed.accessibilityIdentity, graphicsWindowID: refreshed.graphicsWindowID,
+                title: refreshed.title, location: refreshed.location, documentURL: refreshed.documentURL,
+                displayID: refreshed.displayID, selectionScope: nil)
+        }
         guard let selectionID else { return nil }
         let selection = lock.withLock { workingDocumentSelections[selectionID] }
         guard let selection, selection.expiresAt >= ProcessInfo.processInfo.systemUptime else {
@@ -384,13 +412,323 @@ final class AccessibilityController {
            expected != graphicsID, currentURL == nil {
             throw WorkingDocumentUpdateError.unavailable
         }
+        let selectionScope: WorkingSelectionNativeScope?
+        if let selectionScopeID {
+            guard let captured = selection.availableSelection,
+                  captured.candidate.selectionID == selectionScopeID,
+                  validateWorkingSelectionCapture(captured, in: retainedWindow) else {
+                throw WorkingDocumentUpdateError.unavailable
+            }
+            selectionScope = captured
+        } else { selectionScope = nil }
         return WorkingDocumentNativeBinding(generationID: generationID, revision: revision,
             pid: selection.candidate.pid, application: selection.application, window: retainedWindow,
             accessibilityIdentity: selection.candidate.accessibilityIdentity,
             graphicsWindowID: graphicsID ?? selection.candidate.graphicsWindowID,
             title: stringAttribute(retainedWindow, kAXTitleAttribute) ?? selection.candidate.title,
             location: currentURL.flatMap(Self.workingDocumentLocation), documentURL: currentURL,
-            displayID: selection.candidate.displayID)
+            displayID: selection.candidate.displayID, selectionScope: selectionScope)
+    }
+
+    private func captureWorkingSelection(window: AXUIElement, application: AXUIElement,
+                                         pid: pid_t, deadline: TimeInterval) -> WorkingSelectionNativeRecord? {
+        var windowPID: pid_t = 0
+        guard AXUIElementGetPid(window, &windowPID) == .success, windowPID == pid,
+              let focused = selectionElement(application, kAXFocusedUIElementAttribute, deadline: deadline),
+              selectionElementIsWithin(focused, window, deadline: deadline) else { return nil }
+        let role = selectionString(focused, kAXRoleAttribute, deadline: deadline) ?? ""
+        let subrole = selectionString(focused, kAXSubroleAttribute, deadline: deadline) ?? ""
+        if ["AXTextField", "AXTextArea", "AXComboBox"].contains(role),
+           !AutomationTextEntryPolicy.isSecure(role: role, subrole: subrole),
+           let range = selectionTextRange(focused, deadline: deadline), range.length > 0,
+           let value = selectionTextValue(focused, deadline: deadline),
+           WorkingSelectionScopePolicy.validTextRange(range, in: value) {
+            let descriptor = WorkingSelectionCandidate(selectionID: UUID().uuidString.lowercased(), kind: .text,
+                description: "Selected text · \(range.length) characters")
+            return WorkingSelectionNativeRecord(candidate: descriptor, window: window,
+                selectedElement: focused, container: focused, textRange: range, textValue: value)
+        }
+
+        var ancestor: AXUIElement? = focused
+        var visited: Set<UInt> = []
+        for _ in 0..<16 {
+            guard ProcessInfo.processInfo.systemUptime < deadline,
+                  let current = ancestor, visited.insert(CFHash(current)).inserted else { break }
+            if let cells = selectionElements(current, kAXSelectedCellsAttribute,
+                                             maximumCount: WorkingSelectionScopePolicy.maximumCellCount,
+                                             deadline: deadline), !cells.isEmpty {
+                guard cells.count <= WorkingSelectionScopePolicy.maximumCellCount,
+                      let table = selectionNearestTable(for: cells[0], within: window, deadline: deadline),
+                      cells.allSatisfy({ selectionNearestTable(for: $0, within: window, deadline: deadline).map { CFEqual($0, table) } == true }) else {
+                    return nil
+                }
+                let positions: [(row: Int, column: Int)?] = cells.map { cell in
+                    guard let row = selectionIndex(cell, kAXRowIndexRangeAttribute, deadline: deadline),
+                          let column = selectionIndex(cell, kAXColumnIndexRangeAttribute, deadline: deadline) else { return nil }
+                    return (row, column)
+                }
+                guard positions.allSatisfy({ $0 != nil }),
+                      let rectangle = WorkingSelectionScopePolicy.rectangularBounds(positions.compactMap { $0 }) else {
+                    // Do not reinterpret a disconnected or poorly described
+                    // selection as a smaller region at a different ancestor.
+                    return nil
+                }
+                let tableName = selectionElementTitle(table, deadline: deadline).trimmingCharacters(in: .whitespacesAndNewlines)
+                let name = tableName.isEmpty ? "Selected table" : tableName
+                let rangeName = "\(cellName(row: rectangle.rows.lowerBound, column: rectangle.columns.lowerBound)):\(cellName(row: rectangle.rows.upperBound, column: rectangle.columns.upperBound))"
+                let descriptor = WorkingSelectionCandidate(selectionID: UUID().uuidString.lowercased(), kind: .cellRange,
+                    description: "\(name) · \(rangeName)")
+                let anchors = zip(cells, positions.compactMap { $0 }).map {
+                    WorkingSelectionCellAnchor(element: $0.0, row: $0.1.row, column: $0.1.column)
+                }
+                return WorkingSelectionNativeRecord(candidate: descriptor, window: window,
+                    selectedElement: cells[0], container: table, selectedCells: cells, selectedCellAnchors: anchors,
+                    rowRange: rectangle.rows, columnRange: rectangle.columns, selectionOwner: current)
+            }
+            ancestor = selectionElement(current, kAXParentAttribute, deadline: deadline)
+        }
+
+        ancestor = focused
+        visited.removeAll()
+        for _ in 0..<16 {
+            guard ProcessInfo.processInfo.systemUptime < deadline,
+                  let current = ancestor, visited.insert(CFHash(current)).inserted else { break }
+            if let selected = selectionElements(current, kAXSelectedChildrenAttribute, maximumCount: 1,
+                                                deadline: deadline), !selected.isEmpty {
+                guard selected.count == 1, let item = selected.first,
+                      selectionElementIsWithin(item, window, deadline: deadline),
+                      ["AXOutlineRow", "AXRow", "AXListItem", "AXGroup"].contains(selectionString(item, kAXRoleAttribute, deadline: deadline) ?? "") else {
+                    return nil
+                }
+                let label = selectionElementTitle(item, deadline: deadline).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !label.isEmpty else { return nil }
+                let descriptor = WorkingSelectionCandidate(selectionID: UUID().uuidString.lowercased(), kind: .section,
+                    description: "Section · \(String(label.prefix(120)))")
+                return WorkingSelectionNativeRecord(candidate: descriptor, window: window,
+                    selectedElement: item, container: current)
+            }
+            ancestor = selectionElement(current, kAXParentAttribute, deadline: deadline)
+        }
+        return nil
+    }
+
+    private func validateWorkingSelectionCapture(_ capture: WorkingSelectionNativeRecord,
+                                                  in window: AXUIElement) -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.8
+        var windowPID: pid_t = 0
+        guard CFEqual(capture.window, window), AXUIElementGetPid(window, &windowPID) == .success,
+              selectionElementIsWithin(capture.container, window, deadline: deadline),
+              selectionElementIsWithin(capture.selectedElement, window, deadline: deadline) else { return false }
+        switch capture.candidate.kind {
+        case .text:
+            guard let expected = capture.expectedTextValue, let range = capture.expectedSelection,
+                  let value = selectionTextValue(capture.selectedElement, deadline: deadline),
+                  value == expected, selectionTextRange(capture.selectedElement, deadline: deadline) == range,
+                  !AutomationTextEntryPolicy.isSecure(role: selectionString(capture.selectedElement, kAXRoleAttribute, deadline: deadline) ?? "",
+                                                      subrole: selectionString(capture.selectedElement, kAXSubroleAttribute, deadline: deadline) ?? "") else { return false }
+            return true
+        case .cellRange:
+            guard let rowRange = capture.rowRange, let columnRange = capture.columnRange,
+                  capture.selectedCellAnchors.count == capture.selectedCells.count,
+                  capture.selectedCellAnchors.allSatisfy({ anchor in
+                      selectionNearestTable(for: anchor.element, within: window, deadline: deadline).map { CFEqual($0, capture.container) } == true
+                          && selectionIndex(anchor.element, kAXRowIndexRangeAttribute, deadline: deadline) == anchor.row
+                          && selectionIndex(anchor.element, kAXColumnIndexRangeAttribute, deadline: deadline) == anchor.column
+                  }) else { return false }
+            let selectedCells = selectionElements(capture.selectionOwner, kAXSelectedCellsAttribute,
+                                                  maximumCount: WorkingSelectionScopePolicy.maximumCellCount,
+                                                  deadline: deadline)
+            if let selectedCells, selectedCells.count > WorkingSelectionScopePolicy.maximumCellCount { return false }
+            guard let cells = selectedCells, !cells.isEmpty else {
+                // Some spreadsheets expose the selected cells only until a
+                // cell enters edit mode. In that case retain the original
+                // rectangle and accept only a focused native cell inside it.
+                var pid: pid_t = 0
+                guard AXUIElementGetPid(window, &pid) == .success,
+                      let focused = selectionElement(AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute, deadline: deadline),
+                      let cell = selectionNearestCell(for: focused, within: window, deadline: deadline),
+                      selectionNearestTable(for: cell, within: window, deadline: deadline).map({ CFEqual($0, capture.container) }) == true,
+                      let row = selectionIndex(cell, kAXRowIndexRangeAttribute, deadline: deadline),
+                      let column = selectionIndex(cell, kAXColumnIndexRangeAttribute, deadline: deadline) else { return false }
+                return rowRange.contains(row) && columnRange.contains(column)
+            }
+            guard cells.allSatisfy({ selectionNearestTable(for: $0, within: window, deadline: deadline).map { CFEqual($0, capture.container) } == true }) else { return false }
+            let positions = cells.compactMap { cell -> (row: Int, column: Int)? in
+                guard let row = selectionIndex(cell, kAXRowIndexRangeAttribute, deadline: deadline),
+                      let column = selectionIndex(cell, kAXColumnIndexRangeAttribute, deadline: deadline) else { return nil }
+                return (row, column)
+            }
+            guard positions.count == cells.count,
+                  let current = WorkingSelectionScopePolicy.rectangularBounds(positions) else { return false }
+            return current.rows.lowerBound >= rowRange.lowerBound && current.rows.upperBound <= rowRange.upperBound
+                && current.columns.lowerBound >= columnRange.lowerBound && current.columns.upperBound <= columnRange.upperBound
+        case .section:
+            guard let selected = selectionAttribute(capture.container, kAXSelectedChildrenAttribute, deadline: deadline) as? [AXUIElement] else { return false }
+            return selected.count == 1 && CFEqual(selected[0], capture.selectedElement)
+        }
+    }
+
+    private func validateWorkingSelectionBinding(_ capture: WorkingSelectionNativeScope,
+                                                  binding: WorkingDocumentNativeBinding) -> Bool {
+        validateWorkingSelectionCapture(capture, in: binding.window)
+    }
+
+    private func nearestTable(for element: AXUIElement, within window: AXUIElement) -> AXUIElement? {
+        var current: AXUIElement? = element
+        var visited: Set<UInt> = []
+        for _ in 0..<20 {
+            guard let value = current, visited.insert(CFHash(value)).inserted else { break }
+            let role = stringAttribute(value, kAXRoleAttribute) ?? ""
+            if role == "AXTable" || role == "AXGrid" { return self.element(value, isWithin: window) ? value : nil }
+            if CFEqual(value, window) { break }
+            current = accessibilityElement(value, kAXParentAttribute)
+        }
+        return nil
+    }
+
+    private func singleIndex(from value: AnyObject?) -> Int? {
+        guard let value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(value as! AXValue, .cfRange, &range), range.location >= 0, range.length == 1 else { return nil }
+        return range.location
+    }
+
+    private func boundedAttribute(_ element: AXUIElement, _ name: String) -> AnyObject? {
+        AXUIElementSetMessagingTimeout(element, 0.08)
+        defer { AXUIElementSetMessagingTimeout(element, 0) }
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
+        return value
+    }
+
+    private func selectionAttribute(_ element: AXUIElement, _ name: String, deadline: TimeInterval) -> AnyObject? {
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        guard remaining > 0 else { return nil }
+        AXUIElementSetMessagingTimeout(element, Float(min(0.04, remaining)))
+        defer { AXUIElementSetMessagingTimeout(element, 0) }
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
+        return value
+    }
+
+    /// Read no more than `maximumCount + 1` children. The extra item detects an
+    /// oversized/disconnected selection without materializing an unbounded AX array.
+    private func selectionElements(_ element: AXUIElement, _ name: String, maximumCount: Int,
+                                   deadline: TimeInterval) -> [AXUIElement]? {
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        guard remaining > 0, maximumCount >= 1 else { return nil }
+        AXUIElementSetMessagingTimeout(element, Float(min(0.04, remaining)))
+        defer { AXUIElementSetMessagingTimeout(element, 0) }
+        var values: CFArray?
+        guard AXUIElementCopyAttributeValues(element, name as CFString, 0,
+                                              maximumCount + 1, &values) == .success,
+              let elements = values as? [AXUIElement] else { return nil }
+        return elements
+    }
+
+    private func selectionString(_ element: AXUIElement, _ name: String, deadline: TimeInterval) -> String? {
+        selectionAttribute(element, name, deadline: deadline) as? String
+    }
+
+    private func selectionTextValue(_ element: AXUIElement, deadline: TimeInterval) -> String? {
+        guard let countValue = selectionAttribute(element, kAXNumberOfCharactersAttribute, deadline: deadline),
+              CFGetTypeID(countValue) == CFNumberGetTypeID(),
+              let count = countValue as? NSNumber,
+              count.intValue >= 0, count.intValue <= WorkingSelectionScopePolicy.maximumTextBytes,
+              let value = selectionString(element, kAXValueAttribute, deadline: deadline),
+              value.utf8.count <= WorkingSelectionScopePolicy.maximumTextBytes else { return nil }
+        return value
+    }
+
+    private func selectionElement(_ element: AXUIElement, _ name: String, deadline: TimeInterval) -> AXUIElement? {
+        guard let value = selectionAttribute(element, name, deadline: deadline),
+              CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return unsafeBitCast(value, to: AXUIElement.self)
+    }
+
+    private func selectionElementIsWithin(_ child: AXUIElement, _ parent: AXUIElement,
+                                          deadline: TimeInterval) -> Bool {
+        var current = child
+        var visited: Set<UInt> = []
+        for _ in 0..<24 {
+            guard ProcessInfo.processInfo.systemUptime < deadline,
+                  visited.insert(CFHash(current)).inserted else { return false }
+            if CFEqual(current, parent) { return true }
+            guard let next = selectionElement(current, kAXParentAttribute, deadline: deadline),
+                  !CFEqual(next, current) else { return false }
+            current = next
+        }
+        return false
+    }
+
+    private func selectionNearestTable(for element: AXUIElement, within window: AXUIElement,
+                                       deadline: TimeInterval) -> AXUIElement? {
+        var current: AXUIElement? = element
+        var visited: Set<UInt> = []
+        for _ in 0..<20 {
+            guard ProcessInfo.processInfo.systemUptime < deadline,
+                  let value = current, visited.insert(CFHash(value)).inserted else { return nil }
+            let role = selectionString(value, kAXRoleAttribute, deadline: deadline) ?? ""
+            if role == "AXTable" || role == "AXGrid" {
+                return selectionElementIsWithin(value, window, deadline: deadline) ? value : nil
+            }
+            if CFEqual(value, window) { return nil }
+            current = selectionElement(value, kAXParentAttribute, deadline: deadline)
+        }
+        return nil
+    }
+
+    private func selectionNearestCell(for element: AXUIElement, within window: AXUIElement,
+                                      deadline: TimeInterval) -> AXUIElement? {
+        var current: AXUIElement? = element
+        var visited: Set<UInt> = []
+        for _ in 0..<20 {
+            guard ProcessInfo.processInfo.systemUptime < deadline,
+                  let value = current, visited.insert(CFHash(value)).inserted else { return nil }
+            if selectionString(value, kAXRoleAttribute, deadline: deadline) == "AXCell" {
+                return selectionElementIsWithin(value, window, deadline: deadline) ? value : nil
+            }
+            if CFEqual(value, window) { return nil }
+            current = selectionElement(value, kAXParentAttribute, deadline: deadline)
+        }
+        return nil
+    }
+
+    private func selectionIndex(_ element: AXUIElement, _ name: String, deadline: TimeInterval) -> Int? {
+        guard let value = selectionAttribute(element, name, deadline: deadline),
+              CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(value as! AXValue, .cfRange, &range), range.location >= 0, range.length == 1 else { return nil }
+        return range.location
+    }
+
+    private func selectionTextRange(_ element: AXUIElement, deadline: TimeInterval) -> NSRange? {
+        guard let value = selectionAttribute(element, kAXSelectedTextRangeAttribute, deadline: deadline),
+              CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(value as! AXValue, .cfRange, &range), range.location >= 0, range.length >= 0 else { return nil }
+        return NSRange(location: range.location, length: range.length)
+    }
+
+    private func selectionElementTitle(_ element: AXUIElement, deadline: TimeInterval) -> String {
+        [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute]
+            .compactMap { selectionString(element, $0, deadline: deadline) }.first { !$0.isEmpty } ?? ""
+    }
+
+    private func substring(_ value: String, range: NSRange) -> String {
+        guard let swiftRange = Range(range, in: value) else { return "" }
+        return String(value[swiftRange])
+    }
+
+    private func cellName(row: Int, column: Int) -> String {
+        var value = max(0, column) + 1
+        var label = ""
+        while value > 0 {
+            let remainder = (value - 1) % 26
+            label = String(UnicodeScalar(65 + remainder)!) + label
+            value = (value - 1) / 26
+        }
+        return "\(label)\(row + 1)"
     }
 
     func installWorkingDocumentBinding(_ binding: WorkingDocumentNativeBinding?, generationID: String) {
@@ -404,17 +742,27 @@ final class AccessibilityController {
         guard let binding = lock.withLock({ workingDocumentBinding }), binding.generationID == generationID else { return nil }
         let state = refreshWorkingDocumentBinding(binding)
         guard let active = state.binding else {
-            return ["state": "needs_reselection", "application": binding.application.name ?? "Unknown app",
+            var missing: [String: Any] = ["state": "needs_reselection", "application": binding.application.name ?? "Unknown app",
                     "title": binding.title, "revision": Int(binding.revision)]
+            if let scope = binding.selectionScope {
+                missing["selection_state"] = "needs_reselection"
+                missing["selection_description"] = scope.candidate.description
+            }
+            return missing
         }
         if state.changed { installWorkingDocumentBinding(active, generationID: generationID) }
-        return ["state": "active", "application": active.application.name ?? "Unknown app",
+        var info: [String: Any] = ["state": "active", "application": active.application.name ?? "Unknown app",
                 "title": active.title,
                 "location": active.location as Any? ?? NSNull(),
                 "revision": Int(active.revision),
                 "pid": Int(active.pid),
                 "bundle_id": active.application.bundleID ?? "",
                 "accessibility_identity": active.accessibilityIdentity]
+        if let scope = active.selectionScope {
+            info["selection_state"] = validateWorkingSelectionBinding(scope, binding: active) ? "active" : "needs_reselection"
+            info["selection_description"] = scope.candidate.description
+        }
+        return info
     }
 
     private func isWorkingDocumentWindow(_ element: AXUIElement, pid: pid_t, generationID: String) -> Bool {
@@ -471,7 +819,8 @@ final class AccessibilityController {
             pid: binding.pid, application: binding.application, window: window,
             accessibilityIdentity: String(CFHash(window)), graphicsWindowID: graphicsID,
             title: stringAttribute(window, kAXTitleAttribute) ?? binding.title,
-            location: Self.workingDocumentLocation(url), documentURL: url, displayID: binding.displayID), true)
+            location: Self.workingDocumentLocation(url), documentURL: url, displayID: binding.displayID,
+            selectionScope: binding.selectionScope), true)
     }
 
     private static func workingDocumentURL(_ value: Any?) -> URL? {
@@ -1548,6 +1897,9 @@ final class AccessibilityController {
         try ControlCompatibilityProfiles.owned { compatibilityProfiles.prepare(environment: Self.compatibilityEnvironment()) }
         let planningRevision = lock.withLock { observationRevision }
         let type = action["type"] as? String ?? ""
+        if ["open_route", "navigate_browser"].contains(type) {
+            try validateTaskToolWithinWorkingSelection(action)
+        }
         if ["launch_app", "open_route", "navigate_browser"].contains(type) {
             let message = try await perform(action: action, on: display)
             return ["action_type": type, "message": message, "delivery_method": "workspace",
@@ -3162,11 +3514,38 @@ final class AccessibilityController {
                 guard !self.inputIsCancelled() else { throw AccessibilityActionError.cancelled }
                 try Task.checkCancellation()
             })
+        if !secure, action["type"] as? String == "type_text" {
+            updateWorkingTextSelectionAfterVerifiedEdit(record: record, replacement: text, result: result)
+        }
         if let profileKey, let method = ControlDeliveryMethod(rawValue: result.method) {
             try recordCompatibility(result.verified ? .verified : .unconfirmed, method: method,
                                     key: profileKey, record: record, action: action, on: display)
         }
         return result
+    }
+
+    private func updateWorkingTextSelectionAfterVerifiedEdit(record: ElementRecord, replacement: String,
+                                                              result: AutomationTextEntryResult) {
+        guard result.verified,
+              let binding = lock.withLock({ workingDocumentBinding }),
+              let scope = binding.selectionScope, scope.candidate.kind == .text,
+              CFEqual(scope.selectedElement, record.element),
+              let before = scope.expectedTextValue, let range = scope.expectedSelection,
+              let after = readableTextValue(record),
+              let nextRange = WorkingSelectionScopePolicy.replacementPreservesOutsideRegion(
+                before: before, after: after, range: range, replacement: replacement) else { return }
+        var nativeRange = CFRange(location: nextRange.location, length: nextRange.length)
+        guard let value = AXValueCreate(.cfRange, &nativeRange),
+              (try? setTextAttribute(kAXSelectedTextRangeAttribute, value: value, record: record)) == .accepted,
+              selectedTextRange(record.element) == nextRange else {
+            lock.withLock { scope.expectedTextValue = after }
+            return
+        }
+        lock.withLock {
+            guard workingDocumentBinding?.selectionScope === scope else { return }
+            scope.expectedTextValue = after
+            scope.expectedSelection = nextRange
+        }
     }
 
     private func record(for action: [String: Any]) throws -> ElementRecord {
@@ -3278,9 +3657,22 @@ final class AccessibilityController {
         let refreshed = refreshWorkingDocumentBinding(stored)
         guard let binding = refreshed.binding else { throw AccessibilityActionError.workingDocumentLost }
         if refreshed.changed { installWorkingDocumentBinding(binding, generationID: binding.generationID) }
+        if let scope = binding.selectionScope {
+            let savePanelTarget = TaskOwnership.allowWorkingSelectionSaveExport
+                && isWorkingSavePanelTarget(action: action, record: record, binding: binding)
+            guard validateWorkingSelectionBinding(scope, binding: binding)
+                    || (savePanelTarget && workingSelectionAnchorRemains(scope, binding: binding)) else {
+                throw AccessibilityActionError.workingSelectionLost
+            }
+        }
         // Other applications remain available to the task. The binding only
         // constrains actions routed into the selected document's application.
         guard pid == binding.pid else { return }
+        if let scope = binding.selectionScope {
+            try validateWorkingSelectionAction(action, record: record, scope: scope, binding: binding,
+                                               display: display, point: point,
+                                               allowSaveExport: TaskOwnership.allowWorkingSelectionSaveExport)
+        }
         if let record {
             let role = record.role
             let menuAction = role.hasPrefix("AXMenu") || role == "AXMenuBar"
@@ -3307,6 +3699,239 @@ final class AccessibilityController {
         guard let focused, window(focused, belongsTo: binding.window) else {
             throw AccessibilityActionError.workingDocumentTargetMismatch
         }
+    }
+
+    private func validateWorkingSelectionAction(_ action: [String: Any], record: ElementRecord?,
+                                                scope: WorkingSelectionNativeScope,
+                                                binding: WorkingDocumentNativeBinding,
+                                                display: DisplayDescriptor, point: CGPoint?,
+                                                allowSaveExport: Bool) throws {
+        let type = action["type"] as? String ?? ""
+        let savePanelTarget = allowSaveExport && isWorkingSavePanelTarget(action: action, record: record, binding: binding)
+        if savePanelTarget, workingSelectionAnchorRemains(scope, binding: binding) {
+            if let record, isSavePanelTextField(record.element, deadline: ProcessInfo.processInfo.systemUptime + 0.5),
+               ["focus", "type_text", "set_value"].contains(type) { return }
+            if let record, ["press", "click"].contains(type),
+               isSaveExportControl(record.element, deadline: ProcessInfo.processInfo.systemUptime + 0.5) { return }
+            if record == nil, type == "key",
+               ["return", "enter", "escape"].contains((action["key"] as? String ?? "").lowercased()),
+               Set(action["modifiers"] as? [String] ?? []).isEmpty { return }
+        }
+        let targetRole = record?.role
+        let targetLabel = record?.identity.label
+        var targetMatches = false
+        if let record {
+            switch scope.candidate.kind {
+            case .text:
+                targetMatches = CFEqual(record.element, scope.selectedElement)
+            case .cellRange:
+                targetMatches = selectionCellMatchesScope(record.element, scope: scope, binding: binding,
+                                                            deadline: ProcessInfo.processInfo.systemUptime + 0.5)
+            case .section:
+                targetMatches = element(record.element, isWithin: scope.selectedElement)
+            }
+            if !targetMatches, (type == "press" || type == "click" || type == "double_click"),
+               let label = targetLabel?.lowercased(),
+               WorkingSelectionScopePolicy.permits(action: action, scopeKind: scope.candidate.kind,
+                   targetMatchesScope: true, currentSelectionMatches: true,
+                   targetRole: targetRole, targetLabel: label, allowSaveExport: allowSaveExport) {
+                targetMatches = true
+            }
+        } else if type == "key" {
+            let focused = accessibilityElement(AXUIElementCreateApplication(binding.pid), kAXFocusedUIElementAttribute)
+            switch scope.candidate.kind {
+            case .text:
+                targetMatches = focused.map { CFEqual($0, scope.selectedElement) } == true
+            case .cellRange:
+                targetMatches = focused.map {
+                    selectionCellMatchesScope($0, scope: scope, binding: binding,
+                        deadline: ProcessInfo.processInfo.systemUptime + 0.5)
+                } == true
+            case .section:
+                targetMatches = focused.map { element($0, isWithin: scope.selectedElement) } == true
+            }
+        } else if type == "scroll" {
+            targetMatches = true
+        } else if let point, type == "click" || type == "double_click" {
+            targetMatches = frame(of: scope.container)?.contains(point) == true
+        }
+
+        let currentMatches = validateWorkingSelectionBinding(scope, binding: binding)
+            || (savePanelTarget && workingSelectionAnchorRemains(scope, binding: binding))
+        guard WorkingSelectionScopePolicy.permits(action: action, scopeKind: scope.candidate.kind,
+            targetMatchesScope: targetMatches, currentSelectionMatches: currentMatches,
+            targetRole: targetRole, targetLabel: targetLabel,
+            allowSaveExport: allowSaveExport) else {
+            throw AccessibilityActionError.workingSelectionTargetMismatch
+        }
+        // A coordinate-only click in a selected table cannot be grounded to a
+        // native cell even when its point falls inside the table rectangle.
+        if (type == "click" || type == "double_click"), record == nil,
+           scope.candidate.kind == .cellRange {
+            throw AccessibilityActionError.workingSelectionTargetMismatch
+        }
+    }
+
+    private func selectionCellMatchesScope(_ element: AXUIElement,
+                                          scope: WorkingSelectionNativeScope,
+                                          binding: WorkingDocumentNativeBinding,
+                                          deadline: TimeInterval) -> Bool {
+        guard scope.candidate.kind == .cellRange,
+              let rowRange = scope.rowRange, let columnRange = scope.columnRange,
+              let cell = selectionNearestCell(for: element, within: binding.window, deadline: deadline),
+              let table = selectionNearestTable(for: cell, within: binding.window, deadline: deadline),
+              CFEqual(table, scope.container),
+              let row = selectionIndex(cell, kAXRowIndexRangeAttribute, deadline: deadline),
+              let column = selectionIndex(cell, kAXColumnIndexRangeAttribute, deadline: deadline) else { return false }
+        return rowRange.contains(row) && columnRange.contains(column)
+    }
+
+    /// Task tools run outside the Accessibility dispatcher. Keep them from
+    /// bypassing a selected-region boundary: opaque commands are held, and a
+    /// direct write to the bound source document is rejected by path and file
+    /// identity. Writing a separate requested result remains available.
+    func validateTaskToolWithinWorkingSelection(_ action: [String: Any]) throws {
+        guard let binding = lock.withLock({ workingDocumentBinding }),
+              binding.generationID == (TaskOwnership.current?.id ?? taskGenerationID),
+              let scope = binding.selectionScope else { return }
+        guard validateWorkingSelectionBinding(scope, binding: binding) else {
+            throw AccessibilityActionError.workingSelectionLost
+        }
+        switch action["type"] as? String {
+        case "run_command", "inspect_command", "open_route", "navigate_browser":
+            throw AccessibilityActionError.workingSelectionTargetMismatch
+        case "write_file":
+            guard let source = binding.documentURL, source.isFileURL,
+                  let raw = action["path"] as? String else { return }
+            let destination = TaskToolExecutor.expandedFileURL(raw)
+            let sourceURL = source.resolvingSymlinksInPath().standardizedFileURL
+            let targetURL = destination.resolvingSymlinksInPath().standardizedFileURL
+            if sourceURL.path == targetURL.path || sameFileIdentity(sourceURL, targetURL) {
+                throw AccessibilityActionError.workingSelectionTargetMismatch
+            }
+        default: break
+        }
+    }
+
+    private func isWorkingSavePanelTarget(action: [String: Any], record: ElementRecord?,
+                                          binding: WorkingDocumentNativeBinding) -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.5
+        let target: AXUIElement?
+        if let record { target = record.element }
+        else if action["type"] as? String == "key" {
+            target = selectionElement(AXUIElementCreateApplication(binding.pid), kAXFocusedUIElementAttribute,
+                                      deadline: deadline)
+        } else { target = nil }
+        guard let target, let sheet = ancestorSaveSheet(for: target, binding: binding, deadline: deadline) else { return false }
+        return saveSheetContainsSaveOrExport(sheet, deadline: deadline)
+    }
+
+    private func ancestorSaveSheet(for target: AXUIElement, binding: WorkingDocumentNativeBinding,
+                                   deadline: TimeInterval) -> AXUIElement? {
+        var current: AXUIElement? = target
+        var visited: Set<UInt> = []
+        for _ in 0..<24 {
+            guard ProcessInfo.processInfo.systemUptime < deadline,
+                  let value = current, visited.insert(CFHash(value)).inserted else { return nil }
+            if selectionString(value, kAXRoleAttribute, deadline: deadline) == "AXSheet" {
+                return selectionElementIsWithin(value, binding.window, deadline: deadline) ? value : nil
+            }
+            if CFEqual(value, binding.window) { return nil }
+            current = selectionElement(value, kAXParentAttribute, deadline: deadline)
+        }
+        return nil
+    }
+
+    private func saveSheetContainsSaveOrExport(_ sheet: AXUIElement, deadline: TimeInterval) -> Bool {
+        var queue = [sheet]
+        var visited: Set<UInt> = []
+        var index = 0
+        while index < queue.count, index < 128, ProcessInfo.processInfo.systemUptime < deadline {
+            let current = queue[index]
+            index += 1
+            guard visited.insert(CFHash(current)).inserted else { continue }
+            let role = selectionString(current, kAXRoleAttribute, deadline: deadline) ?? ""
+            if ["AXButton", "AXMenuItem"].contains(role), isSaveExportLabel(
+                selectionElementTitle(current, deadline: deadline)) { return true }
+            if let children = selectionAttribute(current, kAXChildrenAttribute, deadline: deadline) as? [AXUIElement] {
+                queue.append(contentsOf: children.prefix(max(0, 128 - queue.count)))
+            }
+        }
+        return false
+    }
+
+    private func isSavePanelTextField(_ element: AXUIElement, deadline: TimeInterval) -> Bool {
+        let role = selectionString(element, kAXRoleAttribute, deadline: deadline) ?? ""
+        let subrole = selectionString(element, kAXSubroleAttribute, deadline: deadline) ?? ""
+        return AutomationTextEntryPolicy.inputRoles.contains(role)
+            && !AutomationTextEntryPolicy.isSecure(role: role, subrole: subrole)
+    }
+
+    private func isSaveExportControl(_ element: AXUIElement, deadline: TimeInterval) -> Bool {
+        let role = selectionString(element, kAXRoleAttribute, deadline: deadline) ?? ""
+        return ["AXButton", "AXMenuItem"].contains(role)
+            && isSaveExportLabel(selectionElementTitle(element, deadline: deadline))
+    }
+
+    private func isSaveExportLabel(_ value: String) -> Bool {
+        WorkingSelectionScopePolicy.saveExportLabels.contains(value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }
+
+    /// During a standard save panel, focus can leave the selected region. Keep
+    /// the restriction only when the retained native anchor and its original
+    /// content/range or structural identity still match.
+    private func workingSelectionAnchorRemains(_ scope: WorkingSelectionNativeScope,
+                                               binding: WorkingDocumentNativeBinding) -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.8
+        guard selectionElementIsWithin(scope.container, binding.window, deadline: deadline),
+              selectionElementIsWithin(scope.selectedElement, binding.window, deadline: deadline) else { return false }
+        switch scope.candidate.kind {
+        case .text:
+            guard let expected = scope.expectedTextValue,
+                  selectionTextValue(scope.selectedElement, deadline: deadline) == expected,
+                  !AutomationTextEntryPolicy.isSecure(
+                    role: selectionString(scope.selectedElement, kAXRoleAttribute, deadline: deadline) ?? "",
+                    subrole: selectionString(scope.selectedElement, kAXSubroleAttribute, deadline: deadline) ?? "") else { return false }
+            return true
+        case .cellRange:
+            guard scope.rowRange != nil, scope.columnRange != nil,
+                  !scope.selectedCellAnchors.isEmpty,
+                  scope.selectedCellAnchors.count <= WorkingSelectionScopePolicy.maximumCellCount else { return false }
+            return scope.selectedCellAnchors.allSatisfy { anchor in
+                selectionNearestTable(for: anchor.element, within: binding.window, deadline: deadline).map { CFEqual($0, scope.container) } == true
+                    && selectionIndex(anchor.element, kAXRowIndexRangeAttribute, deadline: deadline) == anchor.row
+                    && selectionIndex(anchor.element, kAXColumnIndexRangeAttribute, deadline: deadline) == anchor.column
+            }
+        case .section:
+            guard selectionElementIsWithin(scope.selectedElement, scope.container, deadline: deadline),
+                  let selected = selectionAttribute(scope.container, kAXSelectedChildrenAttribute,
+                                                    deadline: deadline) as? [AXUIElement] else { return false }
+            return selected.count == 1 && CFEqual(selected[0], scope.selectedElement)
+        }
+    }
+
+    private func sameFileIdentity(_ lhs: URL, _ rhs: URL) -> Bool {
+        guard let left = try? FileManager.default.attributesOfItem(atPath: lhs.path),
+              let right = try? FileManager.default.attributesOfItem(atPath: rhs.path),
+              let leftDevice = left[.systemNumber] as? NSNumber,
+              let rightDevice = right[.systemNumber] as? NSNumber,
+              let leftInode = left[.systemFileNumber] as? NSNumber,
+              let rightInode = right[.systemFileNumber] as? NSNumber else { return false }
+        return leftDevice == rightDevice && leftInode == rightInode
+    }
+
+    private func nearestCell(for element: AXUIElement, within window: AXUIElement) -> AXUIElement? {
+        var current: AXUIElement? = element
+        var visited: Set<UInt> = []
+        for _ in 0..<20 {
+            guard let value = current, visited.insert(CFHash(value)).inserted else { break }
+            if stringAttribute(value, kAXRoleAttribute) == "AXCell" {
+                return self.element(value, isWithin: window) ? value : nil
+            }
+            if CFEqual(value, window) { break }
+            current = accessibilityElement(value, kAXParentAttribute)
+        }
+        return nil
     }
 
     private func window(_ candidate: AXUIElement, belongsTo selected: AXUIElement) -> Bool {

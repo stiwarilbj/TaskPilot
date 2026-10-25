@@ -137,7 +137,7 @@ STANDARD_LOCATIONS = {
     "music": "~/Music",
 }
 
-WORKING_DOCUMENT_PROTOCOL_VERSION = 1
+WORKING_DOCUMENT_PROTOCOL_VERSION = 2
 
 _active_acp_process: subprocess.Popen[str] | None = None
 _bridge_observation_revision: str | None = None
@@ -252,7 +252,7 @@ def receive_pending_task_control(timeout: float | None = 0) -> dict[str, Any]:
         except (TypeError, ValueError) as error:
             raise RuntimeError("TaskPilot received malformed working-document control data") from error
     if (not isinstance(message, dict) or message.get("kind") != "working_document_update" or
-            message.get("task_generation_id") != context.generation or message.get("version") != 1 or
+            message.get("task_generation_id") != context.generation or message.get("version") != WORKING_DOCUMENT_PROTOCOL_VERSION or
             type(message.get("binding_revision")) is not int or
             message["binding_revision"] != context.working_document_revision + 1):
         raise RuntimeError("TaskPilot received a working-document update for another task or revision")
@@ -271,8 +271,21 @@ def receive_pending_task_control(timeout: float | None = 0) -> dict[str, Any]:
             raise RuntimeError("TaskPilot received an invalid working-document selection") from error
         if selection_canonical != selection_id:
             raise RuntimeError("TaskPilot received a noncanonical working-document selection")
+    selection_scope_id = message.get("selection_scope_id")
+    if selection_scope_id is not None:
+        try:
+            scope_canonical = str(uuid.UUID(selection_scope_id)).lower()
+        except (ValueError, TypeError, AttributeError) as error:
+            raise RuntimeError("TaskPilot received an invalid working-selection ID") from error
+        if scope_canonical != selection_scope_id or selection_id is None:
+            raise RuntimeError("TaskPilot received an invalid working-selection binding")
+    remove_selection_limit = message.get("remove_selection_limit", False)
+    if type(remove_selection_limit) is not bool or (remove_selection_limit and (selection_id is not None or selection_scope_id is not None)):
+        raise RuntimeError("TaskPilot received an invalid working-selection removal")
     return {"control_kind": "working_document_update", "id": canonical,
-            "revision": message["binding_revision"], "selection_id": selection_id}
+            "revision": message["binding_revision"], "selection_id": selection_id,
+            "selection_scope_id": selection_scope_id,
+            "remove_selection_limit": remove_selection_limit}
 
 
 def receive_target_choice_response(timeout: float | None = 0) -> dict[str, Any]:
@@ -912,6 +925,33 @@ def bridge_exchange(method: str, display_id: int, params: dict[str, Any], timeou
         inbox.transport.unregister(key)
 
 
+def task_requests_save_or_export(task: str,
+                                exact_input_references: list[dict[str, Any]] | None = None) -> bool:
+    """Permit standard Save/Export UI only when user instructions ask for it.
+
+    Exact-input values are task data. Mask their validated UTF-8 source ranges
+    before looking for instructions so a filename, URL, or pasted literal that
+    happens to say "save" or "export" cannot grant an execution exception.
+    """
+    text = str(task or "")
+    if exact_input_references:
+        bindings = TaskInputBindings(text, exact_input_references=exact_input_references)
+        encoded = bytearray(text.encode("utf-8"))
+        for _, start, length, _ in bindings.exact_references:
+            end = start + length
+            for index in range(start, end):
+                if encoded[index] not in (0x0A, 0x0D):
+                    encoded[index] = 0x20
+        text = encoded.decode("utf-8")
+    positive = list(re.finditer(r"\b(?:save|export)\b", text, re.I))
+    if not positive:
+        return False
+    negated = list(re.finditer(
+        r"\b(?:do not|don't|never|avoid|without)\s+(?:(?:send|publish|submit|replace|overwrite|change|edit|create|save|export)\s+or\s+)*(?:save|saving|export|exporting)\b|\bno need to (?:save|export)\b",
+        text, re.I))
+    return any(not any(span.start() <= match.start() < span.end() for span in negated) for match in positive)
+
+
 def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
     budget = current_budget.get()
     if budget is None:
@@ -954,6 +994,8 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
                 context.decision.get("intended_target")
                 if isinstance(context.decision, dict) else None
             )
+            params["working_selection_save_export_allowed"] = task_requests_save_or_export(
+                context.task, context.exact_input_references)
             action_type = params.get("action", {}).get("type")
             context.presentation_action_id = params["action_id"] if action_type in {"press", "click", "double_click", "scroll"} else None
             context.current_action_receipt_id = params["action_id"]
@@ -2147,7 +2189,7 @@ def has_unresolved_stop_boundary_action(history: list[dict[str, Any]], boundarie
 
 
 def complete_from_decision(decision: dict[str, Any], fallback: str, ledger: TaskEvidenceLedger,
-                           history: list[dict[str, Any]] | None = None) -> None:
+                           history: list[dict[str, Any]] | None = None) -> bool:
     message = decision["output"] if isinstance(decision.get("output"), str) else str(fallback or "Task completed")
     if not ledger.can_complete(message):
         raise RuntimeError("TaskPilot cannot complete without evidence for every requested requirement")
@@ -2166,12 +2208,17 @@ def complete_from_decision(decision: dict[str, Any], fallback: str, ledger: Task
                 publish_task_wait("reconciling", "Choose the working document again",
                                   operation_key=f"working-document-reselect:{context.working_document_revision}", ledger=ledger)
                 context.pending_task_control = receive_pending_task_control(timeout=None)
-                raise WorkingDocumentSuperseded("Completion is waiting for the selected document to be confirmed again")
+                return False
+            if gate.get("needs_working_selection") is True:
+                publish_task_wait("reconciling", "Choose the working selection again",
+                                  operation_key=f"working-selection-reselect:{context.working_document_revision}", ledger=ledger)
+                context.pending_task_control = receive_pending_task_control(timeout=None)
+                return False
             if gate.get("pending_working_document") is True:
                 publish_task_wait("reconciling", "Applying the selected working document",
                                   operation_key=f"working-document-update:{context.working_document_revision + 1}", ledger=ledger)
                 context.pending_task_control = receive_pending_task_control(timeout=None)
-                raise WorkingDocumentSuperseded("Completion was held while the working document changed")
+                return False
             if gate.get("pending_correction") is not True:
                 raise RuntimeError("TaskPilot could not atomically authorize completion for this instruction revision")
             try:
@@ -2199,6 +2246,7 @@ def complete_from_decision(decision: dict[str, Any], fallback: str, ledger: Task
         kind = "result"
     emit("complete", message=message, show_output=True, title=title, content=message,
          decided_by_agent=True, output_kind=kind)
+    return True
 
 
 def compact_observation(observation: dict[str, Any], task: str = "") -> dict[str, Any]:
@@ -2214,7 +2262,7 @@ def compact_observation(observation: dict[str, Any], task: str = "") -> dict[str
         # the model-facing observation.
         compact["working_document"] = {
             key: working_document[key]
-            for key in ("state", "application", "title", "location", "revision")
+            for key in ("state", "application", "title", "location", "revision", "selection_state", "selection_description")
             if key in working_document
         }
     context = current_task.get()
@@ -3298,7 +3346,7 @@ def desktop_instruction(
     task_context = current_task.get()
     if task_context is not None and task_context.working_document:
         working_document = task_context.working_document
-        context["working_document"] = {key: working_document[key] for key in ("state", "application", "title", "location", "revision") if key in working_document}
+        context["working_document"] = {key: working_document[key] for key in ("state", "application", "title", "location", "revision", "selection_state", "selection_description") if key in working_document}
     if _task_value('command_capabilities'):
         context['command_capabilities'] = [_task_value('command_capabilities')[key] for key in sorted(_task_value('command_capabilities'))]
     examples = relevant_action_examples(context, observation, history)
@@ -3368,6 +3416,11 @@ def desktop_instruction(
         rules += ("The user selected a working document. Treat it as the primary target for references such as ‘this document’ or ‘this spreadsheet’; "
                   "use only a current observation window marked working_document. Other apps remain available when the task explicitly requires them. "
                   "The selection is not proof of completion. If the selected target is marked needs_reselection, wait for the user to choose it again.\n")
+        scope = context["working_document"].get("selection_description")
+        if scope:
+            rules += (f"The user limited edits to this one native region: {scope}. Treat surrounding document content as read-only context. "
+                      "Do not use whole-document replacement, Select All, opaque commands, or routes that could escape this region. "
+                      "If native selection identity no longer matches, wait for the user to choose the working selection again.\n")
     bounds = [PROMPT_BOUNDS["wait"]] if 'wait' in types else []
     if observation.get('elements'):
         bounds.append('Expected checks: dialog_appeared(pid,title[,window_title]); field_value(element_id,value[,pid]); '
@@ -3454,10 +3507,15 @@ def verification_instruction(
     task_context = current_task.get()
     if task_context is not None and task_context.working_document:
         capability_context["working_document"] = {key: task_context.working_document[key]
-            for key in ("state", "application", "title", "location", "revision") if key in task_context.working_document}
+            for key in ("state", "application", "title", "location", "revision", "selection_state", "selection_description") if key in task_context.working_document}
+    selection_scope = (capability_context.get("working_document") or {}).get("selection_description")
+    selection_rules = (f"\nSELECTION LIMIT: The user allowed edits only within {selection_scope}. Audit all attributed changes against that one native region. "
+                      "Context outside it is read-only; unrelated edits or an unresolved scope do not satisfy the request. "
+                      "Selection binding alone proves no requested result.\n") if selection_scope else ""
     boundary_rules = stop_boundary_guidance(task_context.stop_boundaries, completion=True) if task_context is not None else ""
     return compile_prompt("completion",
         instructions=COMPLETION_RULES + (verification_checklist_instruction(ledger) if ledger else "")
+                     + selection_rules
                      + boundary_rules
                      + ("Vision labels/crops are provisional text, not proof of control role, enabled state, focus or successful execution.\n"
                         if observation.get('text_recognition', {}).get('targets') else "")
@@ -3663,10 +3721,10 @@ def verify_task_completion(task: str, candidate: dict[str, Any], display_id: int
                  if fact["type"] == "file_read" else fact["text"])
         if exact not in message: message += "\n\n" + exact
     publish_task_metrics(router, client, ledger)
-    complete_from_decision({"output": message, "output_title": verification.get("title") or candidate.get("output_title") or "OpenClaw result",
-                            "output_kind": verification.get("kind") or candidate.get("output_kind") or "result"}, message, ledger,
-                           history=history)
-    return True
+    return complete_from_decision(
+        {"output": message, "output_title": verification.get("title") or candidate.get("output_title") or "OpenClaw result",
+         "output_kind": verification.get("kind") or candidate.get("output_kind") or "result"},
+        message, ledger, history=history)
 
 
 @local_operation(5.0, 'dependency_inspection')
@@ -4004,8 +4062,12 @@ class TaskExecution:
             publish_task_progress(c.ledger)
             c.machine.transition(Phase.VERIFYING, local_request=True)
             self.local_metrics()
-            complete_from_decision({"output": message, "output_title": "Largest File in Downloads", "output_kind": "answer"}, message, c.ledger,
-                                   history=c.history)
+            completed = complete_from_decision(
+                {"output": message, "output_title": "Largest File in Downloads", "output_kind": "answer"},
+                message, c.ledger, history=c.history)
+            if not completed:
+                self.apply_pending_correction()
+                return False
             return True
         if not c.ledger.local_complete_grammar:
             return False
@@ -4028,8 +4090,12 @@ class TaskExecution:
         c.machine.transition(Phase.OBSERVING)
         c.machine.transition(Phase.VERIFYING, local_request=True)
         self.local_metrics()
-        complete_from_decision({"output": output, "output_title": "File contents", "output_kind": "result"},
-                               str(result.get("message") or "Read file"), c.ledger, history=c.history)
+        completed = complete_from_decision(
+            {"output": output, "output_title": "File contents", "output_kind": "result"},
+            str(result.get("message") or "Read file"), c.ledger, history=c.history)
+        if not completed:
+            self.apply_pending_correction()
+            return False
         return True
 
     def local_metrics(self) -> None:
@@ -4061,15 +4127,21 @@ class TaskExecution:
             c.observation = None
             self.apply_pending_correction()
             c.observation = bridge_call("observe", c.display_id)
-        while isinstance(c.observation.get("working_document"), dict) and c.observation["working_document"].get("state") == "needs_reselection":
+        while isinstance(c.observation.get("working_document"), dict) and (
+                c.observation["working_document"].get("state") == "needs_reselection" or
+                c.observation["working_document"].get("selection_state") == "needs_reselection"):
             missing_document = c.observation["working_document"]
+            selection_missing = missing_document.get("selection_state") == "needs_reselection"
             publish_planned_destination(c.ledger)
             emit("working_document_needs_reselection",
                  binding_revision=missing_document.get("revision"),
                  application=str(missing_document.get("application") or "Unknown app")[:120],
-                 title=str(missing_document.get("title") or "Untitled window")[:240])
-            publish_task_wait("reconciling", "Choose the working document again",
-                operation_key=f"working-document-reselect:{c.working_document_revision}", ledger=c.ledger)
+                 title=str(missing_document.get("title") or "Untitled window")[:240],
+                 selection=selection_missing)
+            wait_text = "Choose the working selection again" if selection_missing else "Choose the working document again"
+            operation_suffix = "selection" if selection_missing else "document"
+            publish_task_wait("reconciling", wait_text,
+                operation_key=f"working-document-reselect:{c.working_document_revision}:{operation_suffix}", ledger=c.ledger)
             c.pending_task_control = receive_pending_task_control(timeout=None)
             discard_observation_image(c.observation)
             c.observation = None
@@ -4078,11 +4150,12 @@ class TaskExecution:
         observed_document = c.observation.get("working_document")
         if isinstance(observed_document, dict):
             c.working_document = observed_document
-            if observed_document.get("state") == "needs_reselection":
+            if observed_document.get("state") == "needs_reselection" or observed_document.get("selection_state") == "needs_reselection":
                 emit("working_document_needs_reselection",
                      binding_revision=observed_document.get("revision"),
                      application=str(observed_document.get("application") or "Unknown app")[:120],
-                     title=str(observed_document.get("title") or "Untitled window")[:240])
+                     title=str(observed_document.get("title") or "Untitled window")[:240],
+                     selection=observed_document.get("selection_state") == "needs_reselection")
         c.screenshot_path = Path(str(c.observation.get("screenshot_path") or ""))
         if not c.screenshot_path.is_file():
             raise RuntimeError(f"{PRODUCT_NAME} did not provide a readable screen image")
@@ -4738,18 +4811,37 @@ class TaskExecution:
             "bind_working_document", c.display_id,
             update_id=update["id"], binding_revision=update["revision"],
             selection_id=update.get("selection_id"),
+            selection_scope_id=update.get("selection_scope_id"),
+            remove_selection_limit=update.get("remove_selection_limit", False),
             _working_document_revision=update["revision"],
         )
         if result.get("applied") is not True:
             emit("working_document_update_rejected", update_id=update["id"],
                  binding_revision=update["revision"],
-                 message="That window changed before it could be selected. Choose the document again.")
+                 message="The document or selected region changed before it could be bound. Choose it again in Live View.")
             if not preserve_secure_input and c.machine.phase != Phase.OBSERVING:
                 c.machine.transition(Phase.OBSERVING)
             return False
         binding = result.get("working_document")
-        if binding is not None and (not isinstance(binding, dict) or binding.get("state") != "active"):
-            raise RuntimeError("The selected document could not be bound safely; choose it again in Live View")
+        if update.get("selection_id") is not None or update.get("remove_selection_limit") is True:
+            if not isinstance(binding, dict) or binding.get("state") != "active" or type(binding.get("revision")) is not int or binding["revision"] != update["revision"]:
+                raise NativeProtocolError("The native working-document acknowledgement is malformed")
+        if binding is not None:
+            if (not isinstance(binding, dict) or binding.get("state") != "active" or
+                    type(binding.get("revision")) is not int or binding["revision"] != update["revision"] or
+                    not isinstance(binding.get("application"), str) or not isinstance(binding.get("title"), str)):
+                raise NativeProtocolError("The native working-document acknowledgement is malformed")
+            description = binding.get("selection_description")
+            state = binding.get("selection_state")
+            if description is not None and (not isinstance(description, str) or not description or len(description.encode("utf-8")) > 512 or
+                                            state not in {"active", "needs_reselection"}):
+                raise NativeProtocolError("The native working-selection acknowledgement is malformed")
+            if description is None and state is not None:
+                raise NativeProtocolError("The native working-selection acknowledgement is inconsistent")
+            if update.get("selection_scope_id") is not None and description is None:
+                raise NativeProtocolError("The native working-selection acknowledgement omitted the selected region")
+            if update.get("remove_selection_limit") is True and description is not None:
+                raise NativeProtocolError("The native working-selection removal was not acknowledged")
         c.working_document_revision = update["revision"]
         c.target_bindings = [binding for binding in c.target_bindings
                              if binding.get("scope") != "document"]
@@ -4776,7 +4868,7 @@ class TaskExecution:
             c.screenshot_path = None
             c.screenshot_digest = ""
         c.reconcile_reason = ""
-        presentation = ({key: binding[key] for key in ("state", "application", "title", "location", "revision") if key in binding}
+        presentation = ({key: binding[key] for key in ("state", "application", "title", "location", "revision", "selection_state", "selection_description") if key in binding}
                         if isinstance(binding, dict) else None)
         emit("working_document_applied", update_id=update["id"], binding_revision=update["revision"],
              working_document=presentation)
