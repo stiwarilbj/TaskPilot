@@ -4,6 +4,20 @@ import XCTest
 @testable import OrbitAgent
 
 final class ManagedOpenClawTests: XCTestCase {
+    func testFullIntegrityAuditScheduleUsesMonotonicTimeAndSuccessfulPassesOnly() {
+        var schedule = FullIntegrityAuditSchedule()
+        XCTAssertTrue(schedule.shouldRun(at:100)) // Gateway host startup.
+        schedule.record(at:100,succeeded:false)
+        XCTAssertFalse(schedule.shouldRun(at:159))
+        XCTAssertTrue(schedule.shouldRun(at:160))
+        schedule.record(at:160,succeeded:true)
+        XCTAssertFalse(schedule.shouldRun(at:3759))
+        XCTAssertTrue(schedule.shouldRun(at:3760))
+        XCTAssertTrue(schedule.shouldRun(at:159)) // A monotonic clock reset forces a full pass.
+        schedule.reset()
+        XCTAssertTrue(schedule.shouldRun(at:10))
+    }
+
     private func descriptor(_ root: URL) throws -> ManagedOpenClawDescriptor {
         let port = 24200
         let value: [String:Any] = ["version":1,"instance_id":UUID().uuidString.lowercased(),

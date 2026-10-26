@@ -4968,6 +4968,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--managed-openclaw", choices=("ensure", "relocate", "rollback", "audit", "repair"))
     parser.add_argument("--managed-resources")
     parser.add_argument("--managed-descriptor")
+    parser.add_argument("--force-integrity-audit", action="store_true")
     parser.add_argument("--managed-acp-probe", action="store_true")
     parser.add_argument("--configuration-command", nargs=argparse.REMAINDER)
     parser.add_argument("--task")
@@ -5078,7 +5079,8 @@ def main() -> int:
     args = parse_args()
     try:
         if args.managed_openclaw:
-            return managed_openclaw.command(args.managed_openclaw, args.managed_resources, args.managed_descriptor)
+            return managed_openclaw.command(args.managed_openclaw, args.managed_resources,
+                                            args.managed_descriptor, force_integrity=args.force_integrity_audit)
         if args.managed_descriptor:
             managed_openclaw.activate_environment(Path(args.managed_descriptor))
         if args.managed_acp_probe:

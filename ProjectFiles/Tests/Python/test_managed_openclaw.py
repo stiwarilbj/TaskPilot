@@ -42,8 +42,199 @@ class ManagedRuntimeTests(unittest.TestCase):
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         self.assertTrue(managed.validate_install(install,'pin'))
         f.write_text('bad');self.assertFalse(managed.validate_install(install,'pin'))
-        f.unlink();outside=self.root/'outside';outside.write_text('good');f.symlink_to(outside)
+        f.unlink();self.assertFalse(managed.validate_install(install,'pin'))
+        outside=self.root/'outside';outside.write_text('good');f.symlink_to(outside)
         self.assertFalse(managed.validate_install(install,'pin'))
+
+    def test_integrity_cache_skips_unchanged_content_reads_and_rehashes_changed_metadata(self):
+        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+        stats={}
+        with patch.object(managed,'_hash_installation_file',wraps=managed._hash_installation_file) as hashing:
+            self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100,stats=stats))
+            self.assertEqual(stats['audit_mode'],'full')
+            self.assertEqual(stats['files_hashed'],1)
+            hashing.reset_mock()
+            self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=200,stats=stats))
+            self.assertEqual(stats['audit_mode'],'incremental')
+            self.assertEqual(stats['cache_hits'],1)
+            self.assertEqual(stats['files_hashed'],0)
+            hashing.assert_not_called()
+            f.write_bytes(b'evil')  # Same size; ctime/inode metadata cannot be restored.
+            self.assertFalse(managed.validate_install(install,'pin',now_monotonic_ns=300,stats=stats))
+            self.assertEqual(stats['files_hashed'],1)
+
+    def test_integrity_cache_rejects_replaced_files_even_when_contents_match(self):
+        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
+        replacement=install/'replacement';replacement.write_bytes(b'good')
+        os.replace(replacement,f)
+        stats={}
+        self.assertFalse(managed.validate_install(install,'pin',now_monotonic_ns=200,stats=stats))
+        self.assertEqual(stats['files_hashed'],1)
+        self.assertEqual(stats['cache_hits'],0)
+
+        periodic=self.root/'periodic-install';periodic.mkdir();periodic_file=periodic/'code';periodic_file.write_bytes(b'good')
+        managed.atomic_json(periodic/'integrity.json',{'fingerprint':'pin','files':managed.seal(periodic)})
+        base=100
+        self.assertTrue(managed.validate_install(periodic,'pin',now_monotonic_ns=base))
+        replacement=periodic/'replacement';replacement.write_bytes(b'good');os.replace(replacement,periodic_file)
+        stats={}
+        self.assertFalse(managed.validate_install(periodic,'pin',now_monotonic_ns=base+3600*1_000_000_000,stats=stats))
+        self.assertEqual(stats['audit_mode'],'full')
+        self.assertEqual(stats['files_hashed'],1)
+
+    def test_integrity_cache_rehashes_permission_and_restored_mtime_changes(self):
+        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
+        before=f.stat();os.chmod(f,0o600)
+        os.utime(f,ns=(before.st_atime_ns,before.st_mtime_ns))
+        stats={}
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=200,stats=stats))
+        self.assertEqual(stats['files_hashed'],1)
+        stats={}
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=300,stats=stats))
+        self.assertEqual(stats['files_hashed'],0)
+
+    def test_integrity_manifest_change_forces_full_hash_and_never_changes_expected_digest(self):
+        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
+        manifest=install/'integrity.json';record=json.loads(manifest.read_text())
+        manifest.write_text(json.dumps(record,indent=2))
+        stats={}
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=200,stats=stats))
+        self.assertEqual(stats['audit_mode'],'full')
+        self.assertEqual(stats['files_hashed'],1)
+        record['files']['code']='0'*64
+        manifest.write_text(json.dumps(record))
+        self.assertFalse(managed.validate_install(install,'pin',now_monotonic_ns=300,stats=stats))
+        self.assertEqual(stats['audit_mode'],'full')
+
+    def test_integrity_cache_forces_periodic_full_audit_and_incremental_checks_do_not_reset_it(self):
+        install=self.root/'install';install.mkdir()
+        for name in ('first','second'):(install/name).write_bytes(name.encode())
+        managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+        stats={};base=10_000_000_000
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=base,stats=stats))
+        self.assertEqual(stats['files_hashed'],2)
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=base-1,stats=stats))
+        self.assertEqual(stats['audit_mode'],'full')  # Monotonic reset means a reboot or bad clock.
+        for offset in (60,600,1800,3599):
+            self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=base+offset*1_000_000_000,stats=stats))
+            self.assertEqual(stats['audit_mode'],'incremental')
+            self.assertEqual(stats['files_hashed'],0)
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=base+3600*1_000_000_000,stats=stats))
+        self.assertEqual(stats['audit_mode'],'full')
+        self.assertEqual(stats['files_hashed'],2)
+
+    def test_integrity_cache_rejects_future_timestamp_and_outdated_schema(self):
+        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
+        cache_file=next((install.parent/'.integrity-cache').glob('*.json'))
+        for change in (
+                lambda value: value.update(last_full_audit_monotonic_ns=10_000),
+                lambda value: value.update(version=0),
+                lambda value: value.update(version=True)):
+            cache=json.loads(cache_file.read_text());change(cache);managed.atomic_json(cache_file,cache)
+            stats={}
+            self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=200,stats=stats))
+            self.assertEqual(stats['audit_mode'],'full')
+            self.assertEqual(stats['files_hashed'],1)
+
+        malformed={
+            'version':managed.INTEGRITY_CACHE_VERSION,
+            'fingerprint':'pin',
+            'manifest_digest':'manifest',
+            'directory':{'path':'/fixture','device':True,'inode':1},
+            'last_full_audit_monotonic_ns':0,
+            'files':{},
+        }
+        self.assertFalse(managed._valid_integrity_cache(
+            malformed,'pin','manifest',{'path':'/fixture','device':1,'inode':1},{}))
+
+    def test_non_object_integrity_manifest_fails_as_unsealed_not_an_exception(self):
+        install=self.root/'install';install.mkdir();(install/'code').write_bytes(b'good')
+        (install/'integrity.json').write_text('[]')
+        self.assertFalse(managed.validate_install(install,'pin'))
+
+    def test_cached_integrity_rejects_symlinked_parent_components_even_when_in_root(self):
+        install=self.root/'install';install.mkdir()
+        actual=install/'real';actual.mkdir();(actual/'code').write_bytes(b'good')
+        managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
+        (install/'real').rename(install/'moved')
+        (install/'real').symlink_to(install/'moved',target_is_directory=True)
+        stats={}
+        self.assertFalse(managed.validate_install(install,'pin',now_monotonic_ns=200,stats=stats))
+
+    def test_integrity_cache_invalidity_lock_contention_and_cache_write_errors_fall_back_to_hashing(self):
+        import fcntl
+        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
+        cache_files=list((install.parent/'.integrity-cache').glob('*.json'))
+        self.assertEqual(len(cache_files),1)
+        cache_files[0].write_text('{damaged')
+        stats={}
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=200,stats=stats))
+        self.assertEqual(stats['audit_mode'],'full')
+        lock_file=next((install.parent/'.integrity-cache').glob('*.lock'))
+        lock_fd=os.open(lock_file,os.O_RDWR)
+        fcntl.flock(lock_fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        try:
+            with patch.object(managed,'_hash_installation_file',wraps=managed._hash_installation_file) as hashing:
+                self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=300,stats=stats))
+                self.assertEqual(stats['audit_mode'],'full')
+                hashing.assert_called_once()
+        finally:
+            fcntl.flock(lock_fd,fcntl.LOCK_UN);os.close(lock_fd)
+        with patch.object(managed,'_write_integrity_cache',side_effect=OSError('read-only')):
+            self.assertTrue(managed.validate_install(install,'pin',force_full=True,now_monotonic_ns=400))
+
+        fallback=self.root/'write-failure-install';fallback.mkdir()
+        first=fallback/'first';first.write_bytes(b'good');second=fallback/'second';second.write_bytes(b'also good')
+        managed.atomic_json(fallback/'integrity.json',{'fingerprint':'pin','files':managed.seal(fallback)})
+        self.assertTrue(managed.validate_install(fallback,'pin',now_monotonic_ns=500))
+        first.chmod(0o600)
+        stats={}
+        with patch.object(managed,'_write_integrity_cache',side_effect=OSError('read-only')):
+            with patch.object(managed,'_hash_installation_file',wraps=managed._hash_installation_file) as hashing:
+                self.assertTrue(managed.validate_install(fallback,'pin',now_monotonic_ns=600,stats=stats))
+        self.assertEqual(stats['audit_mode'],'full')
+        self.assertEqual(stats['files_hashed'],3)  # Changed file, then an uncached full pass.
+        self.assertEqual(stats['cache_hits'],1)
+        self.assertEqual(hashing.call_count,3)
+
+    def test_integrity_cache_symlink_directory_falls_back_to_uncached_hashing(self):
+        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+        outside=self.root/'outside-cache';outside.mkdir()
+        (install.parent/'.integrity-cache').symlink_to(outside, target_is_directory=True)
+        stats={}
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100,stats=stats))
+        self.assertEqual(stats['audit_mode'],'full')
+        self.assertEqual(stats['files_hashed'],1)
+        self.assertEqual(list(outside.iterdir()),[])
+
+    def test_integrity_hash_rejects_a_file_modified_while_reading(self):
+        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
+        actual_read=os.read;changed=False
+        def mutate_during_read(fd,count):
+            nonlocal changed
+            data=actual_read(fd,count)
+            if not changed:
+                changed=True;f.write_bytes(b'evil')
+            return data
+        with patch.object(managed.os,'read',side_effect=mutate_during_read):
+            self.assertFalse(managed.validate_install(install,'pin',force_full=True,now_monotonic_ns=200))
+        cache=json.loads(next((install.parent/'.integrity-cache').glob('*.json')).read_text())
+        self.assertEqual(cache['last_full_audit_monotonic_ns'],100)
     def test_manifest_and_lock_match_every_official_dependency(self):
         resources=Path(__file__).resolve().parents[2]/'Resources/OpenClaw/managed'
         manifest,fingerprint=managed.specification(resources)
@@ -245,7 +436,15 @@ class ManagedRecoveryTests(unittest.TestCase):
         key='fixture-private-key-123456789';(parent/'gemini-api-key').write_text(key)
         with patch.object(managed,'install',return_value=self.fake_install('pin')),patch.object(managed,'bounded_run') as cli,patch.object(managed,'verify_settings'),patch.object(managed,'credential_present',return_value=True):
             d=managed.ensure(self.root,self.root,key)
-            self.assertTrue(managed.audit(self.path)['ok'])
+            first_audit=managed.audit(self.path,force_integrity=True)
+            self.assertTrue(first_audit['ok'])
+            self.assertTrue(first_audit['full_integrity_ok'])
+            self.assertEqual(first_audit['integrity_audit']['audit_mode'],'full')
+            warm_audit=managed.audit(self.path)
+            self.assertTrue(warm_audit['ok'])
+            self.assertFalse(warm_audit['full_integrity_ok'])
+            self.assertEqual(warm_audit['integrity_audit']['audit_mode'],'incremental')
+            self.assertEqual(warm_audit['integrity_audit']['files_hashed'],0)
             config=Path(d['config']);original=json.loads(config.read_text())
             for modify in (lambda v:v['plugins'].update(enabled=False),
                            lambda v:v['agents']['defaults']['models'].update({'google/gemini-3.5-flash':{}}),

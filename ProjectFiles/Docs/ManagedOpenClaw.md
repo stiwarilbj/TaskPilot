@@ -74,8 +74,8 @@ exhausted quota.
 Both Swift and Python require fresh authenticated health (under 45 seconds),
 matching instance/configuration/installation fingerprints, and live host and
 Gateway birth identities. A dead or reused PID invalidates cached health before
-native delivery. Local audits run on startup, relevant faults, and every five
-minutes. They check sealed installation files, the wrapper contents, Google
+native delivery. Configuration audits run on startup, relevant faults, and every
+five minutes. They check the wrapper contents, Google
 plugin, model catalog/defaults, private workspace/endpoint/token, supported CLI
 configuration readback, and the private credential-store record. None generates
 provider requests.
@@ -98,6 +98,16 @@ Explicit configuration writers use a birth-bound drain request/acknowledgement;
 requester exit releases abandoned holds. ACP probes yield to these requests to
 avoid configuration-lock inversion. Stop and existing Pause/correction/secure-input
 boundaries remain authoritative.
+
+Managed installation digests are cached in a private sidecar keyed by the
+installation fingerprint, canonical directory identity, and integrity-manifest
+digest. Each audit checks file identity and metadata; it rehashes changed files
+against the immutable seal. Missing or invalid cache state triggers a full
+verification. The Gateway host performs a full content audit at startup and
+every 60 minutes using a monotonic clock. A failed or interrupted full audit does
+not advance that deadline. Cache write or lock failures fall back to uncached
+hash verification. The cache contains only sealed relative paths, digests, file
+metadata, and audit timing; it cannot establish runtime or provider readiness.
 
 ACP first uses the managed wrapper and explicit endpoint/token file. After the
 failed child ends, it may try the sealed pinned Node executable and entry point,

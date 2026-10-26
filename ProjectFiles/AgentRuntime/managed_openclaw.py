@@ -18,6 +18,7 @@ import secrets
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -27,6 +28,10 @@ import uuid
 
 VERSION = 1
 ROOT = Path.home() / 'Library/Application Support/Orbit Agent/ManagedOpenClaw'
+INTEGRITY_CACHE_VERSION = 1
+FULL_INTEGRITY_AUDIT_SECONDS = 60 * 60
+INTEGRITY_READ_CHUNK_BYTES = 1024 * 1024
+INTEGRITY_CACHE_MAX_BYTES = 64 * 1024 * 1024
 
 class ManagedRuntimeError(RuntimeError): pass
 
@@ -54,7 +59,13 @@ def locked(root: Path):
         fcntl.flock(f, fcntl.LOCK_EX)
         yield
 
-def digest(path): return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+def digest(path):
+    """Hash a file with bounded memory rather than loading the whole file."""
+    hasher = hashlib.sha256()
+    with Path(path).open('rb') as source:
+        while chunk := source.read(INTEGRITY_READ_CHUNK_BYTES):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 def specification(resources: Path):
     manifest = json.loads((resources / 'runtime-manifest.json').read_text())
@@ -104,16 +115,335 @@ def bounded_run(argv, *, env=None, timeout=45, cwd=None, input_data=None, result
 
 def seal(directory):
     # Hash the installed code, not only package.json. Excludes npm cache/logs.
-    return {str(p.relative_to(directory)): digest(p) for p in sorted(directory.rglob('*'))
-            if p.is_file() and not p.is_symlink() and p.name != 'integrity.json'}
+    root = Path(directory).resolve(strict=True)
+    files = {}
+    for path in sorted(root.rglob('*')):
+        if not path.is_file() or path.is_symlink() or path.name == 'integrity.json':
+            continue
+        name = str(path.relative_to(root))
+        value, _ = _hash_installation_file(root, name)
+        if value is None:
+            raise ManagedRuntimeError('Managed installation changed while it was being sealed.')
+        files[name] = value
+    return files
 
-def validate_install(directory, fingerprint):
+
+def _regular_file_metadata(value):
+    return {
+        'device': int(value.st_dev),
+        'inode': int(value.st_ino),
+        'size': int(value.st_size),
+        'mode': int(value.st_mode),
+        'uid': int(value.st_uid),
+        'gid': int(value.st_gid),
+        'mtime_ns': int(value.st_mtime_ns),
+        'ctime_ns': int(value.st_ctime_ns),
+    }
+
+
+def _has_symlink_component(root, relative_name):
+    """Reject links in every path component, including links that stay in-root."""
+    current = Path(root)
+    for part in Path(relative_name).parts:
+        current = current / part
+        try:
+            if stat.S_ISLNK(current.lstat().st_mode):
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _hash_installation_file(directory, relative_name):
+    """Hash one sealed regular file and reject path or content races."""
     try:
-        record = json.loads((directory / 'integrity.json').read_text())
-        return (record['fingerprint'] == fingerprint and bool(record['files']) and
-                all((directory / name).resolve().is_relative_to(directory.resolve()) and digest(directory / name) == value
-                    for name, value in record['files'].items()))
-    except (OSError, ValueError, KeyError): return False
+        root = Path(directory).resolve(strict=True)
+        root_before = root.stat()
+        relative = Path(relative_name)
+        if (not relative_name or relative.is_absolute() or
+                any(part in ('', '.', '..') for part in relative.parts)):
+            return None, None
+        candidate = root.joinpath(*relative.parts)
+        if _has_symlink_component(root, relative_name):
+            return None, None
+        resolved = candidate.resolve(strict=True)
+        if not resolved.is_relative_to(root) or not resolved.is_file():
+            return None, None
+        flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
+        descriptor = os.open(resolved, flags)
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                return None, None
+            before_metadata = _regular_file_metadata(before)
+            hasher = hashlib.sha256()
+            while True:
+                try:
+                    chunk = os.read(descriptor, INTEGRITY_READ_CHUNK_BYTES)
+                except InterruptedError:
+                    continue
+                if not chunk:
+                    break
+                hasher.update(chunk)
+            after = os.fstat(descriptor)
+            after_metadata = _regular_file_metadata(after)
+            root_after = root.stat()
+            if (before_metadata != after_metadata or candidate.resolve(strict=True) != resolved or
+                    (root_before.st_dev, root_before.st_ino) != (root_after.st_dev, root_after.st_ino)):
+                return None, None
+            return hasher.hexdigest(), after_metadata
+        finally:
+            os.close(descriptor)
+    except (OSError, RuntimeError, ValueError):
+        return None, None
+
+
+def _integrity_cache_location(directory, fingerprint, manifest_digest, identity):
+    cache_root = Path(directory).parent / '.integrity-cache'
+    key_payload = json.dumps({
+        'version': INTEGRITY_CACHE_VERSION,
+        'fingerprint': fingerprint,
+        'manifest_digest': manifest_digest,
+        'directory': identity,
+    }, sort_keys=True, separators=(',', ':')).encode()
+    cache_key = hashlib.sha256(key_payload).hexdigest()
+    return cache_root, cache_key
+
+
+def _read_integrity_manifest(directory, fingerprint):
+    root = Path(directory).resolve(strict=True)
+    root_stat = root.stat()
+    identity = {
+        'path': str(root),
+        'device': int(root_stat.st_dev),
+        'inode': int(root_stat.st_ino),
+    }
+    manifest_path = root / 'integrity.json'
+    if manifest_path.is_symlink():
+        return None
+    manifest_bytes = manifest_path.read_bytes()
+    manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+    record = json.loads(manifest_bytes)
+    if not isinstance(record, dict):
+        return None
+    files = record.get('files')
+    if record.get('fingerprint') != fingerprint or not isinstance(files, dict) or not files:
+        return None
+    for name, expected in files.items():
+        if (not isinstance(name, str) or not isinstance(expected, str) or len(expected) != 64 or
+                any(character not in '0123456789abcdef' for character in expected)):
+            return None
+        relative = Path(name)
+        if relative.is_absolute() or any(part in ('', '.', '..') for part in relative.parts):
+            return None
+    cache_root, cache_key = _integrity_cache_location(root, fingerprint, manifest_digest, identity)
+    return root, identity, manifest_digest, files, cache_root, cache_key
+
+
+def _valid_integrity_cache(cache, fingerprint, manifest_digest, identity, files):
+    if not isinstance(cache, dict) or set(cache) != {
+            'version', 'fingerprint', 'manifest_digest', 'directory',
+            'last_full_audit_monotonic_ns', 'files'}:
+        return False
+    cached_identity = cache.get('directory')
+    if (not isinstance(cached_identity, dict) or set(cached_identity) != {'path', 'device', 'inode'} or
+            not isinstance(cached_identity.get('path'), str) or
+            type(cached_identity.get('device')) is not int or cached_identity['device'] < 0 or
+            type(cached_identity.get('inode')) is not int or cached_identity['inode'] < 0):
+        return False
+    if (type(cache.get('version')) is not int or cache.get('version') != INTEGRITY_CACHE_VERSION or
+            cache.get('fingerprint') != fingerprint or
+            cache.get('manifest_digest') != manifest_digest or cached_identity != identity):
+        return False
+    cached_files = cache.get('files')
+    if not isinstance(cached_files, dict) or set(cached_files) != set(files):
+        return False
+    for name, expected in files.items():
+        entry = cached_files.get(name)
+        if not isinstance(entry, dict) or set(entry) != {'digest', 'metadata'} or entry.get('digest') != expected:
+            return False
+        metadata = entry.get('metadata')
+        if not isinstance(metadata, dict) or set(metadata) != {
+                'device', 'inode', 'size', 'mode', 'uid', 'gid', 'mtime_ns', 'ctime_ns'}:
+            return False
+        if any(type(value) is not int or value < 0 for value in metadata.values()):
+            return False
+    timestamp = cache.get('last_full_audit_monotonic_ns')
+    return type(timestamp) is int and timestamp >= 0
+
+
+def _write_integrity_cache(cache_root, cache_key, cache):
+    _prepare_integrity_cache_root(cache_root)
+    atomic_json(cache_root / (cache_key + '.json'), cache)
+
+
+def _prepare_integrity_cache_root(cache_root):
+    cache_root = Path(cache_root)
+    cache_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    value = cache_root.lstat()
+    if (not stat.S_ISDIR(value.st_mode) or value.st_uid != os.getuid()):
+        raise OSError('Integrity cache directory is not privately owned.')
+    if stat.S_IMODE(value.st_mode) != 0o700:
+        os.chmod(cache_root, 0o700)
+
+
+def validate_install(directory, fingerprint, *, force_full=False, now_monotonic_ns=None, stats=None):
+    """Validate the seal, reusing digests only while the file identity is unchanged.
+
+    Cache failures never authorize a file: they cause a full uncached hash pass.
+    A changed file is always rehashed against the immutable integrity manifest.
+    """
+    result = stats if stats is not None else {}
+    result.clear()
+    result.update(audit_mode='full', cache_hits=0, files_hashed=0, bytes_hashed=0,
+                  integrity_passed=False)
+    cache_fd = None
+    cache_path = None
+    cache_root = None
+    cache_key = None
+    try:
+        loaded = _read_integrity_manifest(directory, fingerprint)
+        if loaded is None:
+            return False
+        root, identity, manifest_digest, files, cache_root, cache_key = loaded
+        cache_path = cache_root / (cache_key + '.json')
+
+        # A nonblocking lock avoids making health checks wait behind another
+        # validator. Without the lock, verify every file and do not write cache.
+        try:
+            _prepare_integrity_cache_root(cache_root)
+            cache_fd = os.open(cache_root / (cache_key + '.lock'),
+                               os.O_CREAT | os.O_RDWR | getattr(os, 'O_CLOEXEC', 0) |
+                               getattr(os, 'O_NOFOLLOW', 0), 0o600)
+            lock_stat = os.fstat(cache_fd)
+            if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != os.getuid():
+                os.close(cache_fd)
+                cache_fd = None
+                raise OSError('Integrity cache lock is not privately owned.')
+            if stat.S_IMODE(lock_stat.st_mode) != 0o600:
+                os.fchmod(cache_fd, 0o600)
+            try:
+                fcntl.flock(cache_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(cache_fd)
+                cache_fd = None
+        except OSError:
+            if cache_fd is not None:
+                os.close(cache_fd)
+                cache_fd = None
+
+        cache = None
+        if cache_fd is not None:
+            try:
+                if not cache_path.is_symlink() and cache_path.stat().st_size <= INTEGRITY_CACHE_MAX_BYTES:
+                    cache = json.loads(cache_path.read_text())
+            except (OSError, ValueError, UnicodeError):
+                cache = None
+        cache_valid = _valid_integrity_cache(cache, fingerprint, manifest_digest, identity, files)
+        now = time.monotonic_ns() if now_monotonic_ns is None else now_monotonic_ns
+        if type(now) is not int or now < 0:
+            now = time.monotonic_ns()
+            force_full = True
+        cache_time = cache.get('last_full_audit_monotonic_ns') if cache_valid else None
+        full_due = (not cache_valid or type(cache_time) is not int or now < cache_time or
+                    now - cache_time >= FULL_INTEGRITY_AUDIT_SECONDS * 1_000_000_000)
+        do_full = force_full or full_due or cache_fd is None
+        result['audit_mode'] = 'full' if do_full else 'incremental'
+        # Keep the prior inode baseline even during scheduled full audits so
+        # replacing a sealed path with a same-content file is still detected.
+        previous_files = cache.get('files', {}) if cache_valid else {}
+        verified = {}
+        for name, expected in files.items():
+            # Resolve and stat on every pass. A matching metadata tuple permits
+            # digest reuse, but the seal's expected digest remains authoritative.
+            if not do_full:
+                try:
+                    current_root = root.stat()
+                    if (current_root.st_dev, current_root.st_ino) != (identity['device'], identity['inode']):
+                        return False
+                    candidate = root / name
+                    if _has_symlink_component(root, name):
+                        return False
+                    resolved = candidate.resolve(strict=True)
+                    if not resolved.is_relative_to(root):
+                        return False
+                    current = _regular_file_metadata(resolved.stat())
+                except (OSError, RuntimeError, ValueError):
+                    return False
+                old = previous_files[name]
+                if not do_full and old['digest'] == expected and old['metadata'] == current:
+                    verified[name] = old
+                    result['cache_hits'] += 1
+                    continue
+
+            actual, metadata = _hash_installation_file(root, name)
+            result['files_hashed'] += 1
+            if metadata is not None:
+                result['bytes_hashed'] += metadata['size']
+            if actual is None or actual != expected:
+                return False
+            old = previous_files.get(name)
+            if old is not None and (old['metadata']['device'], old['metadata']['inode']) != (
+                    metadata['device'], metadata['inode']):
+                return False
+            verified[name] = {'digest': expected, 'metadata': metadata}
+
+        final_root = root.stat()
+        if (final_root.st_dev, final_root.st_ino) != (identity['device'], identity['inode']):
+            return False
+
+        # A successful full pass is the only operation that advances the
+        # integrity audit age. Incremental checks cannot defer it.
+        if do_full:
+            last_full = now if now_monotonic_ns is not None else time.monotonic_ns()
+        else:
+            last_full = cache_time
+        result['integrity_passed'] = True
+        if cache_fd is not None:
+            next_cache = {
+                'version': INTEGRITY_CACHE_VERSION,
+                'fingerprint': fingerprint,
+                'manifest_digest': manifest_digest,
+                'directory': identity,
+                'last_full_audit_monotonic_ns': last_full,
+                'files': verified,
+            }
+            if next_cache != cache:
+                try:
+                    _write_integrity_cache(cache_root, cache_key, next_cache)
+                except OSError:
+                    # Validation is already proven from file contents. A cache
+                    # failure cannot corrupt the seal or readiness. If this was
+                    # an incremental pass, confirm every file without cache
+                    # reuse before returning success.
+                    if not do_full:
+                        result['integrity_passed'] = False
+                        result['audit_mode'] = 'full'
+                        retry_verified = {}
+                        for name, expected in files.items():
+                            actual, metadata = _hash_installation_file(root, name)
+                            result['files_hashed'] += 1
+                            if metadata is not None:
+                                result['bytes_hashed'] += metadata['size']
+                            if actual is None or actual != expected:
+                                return False
+                            old = previous_files.get(name)
+                            if old is not None and (old['metadata']['device'], old['metadata']['inode']) != (
+                                    metadata['device'], metadata['inode']):
+                                return False
+                            retry_verified[name] = {'digest': expected, 'metadata': metadata}
+                        verified = retry_verified
+                        result['integrity_passed'] = True
+        return True
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, json.JSONDecodeError):
+        return False
+    finally:
+        if cache_fd is not None:
+            try:
+                fcntl.flock(cache_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(cache_fd)
 
 def install(resources, root):
     manifest, fingerprint = specification(resources)
@@ -315,12 +645,12 @@ def relocate(path):
         return d
 
 
-def command(operation, resources=None, descriptor=None):
+def command(operation, resources=None, descriptor=None, *, force_integrity=False):
     path = Path(descriptor) if descriptor else ROOT / 'runtime.json'
     if operation == 'ensure':
         key = __import__('sys').stdin.readline(8192).strip()
         result = ensure(Path(resources), path.parent, key)
-    elif operation == 'audit': result = audit(path)
+    elif operation == 'audit': result = audit(path, force_integrity=force_integrity)
     elif operation == 'repair': result = repair(path, Path(resources))
     elif operation == 'relocate':
         require_offline(path.parent)
@@ -340,7 +670,7 @@ def rollback(path):
     require_offline(path.parent)
     with locked(path.parent):
         d = load_descriptor(path.parent / 'working-runtime.json')
-        if not validate_install(Path(d['node']).parents[2], d['installation_fingerprint']):
+        if not validate_install(Path(d['node']).parents[2], d['installation_fingerprint'], force_full=True):
             raise ManagedRuntimeError('The last working OpenClaw installation is unavailable; reconfigure in Settings.')
         failed = load_descriptor(path)
         if d['installation_fingerprint'] == failed['installation_fingerprint']:
@@ -454,11 +784,14 @@ def handshake_cause(error):
     return 'startup'
 
 
-def audit(path):
+def audit(path, *, force_integrity=False):
     started = time.monotonic()
     d = load_descriptor(path)
     faults = []
-    if not validate_install(Path(d['node']).parents[2], d['installation_fingerprint']): faults.append('installation')
+    integrity_stats = {}
+    installation_ok = validate_install(Path(d['node']).parents[2], d['installation_fingerprint'],
+                                        force_full=force_integrity, stats=integrity_stats)
+    if not installation_ok: faults.append('installation')
     try:
         if Path(d['executable']).read_text() != wrapper_script(d['state'], d['config'], d['node'], d['entry']) or not os.access(d['executable'], os.X_OK): faults.append('wrapper')
     except (OSError, UnicodeError): faults.append('wrapper')
@@ -490,6 +823,9 @@ def audit(path):
         except OSError: parts.append('missing')
     fingerprint = hashlib.sha256(':'.join(parts).encode()).hexdigest()
     result = {'version':VERSION, 'ok':not faults, 'causes':sorted(set(faults)), 'fingerprint':fingerprint,
+              'full_integrity_ok': integrity_stats.get('audit_mode') == 'full' and installation_ok,
+              'integrity_audit': {key:integrity_stats.get(key) for key in
+                  ('audit_mode','cache_hits','files_hashed','bytes_hashed','integrity_passed')},
               'elapsed_ms':round((time.monotonic()-started)*1000)}
     atomic_json(path.parent / 'audit.json', result)
     return result
@@ -497,7 +833,7 @@ def audit(path):
 
 def repair(path, resources):
     require_offline(path.parent)
-    result = audit(path)
+    result = audit(path, force_integrity=True)
     if result['ok']: return load_descriptor(path)
     # Persist reservation before attempting repair; crashes cannot reset it.
     with locked(path.parent):
@@ -515,7 +851,7 @@ def repair(path, resources):
     try: key = key_path.read_text().strip()
     except OSError: key = ''
     d = ensure(resources, path.parent, key, drained=True)
-    if not audit(path)['ok']:
+    if not audit(path, force_integrity=True)['ok']:
         raise ManagedRuntimeError('Private runtime repair did not pass readback; check the saved key or reinstall TaskPilot.')
     return d
 

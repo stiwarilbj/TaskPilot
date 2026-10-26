@@ -104,6 +104,35 @@ struct GatewayRecoveryBudget: Codable, Equatable {
     mutating func healthy() { restartReserved = false; circuits = 0; nextProbe = 0 } // Restarts remain spent for ten minutes.
 }
 
+struct FullIntegrityAuditSchedule {
+    static let interval: TimeInterval = 60 * 60
+    static let failedAuditRetryDelay: TimeInterval = 60
+    private(set) var lastSuccessfulAudit: TimeInterval?
+    private(set) var retryAfter: TimeInterval = 0
+
+    func shouldRun(at now: TimeInterval, forced: Bool = false) -> Bool {
+        if forced { return true }
+        let due = lastSuccessfulAudit.map { now < $0 || now - $0 >= Self.interval } ?? true
+        return due && now >= retryAfter
+    }
+
+    mutating func record(at now: TimeInterval, succeeded: Bool) {
+        if succeeded {
+            lastSuccessfulAudit = now
+            retryAfter = 0
+        } else {
+            // Keep the last successful timestamp intact. This is only a retry
+            // throttle after a failed pass, never a new audit baseline.
+            retryAfter = now + Self.failedAuditRetryDelay
+        }
+    }
+
+    mutating func reset() {
+        lastSuccessfulAudit = nil
+        retryAfter = 0
+    }
+}
+
 /// App clients have separate birth-identity leases. A crashed/reused PID is not a client.
 /// This helper owns the Gateway with the same native tree supervisor as commands.
 /// It outlives its launcher, tears down after the final app exits, and installs no service.
@@ -201,6 +230,7 @@ enum ManagedGatewayHost {
         var descriptor: ManagedOpenClawDescriptor?
         var nextHealth: TimeInterval = 0
         var nextAudit: TimeInterval = 0
+        var integritySchedule = FullIntegrityAuditSchedule()
         let resources = runtimeURL.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("OpenClaw/managed")
         var acpVerified = false
         var repair = false
@@ -248,10 +278,12 @@ enum ManagedGatewayHost {
                         Thread.sleep(forTimeInterval:0.1); continue
                     }
                     defer { withExtendedLifetime(permit) {} }
-                    teardown(); descriptor = current; nextHealth = 0; nextAudit = 0; repair = false
+                    teardown(); descriptor = current; nextHealth = 0; nextAudit = 0
+                    integritySchedule.reset(); repair = false
                     writeHealth(current, state:"recovering", detail:"Preparing private Gateway connectivity", root:root)
                 }
                 let now = Date().timeIntervalSince1970
+                let monotonicNow = ProcessInfo.processInfo.systemUptime
                 let configurationRequest = root.appendingPathComponent("configuration-request.json")
                 if let data = try? Data(contentsOf:configurationRequest),
                    let value = try? JSONSerialization.jsonObject(with:data) as? [String:Any],
@@ -281,11 +313,21 @@ enum ManagedGatewayHost {
                 if requested { try? FileManager.default.removeItem(at: request) }
                 // Audits are local CLI/readback work, not provider generation.
                 // Offline repair is excluded from every native delivery commit.
-                if now >= nextAudit || faultRequested || requested && repair {
+                let fullIntegrityAuditDue = integritySchedule.shouldRun(at:monotonicNow)
+                let forceFullIntegrityAudit = integritySchedule.shouldRun(
+                    at:monotonicNow, forced:faultRequested || repair)
+                if now >= nextAudit || faultRequested || requested && repair || fullIntegrityAuditDue {
                     nextAudit = now + 300
+                    var auditArguments = ["--managed-openclaw", "audit", "--managed-descriptor", descriptorURL.path]
+                    if forceFullIntegrityAudit { auditArguments.append("--force-integrity-audit") }
                     let audit = ownedCommand(root:root, executable:runtimeURL,
-                        arguments:["--managed-openclaw", "audit", "--managed-descriptor", descriptorURL.path], timeout:90)
-                    if audit.status != 0 || Self.object(audit.output)?["ok"] as? Bool != true {
+                        arguments:auditArguments, timeout:90)
+                    let auditResult = Self.object(audit.output)
+                    if forceFullIntegrityAudit {
+                        integritySchedule.record(at:ProcessInfo.processInfo.systemUptime,
+                            succeeded:auditResult?["full_integrity_ok"] as? Bool == true)
+                    }
+                    if audit.status != 0 || auditResult?["ok"] as? Bool != true {
                         guard let permit = try? ManagedRuntimePermit(root:root, repairing:true) else {
                             nextAudit = now + 1
                             writeHealth(current,state:"recovering",detail:"Waiting for dispatched work to settle before private runtime repair",root:root)
