@@ -479,6 +479,33 @@ final class RuntimeTransportTests: XCTestCase {
         XCTAssertEqual(fcntl(unrelated, F_GETFD), 0)
     }
 
+    @MainActor func testDuplicateFieldsFailBeforeNativeDispatchOrCompletion() async throws {
+        for field in ["kind", "task_generation_id", "instruction_revision", "request_id", "params"] {
+            let executable = try helper("""
+            frame = dict(kind='bridge_request', task_generation_id=config['task_generation_id'],
+                         instruction_revision=0, working_document_revision=0,
+                         request_id='fixture', method='act', params={})
+            encoded = json.dumps(frame)
+            duplicate = json.dumps('\(field)') + ':' + json.dumps(frame['\(field)'])
+            print('{' + duplicate + ',' + encoded[1:], flush=True)
+            emit('complete', message='must not complete')
+            """)
+            let failed = expectation(description: "Duplicate \(field) rejected")
+            var actions = 0, terminals = 0
+            let runtime = AgentRuntimeProcess(bridge: bridge(), bridgeHandler: { _ in actions += 1; return [:] })
+            runtime.onEvent = { event in
+                if case .failed(let message) = event {
+                    XCTAssertTrue(message.contains("transport_duplicate_field"), message)
+                    terminals += 1; failed.fulfill()
+                }
+                if case .completed = event { XCTFail("Ambiguous frame completed") }
+            }
+            try runtime.start(task: "fixture", display: display, runtimeURL: executable, openClawURL: executable, geminiAPIKey: "")
+            await fulfillment(of: [failed], timeout: 5)
+            XCTAssertEqual(actions, 0); XCTAssertEqual(terminals, 1)
+        }
+    }
+
     @MainActor func testOversizedUnterminatedHelperOutputFailsWithoutAnAction() async throws {
         let executable = try helper("sys.stdout.write('x' * (8*1024*1024+1)); sys.stdout.flush(); time.sleep(20)")
         let failed = expectation(description: "Classified framing failure")

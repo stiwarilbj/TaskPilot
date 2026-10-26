@@ -636,9 +636,17 @@ final class AgentRuntimeProcess {
         let receive = telemetry.begin(.ipcReceive, inputBytes: data.count)
         var accepted = false
         defer { receive.finish(accepted ? .succeeded : .failed) }
-        guard let object = try? telemetry.measure(.jsonDecoding, inputBytes: data.count, { _ -> Any in try JSONSerialization.jsonObject(with: data) }),
-              let message = object as? [String: Any],
-              let kind = message["kind"] as? String else {
+        let message: [String: Any]
+        do {
+            message = try telemetry.measure(.jsonDecoding, inputBytes: data.count) { _ in
+                try RuntimeMessageJSON.decode(data)
+            }
+        } catch RuntimeMessageJSON.Failure.duplicateField {
+            failTransport("transport_duplicate_field", for: run); return
+        } catch {
+            failTransport("transport_malformed_frame", for: run); return
+        }
+        guard let kind = message["kind"] as? String else {
             failTransport("transport_malformed_frame", for: run); return
         }
 
