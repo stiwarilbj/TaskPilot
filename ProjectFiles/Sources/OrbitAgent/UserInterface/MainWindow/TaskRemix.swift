@@ -31,33 +31,6 @@ struct TaskRemixReview: Equatable {
     let changes: [TaskRemixInputChange]
     let wordingChanged: Bool
 
-    struct CacheKey: Equatable {
-        struct Reference: Equatable {
-            let id: UUID
-            let kind: String
-            let value: String
-            let userRole: String?
-        }
-
-        let prose: String
-        let references: [Reference]
-    }
-
-    static func cacheKey(for draft: TaskComposerDraft) -> CacheKey {
-        var prose = ""
-        var references: [CacheKey.Reference] = []
-        for segment in draft.segments {
-            switch segment {
-            case .text(let value): prose += value
-            case .reference(let reference):
-                references.append(CacheKey.Reference(id: reference.id,
-                    kind: reference.kind.rawValue, value: reference.value,
-                    userRole: reference.userRole?.rawValue))
-            }
-        }
-        return CacheKey(prose: prose, references: references)
-    }
-
     static func make(baseline: TaskComposerDraft, current: TaskComposerDraft) -> Self {
         let oldReferences = baseline.references
         let newReferences = current.references
@@ -151,25 +124,23 @@ struct TaskRemixReview: Equatable {
 struct TaskRemixReviewCache {
     private struct Entry {
         let sessionID: UUID
-        let baselineKey: TaskRemixReview.CacheKey
-        let currentKey: TaskRemixReview.CacheKey
+        let draftRevision: UInt64
         let review: TaskRemixReview
     }
 
     private var entry: Entry?
     private(set) var buildCount = 0
+    private(set) var cacheHitCount = 0
 
-    mutating func review(sessionID: UUID, baseline: TaskComposerDraft,
+    mutating func review(sessionID: UUID, draftRevision: UInt64, baseline: TaskComposerDraft,
                          current: TaskComposerDraft) -> TaskRemixReview {
-        let baselineKey = TaskRemixReview.cacheKey(for: baseline)
-        let currentKey = TaskRemixReview.cacheKey(for: current)
         if let entry, entry.sessionID == sessionID,
-           entry.baselineKey == baselineKey, entry.currentKey == currentKey {
+           entry.draftRevision == draftRevision {
+            cacheHitCount += 1
             return entry.review
         }
         let review = TaskRemixReview.make(baseline: baseline, current: current)
-        entry = Entry(sessionID: sessionID, baselineKey: baselineKey,
-                      currentKey: currentKey, review: review)
+        entry = Entry(sessionID: sessionID, draftRevision: draftRevision, review: review)
         buildCount += 1
         return review
     }

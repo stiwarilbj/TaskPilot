@@ -44,7 +44,13 @@ final class TaskPilotCoordinator: ObservableObject {
 
     // MARK: - Observable app state
 
-    @Published var taskDraft = TaskComposerDraft()
+    @Published var taskDraft = TaskComposerDraft() {
+        didSet {
+            if !oldValue.hasSameEditorContent(as: taskDraft) {
+                taskDraftSemanticRevision += 1
+            }
+        }
+    }
     @Published private(set) var taskDraftEditorSessionID = UUID()
     @Published private(set) var remixSession: TaskRemixSession? {
         didSet {
@@ -138,6 +144,7 @@ final class TaskPilotCoordinator: ObservableObject {
     @Published private(set) var taskDestination: AgentTaskDestinationSnapshot?
     @Published private(set) var workingDocumentPresentation: WorkingDocumentPresentation?
     private var remixReviewCache = TaskRemixReviewCache()
+    private var taskDraftSemanticRevision: UInt64 = 0
     @Published private(set) var workingDocumentNotice: String?
     private var pendingWorkingDocumentUpdateID: String?
     private var pendingContinuationCheckpoint: AgentTaskContinuationCheckpoint?
@@ -223,6 +230,7 @@ final class TaskPilotCoordinator: ObservableObject {
     var remixReview: TaskRemixReview? {
         guard let remixSession else { return nil }
         return remixReviewCache.review(sessionID: remixSession.id,
+            draftRevision: taskDraftSemanticRevision,
             baseline: remixSession.baselineDraft, current: taskDraft)
     }
 

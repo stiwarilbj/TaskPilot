@@ -149,23 +149,62 @@ final class TaskRemixTests: XCTestCase {
             roleOrigin: .chosen, inferredRole: .source)
         let current = TaskComposerDraft(segments: [.text("Edit "), .reference(currentReference)])
 
-        let first = cache.review(sessionID: sessionID, baseline: baseline, current: current)
-        let second = cache.review(sessionID: sessionID, baseline: baseline, current: current)
+        let first = cache.review(sessionID: sessionID, draftRevision: 4,
+                                 baseline: baseline, current: current)
+        let second = cache.review(sessionID: sessionID, draftRevision: 4,
+                                  baseline: baseline, current: current)
         XCTAssertEqual(first, second)
         XCTAssertEqual(cache.buildCount, 1)
+        XCTAssertEqual(cache.cacheHitCount, 1)
 
         let presentationOnlyUpdate = TaskComposerDraft(segments: [.text("Edit "), .reference(
             TaskComposerReference(id: id, kind: .file, value: "/tmp/report.txt",
                 userRole: .destination, presentedRole: .referenceExample,
                 roleOrigin: .chosen, inferredRole: .referenceExample))])
-        _ = cache.review(sessionID: sessionID, baseline: baseline, current: presentationOnlyUpdate)
+        _ = cache.review(sessionID: sessionID, draftRevision: 4,
+                         baseline: baseline, current: presentationOnlyUpdate)
         XCTAssertEqual(cache.buildCount, 1)
+        XCTAssertEqual(cache.cacheHitCount, 2)
 
         let changedRole = TaskComposerDraft(segments: [.text("Edit "), .reference(
             TaskComposerReference(id: id, kind: .file, value: "/tmp/report.txt", userRole: nil))])
-        let updated = cache.review(sessionID: sessionID, baseline: baseline, current: changedRole)
+        let updated = cache.review(sessionID: sessionID, draftRevision: 5,
+                                   baseline: baseline, current: changedRole)
         XCTAssertEqual(updated.changes.map(\.kind), [.roleChanged])
         XCTAssertEqual(cache.buildCount, 2)
+
+        let newSessionID = UUID()
+        let newSession = cache.review(sessionID: newSessionID, draftRevision: 0,
+                                      baseline: baseline, current: changedRole)
+        XCTAssertEqual(newSession, updated)
+        XCTAssertEqual(cache.buildCount, 3)
+    }
+
+    func testDraftSemanticComparisonTracksReviewInputsButIgnoresPresentation() {
+        let id = UUID()
+        let original = TaskComposerReference(id: id, kind: .file, value: "/tmp/a.txt", userRole: .source)
+        let baseline = TaskComposerDraft(segments: [.text("Edit "), .reference(original)])
+
+        let presentationOnly = TaskComposerDraft(segments: [.text("Edit "), .reference(
+            TaskComposerReference(id: id, kind: .file, value: "/tmp/a.txt", userRole: .source,
+                presentedRole: .referenceExample, roleOrigin: .chosen,
+                inferredRole: .referenceExample, pendingRole: .destination))])
+        XCTAssertTrue(baseline.hasSameEditorContent(as: presentationOnly))
+
+        let changedText = TaskComposerDraft(segments: [.text("Review "), .reference(original)])
+        let changedIdentity = TaskComposerDraft(segments: [.text("Edit "), .reference(
+            TaskComposerReference(kind: .file, value: "/tmp/a.txt", userRole: .source))])
+        let changedValue = TaskComposerDraft(segments: [.text("Edit "), .reference(
+            TaskComposerReference(id: id, kind: .file, value: "/tmp/b.txt", userRole: .source))])
+        let changedRole = TaskComposerDraft(segments: [.text("Edit "), .reference(
+            TaskComposerReference(id: id, kind: .file, value: "/tmp/a.txt", userRole: .destination))])
+        let moved = TaskComposerDraft(segments: [.reference(original), .text(" Edit")])
+
+        XCTAssertFalse(baseline.hasSameEditorContent(as: changedText))
+        XCTAssertFalse(baseline.hasSameEditorContent(as: changedIdentity))
+        XCTAssertFalse(baseline.hasSameEditorContent(as: changedValue))
+        XCTAssertFalse(baseline.hasSameEditorContent(as: changedRole))
+        XCTAssertFalse(baseline.hasSameEditorContent(as: moved))
     }
 
     func testRemixCacheReuses128MovedChipComparisonAcrossStatusRefreshes() {
@@ -177,14 +216,19 @@ final class TaskRemixTests: XCTestCase {
         var cache = TaskRemixReviewCache()
         let sessionID = UUID()
         let start = DispatchTime.now().uptimeNanoseconds
-        let review = cache.review(sessionID: sessionID, baseline: baseline, current: moved)
+        let review = cache.review(sessionID: sessionID, draftRevision: 1,
+                                  baseline: baseline, current: moved)
         let calculationTime = DispatchTime.now().uptimeNanoseconds - start
+        let cacheStart = DispatchTime.now().uptimeNanoseconds
         for _ in 0..<50 {
-            _ = cache.review(sessionID: sessionID, baseline: baseline, current: moved)
+            _ = cache.review(sessionID: sessionID, draftRevision: 1,
+                             baseline: baseline, current: moved)
         }
+        let cacheTime = DispatchTime.now().uptimeNanoseconds - cacheStart
         XCTAssertTrue(review.changes.isEmpty)
         XCTAssertEqual(cache.buildCount, 1)
-        print("Remix cache benchmark: 128 moved chips, one fresh comparison in \(Double(calculationTime) / 1_000_000) ms; 50 cached refreshes")
+        XCTAssertEqual(cache.cacheHitCount, 50)
+        print("Remix cache benchmark: 128 moved chips, comparison \(Double(calculationTime) / 1_000_000) ms; 50 cache hits \(Double(cacheTime) / 1_000_000) ms")
     }
 
     func testReferenceReorderingAloneDoesNotShowChangedInputs() {
