@@ -679,7 +679,9 @@ final class AgentRuntimeProcess {
         case "model_health":
             emit(.modelHealth(message["model"] as? String ?? "", message["state"] as? String ?? "repair", message["detail"] as? String ?? ""), for: run)
         case "request_metrics":
-            if let metrics = try? run.metricsDecoder.decode(AgentRequestMetrics.self, from: data) { emit(.diagnostics(metrics), for: run) }
+            if let metrics = try? BackendTelemetry.DiagnosticSchema.decodeRequestMetrics(data, using: run.metricsDecoder) {
+                emit(.diagnostics(metrics), for: run)
+            }
         case "bridge_request":
             guard let method = message["method"] as? String,
                   let instructionRevision = exactRevision(message["instruction_revision"]),

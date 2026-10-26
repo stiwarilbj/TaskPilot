@@ -24,6 +24,7 @@ import re
 import shutil
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -90,6 +91,7 @@ from response_validation import (
     VALIDATION_VERSION, ResponseValidationError, extract_json_object, bind_command_outcomes,
     normalize_action, validate_response,
 )
+from private_diagnostics import action_record, validate_action_record, validate_request_metrics
 
 
 def expected_wait_description(decision: dict[str, Any] | None) -> str:
@@ -438,6 +440,12 @@ def emit(kind: str, **payload: Any) -> None:
                 ledger=context.ledger,
             )
         return
+    if kind == "request_metrics":
+        try:
+            payload = validate_request_metrics(payload)
+        except (TypeError, ValueError):
+            # Diagnostic rejection is intentionally non-fatal to task work.
+            return
     envelope = {"kind": kind, **payload}
     if _task_value('generation') is not None: envelope["task_generation_id"] = _task_value('generation')
     context = current_task.get()
@@ -1579,20 +1587,35 @@ def blocked_recovery_action(task: str, observation: dict[str, Any], history: lis
 
 
 def record_action_diagnostic(action: dict[str, Any], result: dict[str, Any]) -> None:
-    """Private bounded diagnostics omit text, paths, commands and screen data."""
+    """Persist only fields admitted by the private diagnostic schema."""
     try:
         folder = Path.home() / "Library/Application Support" / LEGACY_APPLICATION_SUPPORT_FOLDER
-        folder.mkdir(parents=True, exist_ok=True)
+        folder.mkdir(parents=True, mode=0o700, exist_ok=True)
         path = folder / "automation-diagnostics.jsonl"
-        if path.exists() and path.stat().st_size > 1_000_000:
-            path.unlink()
-        entry = {"timestamp": time.time(), "runtime_pid": os.getpid(), "action": action.get("type"),
-                 **{k: result[k] for k in ("outcome", "delivery_method", "error_code", "verification_scope", "recovery") if k in result}}
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "a") as output:
-            output.write(json.dumps(entry) + "\n")
-    except OSError:
+        entry = action_record(action, result, timestamp=time.time(), runtime_pid=os.getpid())
+        entry = validate_action_record(entry)
+        if entry is None:
+            return
+        line = (json.dumps(entry, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+        if len(line) > 4_096:
+            return
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            status = os.fstat(descriptor)
+            if not stat.S_ISREG(status.st_mode) or status.st_uid != os.getuid() or status.st_nlink != 1:
+                return
+            os.fchmod(descriptor, 0o600)
+            if status.st_size + len(line) > 1_000_000:
+                os.ftruncate(descriptor, 0)
+            offset = 0
+            while offset < len(line):
+                written = os.write(descriptor, line[offset:])
+                if written <= 0:
+                    return
+                offset += written
+        finally:
+            os.close(descriptor)
+    except (OSError, TypeError, ValueError, OverflowError):
         pass
 
 

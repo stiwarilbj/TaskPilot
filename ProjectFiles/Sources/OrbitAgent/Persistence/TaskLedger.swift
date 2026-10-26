@@ -324,6 +324,11 @@ struct AgentTaskLedgerStore: Sendable {
             let telemetry = BackendTelemetry.current
             let data = try codingQueue.sync {
                 try telemetry.measure(.jsonEncoding) { encoding in
+                    for entry in history {
+                        if let metrics = entry.requestMetrics {
+                            try BackendTelemetry.DiagnosticSchema.validateRequestMetrics(metrics)
+                        }
+                    }
                     let data = try encoder.encode(AgentTaskLedgerSnapshot(queue: queue, history: history, activeTask: activeTask))
                     encoding.record(outputBytes: data.count)
                     return data
