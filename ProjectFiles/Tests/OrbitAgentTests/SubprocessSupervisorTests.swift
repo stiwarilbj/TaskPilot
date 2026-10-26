@@ -10,10 +10,10 @@ final class SubprocessSupervisorTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         return root
     }
-    private func process(_ body: String) -> SubprocessSupervisor {
+    private func process(_ body: String, arguments: [String] = []) -> SubprocessSupervisor {
         let process = SubprocessSupervisor()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-f", "-c", body]
+        process.arguments = ["-f", "-c", body] + arguments
         addTeardownBlock { process.beginTeardown(); _ = process.waitForTree(until: .now() + 2, ignoreInterrupt: true) }
         return process
     }
@@ -158,6 +158,78 @@ final class SubprocessSupervisorTests: XCTestCase {
         XCTAssertFalse(process.snapshot.treeFinished)
         gate.resume()
         guard case .finished = process.waitForTree(until: .now() + 2) else { return XCTFail("Recovered inspection stayed blocked") }
+    }
+
+    func testSeededChildExitCancellationAndDelayedCallbacksAreReproducible() async throws {
+        var observedRaceOrders = Set<String>()
+        var replayBySeed: [UInt64: (raceOrder: String, callbacks: [String], markerExists: Bool)] = [:]
+        for seed: UInt64 in [1, 2, 1, 2] {
+            let root = try fixture()
+            let release = root.appendingPathComponent("release-child")
+            let marker = root.appendingPathComponent("child-finished")
+            let scheduler = SeededLifecycleScheduler(seed: seed)
+            let callbacks = LockedTestValue<[String]>([])
+            let parentCallbackQueued = LockedTestValue(false)
+            let treeCallbackQueued = LockedTestValue(false)
+            let process = process("(while [[ ! -e \"$1\" ]]; do /bin/sleep 0.01; done; /usr/bin/touch \"$2\") & exit 0",
+                                  arguments: ["fixture", release.path, marker.path])
+            process.terminationHandler = { _ in
+                scheduler.schedule(after: 20, name: "delayed-parent-callback") {
+                    callbacks.update { $0.append("parent") }
+                }
+                parentCallbackQueued.update { $0 = true }
+            }
+            process.whenTreeExits {
+                scheduler.schedule(after: 5, name: "delayed-tree-callback") {
+                    callbacks.update { $0.append("tree") }
+                }
+                treeCallbackQueued.update { $0 = true }
+            }
+            try process.run()
+            let parentCallbackArrived = await waitForSeededLifecycleCondition { parentCallbackQueued.read() }
+            XCTAssertTrue(parentCallbackArrived, "parent callback timeout; seed=\(seed)")
+            XCTAssertTrue(process.snapshot.parentExited, "seed=\(seed)")
+
+            scheduler.schedule(at: 10, name: "release-child") {
+                FileManager.default.createFile(atPath: release.path, contents: Data())
+                guard case .finished = process.waitForTree(until: .now() + 2, ignoreInterrupt: true) else {
+                    XCTFail("Child did not drain after release; seed=\(seed)")
+                    return
+                }
+                let callbackArrived = await waitForSeededLifecycleCondition { treeCallbackQueued.read() }
+                XCTAssertTrue(callbackArrived, "tree callback timeout; seed=\(seed)")
+            }
+            scheduler.schedule(at: 10, name: "cancel-tree") {
+                process.beginTeardown(grace: 0)
+                guard case .finished = process.waitForTree(until: .now() + 2, ignoreInterrupt: true) else {
+                    XCTFail("Child did not drain after cancellation; seed=\(seed)")
+                    return
+                }
+                let callbackArrived = await waitForSeededLifecycleCondition { treeCallbackQueued.read() }
+                XCTAssertTrue(callbackArrived, "tree callback timeout; seed=\(seed)")
+            }
+            await scheduler.runAll()
+            await scheduler.runAll()
+
+            XCTAssertTrue(process.snapshot.parentExited, "seed=\(seed)")
+            XCTAssertTrue(process.snapshot.treeFinished, "seed=\(seed)")
+            let raceOrder = scheduler.trace.filter { $0 == "release-child" || $0 == "cancel-tree" }
+            XCTAssertEqual(raceOrder.count, 2, "seed=\(seed)")
+            observedRaceOrders.insert(raceOrder.joined(separator: ","))
+            let markerExists = FileManager.default.fileExists(atPath: marker.path)
+            XCTAssertEqual(markerExists, raceOrder.first == "release-child",
+                           "the first seeded event should decide whether the child finishes naturally; seed=\(seed)")
+            XCTAssertEqual(callbacks.read(), ["tree", "parent"], "delayed callbacks must remain exactly once and ordered; seed=\(seed)")
+            XCTAssertGreaterThanOrEqual(scheduler.clock.now, 20)
+            let current = (raceOrder: raceOrder.joined(separator: ","), callbacks: callbacks.read(), markerExists: markerExists)
+            if let previous = replayBySeed[seed] {
+                XCTAssertEqual(current.raceOrder, previous.raceOrder, "same seed changed event order; seed=\(seed)")
+                XCTAssertEqual(current.callbacks, previous.callbacks, "same seed changed callback trace; seed=\(seed)")
+                XCTAssertEqual(current.markerExists, previous.markerExists, "same seed changed child outcome; seed=\(seed)")
+            }
+            replayBySeed[seed] = current
+        }
+        XCTAssertEqual(observedRaceOrders, ["release-child,cancel-tree", "cancel-tree,release-child"])
     }
 
     func testMonitorOutlivesCallerAndImmediateParentThenReleasesItself() async throws {

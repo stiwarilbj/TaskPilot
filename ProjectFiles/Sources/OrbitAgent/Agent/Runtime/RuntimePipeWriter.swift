@@ -3,6 +3,8 @@ import Foundation
 
 /// Confined to the invocation's I/O queue. No pipe write can block Stop.
 final class RuntimePipeWriter {
+    typealias WriteOperation = (Int32, UnsafeRawPointer, Int) -> Int
+
     private struct Frame {
         let data: Data
         var offset = 0
@@ -13,6 +15,8 @@ final class RuntimePipeWriter {
     private let queue: DispatchQueue
     private let failure: (String) -> Void
     private let telemetry: BackendTelemetry
+    // Injectable only so tests can force partial POSIX writes; production uses Darwin.write.
+    private let writeOperation: WriteOperation
     private var frames: [Frame] = []
     private var frameHead = 0
     private var bytes = 0
@@ -27,8 +31,10 @@ final class RuntimePipeWriter {
 
     init(handle: FileHandle, queue: DispatchQueue, byteLimit: Int = 32 * 1024 * 1024,
          reserve: Int = 8 * 1024 * 1024, timeout: TimeInterval = 5, telemetry: BackendTelemetry = .current,
+         writeOperation: @escaping WriteOperation = { descriptor, bytes, count in Darwin.write(descriptor, bytes, count) },
          failure: @escaping (String) -> Void) {
         descriptor = handle.fileDescriptor; self.queue = queue; self.failure = failure; self.telemetry = telemetry
+        self.writeOperation = writeOperation
         self.byteLimit = byteLimit; self.reserve = reserve; self.timeout = timeout
         let flags = fcntl(descriptor, F_GETFL)
         // Darwin.write otherwise raises SIGPIPE before it can return EPIPE.
@@ -72,8 +78,8 @@ final class RuntimePipeWriter {
         while frameHead < frames.count && allowance > 0 && !closed {
             frames[frameHead].waitTicket.start()
             let written = frames[frameHead].data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
-                Darwin.write(descriptor, buffer.baseAddress!.advanced(by: frames[frameHead].offset),
-                             min(allowance, buffer.count - frames[frameHead].offset))
+                writeOperation(descriptor, buffer.baseAddress!.advanced(by: frames[frameHead].offset),
+                               min(allowance, buffer.count - frames[frameHead].offset))
             }
             if written < 0 {
                 if errno == EAGAIN || errno == EINTR { return }

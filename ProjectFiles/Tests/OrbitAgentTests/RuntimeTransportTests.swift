@@ -4,6 +4,12 @@ import XCTest
 @testable import OrbitAgent
 
 final class RuntimeTransportTests: XCTestCase {
+    private struct PartialWriteState {
+        var calls = 0
+        var bytesWritten = 0
+        var blocked = false
+    }
+
     private final class FakeClock: @unchecked Sendable {
         private let lock = NSLock()
         private var value = 0.0
@@ -115,6 +121,165 @@ final class RuntimeTransportTests: XCTestCase {
         XCTAssertEqual(histogram?.countsByDisposition[.started]?[2], 1)
         XCTAssertEqual(histogram?.countsByDisposition[.cancelled]?[2], 1)
         queue.sync { writer.cancel() }
+    }
+
+    func testSeededPartialWritesRaceReaderDrainAgainstCancellation() async throws {
+        var observedOrders = Set<String>()
+        var replayBySeed: [UInt64: (raceOrder: String, callback: Bool)] = [:]
+        for seed: UInt64 in [1, 2, 1, 2] {
+            let queue = DispatchQueue(label: "fixture.seeded-writer.\(seed)")
+            let pipe = Pipe()
+            let readFD = pipe.fileHandleForReading.fileDescriptor
+            let oldFlags = fcntl(readFD, F_GETFL)
+            XCTAssertGreaterThanOrEqual(oldFlags, 0)
+            XCTAssertNotEqual(fcntl(readFD, F_SETFL, oldFlags | O_NONBLOCK), -1)
+            let payload = Data((0..<2 * 1024 * 1024).map { UInt8($0 % 251) })
+            let writeState = LockedTestValue(PartialWriteState())
+            let callbacks = LockedTestValue<[Bool]>([])
+            let cancelled = LockedTestValue(false)
+            let readerReleased = LockedTestValue(false)
+            let completion = DeterministicAsyncLatch()
+            let scheduler = SeededLifecycleScheduler(seed: seed)
+            var writer: RuntimePipeWriter!
+
+            queue.sync {
+                writer = RuntimePipeWriter(handle: pipe.fileHandleForWriting, queue: queue, timeout: 5,
+                    writeOperation: { descriptor, pointer, requested in
+                        if !readerReleased.read() && writeState.read().bytesWritten >= 32 * 1024 {
+                            writeState.update { $0.blocked = true }
+                            errno = EAGAIN
+                            return -1
+                        }
+                        let result = Darwin.write(descriptor, pointer, min(requested, 4096))
+                        if result > 0 {
+                            writeState.update { $0.calls += 1; $0.bytesWritten += result }
+                        } else if result < 0 {
+                            let savedErrno = errno
+                            writeState.update { $0.blocked = savedErrno == EAGAIN || savedErrno == EWOULDBLOCK }
+                            errno = savedErrno
+                        }
+                        return result
+                    }, failure: { XCTFail("seed=\(seed): \($0)") })
+                writer.enqueue(payload) { success in
+                    callbacks.update { $0.append(success) }
+                    completion.signal()
+                }
+            }
+
+            let writeDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while !writeState.read().blocked && ContinuousClock.now < writeDeadline {
+                try await Task.sleep(for: .milliseconds(1))
+            }
+            XCTAssertTrue(writeState.read().blocked, "writer should reach EAGAIN before the seeded race; seed=\(seed)")
+            XCTAssertGreaterThan(writeState.read().calls, 1, "write injection must force partial writes; seed=\(seed)")
+            XCTAssertLessThan(writeState.read().bytesWritten, payload.count)
+
+            scheduler.schedule(at: 10, name: "drain-reader") {
+                readerReleased.update { $0 = true }
+                let target = cancelled.read() ? writeState.read().bytesWritten : payload.count
+                var received = Data(); received.reserveCapacity(target)
+                var buffer = [UInt8](repeating: 0, count: 16 * 1024)
+                while received.count < target {
+                    let amount = Darwin.read(readFD, &buffer, buffer.count)
+                    if amount > 0 {
+                        received.append(contentsOf: buffer.prefix(amount))
+                    } else if amount < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                        try? await Task.sleep(for: .milliseconds(1))
+                    } else {
+                        XCTFail("unexpected pipe read result \(amount); seed=\(seed)")
+                        return
+                    }
+                }
+                if !cancelled.read() { await completion.wait() }
+                let expected = cancelled.read() ? Data(payload.prefix(target)) : payload
+                XCTAssertEqual(received, expected, "FIFO bytes changed during partial writes; seed=\(seed)")
+            }
+            scheduler.schedule(at: 10, name: "cancel-writer") {
+                queue.sync {
+                    cancelled.update { $0 = true }
+                    writer.cancel()
+                }
+                await completion.wait()
+            }
+            await scheduler.runAll()
+
+            let raceOrder = scheduler.trace.filter { $0 == "drain-reader" || $0 == "cancel-writer" }
+            XCTAssertEqual(raceOrder.count, 2, "seed=\(seed)")
+            observedOrders.insert(raceOrder.joined(separator: ","))
+            XCTAssertEqual(callbacks.read(), [raceOrder.first == "drain-reader"], "completion must occur once; seed=\(seed)")
+            XCTAssertGreaterThanOrEqual(scheduler.clock.now, 10)
+            let current = (raceOrder: raceOrder.joined(separator: ","), callback: callbacks.read().first ?? false)
+            if let previous = replayBySeed[seed] {
+                XCTAssertEqual(current.raceOrder, previous.raceOrder, "same seed changed write race order; seed=\(seed)")
+                XCTAssertEqual(current.callback, previous.callback, "same seed changed completion result; seed=\(seed)")
+            }
+            replayBySeed[seed] = current
+            queue.sync { writer.cancel() }
+            try pipe.fileHandleForReading.close()
+            try pipe.fileHandleForWriting.close()
+        }
+        XCTAssertEqual(observedOrders, ["drain-reader,cancel-writer", "cancel-writer,drain-reader"])
+    }
+
+    @MainActor
+    func testSeededRuntimeStopAndTerminalCallbackRaceIsReproducible() async throws {
+        var observedOutcomes = Set<String>()
+        var replayBySeed: [UInt64: (raceOrder: String, outcome: String)] = [:]
+        for seed: UInt64 in [1, 2, 1, 2] {
+            let gate = FileManager.default.temporaryDirectory.appendingPathComponent("taskpilot-runtime-gate-\(UUID().uuidString)")
+            let executable = try helper("""
+            import os
+            gate = \(String(reflecting: gate.path))
+            while not os.path.exists(gate): time.sleep(0.002)
+            emit('complete', message='finished')
+            """)
+            let scheduler = SeededLifecycleScheduler(seed: seed)
+            let callbackQueued = DeterministicAsyncLatch()
+            let terminalDelivered = DeterministicAsyncLatch()
+            let terminalResult = LockedTestValue<[String]>([])
+            let runtime = AgentRuntimeProcess(bridge: bridge())
+            runtime.onEvent = { event in
+                let value: String
+                switch event {
+                case .completed: value = "completed"
+                case .stopped: value = "stopped"
+                case .failed(let message): value = "failed:\(message)"
+                default: return
+                }
+                scheduler.schedule(after: 5, name: "deliver-runtime-terminal-callback") {
+                    terminalResult.update { $0.append(value) }
+                    terminalDelivered.signal()
+                }
+                callbackQueued.signal()
+            }
+            try runtime.start(task: "seeded fixture", display: display, runtimeURL: executable,
+                              openClawURL: executable, geminiAPIKey: "")
+            scheduler.schedule(at: 5, name: "helper-terminal") {
+                FileManager.default.createFile(atPath: gate.path, contents: Data())
+                await callbackQueued.wait()
+            }
+            scheduler.schedule(at: 5, name: "stop-runtime") {
+                runtime.stop()
+                await callbackQueued.wait()
+            }
+            await scheduler.runAll()
+            await terminalDelivered.wait()
+            try await Task.sleep(for: .milliseconds(50))
+
+            let raceOrder = scheduler.trace.filter { $0 == "helper-terminal" || $0 == "stop-runtime" }
+            XCTAssertEqual(raceOrder.count, 2, "seed=\(seed)")
+            let expected = raceOrder.first == "helper-terminal" ? "completed" : "stopped"
+            XCTAssertEqual(terminalResult.read(), [expected], "terminal event must be delivered once; seed=\(seed)")
+            observedOutcomes.insert(expected)
+            XCTAssertGreaterThanOrEqual(scheduler.clock.now, 5)
+            let current = (raceOrder: raceOrder.joined(separator: ","), outcome: expected)
+            if let previous = replayBySeed[seed] {
+                XCTAssertEqual(current.raceOrder, previous.raceOrder, "same seed changed runtime event order; seed=\(seed)")
+                XCTAssertEqual(current.outcome, previous.outcome, "same seed changed terminal outcome; seed=\(seed)")
+            }
+            replayBySeed[seed] = current
+        }
+        XCTAssertEqual(observedOutcomes, ["completed", "stopped"])
     }
 
     func testBlockedWriterHasBoundedDeadlineWithoutBlockingOwningQueue() {
