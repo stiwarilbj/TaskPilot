@@ -18,6 +18,19 @@ enum TaskTemporaryResourceLedger {
         let processID: Int32
         let processStartSeconds: UInt64
         let processStartMicroseconds: UInt64
+        var captureDirectory: DirectoryIdentity? = nil
+    }
+
+    fileprivate struct DirectoryIdentity: Codable, Equatable {
+        let device: Int32
+        let inode: UInt64
+        let birthSeconds: Int64
+        let birthNanoseconds: Int64
+        init(_ status: stat) {
+            device = status.st_dev; inode = status.st_ino
+            birthSeconds = Int64(status.st_birthtimespec.tv_sec)
+            birthNanoseconds = Int64(status.st_birthtimespec.tv_nsec)
+        }
     }
 
     static var defaultRoot: URL {
@@ -46,12 +59,20 @@ enum TaskTemporaryResourceLedger {
         var leaseDescriptor: Int32 = -1
         var transferredLease = false
         defer {
-            if directoryDescriptor >= 0 { close(directoryDescriptor) }
             if leaseDescriptor >= 0 && !transferredLease {
                 flock(leaseDescriptor, LOCK_UN)
                 close(leaseDescriptor)
             }
-            if !transferredLease { try? FileManager.default.removeItem(at: directory) }
+            if !transferredLease, directoryDescriptor >= 0 {
+                var opened = stat(), current = stat()
+                if fstat(directoryDescriptor, &opened) == 0,
+                   fstatat(rootDescriptor, directoryID, &current, AT_SYMLINK_NOFOLLOW) == 0,
+                   DirectoryIdentity(opened) == DirectoryIdentity(current),
+                   removeContents(directoryDescriptor, preserving: nil) {
+                    _ = unlinkat(rootDescriptor, directoryID, AT_REMOVEDIR)
+                }
+                close(directoryDescriptor)
+            }
         }
 
         directoryDescriptor = openat(rootDescriptor, directoryID,
@@ -80,6 +101,7 @@ enum TaskTemporaryResourceLedger {
 
         transferredLease = true
         return TaskTemporaryResourceLease(root: root, directory: directory, leaseDescriptor: leaseDescriptor,
+            directoryDescriptor: directoryDescriptor,
             device: directoryStatus.st_dev, inode: directoryStatus.st_ino)
     }
 
@@ -121,16 +143,13 @@ enum TaskTemporaryResourceLedger {
         return removed
     }
 
-    fileprivate static func removeOwnedDirectory(root: URL, directory: URL, leaseDescriptor: Int32,
+    fileprivate static func removeOwnedDirectory(root: URL, directory: URL, leaseDescriptor: Int32, directoryDescriptor: Int32,
                                                   device: dev_t, inode: ino_t) {
         guard directory.deletingLastPathComponent().standardizedFileURL == root.standardizedFileURL,
               UUID(uuidString: directory.lastPathComponent) != nil,
               let rootDescriptor = try? openRoot(root, create: false) else { return }
         defer { close(rootDescriptor) }
         let name = directory.lastPathComponent
-        guard let directoryDescriptor = openat(rootDescriptor, name,
-            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC).nonnegative else { return }
-        defer { close(directoryDescriptor) }
         _ = removeDirectoryEntry(rootDescriptor, directoryDescriptor, leaseDescriptor, name: name,
                                  expectedDevice: device, expectedInode: inode)
     }
@@ -147,7 +166,10 @@ enum TaskTemporaryResourceLedger {
               fstat(leaseDescriptor, &lease) == 0,
               fstatat(directoryDescriptor, ownerFileName, &leaseEntry, AT_SYMLINK_NOFOLLOW) == 0,
               lease.st_dev == leaseEntry.st_dev, lease.st_ino == leaseEntry.st_ino,
-              removeContents(directoryDescriptor, preserving: ownerFileName) else { return false }
+              let record = readOwnerRecord(leaseDescriptor),
+              captureDirectoryMatches(record.captureDirectory, in: directoryDescriptor),
+              removeContents(directoryDescriptor, preserving: ownerFileName,
+                             captureIdentity: record.captureDirectory) else { return false }
         guard unlinkat(directoryDescriptor, ownerFileName, 0) == 0,
               unlinkat(rootDescriptor, name, AT_REMOVEDIR) == 0,
               fsync(rootDescriptor) == 0 else { return false }
@@ -157,8 +179,9 @@ enum TaskTemporaryResourceLedger {
     /// Recursively removes a scratch directory without following symlinks. The
     /// owner lease is preserved until every other entry is gone so an
     /// interrupted cleanup remains verifiable on the next startup.
-    private static func removeContents(_ descriptor: Int32, preserving preservedName: String?) -> Bool {
-        let duplicate = dup(descriptor)
+    private static func removeContents(_ descriptor: Int32, preserving preservedName: String?,
+                                       captureIdentity: DirectoryIdentity? = nil) -> Bool {
+        let duplicate = fcntl(descriptor, F_DUPFD_CLOEXEC, 0)
         guard duplicate >= 0, let stream = fdopendir(duplicate) else {
             if duplicate >= 0 { close(duplicate) }
             return false
@@ -177,9 +200,22 @@ enum TaskTemporaryResourceLedger {
                 if errno == ENOENT { continue }
                 return false
             }
+            if name == "capture", let captureIdentity {
+                guard (initial.st_mode & S_IFMT) == S_IFDIR,
+                      DirectoryIdentity(initial) == captureIdentity else { return false }
+            }
             if (initial.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) {
                 let child = openat(descriptor, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                 guard child >= 0 else { return false }
+                var opened = stat()
+                guard fstat(child, &opened) == 0, DirectoryIdentity(opened) == DirectoryIdentity(initial) else {
+                    close(child); return false
+                }
+                if name == "capture", captureIdentity != nil {
+                    var conflict = stat()
+                    let foundConflict = fstatat(child, TaskCaptureDirectory.conflictMarker, &conflict, AT_SYMLINK_NOFOLLOW) == 0
+                    guard !foundConflict, errno == ENOENT else { close(child); return false }
+                }
                 let removed = removeContents(child, preserving: nil)
                 close(child)
                 guard removed else { return false }
@@ -192,6 +228,31 @@ enum TaskTemporaryResourceLedger {
             }
         }
         return true
+    }
+
+    private static func captureDirectoryMatches(_ expected: DirectoryIdentity?, in descriptor: Int32) -> Bool {
+        guard let expected else { return true } // Existing leases remain readable.
+        var current = stat()
+        if fstatat(descriptor, "capture", &current, AT_SYMLINK_NOFOLLOW) != 0 { return errno == ENOENT }
+        return (current.st_mode & S_IFMT) == S_IFDIR && DirectoryIdentity(current) == expected
+    }
+
+    fileprivate static func recordCaptureDirectory(_ status: stat, leaseDescriptor: Int32) throws {
+        guard var record = readOwnerRecord(leaseDescriptor) else { throw TaskTemporaryResourceError.unavailable }
+        let identity = DirectoryIdentity(status)
+        if let recorded = record.captureDirectory, recorded != identity { throw TaskTemporaryResourceError.unavailable }
+        if record.captureDirectory == identity { return }
+        record.captureDirectory = identity
+        let data = try JSONEncoder().encode(record)
+        guard data.count <= maximumOwnerBytes, lseek(leaseDescriptor, 0, SEEK_SET) == 0 else {
+            throw TaskTemporaryResourceError.unavailable
+        }
+        // The live lease lock excludes recovery readers. A torn write is
+        // deliberately retained as unverifiable metadata after a crash.
+        try writeFully(data, to: leaseDescriptor)
+        guard ftruncate(leaseDescriptor, off_t(data.count)) == 0, fsync(leaseDescriptor) == 0 else {
+            throw TaskTemporaryResourceError.unavailable
+        }
     }
 
     private static func ownerIsGone(_ record: OwnerRecord) -> Bool {
@@ -230,7 +291,7 @@ enum TaskTemporaryResourceLedger {
         return descriptor
     }
 
-    private static func validatePrivateDirectory(_ descriptor: Int32) throws {
+    fileprivate static func validatePrivateDirectory(_ descriptor: Int32) throws {
         var status = stat()
         guard fstat(descriptor, &status) == 0,
               (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR),
@@ -263,6 +324,94 @@ enum TaskTemporaryResourceLedger {
     }
 }
 
+/// The retained directory, rather than its mutable pathname, is the authority
+/// for PNG metadata and cleanup. It never follows an entry's symbolic link.
+final class TaskCaptureDirectory: @unchecked Sendable {
+    static let conflictMarker = ".cleanup-conflict"
+    struct FileIdentity: Equatable {
+        let device: dev_t
+        let inode: ino_t
+        let bytes: Int64
+        let owner: uid_t
+        let mode: mode_t
+        let birth: timespec
+        let modified: timespec
+        init(_ status: stat) {
+            device = status.st_dev; inode = status.st_ino; bytes = status.st_size
+            owner = status.st_uid; mode = status.st_mode
+            birth = status.st_birthtimespec; modified = status.st_mtimespec
+        }
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.device == rhs.device && lhs.inode == rhs.inode && lhs.bytes == rhs.bytes &&
+                lhs.owner == rhs.owner && lhs.mode == rhs.mode &&
+                lhs.birth.tv_sec == rhs.birth.tv_sec && lhs.birth.tv_nsec == rhs.birth.tv_nsec &&
+                lhs.modified.tv_sec == rhs.modified.tv_sec && lhs.modified.tv_nsec == rhs.modified.tv_nsec
+        }
+    }
+    let directoryURL: URL
+    private let descriptor: Int32
+    private let identity: TaskTemporaryResourceLedger.DirectoryIdentity
+    private let conflictLock = NSLock()
+    private var removalConflict = false
+    var hasRemovalConflict: Bool { conflictLock.withLock { removalConflict } }
+    fileprivate init(directoryURL: URL, descriptor: Int32, status: stat) {
+        self.directoryURL = directoryURL; self.descriptor = descriptor
+        identity = .init(status)
+    }
+    deinit { close(descriptor) }
+
+    func filename(for url: URL) -> String? {
+        guard url.isFileURL, url.pathExtension == "png",
+              url.standardizedFileURL.deletingLastPathComponent() == directoryURL.standardizedFileURL else { return nil }
+        return url.standardizedFileURL.lastPathComponent
+    }
+    func pathIsCurrent() -> Bool {
+        var current = stat()
+        return lstat(directoryURL.path, &current) == 0 && (current.st_mode & S_IFMT) == S_IFDIR &&
+            TaskTemporaryResourceLedger.DirectoryIdentity(current) == identity
+    }
+    func status(named name: String) throws -> stat? {
+        guard name != ".", name != "..", !name.contains("/"), !name.utf8.contains(0) else {
+            throw TaskTemporaryResourceError.unavailable
+        }
+        var current = stat()
+        guard fstatat(descriptor, name, &current, AT_SYMLINK_NOFOLLOW) == 0 else {
+            if errno == ENOENT { return nil }
+            throw TaskTemporaryResourceError.unavailable
+        }
+        return current
+    }
+    /// Rename within the pinned directory, then recheck identity before unlink.
+    /// A replacement racing the initial check is restored without overwriting
+    /// a newer entry; it is never accepted as the expired capture.
+    func removeFile(named name: String, expected: FileIdentity,
+                    beforeRemoval: (() throws -> Void)? = nil,
+                    afterQuarantine: (() throws -> Void)? = nil) throws -> Bool {
+        guard let current = try status(named: name) else { return true }
+        guard (current.st_mode & S_IFMT) == S_IFREG, FileIdentity(current) == expected else { return false }
+        try beforeRemoval?()
+        let temporary = ".discard-\(UUID().uuidString).png"
+        guard renameatx_np(descriptor, name, descriptor, temporary, UInt32(RENAME_EXCL)) == 0 else {
+            return errno == ENOENT
+        }
+        var removed = false
+        defer {
+            if !removed, renameatx_np(descriptor, temporary, descriptor, name, UInt32(RENAME_EXCL)) != 0, errno != ENOENT {
+                // Never overwrite a newer entry to restore a raced replacement.
+                // Preserve the quarantined file through retirement and recovery.
+                conflictLock.withLock { removalConflict = true }
+                let marker = openat(descriptor, Self.conflictMarker, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0o600)
+                if marker >= 0 { _ = fsync(marker); close(marker); _ = fsync(descriptor) }
+            }
+        }
+        try afterQuarantine?()
+        guard let moved = try status(named: temporary), (moved.st_mode & S_IFMT) == S_IFREG,
+              FileIdentity(moved) == expected, unlinkat(descriptor, temporary, 0) == 0 else { return false }
+        removed = true
+        return true
+    }
+}
+
 final class TaskTemporaryResourceLease: @unchecked Sendable {
     let directoryURL: URL
     private let rootURL: URL
@@ -270,11 +419,43 @@ final class TaskTemporaryResourceLease: @unchecked Sendable {
     private let inode: ino_t
     private let lock = NSLock()
     private var descriptor: Int32
+    private var directoryDescriptor: Int32
+    private var captureStorage: TaskCaptureDirectory?
     private var removed = false
 
-    fileprivate init(root: URL, directory: URL, leaseDescriptor: Int32, device: dev_t, inode: ino_t) {
+    fileprivate init(root: URL, directory: URL, leaseDescriptor: Int32, directoryDescriptor: Int32,
+                     device: dev_t, inode: ino_t) {
         rootURL = root; directoryURL = directory; descriptor = leaseDescriptor
+        self.directoryDescriptor = directoryDescriptor
         self.device = device; self.inode = inode
+    }
+
+    func captureDirectory() throws -> TaskCaptureDirectory {
+        lock.lock(); defer { lock.unlock() }
+        guard !removed, descriptor >= 0, directoryDescriptor >= 0 else { throw TaskTemporaryResourceError.unavailable }
+        if let captureStorage {
+            guard captureStorage.pathIsCurrent() else { throw TaskTemporaryResourceError.unavailable }
+            return captureStorage
+        }
+        var current = stat()
+        guard lstat(directoryURL.path, &current) == 0, (current.st_mode & S_IFMT) == S_IFDIR,
+              current.st_dev == device, current.st_ino == inode else { throw TaskTemporaryResourceError.unavailable }
+        if mkdirat(directoryDescriptor, "capture", TaskTemporaryResourceLedger.directoryPermissions) != 0 && errno != EEXIST {
+            throw TaskTemporaryResourceError.unavailable
+        }
+        let child = openat(directoryDescriptor, "capture", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard child >= 0 else { throw TaskTemporaryResourceError.unavailable }
+        var transferred = false
+        defer { if !transferred { close(child) } }
+        try TaskTemporaryResourceLedger.validatePrivateDirectory(child)
+        guard fstat(child, &current) == 0, fsync(directoryDescriptor) == 0 else { throw TaskTemporaryResourceError.unavailable }
+        try TaskTemporaryResourceLedger.recordCaptureDirectory(current, leaseDescriptor: descriptor)
+        let capture = TaskCaptureDirectory(directoryURL: directoryURL.appendingPathComponent("capture", isDirectory: true),
+                                           descriptor: child, status: current)
+        transferred = true
+        guard capture.pathIsCurrent() else { throw TaskTemporaryResourceError.unavailable }
+        captureStorage = capture
+        return capture
     }
 
     /// Graceful retirement removes only this UUID directory while its process
@@ -284,22 +465,30 @@ final class TaskTemporaryResourceLease: @unchecked Sendable {
         guard !removed else { lock.unlock(); return }
         removed = true
         let leaseDescriptor = descriptor
+        let directoryDescriptor = self.directoryDescriptor
         lock.unlock()
 
-        TaskTemporaryResourceLedger.removeOwnedDirectory(root: rootURL, directory: directoryURL,
-            leaseDescriptor: leaseDescriptor, device: device, inode: inode)
+        if captureStorage?.hasRemovalConflict != true {
+            TaskTemporaryResourceLedger.removeOwnedDirectory(root: rootURL, directory: directoryURL,
+                leaseDescriptor: leaseDescriptor, directoryDescriptor: directoryDescriptor, device: device, inode: inode)
+        }
         release(leaseDescriptor)
     }
 
     private func release(_ leaseDescriptor: Int32) {
         guard leaseDescriptor >= 0 else { return }
-        lock.lock(); descriptor = -1; lock.unlock()
+        lock.lock(); descriptor = -1
+        let directory = directoryDescriptor; directoryDescriptor = -1; captureStorage = nil
+        lock.unlock()
+        if directory >= 0 { close(directory) }
         flock(leaseDescriptor, LOCK_UN)
         close(leaseDescriptor)
     }
 
     deinit {
-        lock.lock(); let leaseDescriptor = descriptor; descriptor = -1; lock.unlock()
+        lock.lock(); let leaseDescriptor = descriptor; descriptor = -1
+        let directory = directoryDescriptor; directoryDescriptor = -1; lock.unlock()
+        if directory >= 0 { close(directory) }
         if leaseDescriptor >= 0 { flock(leaseDescriptor, LOCK_UN); close(leaseDescriptor) }
     }
 }

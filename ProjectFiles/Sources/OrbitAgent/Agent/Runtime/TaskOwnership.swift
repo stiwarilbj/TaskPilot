@@ -24,8 +24,7 @@ final class TaskLease: @unchecked Sendable {
     }
     private struct CaptureArtifact {
         let bytes: Int64
-        let device: dev_t
-        let inode: ino_t
+        let identity: TaskCaptureDirectory.FileIdentity
         var references = 0
         var expired = false
     }
@@ -36,6 +35,7 @@ final class TaskLease: @unchecked Sendable {
     private let captureByteLimit: Int64
     private let scratchRoot: URL
     private var scratchLease: TaskTemporaryResourceLease?
+    private var captureStorage: TaskCaptureDirectory?
     private var screenText: (revision: String, suspension: Int, snapshot: ScreenTextSnapshot)?
     private var revocationObservers: [UUID: @Sendable () -> Void] = [:]
     private var pauseWaiters: [UUID: @Sendable () -> Void] = [:]
@@ -575,30 +575,25 @@ final class TaskLease: @unchecked Sendable {
     }
     /// Only PNGs in this owner's private capture directory enter the ledger.
     /// A snapshot's lifetime expires on explicit discard or drained retirement.
-    private func capturePathIsOwned(_ url: URL) -> Bool {
-        guard let scratchLease, url.isFileURL, url.pathExtension == "png" else { return false }
-        let parent = scratchLease.directoryURL.appendingPathComponent("capture", isDirectory: true).standardizedFileURL
-        return url.standardizedFileURL.deletingLastPathComponent() == parent &&
-            parent.resolvingSymlinksInPath() == parent
-    }
-    private func captureStatus(_ url: URL) -> stat? {
-        var info = stat()
-        guard lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
-              info.st_size >= 0 else { return nil }
-        return info
+    private func boundCaptureDirectory() throws -> TaskCaptureDirectory {
+        if let captureStorage { return captureStorage }
+        guard let scratchLease else { throw CaptureArtifactError.invalidArtifact }
+        let capture = try scratchLease.captureDirectory()
+        captureStorage = capture
+        return capture
     }
     /// Metadata only: no directory scan, image read, or user output tracking.
     private func pruneCaptureArtifacts() {
         for url in Array(artifacts.keys) {
             guard let entry = artifacts[url], entry.references == 0 else { continue }
-            var info = stat()
-            let found = lstat(url.path, &info) == 0
-            // An unreadable parent is not proof that a retained file is gone.
-            guard found || errno == ENOENT else { continue }
-            let matches = found && (info.st_mode & S_IFMT) == S_IFREG &&
-                info.st_dev == entry.device && info.st_ino == entry.inode
-            if entry.expired && matches && capturePathIsOwned(url) {
-                do { try FileManager.default.removeItem(at: url) } catch { continue }
+            guard let captureStorage, let name = captureStorage.filename(for: url) else { continue }
+            let current: stat?
+            // An unreadable descriptor is not proof that a retained file is gone.
+            do { current = try captureStorage.status(named: name) } catch { continue }
+            let matches = current.map { ($0.st_mode & S_IFMT) == S_IFREG &&
+                TaskCaptureDirectory.FileIdentity($0) == entry.identity } ?? false
+            if entry.expired && matches {
+                guard (try? captureStorage.removeFile(named: name, expected: entry.identity)) == true else { continue }
             } else if matches { continue }
             artifacts.removeValue(forKey: url)
             artifactBytes -= entry.bytes
@@ -607,6 +602,7 @@ final class TaskLease: @unchecked Sendable {
         // also protect early retirement and delayed native image consumers.
         if value == .retired && artifacts.isEmpty && captureEncoders == 0 {
             let scratch = scratchLease; scratchLease = nil
+            captureStorage = nil
             scratch?.removeDirectory()
         }
     }
@@ -618,6 +614,8 @@ final class TaskLease: @unchecked Sendable {
     func beginCaptureEncoding() throws -> CaptureArtifactHold {
         lock.lock(); defer { lock.unlock() }
         try check()
+        _ = try scratchDirectory()
+        _ = try boundCaptureDirectory()
         captureEncoders += 1
         return CaptureArtifactHold { [self] in
             lock.lock(); defer { lock.unlock() }
@@ -628,8 +626,10 @@ final class TaskLease: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         try check()
         let url = url.standardizedFileURL
+        let capture = try boundCaptureDirectory()
         guard var entry = artifacts[url], !entry.expired,
-              let info = captureStatus(url), info.st_dev == entry.device, info.st_ino == entry.inode else {
+              capture.pathIsCurrent(), let name = capture.filename(for: url),
+              let info = try capture.status(named: name), TaskCaptureDirectory.FileIdentity(info) == entry.identity else {
             throw CaptureArtifactError.invalidArtifact
         }
         entry.references += 1; artifacts[url] = entry
@@ -642,30 +642,32 @@ final class TaskLease: @unchecked Sendable {
     func ownArtifact(_ url: URL) throws {
         lock.lock(); defer { lock.unlock() }
         let url = url.standardizedFileURL
-        guard capturePathIsOwned(url), let info = captureStatus(url) else { throw CaptureArtifactError.invalidArtifact }
         try check()
+        let capture = try boundCaptureDirectory()
+        guard capture.pathIsCurrent(), let name = capture.filename(for: url),
+              let info = try capture.status(named: name), (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_uid == getuid(), info.st_size >= 0 else { throw CaptureArtifactError.invalidArtifact }
         pruneCaptureArtifacts()
         if let existing = artifacts[url] {
-            guard existing.device == info.st_dev, existing.inode == info.st_ino,
-                  existing.bytes == info.st_size else { throw CaptureArtifactError.invalidArtifact }
+            guard existing.identity == TaskCaptureDirectory.FileIdentity(info) else { throw CaptureArtifactError.invalidArtifact }
             return
         }
         guard artifacts.count < captureFileLimit,
               info.st_size <= captureByteLimit - artifactBytes else { throw CaptureArtifactError.retentionLimit }
-        artifacts[url] = CaptureArtifact(bytes: info.st_size, device: info.st_dev, inode: info.st_ino)
+        artifacts[url] = CaptureArtifact(bytes: info.st_size, identity: .init(info))
         artifactBytes += info.st_size
     }
     func discardArtifact(_ url: URL) {
         lock.lock(); defer { lock.unlock() }
         let url = url.standardizedFileURL
-        guard capturePathIsOwned(url) else { return }
+        guard let capture = try? boundCaptureDirectory(), let name = capture.filename(for: url) else { return }
         if var entry = artifacts[url] {
             entry.expired = true; artifacts[url] = entry
             pruneCaptureArtifacts()
-        } else if captureStatus(url) != nil {
+        } else if let info = try? capture.status(named: name), (info.st_mode & S_IFMT) == S_IFREG {
             // Failed/partial compression has not yet entered the ledger. Only
             // the encoder's private, unique destination may be removed here.
-            try? FileManager.default.removeItem(at: url)
+            _ = try? capture.removeFile(named: name, expected: .init(info))
         }
     }
     func bindScreenText(_ snapshot: ScreenTextSnapshot?, revision: String = "") throws {

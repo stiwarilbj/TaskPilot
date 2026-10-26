@@ -120,4 +120,72 @@ final class CaptureArtifactLedgerTests: XCTestCase {
         XCTAssertThrowsError(try owner.beginCaptureEncoding())
         XCTAssertThrowsError(try owner.retainCaptureArtifact(a))
     }
+
+    func testRenamedCaptureDirectoryCannotRedirectCleanupOrRetains() throws {
+        for useSymlink in [false, true] {
+            let owner = try owner()
+            let original = try file(owner, bytes: 9, name: "screen")
+            let scratch = try owner.scratchDirectory()
+            try owner.ownArtifact(original)
+            var hold: CaptureArtifactHold? = try owner.retainCaptureArtifact(original)
+            let parked = scratch.deletingLastPathComponent().appendingPathComponent("parked-\(UUID())")
+            try FileManager.default.moveItem(at: original.deletingLastPathComponent(), to: parked)
+            let replacement = scratch.deletingLastPathComponent().appendingPathComponent("replacement-\(UUID())")
+            if useSymlink {
+                try FileManager.default.createDirectory(at: replacement, withIntermediateDirectories: false)
+                try FileManager.default.createSymbolicLink(at: original.deletingLastPathComponent(), withDestinationURL: replacement)
+            } else {
+                try FileManager.default.createDirectory(at: original.deletingLastPathComponent(), withIntermediateDirectories: false)
+            }
+            let replacementFile = useSymlink ? replacement.appendingPathComponent(original.lastPathComponent) : original
+            try Data("replacement".utf8).write(to: replacementFile)
+            XCTAssertThrowsError(try owner.retainCaptureArtifact(original))
+            XCTAssertThrowsError(try owner.ownArtifact(original))
+            owner.discardArtifact(original)
+            XCTAssertEqual(owner.captureArtifactUsage.totalBytes, 9)
+            withExtendedLifetime(hold) {}; hold = nil
+            XCTAssertFalse(FileManager.default.fileExists(atPath: parked.appendingPathComponent(original.lastPathComponent).path))
+            XCTAssertEqual(owner.captureArtifactUsage, .init(fileCount: 0, totalBytes: 0))
+            owner.revoke(); owner.retire()
+            XCTAssertEqual(try Data(contentsOf: replacementFile), Data("replacement".utf8),
+                           "Final scratch cleanup must also refuse a replacement capture directory")
+        }
+    }
+
+    func testReplacedOrModifiedPNGDoesNotCountAsTheRegisteredArtifact() throws {
+        let owner = try owner()
+        let original = try file(owner, bytes: 9)
+        try owner.ownArtifact(original)
+        let parked = original.appendingPathExtension("old")
+        try FileManager.default.moveItem(at: original, to: parked)
+        try Data("different".utf8).write(to: original)
+        owner.discardArtifact(original)
+        XCTAssertEqual(try Data(contentsOf: original), Data("different".utf8))
+        XCTAssertEqual(owner.captureArtifactUsage.fileCount, 0)
+
+        let modified = try file(owner, bytes: 9)
+        try owner.ownArtifact(modified)
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: modified.path)
+        owner.discardArtifact(modified)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: modified.path))
+        XCTAssertEqual(owner.captureArtifactUsage.fileCount, 0)
+        owner.revoke(); owner.retire()
+    }
+
+    func testPartialCaptureDiscardUsesTheDirectoryPinnedBeforeEncoding() throws {
+        let owner = try owner()
+        var encoding: CaptureArtifactHold? = try owner.beginCaptureEncoding()
+        let partial = try file(owner, bytes: 3, name: "partial")
+        let scratch = try owner.scratchDirectory()
+        let parked = scratch.deletingLastPathComponent().appendingPathComponent("partial-\(UUID())")
+        try FileManager.default.moveItem(at: partial.deletingLastPathComponent(), to: parked)
+        try FileManager.default.createDirectory(at: partial.deletingLastPathComponent(), withIntermediateDirectories: false)
+        try Data("replacement".utf8).write(to: partial)
+        owner.discardArtifact(partial)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: parked.appendingPathComponent(partial.lastPathComponent).path))
+        XCTAssertEqual(try Data(contentsOf: partial), Data("replacement".utf8))
+        owner.revoke(); owner.retire()
+        withExtendedLifetime(encoding) {}; encoding = nil
+        XCTAssertEqual(try Data(contentsOf: partial), Data("replacement".utf8))
+    }
 }
