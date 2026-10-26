@@ -4,6 +4,12 @@ import XCTest
 @testable import OrbitAgent
 
 final class RuntimeTransportTests: XCTestCase {
+    private final class FakeClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0.0
+        func now() -> TimeInterval { lock.withLock { value } }
+        func advance(_ seconds: TimeInterval) { lock.withLock { value += seconds } }
+    }
     func testUnterminatedFloodNeverRetainsMoreThanOneFrame() {
         var buffer = RuntimeLineBuffer(frameLimit: 64)
         XCTAssertTrue(buffer.append(Data(repeating: 0x78, count: 64)).isEmpty)
@@ -64,6 +70,28 @@ final class RuntimeTransportTests: XCTestCase {
         queue.sync { XCTAssertEqual(writer.pendingBytes, 0); writer.cancel() }
     }
 
+    func testWriterQueueWaitEndsAtFirstWriteAndSeparatesPendingCancellation() {
+        let queue = DispatchQueue(label: "fixture.writer.queue-wait"), pipe = Pipe()
+        let clock = FakeClock(), telemetry = BackendTelemetry(now: { clock.now() })
+        let delivered = expectation(description: "First frame delivered")
+        var writer: RuntimePipeWriter!
+        queue.sync {
+            writer = RuntimePipeWriter(handle: pipe.fileHandleForWriting, queue: queue, telemetry: telemetry) { XCTFail($0) }
+            writer.enqueue(Data("first".utf8)) { success in XCTAssertTrue(success); delivered.fulfill() }
+            clock.advance(0.004) // Hold the serial queue before the write source can run.
+        }
+        wait(for: [delivered], timeout: 1)
+        queue.sync {
+            writer.enqueue(Data("cancelled".utf8)) { success in XCTAssertFalse(success) }
+            clock.advance(0.002)
+            writer.cancel() // Cancellation wins before the queued write callback.
+        }
+        let histogram = telemetry.queueWaitHistograms().first { $0.queue == .pipeFirstWrite }
+        XCTAssertEqual(histogram?.countsByDisposition[.started]?[2], 1)
+        XCTAssertEqual(histogram?.countsByDisposition[.cancelled]?[2], 1)
+        queue.sync { writer.cancel() }
+    }
+
     func testBlockedWriterHasBoundedDeadlineWithoutBlockingOwningQueue() {
         let queue = DispatchQueue(label: "fixture.blocked.writer"), pipe = Pipe()
         let failed = expectation(description: "Write deadline"), responsive = expectation(description: "Queue remains responsive")
@@ -81,15 +109,20 @@ final class RuntimeTransportTests: XCTestCase {
 
     func testWriterOverflowRejectsAllPendingFramesExactlyOnce() {
         let queue = DispatchQueue(label: "fixture.writer.overflow"), pipe = Pipe()
+        let telemetry = BackendTelemetry()
         var outcomes: [Bool] = [], failures: [String] = []
         queue.sync {
-            let writer = RuntimePipeWriter(handle: pipe.fileHandleForWriting, queue: queue, byteLimit: 100, reserve: 40) { failures.append($0) }
+            let writer = RuntimePipeWriter(handle: pipe.fileHandleForWriting, queue: queue, byteLimit: 100, reserve: 40,
+                telemetry: telemetry) { failures.append($0) }
             writer.enqueue(Data(repeating: 0x61, count: 60)) { outcomes.append($0) }
             writer.enqueue(Data(repeating: 0x62, count: 1)) { outcomes.append($0) }
             writer.cancel()
             XCTAssertEqual(writer.pendingBytes, 0)
         }
         XCTAssertEqual(outcomes, [false, false]); XCTAssertEqual(failures, ["transport_buffer_limit"])
+        let histogram = telemetry.queueWaitHistograms().first { $0.queue == .pipeFirstWrite }
+        XCTAssertEqual(histogram?.countsByDisposition[.rejected]?.reduce(0, +), 1)
+        XCTAssertEqual(histogram?.countsByDisposition[.cancelled]?.reduce(0, +), 1)
     }
 
     func testCancellationWakesWriterWithoutWaitingForItsDeadline() {

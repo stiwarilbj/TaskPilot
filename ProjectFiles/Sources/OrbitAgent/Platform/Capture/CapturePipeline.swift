@@ -39,6 +39,7 @@ actor CaptureAcquisitionQueue {
         let owner: TaskLease?
         let epoch: Int?
         let observer: UUID?
+        let waitTicket: BackendTelemetry.QueueTicket
         let continuation: CheckedContinuation<Reservation, Error>
         func valid() -> Bool {
             (try? cancellation.check()) != nil && (owner == nil || (owner?.state == .running && owner?.suspensionRevision == epoch))
@@ -56,7 +57,9 @@ actor CaptureAcquisitionQueue {
               previewFrames: frames.values.filter { $0 == .preview }.count,
               waitingEvidence: evidence.count, waitingPreview: preview == nil ? 0 : 1, acquiring: active != nil)
     }
-    func acquire(_ kind: Kind, owner: TaskLease? = nil) async throws -> Reservation {
+    func acquire(_ kind: Kind, owner: TaskLease? = nil,
+                 waitTicket suppliedTicket: BackendTelemetry.QueueTicket? = nil) async throws -> Reservation {
+        let waitTicket = suppliedTicket ?? BackendTelemetry.current.beginQueueWait(kind == .evidence ? .captureEvidence : .capturePreview)
         let id = UUID(), cancellation = CaptureCancellation(), epoch = owner?.suspensionRevision
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -64,18 +67,21 @@ actor CaptureAcquisitionQueue {
                     cancellation.cancel(); Task { await self?.cancel(id) }
                 }
                 let request = Request(id: id, kind: kind, cancellation: cancellation, owner: owner,
-                    epoch: epoch, observer: observer, continuation: continuation)
+                    epoch: epoch, observer: observer, waitTicket: waitTicket, continuation: continuation)
                 guard !Task.isCancelled, request.valid() else {
+                    waitTicket.discard(.cancelled)
                     request.removeObserver(); continuation.resume(throwing: CancellationError()); return
                 }
                 if kind == .evidence {
                     guard evidence.count < maximumWaitingEvidence else {
+                        waitTicket.discard(.rejected)
                         request.removeObserver(); continuation.resume(throwing: ScreenCaptureError.pipelineBusy); return
                     }
                     evidence.append(request)
                 } else {
                     // Never retain a chain of obsolete viewer requests.
                     if let previous = preview {
+                        previous.waitTicket.discard(.coalesced)
                         previous.cancellation.cancel(); previous.removeObserver()
                         previous.continuation.resume(throwing: CancellationError())
                     }
@@ -88,10 +94,10 @@ actor CaptureAcquisitionQueue {
     }
     private func cancel(_ id: UUID) {
         if let index = evidence.firstIndex(where: { $0.id == id }) {
-            let request = evidence.remove(at: index); request.removeObserver()
+            let request = evidence.remove(at: index); request.waitTicket.discard(.cancelled); request.removeObserver()
             request.continuation.resume(throwing: CancellationError())
         } else if preview?.id == id, let request = preview {
-            preview = nil; request.removeObserver(); request.continuation.resume(throwing: CancellationError())
+            preview = nil; request.waitTicket.discard(.cancelled); request.removeObserver(); request.continuation.resume(throwing: CancellationError())
         }
         // An active native acquisition must drain before another starts.
         if active?.id == id { active?.cancellation.cancel() }
@@ -102,10 +108,10 @@ actor CaptureAcquisitionQueue {
         // Reject stopped/paused epochs even if their cancellation callback has
         // not reached this actor. Every continuation settles exactly once.
         while let first = evidence.first, !first.valid() {
-            evidence.removeFirst(); first.removeObserver(); first.continuation.resume(throwing: CancellationError())
+            evidence.removeFirst(); first.waitTicket.discard(.cancelled); first.removeObserver(); first.continuation.resume(throwing: CancellationError())
         }
         if let request = preview, !request.valid() {
-            preview = nil; request.removeObserver(); request.continuation.resume(throwing: CancellationError())
+            preview = nil; request.waitTicket.discard(.cancelled); request.removeObserver(); request.continuation.resume(throwing: CancellationError())
         }
         let request: Request
         if !evidence.isEmpty, frames.values.filter({ $0 == .evidence }).count < 2 {
@@ -114,6 +120,7 @@ actor CaptureAcquisitionQueue {
             guard !frames.values.contains(.preview) else { return }
             request = next; preview = nil
         } else { return }
+        request.waitTicket.start()
         active = request; frames[request.id] = request.kind
         request.continuation.resume(returning: Reservation(id: request.id, cancellation: request.cancellation, owner: request.owner, epoch: request.epoch, queue: self))
     }
@@ -155,6 +162,7 @@ actor CapturePNGEncoder {
         let cancellation: CaptureCancellation
         let observer: UUID?
         let telemetry: BackendTelemetry
+        let waitTicket: BackendTelemetry.QueueTicket
         let budget: LocalOperationBudget?
         let continuation: CheckedContinuation<URL, Error>
         func removeObserver() { if let observer { frame.reservation.owner?.removeRevocationObserver(observer) } }
@@ -171,21 +179,25 @@ actor CapturePNGEncoder {
     }
     var pendingCount: Int { waiting.count }
     var activeCount: Int { active == nil ? 0 : 1 }
-    func encode(_ frame: CapturedFrame) async throws -> URL {
-        try frame.check()
+    func encode(_ frame: CapturedFrame, telemetry suppliedTelemetry: BackendTelemetry? = nil,
+                waitTicket suppliedTicket: BackendTelemetry.QueueTicket? = nil) async throws -> URL {
+        let waitTicket = suppliedTicket ?? BackendTelemetry.current.beginQueueWait(.pngCompression)
+        do { try frame.check() } catch { waitTicket.discard(error is CancellationError ? .cancelled : .rejected); throw error }
         let id = UUID(), cancellation = CaptureCancellation()
-        let telemetry = BackendTelemetry.current
+        let telemetry = suppliedTelemetry ?? BackendTelemetry.current
         let url: URL = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                guard !Task.isCancelled else { continuation.resume(throwing: CancellationError()); return }
+                guard !Task.isCancelled else { waitTicket.discard(.cancelled); continuation.resume(throwing: CancellationError()); return }
                 guard frameIDs.count < 2, !frameIDs.contains(frame.id) else {
+                    waitTicket.discard(.rejected)
                     continuation.resume(throwing: ScreenCaptureError.pipelineBusy); return
                 }
                 let observer = frame.reservation.owner?.observeRevocation { [weak self] in
                     cancellation.cancel(); Task { await self?.cancel(id) }
                 }
                 let job = Job(id: id, frame: frame, url: directory.appendingPathComponent("screen-\(UUID().uuidString).png"),
-                    cancellation: cancellation, observer: observer, telemetry: telemetry, budget: LocalOperationBudget.current, continuation: continuation)
+                    cancellation: cancellation, observer: observer, telemetry: telemetry, waitTicket: waitTicket,
+                    budget: LocalOperationBudget.current, continuation: continuation)
                 frameIDs.insert(frame.id); waiting.append(job); pump()
             }
         } onCancel: { cancellation.cancel(); Task { await self.cancel(id) } }
@@ -195,7 +207,7 @@ actor CapturePNGEncoder {
     }
     private func cancel(_ id: UUID) {
         if let index = waiting.firstIndex(where: { $0.id == id }) {
-            let job = waiting.remove(at: index); frameIDs.remove(job.frame.id); job.removeObserver()
+            let job = waiting.remove(at: index); job.waitTicket.discard(.cancelled); frameIDs.remove(job.frame.id); job.removeObserver()
             job.continuation.resume(throwing: CancellationError())
         }
         if active?.id == id {
@@ -208,6 +220,7 @@ actor CapturePNGEncoder {
         let job = waiting.removeFirst(); active = job
         let writer = writer, directory = directory
         worker = Task.detached(priority: .userInitiated) {
+            job.waitTicket.start()
             let result: Result<URL, Error> = Result {
                 try LocalOperationBudget.$current.withValue(job.budget) {
                     try BackendTelemetry.$current.withValue(job.telemetry) {

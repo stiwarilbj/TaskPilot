@@ -27,8 +27,8 @@ rank; individual numeric samples retain failures and cancellations.
 | PNG Encoding | Existing ImageIO PNG encoding and file output; raw and encoded byte counts plus pixels. Includes an optional file-size read. |
 | JSON Encoding / Decoding | Native runtime JSON serialization/parsing and task-ledger codecs, including failures. Bytes reflect the encoded frame/file where safe. |
 | IPC Receive | One runtime line's decode, ownership checks, and dispatch scheduling; excludes waiting for a line/provider response. |
-| IPC Send | Write to the originating private pipe, including initial configuration. Bytes include the newline where recorded. |
-| IPC Bridge | Owned native bridge scheduling/handling through response encoding and pipe delivery, or rejection/cancellation. Can overlap capture/AX/action intervals. |
+| IPC Send | End-to-end write to the originating private pipe, including time queued behind prior frames and pipe backpressure. Bytes include the newline where recorded. Do not interpret this span as pure processing time. |
+| IPC Bridge | End-to-end owned bridge handling from accepted request through response encoding and private-pipe delivery, or rejection/cancellation. Includes bridge-task and response-queue waits, so it is not pure processing time; queue histograms report admission waits separately. Can overlap capture/AX/action intervals. |
 | Command Launch | `Process.run()` inside the existing ownership/delivery gate. Counts arguments excluding executable; also covers existing syntax/probe process launches. Execution, timeout waits, and output drainage are excluded. |
 | Persistence Read / Write | Entire existing task-ledger load/save, including queued codecs, atomic write, and permissions. File bytes and entry counts only. |
 
@@ -36,6 +36,31 @@ These are wall-time intervals, not CPU measurements. Nested intervals must not
 be added to infer total latency. Python Base64 encoding and ACP/provider waits
 are outside this native instrumentation. Measurements never create observations,
 actions, retries, or model requests. They do not change readiness or completion.
+
+## Queue wait histograms
+
+Queue tickets capture a monotonic enqueue time before submission and close at
+the first execution or admission boundary. Fixed-size counters stay in memory
+for the recorder lifetime; no individual enqueue times, payloads, task IDs, or
+event histories are retained. Buckets have upper bounds of 0.1, 1, 5, 10, 50,
+100, 500, 1,000, and 5,000 milliseconds, followed by overflow. Started work
+and work cancelled, rejected, coalesced, or abandoned before start have separate
+counts and share a per-queue maximum wait.
+
+| Queue | Enqueue to start boundary |
+| --- | --- |
+| Runtime I/O | Before async/sync submission to the serialized runtime queue; first instruction of the queued closure. Calls already executing on that queue are direct and have no wait sample. |
+| Bridge task / observation task | Before creating the bridge task; its first instruction. Observation task wait is scheduling only; AX Collection remains the synchronous traversal span. |
+| Main event delivery | Before `DispatchQueue.main.async`; first instruction of its main-queue closure. The later runtime I/O ownership check is measured separately. |
+| Evidence / preview capture | Before capture actor submission; when a reservation is granted. Preview replacements count as coalesced before start. |
+| PNG compression | Before encoder actor submission; first instruction on the detached compression worker. This includes actor admission, the encoder backlog, and worker scheduling. |
+| Pipe first write | When a frame is accepted by the private writer; immediately before its first write attempt. Later partial writes and backpressure remain in the end-to-end IPC Send span. |
+
+Intentional timer delays, provider-response waits, Pause time, and periodic drain
+polling are excluded. Queue wait is not processing duration; existing phase
+spans measure work after it begins. Overlapping wall-time spans must not be
+subtracted or summed to infer CPU time. Signposts use fixed queue names and
+numeric disposition and wait fields only.
 
 ## Offline baseline
 
@@ -91,6 +116,11 @@ path is explicitly supplied. Reports contain only fixed workload names and
 numeric metrics and are saved with mode 0600. No task evidence is exported.
 Run the benchmark without other suites or profiling for latency comparisons.
 Use the same build mode and workloads across changes.
+The report includes idle and synthetic eight-millisecond queue-wait fixtures,
+a serial worker held behind a contended queue, their histograms, paired bridge
+spans, and approximate idle ticket cost. Synthetic waits use an injected clock;
+the contended fixture uses a disposable serial queue. Capture and runtime
+transport fixtures also exercise local queue admission without desktop automation.
 
 To verify emission separately, launch the **XCTest runner**, not TaskPilot, under
 Instruments' `os_signpost` instrument. Select the offline benchmark test in the

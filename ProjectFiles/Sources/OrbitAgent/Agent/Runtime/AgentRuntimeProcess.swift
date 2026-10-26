@@ -130,6 +130,7 @@ final class AgentRuntimeProcess {
     private let bridgeHandler: (([String: Any]) async -> [String: Any])?
     private let drainReportingDelay: TimeInterval
     private let ioQueue = DispatchQueue(label: "com.orbitagent.runtime-io")
+    private let ioQueueKey = DispatchSpecificKey<UInt8>()
     private let telemetry = BackendTelemetry.current
     private var pressureRegistration: MemoryPressureMonitor.Registration?
     private final class Invocation {
@@ -191,11 +192,23 @@ final class AgentRuntimeProcess {
         self.bridge = bridge
         self.bridgeHandler = bridgeHandler
         self.drainReportingDelay = drainReportingDelay
+        ioQueue.setSpecific(key: ioQueueKey, value: 1)
         pressureRegistration = memoryPressure.register { [weak self] in self?.evictRuntimeCaches() }
     }
 
+    private func enqueueIO(_ work: @escaping () -> Void) {
+        let wait = telemetry.beginQueueWait(.runtimeIO)
+        ioQueue.async { wait.start(); work() }
+    }
+
+    private func syncIO<T>(_ work: () throws -> T) rethrows -> T {
+        if DispatchQueue.getSpecific(key: ioQueueKey) != nil { return try work() }
+        let wait = telemetry.beginQueueWait(.runtimeIO)
+        return try ioQueue.sync { wait.start(); return try work() }
+    }
+
     private func evictRuntimeCaches() {
-        ioQueue.async { [weak self] in
+        enqueueIO { [weak self] in
             guard let self, let run = self.invocation, run.supportsMemoryPressure,
                   run.lease.accepts(run.lease.id) else { return }
             self.send(["kind": "memory_pressure", "task_generation_id": run.lease.id,
@@ -213,7 +226,7 @@ final class AgentRuntimeProcess {
         continuationCheckpoint: AgentTaskContinuationCheckpoint? = nil,
         lease: TaskLease = TaskLease()
     ) throws {
-        guard ioQueue.sync(execute: { invocation == nil || invocation?.lease.state == .retired }) else { throw RuntimeProcessError.alreadyRunning }
+        guard syncIO({ invocation == nil || invocation?.lease.state == .retired }) else { throw RuntimeProcessError.alreadyRunning }
         let startup = telemetry.begin(.startup)
         var startupTransferred = false
         defer { if !startupTransferred { startup.finish(.failed) } }
@@ -251,9 +264,9 @@ final class AgentRuntimeProcess {
                              taskRequest: task, exactInputReferences: exactInputReferences, handler: onEvent)
         run.startupSpan = startup
         startupTransferred = true
-        ioQueue.sync {
+        syncIO {
             invocation = run
-            run.writer = RuntimePipeWriter(handle: input.fileHandleForWriting, queue: ioQueue) { [weak self, weak run] code in
+            run.writer = RuntimePipeWriter(handle: input.fileHandleForWriting, queue: ioQueue, telemetry: telemetry) { [weak self, weak run] code in
                 guard let self, let run else { return }
                 self.failTransport(code, for: run)
             }
@@ -263,7 +276,7 @@ final class AgentRuntimeProcess {
 
         process.terminationHandler = { [weak self] terminated in
             guard let self else { return }
-            self.ioQueue.async {
+            self.enqueueIO {
                 terminated.terminationHandler = nil
                 guard self.invocation === run, run.process === terminated else { return }
                 // Parent exit is not tree exit. Keep readers installed while
@@ -275,7 +288,7 @@ final class AgentRuntimeProcess {
                 self.beginDrain(run)
                 run.process.beginTeardown()
                 run.process.whenTreeExits {
-                    self.ioQueue.async {
+                    self.enqueueIO {
                         guard self.invocation === run else { return }
                         output.fileHandleForReading.readabilityHandler = nil
                         error.fileHandleForReading.readabilityHandler = nil
@@ -326,7 +339,7 @@ final class AgentRuntimeProcess {
             var configuration = try telemetry.encodeJSON(configurationFields, recordSize: false)
             configuration.append(0x0A)
             let sendSpan = telemetry.begin(.ipcSend)
-            ioQueue.sync {
+            syncIO {
                 run.writer?.enqueue(configuration, priority: true) { delivered in
                     sendSpan.finish(delivered ? .succeeded : .failed)
                 }
@@ -335,7 +348,7 @@ final class AgentRuntimeProcess {
             if launched {
                 // A successfully spawned helper must drain like every other
                 // invocation, even if writing its startup configuration fails.
-                ioQueue.async {
+                enqueueIO {
                     run.pendingTerminalEvent = .failed("Could not start the agent: \(launchError.localizedDescription)")
                     self.beginDrain(run)
                     process.beginTeardown()
@@ -349,13 +362,13 @@ final class AgentRuntimeProcess {
             lease.revoke()
             run.startupSpan?.finish(.failed)
             run.startupSpan = nil
-            ioQueue.sync { run.writer?.cancel(); run.exited = true; run.pendingTerminalEvent = nil; run.lease.retire() }
+            syncIO { run.writer?.cancel(); run.exited = true; run.pendingTerminalEvent = nil; run.lease.retire() }
             throw launchError
         }
     }
 
     func pause() {
-        ioQueue.sync {
+        syncIO {
             invocation?.snapshots.invalidateStatus()
             invocation?.lease.pause()
         }
@@ -364,7 +377,7 @@ final class AgentRuntimeProcess {
     }
 
     func resume() {
-        ioQueue.sync {
+        syncIO {
             invocation?.snapshots.invalidateStatus()
             invocation?.lease.resume()
         }
@@ -373,7 +386,7 @@ final class AgentRuntimeProcess {
     }
 
     func stop() {
-        let run = ioQueue.sync { () -> Invocation? in
+        let run = syncIO { () -> Invocation? in
             guard let run = invocation, run.lease.state != .retired else { return nil }
             run.lease.revoke(); run.requestedStop = true
             beginDrain(run)
@@ -393,7 +406,7 @@ final class AgentRuntimeProcess {
         // The credential crosses only the existing private stdin pipe. It is
         // never placed in arguments, environment variables, status text, or
         // the OpenClaw conversation.
-        let run = ioQueue.sync { () -> Invocation? in
+        let run = syncIO { () -> Invocation? in
             guard let run = invocation, run.pendingUserInputID == requestID,
                   run.pendingUserInputRevision == instructionRevision,
                   run.lease.accepts(taskGenerationID) else { return nil }
@@ -421,7 +434,7 @@ final class AgentRuntimeProcess {
     @discardableResult
     func submitTargetChoice(request: AgentTargetChoiceRequest, candidateID: String? = nil,
                             inspectAgain: Bool = false) -> Bool {
-        let run = ioQueue.sync { () -> Invocation? in
+        let run = syncIO { () -> Invocation? in
             guard let run = invocation, run.pendingTargetChoice?.id == request.id,
                   run.lease.accepts(request.taskGenerationID),
                   request.taskGenerationID == run.lease.id,
@@ -456,7 +469,7 @@ final class AgentRuntimeProcess {
     }
 
     func prepareInstructionCorrection(_ correction: TaskInstructionCorrection, generationID: String) throws {
-        let run = try ioQueue.sync { () throws -> Invocation in
+        let run = try syncIO { () throws -> Invocation in
             guard let run = invocation, run.lease.id == generationID,
                   run.lease.state == .running || run.lease.state == .paused else {
                 throw TaskInstructionCorrectionError.stale
@@ -474,7 +487,7 @@ final class AgentRuntimeProcess {
     }
 
     func sendInstructionCorrection(_ correction: TaskInstructionCorrection, generationID: String) throws {
-        let run = try ioQueue.sync { () throws -> Invocation in
+        let run = try syncIO { () throws -> Invocation in
             guard let run = invocation, run.lease.id == generationID,
                   run.correctionIDs.contains(correction.id.uuidString.lowercased()),
                   run.lease.state == .running || run.lease.state == .paused else {
@@ -492,13 +505,13 @@ final class AgentRuntimeProcess {
         run.writer?.enqueue(frame, priority: true) { [weak self, weak run] delivered in
             guard let self, let run else { return }
             if !delivered {
-                self.ioQueue.async { self.failTransport("transport_closed", for: run) }
+                self.enqueueIO { self.failTransport("transport_closed", for: run) }
             }
         }
     }
 
     func cancelInstructionCorrection(_ correctionID: UUID, generationID: String) {
-        let run = ioQueue.sync { () -> Invocation? in
+        let run = syncIO { () -> Invocation? in
             guard let run = invocation, run.lease.id == generationID else { return nil }
             run.lease.cancelInstructionCorrection(id: correctionID.uuidString)
             return run
@@ -507,7 +520,7 @@ final class AgentRuntimeProcess {
     }
 
     func prepareWorkingDocumentUpdate(_ update: WorkingDocumentUpdate, generationID: String) throws {
-        try ioQueue.sync {
+        try syncIO {
             guard let run = invocation, run.lease.id == generationID,
                   run.lease.state == .running || run.lease.state == .paused else {
                 throw WorkingDocumentUpdateError.stale
@@ -527,7 +540,7 @@ final class AgentRuntimeProcess {
     }
 
     func sendWorkingDocumentUpdate(_ update: WorkingDocumentUpdate, generationID: String) throws {
-        let run = try ioQueue.sync { () throws -> Invocation in
+        let run = try syncIO { () throws -> Invocation in
             guard let run = invocation, run.lease.id == generationID,
                   run.workingDocumentIDs.contains(update.id),
                   run.lease.state == .running || run.lease.state == .paused else {
@@ -539,12 +552,12 @@ final class AgentRuntimeProcess {
         frame.append(0x0A)
         run.writer?.enqueue(frame, priority: true) { [weak self, weak run] delivered in
             guard let self, let run else { return }
-            if !delivered { self.ioQueue.async { self.failTransport("transport_closed", for: run) } }
+            if !delivered { self.enqueueIO { self.failTransport("transport_closed", for: run) } }
         }
     }
 
     func cancelWorkingDocumentUpdate(_ updateID: String, generationID: String) {
-        ioQueue.sync {
+        syncIO {
             guard let run = invocation, run.lease.id == generationID else { return }
             run.lease.cancelWorkingDocumentUpdate(id: updateID)
             run.workingDocumentIDs.remove(updateID.lowercased())
@@ -552,7 +565,7 @@ final class AgentRuntimeProcess {
     }
 
     private func signalRuntime(_ signal: Int32) {
-        let process = ioQueue.sync { invocation?.process }
+        let process = syncIO { invocation?.process }
         process?.signal(signal)
     }
 
@@ -562,7 +575,7 @@ final class AgentRuntimeProcess {
             // read is queued can enqueue another blocking read ahead of a
             // bridge response and deadlock the controller pipe.
             handle.readabilityHandler = nil
-            self?.ioQueue.async { [weak self] in
+            self?.enqueueIO { [weak self] in
                 guard let self, self.invocation === run else { return }
                 let eof = self.drainAvailable(handle) { self.appendOutput($0, for: run) }
                 if !eof && !run.exited { self.installOutputHandler(handle, for: run) }
@@ -573,7 +586,7 @@ final class AgentRuntimeProcess {
     private func installErrorHandler(_ handle: FileHandle, for run: Invocation) {
         handle.readabilityHandler = { [weak self] handle in
             handle.readabilityHandler = nil
-            self?.ioQueue.async { [weak self] in
+            self?.enqueueIO { [weak self] in
                 guard let self, self.invocation === run else { return }
                 let eof = self.drainAvailable(handle) { self.appendError($0, for: run) }
                 if !eof && !run.exited { self.installErrorHandler(handle, for: run) }
@@ -706,24 +719,28 @@ final class AgentRuntimeProcess {
                 run.receiptIDs.insert(id)
             }
             let bridgeSpan = telemetry.begin(.ipcBridge, inputBytes: data.count)
+            let bridgeWait = telemetry.beginQueueWait(method == "observe" ? .observationTask : .bridgeTask)
             let operationID = UUID()
             run.pendingBridgeBytes += requestBytes
             let operation = Task { [weak self] in
-                guard let self else { bridgeSpan.finish(.cancelled); return }
-                var response = await TaskOwnership.$current.withValue(run.lease) {
-                    await TaskOwnership.$instructionRevision.withValue(instructionRevision) {
-                    await TaskOwnership.$workingDocumentRevision.withValue(workingDocumentRevision) {
-                    if let handler = self.bridgeHandler {
-                        return await TaskOwnership.withCancellationWakeup { await handler(message) }
-                    }
-                    return await self.bridge.handle(message)
-                    }
+                guard let self else { bridgeWait.discard(.abandoned); bridgeSpan.finish(.cancelled); return }
+                bridgeWait.start()
+                var response = await BackendTelemetry.$current.withValue(self.telemetry) {
+                    await TaskOwnership.$current.withValue(run.lease) {
+                        await TaskOwnership.$instructionRevision.withValue(instructionRevision) {
+                            await TaskOwnership.$workingDocumentRevision.withValue(workingDocumentRevision) {
+                                if let handler = self.bridgeHandler {
+                                    return await TaskOwnership.withCancellationWakeup { await handler(message) }
+                                }
+                                return await self.bridge.handle(message)
+                            }
+                        }
                     }
                 }
                 let changeLensCandidate = response.removeValue(forKey: "change_lens_candidate") as? [String: Any]
                 response["instruction_revision"] = message["instruction_revision"]
                 response["working_document_revision"] = message["working_document_revision"]
-                self.ioQueue.async {
+                self.enqueueIO {
                     if let changeLensCandidate,
                        let snapshot = AgentTaskChangeLensSnapshot.validatedCandidate(
                         changeLensCandidate, response: response, request: message, generationID: run.lease.id,
@@ -1098,7 +1115,7 @@ final class AgentRuntimeProcess {
     }
 
     private func send(_ object: [String: Any], for run: Invocation, bridgeSpan: BackendTelemetry.Span? = nil) {
-        ioQueue.async { [weak self] in
+        enqueueIO { [weak self] in
             guard let self, self.invocation === run, run.lease.accepts(object["task_generation_id"] as? String) else {
                 bridgeSpan?.finish(.cancelled); return
             }
@@ -1200,9 +1217,11 @@ final class AgentRuntimeProcess {
             failTransport("transport_event_limit", for: run); return
         }
         run.queuedEventCount += 1; run.queuedEventBytes += bytes
+        let deliveryWait = telemetry.beginQueueWait(.eventDelivery)
         DispatchQueue.main.async { [weak self] in
+            deliveryWait.start()
             guard let self else { return }
-            let delivery = self.ioQueue.sync {
+            let delivery = self.syncIO {
                 run.queuedEventCount -= 1; run.queuedEventBytes -= bytes
                 let checkpointDuringDrain: Bool
                 if case .taskContinuationCheckpoint = event { checkpointDuringDrain = true }

@@ -4,7 +4,7 @@ import XCTest
 @testable import OrbitAgent
 
 final class BackendTelemetryTests: XCTestCase {
-    private final class Clock: @unchecked Sendable {
+    private final class FakeClock: @unchecked Sendable {
         private let lock = NSLock()
         private var time = 0.0
         func now() -> Double { lock.withLock { time } }
@@ -17,7 +17,7 @@ final class BackendTelemetryTests: XCTestCase {
         return root
     }
     func testNumericMetadataAndFinishAreExactlyOnce() throws {
-        let clock = Clock(), telemetry = BackendTelemetry(now: { clock.now() })
+        let clock = FakeClock(), telemetry = BackendTelemetry(now: { clock.now() })
         let span = telemetry.begin(.capture, inputBytes: -1, items: 4)
         clock.advance(0.025)
         span.record(outputBytes: 32)
@@ -49,7 +49,7 @@ final class BackendTelemetryTests: XCTestCase {
         XCTAssertTrue(telemetry.summaries().isEmpty)
     }
     func testSuccessfulPercentilesAndPerPhaseRetention() throws {
-        let clock = Clock(), telemetry = BackendTelemetry(capacity: 20, now: { clock.now() })
+        let clock = FakeClock(), telemetry = BackendTelemetry(capacity: 20, now: { clock.now() })
         for value in 1...21 {
             telemetry.measure(.jsonEncoding) { _ in clock.advance(Double(value) / 1000) }
         }
@@ -72,6 +72,68 @@ final class BackendTelemetryTests: XCTestCase {
         }
         XCTAssertEqual(telemetry.samples().count, 16)
         XCTAssertTrue(telemetry.samples().allSatisfy { $0.inputBytes == 12 && $0.outcome == .succeeded })
+    }
+    func testQueueWaitHistogramsUseFixedBucketsAndCountEachDispositionOnce() throws {
+        let clock = FakeClock(), telemetry = BackendTelemetry(now: { clock.now() })
+        let immediate = telemetry.beginQueueWait(.runtimeIO)
+        XCTAssertTrue(immediate.start()); XCTAssertFalse(immediate.start())
+        immediate.discard(.cancelled)
+
+        let delayed = telemetry.beginQueueWait(.bridgeTask)
+        clock.advance(0.002) // 2 ms -> the 5 ms bucket
+        XCTAssertTrue(delayed.start())
+
+        let coalesced = telemetry.beginQueueWait(.capturePreview)
+        clock.advance(0.020) // 20 ms -> the 50 ms bucket
+        coalesced.discard(.coalesced); coalesced.discard(.coalesced)
+
+        let rejected = telemetry.beginQueueWait(.captureEvidence)
+        clock.advance(2)
+        rejected.discard(.rejected)
+
+        var abandoned: BackendTelemetry.QueueTicket? = telemetry.beginQueueWait(.pipeFirstWrite)
+        clock.advance(5.1)
+        XCTAssertNotNil(abandoned)
+        abandoned = nil
+
+        let histograms = telemetry.queueWaitHistograms()
+        let bridge = try XCTUnwrap(histograms.first { $0.queue == .bridgeTask })
+        XCTAssertEqual(bridge.upperBoundsMilliseconds, [0.1, 1, 5, 10, 50, 100, 500, 1_000, 5_000])
+        XCTAssertEqual(bridge.countsByDisposition[.started]?[2], 1)
+        let preview = try XCTUnwrap(histograms.first { $0.queue == .capturePreview })
+        XCTAssertEqual(preview.countsByDisposition[.coalesced]?[4], 1)
+        XCTAssertEqual(preview.maximumMilliseconds, 20, accuracy: 0.000001)
+        let capture = try XCTUnwrap(histograms.first { $0.queue == .captureEvidence })
+        XCTAssertEqual(capture.countsByDisposition[.rejected]?[8], 1)
+        let pipe = try XCTUnwrap(histograms.first { $0.queue == .pipeFirstWrite })
+        XCTAssertEqual(pipe.countsByDisposition[.abandoned]?[9], 1)
+        XCTAssertEqual(histograms.first { $0.queue == .runtimeIO }?.countsByDisposition[.started]?[0], 1)
+        XCTAssertNil(histograms.first { $0.queue == .runtimeIO }?.countsByDisposition[.cancelled])
+    }
+    func testQueueWaitBucketsCoverEveryBoundaryAndOverflow() throws {
+        let clock = FakeClock(), telemetry = BackendTelemetry(now: { clock.now() })
+        let bounds = [0.1, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1_000.0, 5_000.0]
+        let edgeCases = [0.0] + bounds.flatMap { [$0 - 0.001, $0 + 0.001] }
+        for milliseconds in edgeCases {
+            let ticket = telemetry.beginQueueWait(.runtimeIO)
+            clock.advance(milliseconds / 1_000)
+            XCTAssertTrue(ticket.start())
+        }
+        let histogram = try XCTUnwrap(telemetry.queueWaitHistograms().first { $0.queue == .runtimeIO })
+        XCTAssertEqual(histogram.countsByDisposition[.started], [2, 2, 2, 2, 2, 2, 2, 2, 2, 1])
+        XCTAssertEqual(histogram.upperBoundsMilliseconds, [0.1, 1, 5, 10, 50, 100, 500, 1_000, 5_000])
+    }
+    func testQueueWaitAggregationIsConcurrentAndFixedSize() throws {
+        let telemetry = BackendTelemetry()
+        DispatchQueue.concurrentPerform(iterations: 1_000) { _ in
+            let ticket = telemetry.beginQueueWait(.runtimeIO)
+            XCTAssertTrue(ticket.start())
+        }
+        let histograms = telemetry.queueWaitHistograms()
+        XCTAssertEqual(histograms.count, 1)
+        XCTAssertEqual(histograms[0].countsByDisposition.count, 1)
+        XCTAssertEqual(histograms[0].countsByDisposition[.started]?.count, 10)
+        XCTAssertEqual(histograms[0].countsByDisposition[.started]?.reduce(0, +), 1_000)
     }
     func testJSONContentCannotAppearInTelemetrySerialization() throws {
         let telemetry = BackendTelemetry()
@@ -137,6 +199,12 @@ final class BackendTelemetryTests: XCTestCase {
 
 /// Offline only: never collects the desktop, contacts a provider, or dispatches GUI input.
 final class BackendPhaseFixtureTests: XCTestCase {
+    private final class BenchmarkClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var time = 0.0
+        func now() -> TimeInterval { lock.withLock { time } }
+        func advance(_ seconds: TimeInterval) { lock.withLock { time += seconds } }
+    }
     private func fixture() throws -> URL {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
@@ -198,7 +266,7 @@ final class BackendPhaseFixtureTests: XCTestCase {
         let root = try fixture(), telemetry = BackendTelemetry()
         let url = try helper(root, body: """
         emit('runtime_ready', memory_pressure_version=1)
-        emit('bridge_request', request_id='fixture', method='fixture', params={})
+        emit('bridge_request', request_id='fixture', method='observe', params={})
         reply=json.loads(sys.stdin.readline())
         assert reply['ok'] and reply['task_generation_id']==config['task_generation_id']
         emit('complete', message='fixture complete')
@@ -212,6 +280,10 @@ final class BackendPhaseFixtureTests: XCTestCase {
         XCTAssertEqual(telemetry.samples().filter { $0.phase == .ipcSend }.count, 3)
         XCTAssertEqual(telemetry.samples().filter { $0.phase == .ipcReceive }.count, 4)
         XCTAssertGreaterThan(telemetry.samples().first { $0.phase == .ipcBridge }?.outputBytes ?? 0, 0)
+        let waits = telemetry.queueWaitHistograms()
+        for queue in [BackendTelemetry.Queue.runtimeIO, .bridgeTask, .observationTask, .eventDelivery, .pipeFirstWrite] {
+            XCTAssertGreaterThan(waits.first { $0.queue == queue }?.countsByDisposition[.started]?.reduce(0, +) ?? 0, 0)
+        }
     }
     @MainActor func testStartupFailureAndMissingRuntimeCloseIntervals() async throws {
         let root = try fixture(), telemetry = BackendTelemetry()
@@ -266,13 +338,16 @@ final class BackendPhaseFixtureTests: XCTestCase {
         struct Report: Codable {
             let workload: String
             let summaries: [BackendTelemetry.Summary]
+            let queueWaits: [BackendTelemetry.QueueWaitHistogram]
+            let instrumentationNanosecondsPerTicket: Double?
             let maxInputBytes: Int
             let maxOutputBytes: Int
         }
         var reports = [Report]()
-        func record(_ workload: String, _ telemetry: BackendTelemetry) {
+        func record(_ workload: String, _ telemetry: BackendTelemetry, ticketCost: Double? = nil) {
             XCTAssertTrue(telemetry.samples().allSatisfy { $0.outcome == .succeeded })
-            reports.append(Report(workload: workload, summaries: telemetry.summaries(),
+            reports.append(Report(workload: workload, summaries: telemetry.summaries(), queueWaits: telemetry.queueWaitHistograms(),
+                instrumentationNanosecondsPerTicket: ticketCost,
                 maxInputBytes: telemetry.samples().compactMap(\.inputBytes).max() ?? 0,
                 maxOutputBytes: telemetry.samples().compactMap(\.outputBytes).max() ?? 0))
         }
@@ -291,6 +366,37 @@ final class BackendPhaseFixtureTests: XCTestCase {
             }
             record("controls_\(count)_in_process", telemetry)
         }
+        for (workload, waitSeconds) in [("queue_wait_idle", 0.0), ("queue_wait_synthetic_8ms", 0.008)] {
+            let clock = BenchmarkClock(), telemetry = BackendTelemetry(now: { clock.now() })
+            let iterations = 500
+            let started = ContinuousClock.now
+            for _ in 0..<iterations {
+                let ticket = telemetry.beginQueueWait(.bridgeTask)
+                clock.advance(waitSeconds)
+                ticket.start()
+                telemetry.measure(.ipcBridge) { _ in clock.advance(0.0002) }
+            }
+            let elapsed = started.duration(to: .now)
+            let parts = elapsed.components
+            let elapsedNanoseconds = Double(parts.seconds) * 1_000_000_000 + Double(parts.attoseconds) / 1_000_000_000
+            record(workload, telemetry, ticketCost: elapsedNanoseconds / Double(iterations))
+        }
+        let contended = BackendTelemetry(), contendedQueue = DispatchQueue(label: "fixture.contended.runtime-io")
+        for _ in 0..<20 {
+            let ready = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+            contendedQueue.async { ready.signal(); _ = release.wait(timeout: .now() + 2) }
+            XCTAssertEqual(ready.wait(timeout: .now() + 2), .success)
+            let ticket = contended.beginQueueWait(.runtimeIO), finished = DispatchSemaphore(value: 0)
+            contendedQueue.async {
+                ticket.start()
+                contended.measure(.ipcBridge) { _ in }
+                finished.signal()
+            }
+            try await Task.sleep(for: .milliseconds(8))
+            release.signal()
+            XCTAssertEqual(finished.wait(timeout: .now() + 2), .success)
+        }
+        record("queue_wait_contended_worker", contended)
         for dimensions in [(640, 360), (2560, 1440)] {
             let telemetry = BackendTelemetry(), (width, height) = dimensions
             let context = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,

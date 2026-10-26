@@ -5,6 +5,12 @@ import XCTest
 @testable import OrbitAgent
 
 final class CapturePipelineTests: XCTestCase {
+    private final class Clock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0.0
+        func now() -> TimeInterval { lock.withLock { value } }
+        func advance(_ seconds: TimeInterval) { lock.withLock { value += seconds } }
+    }
     private var display: DisplayDescriptor { .init(id: 777, name: "fixture", x: -20, y: 10, width: 100, height: 80, isMain: false) }
     private func image(_ red: CGFloat, _ green: CGFloat = 0, _ blue: CGFloat = 0) throws -> CGImage {
         let context = try XCTUnwrap(CGContext(data: nil, width: 4, height: 4, bitsPerComponent: 8, bytesPerRow: 16,
@@ -93,6 +99,30 @@ final class CapturePipelineTests: XCTestCase {
         let preview = try await latest.value; try preview.check()
         await queue.acquired(preview)
     }
+    func testCaptureQueueMeasuresWaitAndPreviewCoalescing() async throws {
+        let clock = Clock(), telemetry = BackendTelemetry(now: { clock.now() }), queue = CaptureAcquisitionQueue()
+        let blockerTicket = telemetry.beginQueueWait(.capturePreview)
+        var blocker: CaptureAcquisitionQueue.Reservation? = try await queue.acquire(.preview, waitTicket: blockerTicket)
+        let oldTicket = telemetry.beginQueueWait(.capturePreview)
+        let old = Task { try await queue.acquire(.preview, waitTicket: oldTicket) }
+        await eventually { await queue.statistics.waitingPreview == 1 }
+        clock.advance(0.020)
+        let latestTicket = telemetry.beginQueueWait(.capturePreview)
+        let latest = Task { try await queue.acquire(.preview, waitTicket: latestTicket) }
+        await cancelled(old)
+        await eventually { await queue.statistics.waitingPreview == 1 }
+        let coalesced = telemetry.queueWaitHistograms().first { $0.queue == .capturePreview }
+        XCTAssertEqual(coalesced?.countsByDisposition[.coalesced]?.reduce(0, +), 1)
+        clock.advance(0.020)
+        XCTAssertNotNil(blocker)
+        blocker = nil
+        let reservation = try await latest.value
+        let histogram = try XCTUnwrap(telemetry.queueWaitHistograms().first { $0.queue == .capturePreview })
+        XCTAssertEqual(histogram.countsByDisposition[.started]?.reduce(0, +), 2)
+        XCTAssertEqual(histogram.countsByDisposition[.coalesced]?.reduce(0, +), 1)
+        XCTAssertEqual(histogram.countsByDisposition[.started]?[4], 1) // 20 ms admission wait
+        await queue.acquired(reservation)
+    }
     func testPreviewFloodRetainsOnlyOnePendingRequest() async throws {
         let queue = CaptureAcquisitionQueue(), counter = Counter()
         var blocker: CaptureAcquisitionQueue.Reservation? = try await queue.acquire(.preview)
@@ -158,9 +188,15 @@ final class CapturePipelineTests: XCTestCase {
         let encoder = CapturePNGEncoder(directory: root, writer: { try writer.write($0, to: $1) })
         let images = Images([try image(1), try image(0, 0, 1), try image(0, 1)])
         let capture = ScreenCaptureService(acquisitionQueue: queue, encoder: encoder, acquirer: { _, _, preview in try await images.acquire(preview: preview) })
-        let accepted = try await capture.acquire(display: display)
-        let compression = Task { try await capture.encode(accepted) }
+        let telemetry = BackendTelemetry()
+        let accepted = try await BackendTelemetry.$current.withValue(telemetry) { try await capture.acquire(display: display) }
+        let compression = Task {
+            try await BackendTelemetry.$current.withValue(telemetry) { try await capture.encode(accepted) }
+        }
         await fulfillment(of: [started], timeout: 2)
+        let queueWait = telemetry.queueWaitHistograms().first { $0.queue == .pngCompression }
+        XCTAssertEqual(queueWait?.countsByDisposition[.started]?.reduce(0, +), 1)
+        XCTAssertEqual(telemetry.queueWaitHistograms().first { $0.queue == .captureEvidence }?.countsByDisposition[.started]?.reduce(0, +), 1)
         let newer = try await capture.acquire(display: display)
         let preview = try await capture.capturePreview(display: display)
         XCTAssertEqual(try pixel(newer.image), [0, 0, 255, 255]); XCTAssertEqual(try pixel(preview), [0, 255, 0, 255])
@@ -233,19 +269,28 @@ final class CapturePipelineTests: XCTestCase {
         let encoder = CapturePNGEncoder(directory: try directory(), writer: { try writer.write($0, to: $1) })
         let pixels = try image(1), service = ScreenCaptureService(acquirer: { _, _, _ in pixels })
         let first = try await service.acquire(display: display), second = try await service.acquire(display: display)
-        let running = Task { try await encoder.encode(first) }
+        let clock = Clock(), telemetry = BackendTelemetry(now: { clock.now() })
+        let firstTicket = telemetry.beginQueueWait(.pngCompression)
+        let running = Task { try await encoder.encode(first, telemetry: telemetry, waitTicket: firstTicket) }
         await fulfillment(of: [started], timeout: 2)
         do { _ = try await encoder.encode(first); XCTFail("Duplicate compression queued") }
         catch { guard case ScreenCaptureError.pipelineBusy = error else { return XCTFail("\(error)") } }
-        let queued = Task { try await encoder.encode(second) }
+        let queuedTicket = telemetry.beginQueueWait(.pngCompression)
+        let queued = Task { try await encoder.encode(second, telemetry: telemetry, waitTicket: queuedTicket) }
         await eventually { await encoder.pendingCount == 1 }
+        clock.advance(0.020)
         let otherService = ScreenCaptureService(acquirer: { _, _, _ in pixels })
         let third = try await otherService.acquire(display: display)
-        do { _ = try await encoder.encode(third); XCTFail("Compression queue overflowed") }
+        let rejectedTicket = telemetry.beginQueueWait(.pngCompression)
+        do { _ = try await encoder.encode(third, telemetry: telemetry, waitTicket: rejectedTicket); XCTFail("Compression queue overflowed") }
         catch { guard case ScreenCaptureError.pipelineBusy = error else { return XCTFail("\(error)") } }
         XCTAssertEqual(writer.count, 1)
         writer.release.signal(); _ = try await running.value; _ = try await queued.value
         XCTAssertEqual(writer.count, 2)
+        let histogram = try XCTUnwrap(telemetry.queueWaitHistograms().first { $0.queue == .pngCompression })
+        XCTAssertEqual(histogram.countsByDisposition[.started]?.reduce(0, +), 2)
+        XCTAssertEqual(histogram.countsByDisposition[.started]?[4], 1) // Backlog through worker start.
+        XCTAssertEqual(histogram.countsByDisposition[.rejected]?.reduce(0, +), 1)
     }
     func testConsistencyRejectsUnpairedFramesBeforeEncodingAndFreezesAcceptedPair() async throws {
         var stages = 0, captures = 0, discarded: [Int] = [], encoded: [Int] = [], published: [Int] = []

@@ -30,6 +30,32 @@ final class BackendTelemetry: @unchecked Sendable {
         }
     }
     enum Outcome: Int, Codable { case succeeded, failed, cancelled, abandoned }
+    /// Fixed queue names keep aggregate diagnostics independent of task and
+    /// application content. Queue waits end when work first becomes runnable.
+    enum Queue: String, CaseIterable, Codable {
+        case runtimeIO, bridgeTask, observationTask, eventDelivery
+        case captureEvidence, capturePreview, pngCompression, pipeFirstWrite
+        var name: StaticString {
+            switch self {
+            case .runtimeIO: return "Wait Runtime I/O Queue"
+            case .bridgeTask: return "Wait Bridge Task"
+            case .observationTask: return "Wait Observation Task"
+            case .eventDelivery: return "Wait Main Event Queue"
+            case .captureEvidence: return "Wait Evidence Capture Queue"
+            case .capturePreview: return "Wait Preview Capture Queue"
+            case .pngCompression: return "Wait PNG Compression Queue"
+            case .pipeFirstWrite: return "Wait Pipe First Write"
+            }
+        }
+    }
+    enum QueueDisposition: Int, CaseIterable, Codable { case started, cancelled, rejected, coalesced, abandoned }
+    struct QueueWaitHistogram: Codable {
+        let queue: Queue
+        /// Upper bounds in milliseconds, followed by an overflow bucket.
+        let upperBoundsMilliseconds: [Double]
+        let countsByDisposition: [QueueDisposition: [UInt64]]
+        let maximumMilliseconds: Double
+    }
     struct Sample: Codable {
         let phase: Phase
         let outcome: Outcome
@@ -52,6 +78,47 @@ final class BackendTelemetry: @unchecked Sendable {
             if values.count < capacity { values.append(value) }
             else { values[next] = value; next = (next + 1) % capacity }
         }
+    }
+    private struct QueueCounts {
+        var byDisposition: [QueueDisposition: [UInt64]] = [:]
+        var maximumMilliseconds = 0.0
+        mutating func record(_ disposition: QueueDisposition, milliseconds: Double, bucketCount: Int) {
+            var buckets = byDisposition[disposition] ?? Array(repeating: 0, count: bucketCount)
+            let index = BackendTelemetry.bucketIndex(milliseconds)
+            if buckets[index] < UInt64.max { buckets[index] += 1 }
+            byDisposition[disposition] = buckets
+            maximumMilliseconds = max(maximumMilliseconds, milliseconds)
+        }
+    }
+    final class QueueTicket: @unchecked Sendable {
+        private let owner: BackendTelemetry
+        private let queue: Queue
+        private let state: OSSignpostIntervalState
+        private let enqueued: TimeInterval
+        private let lock = NSLock()
+        private var settled = false
+        fileprivate init(_ owner: BackendTelemetry, _ queue: Queue) {
+            self.owner = owner; self.queue = queue; enqueued = owner.now()
+            state = owner.signposter.beginInterval(queue.name, id: owner.signposter.makeSignpostID())
+        }
+        @discardableResult func start() -> Bool { settle(.started) }
+        func discard(_ disposition: QueueDisposition) {
+            guard disposition != .started else { return }
+            _ = settle(disposition)
+        }
+        private func settle(_ disposition: QueueDisposition) -> Bool {
+            let result: (Bool, Double)? = lock.withLock {
+                guard !settled else { return nil }
+                settled = true
+                return (disposition == .started, max(0, owner.now() - enqueued) * 1000)
+            }
+            guard let (started, milliseconds) = result else { return false }
+            owner.signposter.endInterval(queue.name, state,
+                "disposition=\(disposition.rawValue, privacy: .public) wait_ms=\(milliseconds, privacy: .public)")
+            owner.recordQueueWait(queue, disposition: disposition, milliseconds: milliseconds)
+            return started
+        }
+        deinit { discard(.abandoned) }
     }
     final class Span: @unchecked Sendable {
         private let owner: BackendTelemetry
@@ -100,12 +167,15 @@ final class BackendTelemetry: @unchecked Sendable {
     private let capacity: Int
     private let now: @Sendable () -> TimeInterval
     private var rings: [Phase: Ring] = [:]
+    private var queueCounts: [Queue: QueueCounts] = [:]
+    private static let waitUpperBoundsMilliseconds: [Double] = [0.1, 1, 5, 10, 50, 100, 500, 1_000, 5_000]
     init(capacity: Int = 128, now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.capacity = max(1, min(1024, capacity)); self.now = now
     }
     func begin(_ phase: Phase, inputBytes: Int? = nil, items: Int? = nil) -> Span {
         Span(self, phase, inputBytes: inputBytes, items: items)
     }
+    func beginQueueWait(_ queue: Queue) -> QueueTicket { QueueTicket(self, queue) }
     func measure<T>(_ phase: Phase, inputBytes: Int? = nil, items: Int? = nil, _ body: (Span) throws -> T) rethrows -> T {
         let span = begin(phase, inputBytes: inputBytes, items: items)
         do { let result = try body(span); span.finish(.succeeded); return result }
@@ -119,6 +189,24 @@ final class BackendTelemetry: @unchecked Sendable {
         }
     }
     private func append(_ sample: Sample) { lock.withLock { rings[sample.phase, default: Ring()].append(sample, capacity: capacity) } }
+    private static func bucketIndex(_ milliseconds: Double) -> Int {
+        waitUpperBoundsMilliseconds.firstIndex(where: { milliseconds <= $0 }) ?? waitUpperBoundsMilliseconds.count
+    }
+    private func recordQueueWait(_ queue: Queue, disposition: QueueDisposition, milliseconds: Double) {
+        lock.withLock {
+            queueCounts[queue, default: QueueCounts()].record(disposition, milliseconds: milliseconds,
+                bucketCount: Self.waitUpperBoundsMilliseconds.count + 1)
+        }
+    }
+    func queueWaitHistograms() -> [QueueWaitHistogram] {
+        lock.withLock {
+            Queue.allCases.compactMap { queue in
+                guard let counts = queueCounts[queue] else { return nil }
+                return QueueWaitHistogram(queue: queue, upperBoundsMilliseconds: Self.waitUpperBoundsMilliseconds,
+                    countsByDisposition: counts.byDisposition, maximumMilliseconds: counts.maximumMilliseconds)
+            }
+        }
+    }
     func samples() -> [Sample] { lock.withLock { Phase.allCases.flatMap { rings[$0]?.values ?? [] } } }
     func summaries() -> [Summary] {
         let samples = samples()

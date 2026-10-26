@@ -84,7 +84,10 @@ actor ScreenCaptureService {
         }
 
         do {
-            let reservation = try await acquisitionQueue.acquire(.evidence)
+            let waitTicket = BackendTelemetry.current.beginQueueWait(.captureEvidence)
+            let reservation: CaptureAcquisitionQueue.Reservation
+            do { reservation = try await acquisitionQueue.acquire(.evidence, waitTicket: waitTicket) }
+            catch { waitTicket.discard(error is CancellationError ? .cancelled : .rejected); throw error }
             do {
                 let status = try await verifyAuthorizationPixels()
                 await acquisitionQueue.acquired(reservation)
@@ -132,8 +135,15 @@ actor ScreenCaptureService {
     func acquire(display: DisplayDescriptor, forceRefresh: Bool = false) async throws -> CapturedFrame {
         try await TaskOwnership.checkpoint()
         let queue = acquisitionQueue, owner = TaskOwnership.current
-        let reservation = try await LocalOperationBudget.bounded(phase: "capture_queue") {
-            try await queue.acquire(.evidence, owner: owner)
+        let waitTicket = BackendTelemetry.current.beginQueueWait(.captureEvidence)
+        let reservation: CaptureAcquisitionQueue.Reservation
+        do {
+            reservation = try await LocalOperationBudget.bounded(phase: "capture_queue") {
+                try await queue.acquire(.evidence, owner: owner, waitTicket: waitTicket)
+            }
+        } catch {
+            waitTicket.discard(error is CancellationError ? .cancelled : .rejected)
+            throw error
         }
         do {
             try reservation.check(); try LocalOperationBudget.check("capture_acquisition")
@@ -155,8 +165,17 @@ actor ScreenCaptureService {
 
     func encode(_ frame: CapturedFrame) async throws -> CapturedScreen {
         let encoder = encoder
-        let url = try await LocalOperationBudget.bounded(phase: "capture_encoding") { try await encoder.encode(frame) }
-        return CapturedScreen(url: url, frame: frame)
+        let telemetry = BackendTelemetry.current
+        let waitTicket = telemetry.beginQueueWait(.pngCompression)
+        do {
+            let url = try await LocalOperationBudget.bounded(phase: "capture_encoding") {
+                try await encoder.encode(frame, telemetry: telemetry, waitTicket: waitTicket)
+            }
+            return CapturedScreen(url: url, frame: frame)
+        } catch {
+            waitTicket.discard(error is CancellationError ? .cancelled : .rejected)
+            throw error
+        }
     }
 
     func capture(display: DisplayDescriptor, forceRefresh: Bool = false) async throws -> CapturedScreen {
@@ -245,7 +264,10 @@ actor ScreenCaptureService {
     /// TaskPilot's click-through cursor overlay so the user can watch exactly where
     /// the agent is pointing without moving their hardware cursor.
     func capturePreview(display: DisplayDescriptor) async throws -> CGImage {
-        let reservation = try await acquisitionQueue.acquire(.preview)
+        let waitTicket = BackendTelemetry.current.beginQueueWait(.capturePreview)
+        let reservation: CaptureAcquisitionQueue.Reservation
+        do { reservation = try await acquisitionQueue.acquire(.preview, waitTicket: waitTicket) }
+        catch { waitTicket.discard(error is CancellationError ? .cancelled : .rejected); throw error }
         do {
             try reservation.check()
             let image: CGImage

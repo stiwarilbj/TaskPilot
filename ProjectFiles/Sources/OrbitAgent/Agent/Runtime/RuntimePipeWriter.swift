@@ -3,10 +3,16 @@ import Foundation
 
 /// Confined to the invocation's I/O queue. No pipe write can block Stop.
 final class RuntimePipeWriter {
-    private struct Frame { let data: Data; var offset = 0; let completion: (Bool) -> Void }
+    private struct Frame {
+        let data: Data
+        var offset = 0
+        let completion: (Bool) -> Void
+        let waitTicket: BackendTelemetry.QueueTicket
+    }
     private let descriptor: Int32
     private let queue: DispatchQueue
     private let failure: (String) -> Void
+    private let telemetry: BackendTelemetry
     private var frames: [Frame] = []
     private var bytes = 0
     private var source: DispatchSourceWrite?
@@ -18,9 +24,9 @@ final class RuntimePipeWriter {
     var pendingBytes: Int { bytes }
 
     init(handle: FileHandle, queue: DispatchQueue, byteLimit: Int = 32 * 1024 * 1024,
-         reserve: Int = 8 * 1024 * 1024, timeout: TimeInterval = 5,
+         reserve: Int = 8 * 1024 * 1024, timeout: TimeInterval = 5, telemetry: BackendTelemetry = .current,
          failure: @escaping (String) -> Void) {
-        descriptor = handle.fileDescriptor; self.queue = queue; self.failure = failure
+        descriptor = handle.fileDescriptor; self.queue = queue; self.failure = failure; self.telemetry = telemetry
         self.byteLimit = byteLimit; self.reserve = reserve; self.timeout = timeout
         let flags = fcntl(descriptor, F_GETFL)
         // Darwin.write otherwise raises SIGPIPE before it can return EPIPE.
@@ -31,15 +37,18 @@ final class RuntimePipeWriter {
     }
 
     func enqueue(_ data: Data, priority: Bool = false, completion: @escaping (Bool) -> Void = { _ in }) {
-        guard !closed else { completion(false); return }
-        guard !data.isEmpty else { completion(true); return }
+        guard !data.isEmpty else { completion(!closed); return }
+        let waitTicket = telemetry.beginQueueWait(.pipeFirstWrite)
+        guard !closed else { waitTicket.discard(.rejected); completion(false); return }
         guard data.count <= RuntimeLineBuffer.maximumFrameBytes + 1 else {
+            waitTicket.discard(.rejected)
             completion(false); fail("transport_frame_limit"); return
         }
         guard bytes + data.count <= byteLimit - (priority ? 0 : reserve), frames.count < (priority ? 1056 : 1024) else {
+            waitTicket.discard(.rejected)
             completion(false); fail("transport_buffer_limit"); return
         }
-        frames.append(Frame(data: data, completion: completion)); bytes += data.count
+        frames.append(Frame(data: data, completion: completion, waitTicket: waitTicket)); bytes += data.count
         if source == nil {
             let source = DispatchSource.makeWriteSource(fileDescriptor: descriptor, queue: queue)
             source.setEventHandler { [weak self] in self?.pump() }
@@ -59,6 +68,7 @@ final class RuntimePipeWriter {
     private func pump() {
         var allowance = 64 * 1024
         while !frames.isEmpty && allowance > 0 && !closed {
+            frames[0].waitTicket.start()
             let written = frames[0].data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
                 Darwin.write(descriptor, buffer.baseAddress!.advanced(by: frames[0].offset),
                              min(allowance, buffer.count - frames[0].offset))
@@ -86,7 +96,10 @@ final class RuntimePipeWriter {
         guard !closed else { return }
         closed = true; source?.cancel(); source = nil; deadline?.cancel(); deadline = nil
         let pending = frames; frames.removeAll(); bytes = 0
-        for frame in pending { frame.completion(false) }
+        for frame in pending {
+            frame.waitTicket.discard(.cancelled)
+            frame.completion(false)
+        }
     }
 
     private func fail(_ code: String) { cancel(); failure(code) }
