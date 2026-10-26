@@ -262,6 +262,8 @@ final class TaskToolExecutor {
         let operation = try BoundFileOperation(url, createParents: createParents)
         let (finalSize, identity, textSnapshot) = try operation.replaceCapturingText(with: data,
             append: mode == "append", mustBeAbsent: action["precondition"] as? String == "absent")
+        let formatName = (identity["file_format"] as? [String: Any])?["format"] as? String
+        let formatLabel = formatName.map { " as \($0.uppercased())" } ?? ""
 
         if let textSnapshot, let actionID = TaskOwnership.actionReceipt?.id,
            requirementIDs.count <= 32, Set(requirementIDs).count == requirementIDs.count {
@@ -288,7 +290,7 @@ final class TaskToolExecutor {
 
         return [
             "action_type": "write_file", "verification_scope": "file_write",
-            "message": "\(mode == "append" ? "Appended" : "Wrote") and verified \(data.count) bytes in \(url.lastPathComponent)",
+            "message": "\(mode == "append" ? "Appended" : "Wrote") and verified \(data.count) bytes\(formatLabel) in \(url.lastPathComponent)",
             "path": url.path,
             "bytes_written": data.count,
             "content_sha256": SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(),

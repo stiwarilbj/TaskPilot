@@ -228,7 +228,51 @@ def validate_native_payload(schema, value, path=None):
         _field(value, CONTRACT['native_schemas'][schema], path)
     except ActionContractError as error:
         raise NativeProtocolError(str(error)) from error
+    _validate_file_format_payload(schema, value, path)
     return value
+
+
+def expected_file_format(path):
+    if not isinstance(path, str): return None
+    suffix = os.path.splitext(path)[1].lower()
+    return {'.pdf': 'pdf', '.docx': 'docx', '.xlsx': 'xlsx'}.get(suffix)
+
+
+def _validate_file_format_payload(schema, value, path):
+    if schema == 'check_batch':
+        for index, checked in enumerate(value.get('checks', [])):
+            _validate_file_format_attestation('check_result', checked, f'{path}.checks[{index}]')
+    elif schema == 'action_result':
+        if value.get('action_type') == 'write_file' and value.get('verified') is True:
+            _validate_file_format_attestation(schema, value, path, required=True)
+        for index, checked in enumerate(value.get('checks', [])):
+            _validate_file_format_attestation('check_result', checked, f'{path}.checks[{index}]')
+    elif schema == 'check_result':
+        if value.get('type') in {'file_exists', 'file_contents'}:
+            _validate_file_format_attestation(schema, value, path)
+    elif schema == 'evidence_fact':
+        _validate_file_format_attestation(schema, value, path,
+            required=value.get('type') in {'file_exists', 'file_contents', 'file_append', 'file_written'})
+    elif schema == 'evidence':
+        _validate_file_format_payload('evidence_fact', value['fact'], path + '.fact')
+    elif schema == 'receipt' and isinstance(value.get('result'), dict):
+        _validate_file_format_payload('action_result', value['result'], path + '.result')
+
+
+def _validate_file_format_attestation(schema, value, path, required=False):
+    file_path = value.get('path')
+    expected = expected_file_format(file_path)
+    attestation = value.get('file_format')
+    if expected is None:
+        if attestation is not None:
+            raise NativeProtocolError(path + '.file_format is not valid for this destination')
+        return
+    if attestation is None:
+        if required or (schema == 'check_result' and value.get('type') in {'file_exists', 'file_contents'} and value.get('verified') is True):
+            raise NativeProtocolError(path + '.file_format is required for a verified ' + expected.upper() + ' result')
+        return
+    if attestation.get('format') != expected or attestation.get('verified') is not True:
+        raise NativeProtocolError(path + '.file_format must verify the requested ' + expected.upper() + ' format')
 
 
 def validate_check_batch(value, path='result', requested_checks=None):

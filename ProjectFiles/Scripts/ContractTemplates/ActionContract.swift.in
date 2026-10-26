@@ -246,9 +246,74 @@
     }
     @discardableResult
     static func validateNativePayload(_ schema: String, _ value: Any, path: String? = nil) throws -> [String: Any] {
-        do { try field(value, (definition["native_schemas"] as! [String: [String: Any]])[schema]!, path ?? schema) }
+        let fieldPath = path ?? schema
+        do { try field(value, (definition["native_schemas"] as! [String: [String: Any]])[schema]!, fieldPath) }
         catch { throw NativeProtocolError(message: error.localizedDescription) }
-        return value as! [String: Any]
+        let payload = value as! [String: Any]
+        try validateFileFormatPayload(schema, payload, path: fieldPath)
+        return payload
+    }
+    private static func expectedFileFormat(_ path: String?) -> String? {
+        guard let path else { return nil }
+        switch URL(fileURLWithPath: (path as NSString).expandingTildeInPath).pathExtension.lowercased() {
+        case "pdf": return "pdf"
+        case "docx": return "docx"
+        case "xlsx": return "xlsx"
+        default: return nil
+        }
+    }
+    private static func validateFileFormatAttestation(_ schema: String, _ value: [String: Any], path: String,
+                                                      required: Bool = false) throws {
+        let expected = expectedFileFormat(value["path"] as? String)
+        let attestation = value["file_format"] as? [String: Any]
+        guard let expected else {
+            if value["file_format"] != nil {
+                throw NativeProtocolError(message: path + ".file_format is not valid for this destination")
+            }
+            return
+        }
+        guard let attestation else {
+            if required || (schema == "check_result" && ["file_exists", "file_contents"].contains(value["type"] as? String ?? "") &&
+                            value["verified"] as? Bool == true) {
+                throw NativeProtocolError(message: path + ".file_format is required for a verified \(expected.uppercased()) result")
+            }
+            return
+        }
+        guard attestation["format"] as? String == expected, attestation["verified"] as? Bool == true else {
+            throw NativeProtocolError(message: path + ".file_format must verify the requested \(expected.uppercased()) format")
+        }
+    }
+    private static func validateFileFormatPayload(_ schema: String, _ value: [String: Any], path: String) throws {
+        switch schema {
+        case "action_result":
+            if value["action_type"] as? String == "write_file", value["verified"] as? Bool == true {
+                try validateFileFormatAttestation(schema, value, path: path, required: true)
+            }
+            for (index, checked) in (value["checks"] as? [[String: Any]] ?? []).enumerated() {
+                try validateFileFormatAttestation("check_result", checked, path: "\(path).checks[\(index)]")
+            }
+        case "check_result":
+            if ["file_exists", "file_contents"].contains(value["type"] as? String ?? "") {
+                try validateFileFormatAttestation(schema, value, path: path)
+            }
+        case "check_batch":
+            for (index, checked) in (value["checks"] as? [[String: Any]] ?? []).enumerated() {
+                try validateFileFormatAttestation("check_result", checked, path: "\(path).checks[\(index)]")
+            }
+        case "evidence_fact":
+            let kind = value["type"] as? String
+            try validateFileFormatAttestation(schema, value, path: path,
+                required: ["file_exists", "file_contents", "file_append", "file_written"].contains(kind ?? ""))
+        case "evidence":
+            if let fact = value["fact"] as? [String: Any] {
+                try validateFileFormatPayload("evidence_fact", fact, path: path + ".fact")
+            }
+        case "receipt":
+            if let result = value["result"] as? [String: Any] {
+                try validateFileFormatPayload("action_result", result, path: path + ".result")
+            }
+        default: break
+        }
     }
     private static func validateCheckPairs(_ requested: [[String: Any]], _ actual: [[String: Any]], _ path: String) throws {
         guard requested.count == actual.count else { throw NativeProtocolError(message: path + ".checks must match requested_checks") }

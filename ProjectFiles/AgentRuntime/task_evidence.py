@@ -18,7 +18,8 @@ from copy import deepcopy
 from typing import Any
 
 from action_contract_generated import (CONTRACT, ActionContractError, _field, validate_action, validate_outcome_check,
-    validate_native_result, validate_check_batch, validate_native_readback, validate_native_payload, validate_native_evidence)
+    validate_native_result, validate_check_batch, validate_native_readback, validate_native_payload, validate_native_evidence,
+    expected_file_format)
 from task_inputs import TaskInputBindings
 from expected_effects import ExpectedEffect, ExpectedEffectError, validate_expectation
 from observation_context import coordinate_targets, observation_indexes
@@ -1468,19 +1469,24 @@ class TaskEvidenceLedger:
             try: data = content_bytes(result)
             except (ValueError, UnicodeEncodeError): return
             if len(data) != result["bytes_returned"] or hashlib.sha256(data).hexdigest() != result.get("content_sha256"): return
-            self.add_evidence({"type": "file_read", "path": result["path"], "content": result["content"],
-                               "encoding": result["encoding"], "content_sha256": result["content_sha256"], **identity}, mutable=True, action=action)
+            fact = {"type": "file_read", "path": result["path"], "content": result["content"],
+                    "encoding": result["encoding"], "content_sha256": result["content_sha256"], **identity}
+            if "file_format" in result: fact["file_format"] = deepcopy(result["file_format"])
+            self.add_evidence(fact, mutable=True, action=action)
         elif kind == "write_file":
             if (result.get("verified") is not True or result.get("path") != path_key(action["path"]) or
                     result.get("mode") != action.get("mode", "overwrite").lower() or
                     result.get("content_sha256") != content_hash(action) or
                     type(result.get("bytes_written")) is not int or result["bytes_written"] != len(content_bytes(action))): return
             self.add_evidence({"type": "file_written", "path": result["path"], "mode": result["mode"],
-                               "content_sha256": result["content_sha256"], **identity}, action=action)
+                               "content_sha256": result["content_sha256"],
+                               **({"file_format": deepcopy(result["file_format"])} if "file_format" in result else {}), **identity}, action=action)
             fact = {"type": "file_append" if result["mode"] == "append" else "file_contents",
-                    "path": result["path"], "content_sha256": result["content_sha256"], **identity}
+                    "path": result["path"], "content_sha256": result["content_sha256"],
+                    **({"file_format": deepcopy(result["file_format"])} if "file_format" in result else {}), **identity}
             self.add_evidence(fact, mutable=result["mode"] != "append", action=action)
-            self.add_evidence({"type": "file_exists", "path": result["path"], **identity}, mutable=True, action=action)
+            self.add_evidence({"type": "file_exists", "path": result["path"],
+                               **({"file_format": deepcopy(result["file_format"])} if "file_format" in result else {}), **identity}, mutable=True, action=action)
         elif kind == "run_command":
             if result.get("timed_out") is not False or type(result.get("exit_code")) is not int or result["exit_code"] != 0: return
             fact = {"type": "command_executed", **{k: action[k] for k in ("argv", "command") if k in action},
@@ -1518,6 +1524,9 @@ class TaskEvidenceLedger:
     def check_matches(check: dict, actual: dict) -> bool:
         if not isinstance(actual, dict) or actual.get('verified') is not True or actual.get('type') != check.get('type'): return False
         if check['type'] in FILE_CHECKS:
+            expected_format = expected_file_format(check.get('path'))
+            if (check['type'] in {'file_exists', 'file_contents'} and expected_format and
+                    actual.get('file_format') != {"format": expected_format, "verified": True}): return False
             return (actual.get('path') == path_key(check['path']) and
                     (check['type'] != 'file_contents' or actual.get('content_sha256') == content_hash(check)))
         return check['type'] == 'stdout_equals' and actual.get('text_sha256') == hashlib.sha256(check['text'].encode()).hexdigest()
@@ -1530,7 +1539,7 @@ class TaskEvidenceLedger:
         if kind in FILE_CHECKS:
             if actual.get("path") != path_key(check["path"]): return
             fact = {"type": kind, "path": actual["path"], **{key: actual[key] for key in
-                    ("file_identity", "file_version", "parent_identity") if key in actual}}
+                    ("file_identity", "file_version", "parent_identity", "file_format") if key in actual}}
             if kind == "file_contents":
                 if actual.get("content_sha256") != content_hash(check): return
                 fact["content_sha256"] = actual["content_sha256"]
@@ -1574,6 +1583,9 @@ class TaskEvidenceLedger:
             return semantic and fact["type"] in {"observation", "file_read", "stdout_equals", "local_answer"}
         if kind in OBSERVATION_CHECKS:
             return fact["type"] == "requirement_observed" and fact.get("check_fingerprint") == digest(check)
+        expected_format = expected_file_format(check.get("path")) if kind in {
+            "file_exists", "file_contents", "file_written", "file_append"} else None
+        if expected_format and fact.get("file_format") != {"format": expected_format, "verified": True}: return False
         if kind == "file_contents" and fact["type"] == "file_read":
             return path_key(check["path"]) == fact["path"] and content_hash(check) == fact["content_sha256"]
         if kind == "file_exists" and fact["type"] == "file_contents":

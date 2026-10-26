@@ -47,6 +47,9 @@ def native_check(check, verified=True, **fields):
     if 'path' in check: result['path'] = os.path.normpath(os.path.expanduser(check['path']))
     if verified and 'path' in check:
         result.update(filesystem_identity(result['path']))
+        suffix = os.path.splitext(result['path'])[1].lower()
+        format_name = {'.pdf': 'pdf', '.docx': 'docx', '.xlsx': 'xlsx'}.get(suffix)
+        if format_name: result['file_format'] = {'format': format_name, 'verified': True}
         if check['type'] == 'path_absent':
             result.pop('file_identity'); result.pop('file_version')
     if verified and check['type'] == 'file_contents' and 'content' in check:
@@ -100,6 +103,10 @@ def native_result(action, **fields):
     elif kind in {'focus', 'launch_app'}:
         result.update(verified=True, outcome='verified', verification_scope='focus' if kind=='focus' else 'window_visible')
     if kind in {'read_file','write_file'}: result.update(filesystem_identity(result['path']))
+    if result.get('verified') is True and kind in {'read_file', 'write_file'}:
+        suffix = os.path.splitext(result['path'])[1].lower()
+        format_name = {'.pdf': 'pdf', '.docx': 'docx', '.xlsx': 'xlsx'}.get(suffix)
+        if format_name: result['file_format'] = {'format': format_name, 'verified': True}
     return {**result, **fields}
 
 

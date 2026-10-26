@@ -3616,6 +3616,115 @@
         "content": "Example text"
       },
       "error": "result.file_sha256 is required"
+    },
+    {
+      "name": "valid verified PDF output attestation",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "file_write",
+        "path": "/example/report.pdf",
+        "mode": "overwrite",
+        "bytes_written": 3,
+        "file_size": 3,
+        "content_sha256": "1d393b0081b632c54654eb08c345ff76b92ae4efe0768b4c0f64b9ebbe920492",
+        "file_sha256": "1d393b0081b632c54654eb08c345ff76b92ae4efe0768b4c0f64b9ebbe920492",
+        "file_identity": "1111111111111111111111111111111111111111111111111111111111111111",
+        "file_version": "2222222222222222222222222222222222222222222222222222222222222222",
+        "parent_identity": "3333333333333333333333333333333333333333333333333333333333333333",
+        "file_format": {
+          "format": "pdf",
+          "verified": true
+        }
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/example/report.pdf",
+        "content": "PDF"
+      }
+    },
+    {
+      "name": "PDF output missing format attestation",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "file_write",
+        "path": "/example/report.pdf",
+        "mode": "overwrite",
+        "bytes_written": 3,
+        "file_size": 3,
+        "content_sha256": "1d393b0081b632c54654eb08c345ff76b92ae4efe0768b4c0f64b9ebbe920492",
+        "file_sha256": "1d393b0081b632c54654eb08c345ff76b92ae4efe0768b4c0f64b9ebbe920492",
+        "file_identity": "1111111111111111111111111111111111111111111111111111111111111111",
+        "file_version": "2222222222222222222222222222222222222222222222222222222222222222",
+        "parent_identity": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/example/report.pdf",
+        "content": "PDF"
+      },
+      "error": "result.file_format is required for a verified PDF result"
+    },
+    {
+      "name": "PDF output contradictory format attestation",
+      "schema": "action_result",
+      "value": {
+        "action_type": "write_file",
+        "verified": true,
+        "outcome": "verified",
+        "verification_scope": "file_write",
+        "path": "/example/report.pdf",
+        "mode": "overwrite",
+        "bytes_written": 3,
+        "file_size": 3,
+        "content_sha256": "1d393b0081b632c54654eb08c345ff76b92ae4efe0768b4c0f64b9ebbe920492",
+        "file_sha256": "1d393b0081b632c54654eb08c345ff76b92ae4efe0768b4c0f64b9ebbe920492",
+        "file_identity": "1111111111111111111111111111111111111111111111111111111111111111",
+        "file_version": "2222222222222222222222222222222222222222222222222222222222222222",
+        "parent_identity": "3333333333333333333333333333333333333333333333333333333333333333",
+        "file_format": {
+          "format": "xlsx",
+          "verified": true
+        }
+      },
+      "action": {
+        "type": "write_file",
+        "path": "/example/report.pdf",
+        "content": "PDF"
+      },
+      "error": "result.file_format must verify the requested PDF format"
+    },
+    {
+      "name": "verified XLSX existence check missing format attestation",
+      "schema": "check_result",
+      "value": {
+        "type": "file_exists",
+        "outcome": "verified",
+        "verified": true,
+        "verification_scope": "file_exists",
+        "path": "/example/book.xlsx",
+        "file_identity": "1111111111111111111111111111111111111111111111111111111111111111",
+        "file_version": "2222222222222222222222222222222222222222222222222222222222222222",
+        "parent_identity": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "error": "check_result.file_format is required for a verified XLSX result"
+    },
+    {
+      "name": "path absence for a document filename needs no format attestation",
+      "schema": "check_result",
+      "value": {
+        "type": "path_absent",
+        "outcome": "verified",
+        "verified": true,
+        "verification_scope": "path_absent",
+        "path": "/example/missing.pdf",
+        "parent_identity": "3333333333333333333333333333333333333333333333333333333333333333"
+      }
     }
   ]
 }

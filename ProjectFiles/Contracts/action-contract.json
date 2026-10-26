@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "fields": {
     "element_id": {
       "type": "string",
@@ -1106,7 +1106,7 @@
     "option": 524288,
     "control": 262144
   },
-  "task_protocol_version": 9,
+  "task_protocol_version": 10,
   "command_operations": {
     "create_directory": {
       "fields": {
@@ -1412,6 +1412,39 @@
             "parent_identity": {
               "type": "string",
               "format": "sha256"
+            },
+            "file_format": {
+              "type": "object",
+              "fields": {
+                "format": {
+                  "type": "string",
+                  "choices": [
+                    "pdf",
+                    "docx",
+                    "xlsx"
+                  ]
+                },
+                "verified": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "format",
+                "verified"
+              ],
+              "rules": [
+                {
+                  "path": "verified",
+                  "error": "must attest a verified format",
+                  "assert": {
+                    "equals": [
+                      "verified",
+                      true
+                    ]
+                  }
+                }
+              ],
+              "reject_unknown": true
             }
           },
           "required": [
@@ -1832,6 +1865,39 @@
             "parent_identity": {
               "type": "string",
               "format": "sha256"
+            },
+            "file_format": {
+              "type": "object",
+              "fields": {
+                "format": {
+                  "type": "string",
+                  "choices": [
+                    "pdf",
+                    "docx",
+                    "xlsx"
+                  ]
+                },
+                "verified": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "format",
+                "verified"
+              ],
+              "rules": [
+                {
+                  "path": "verified",
+                  "error": "must attest a verified format",
+                  "assert": {
+                    "equals": [
+                      "verified",
+                      true
+                    ]
+                  }
+                }
+              ],
+              "reject_unknown": true
             }
           },
           "required": [
@@ -3582,6 +3648,39 @@
             "parent_identity": {
               "type": "string",
               "format": "sha256"
+            },
+            "file_format": {
+              "type": "object",
+              "fields": {
+                "format": {
+                  "type": "string",
+                  "choices": [
+                    "pdf",
+                    "docx",
+                    "xlsx"
+                  ]
+                },
+                "verified": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "format",
+                "verified"
+              ],
+              "rules": [
+                {
+                  "path": "verified",
+                  "error": "must attest a verified format",
+                  "assert": {
+                    "equals": [
+                      "verified",
+                      true
+                    ]
+                  }
+                }
+              ],
+              "reject_unknown": true
             }
           },
           "required": [
@@ -3743,6 +3842,39 @@
             "file_sha256": {
               "type": "string",
               "format": "sha256"
+            },
+            "file_format": {
+              "type": "object",
+              "fields": {
+                "format": {
+                  "type": "string",
+                  "choices": [
+                    "pdf",
+                    "docx",
+                    "xlsx"
+                  ]
+                },
+                "verified": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "format",
+                "verified"
+              ],
+              "rules": [
+                {
+                  "path": "verified",
+                  "error": "must attest a verified format",
+                  "assert": {
+                    "equals": [
+                      "verified",
+                      true
+                    ]
+                  }
+                }
+              ],
+              "reject_unknown": true
             }
           },
           "required": [
@@ -4777,6 +4909,39 @@
             "file_sha256": {
               "type": "string",
               "format": "sha256"
+            },
+            "file_format": {
+              "type": "object",
+              "fields": {
+                "format": {
+                  "type": "string",
+                  "choices": [
+                    "pdf",
+                    "docx",
+                    "xlsx"
+                  ]
+                },
+                "verified": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "format",
+                "verified"
+              ],
+              "rules": [
+                {
+                  "path": "verified",
+                  "error": "must attest a verified format",
+                  "assert": {
+                    "equals": [
+                      "verified",
+                      true
+                    ]
+                  }
+                }
+              ],
+              "reject_unknown": true
             }
           },
           "required": [
@@ -4857,6 +5022,39 @@
             "file_sha256": {
               "type": "string",
               "format": "sha256"
+            },
+            "file_format": {
+              "type": "object",
+              "fields": {
+                "format": {
+                  "type": "string",
+                  "choices": [
+                    "pdf",
+                    "docx",
+                    "xlsx"
+                  ]
+                },
+                "verified": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "format",
+                "verified"
+              ],
+              "rules": [
+                {
+                  "path": "verified",
+                  "error": "must attest a verified format",
+                  "assert": {
+                    "equals": [
+                      "verified",
+                      true
+                    ]
+                  }
+                }
+              ],
+              "reject_unknown": true
             }
           },
           "required": [
@@ -4890,6 +5088,39 @@
             "file_sha256": {
               "type": "string",
               "format": "sha256"
+            },
+            "file_format": {
+              "type": "object",
+              "fields": {
+                "format": {
+                  "type": "string",
+                  "choices": [
+                    "pdf",
+                    "docx",
+                    "xlsx"
+                  ]
+                },
+                "verified": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "format",
+                "verified"
+              ],
+              "rules": [
+                {
+                  "path": "verified",
+                  "error": "must attest a verified format",
+                  "assert": {
+                    "equals": [
+                      "verified",
+                      true
+                    ]
+                  }
+                }
+              ],
+              "reject_unknown": true
             }
           },
           "required": [
@@ -4930,6 +5161,39 @@
             "file_sha256": {
               "type": "string",
               "format": "sha256"
+            },
+            "file_format": {
+              "type": "object",
+              "fields": {
+                "format": {
+                  "type": "string",
+                  "choices": [
+                    "pdf",
+                    "docx",
+                    "xlsx"
+                  ]
+                },
+                "verified": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "format",
+                "verified"
+              ],
+              "rules": [
+                {
+                  "path": "verified",
+                  "error": "must attest a verified format",
+                  "assert": {
+                    "equals": [
+                      "verified",
+                      true
+                    ]
+                  }
+                }
+              ],
+              "reject_unknown": true
             }
           },
           "required": [
@@ -4970,6 +5234,39 @@
             "parent_identity": {
               "type": "string",
               "format": "sha256"
+            },
+            "file_format": {
+              "type": "object",
+              "fields": {
+                "format": {
+                  "type": "string",
+                  "choices": [
+                    "pdf",
+                    "docx",
+                    "xlsx"
+                  ]
+                },
+                "verified": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "format",
+                "verified"
+              ],
+              "rules": [
+                {
+                  "path": "verified",
+                  "error": "must attest a verified format",
+                  "assert": {
+                    "equals": [
+                      "verified",
+                      true
+                    ]
+                  }
+                }
+              ],
+              "reject_unknown": true
             }
           },
           "required": [

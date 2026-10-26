@@ -23,7 +23,22 @@ final class BoundFileOperation {
         let data: Data
         let identity: Identity
         let parent: Identity
-        var fields: [String: Any] { ["file_identity": identity.object, "file_version": identity.version, "parent_identity": parent.object] }
+        let fileFormat: [String: Any]?
+        let fileFormatValid: Bool
+        init(data: Data, identity: Identity, parent: Identity, fileFormat: [String: Any]? = nil,
+             fileFormatValid: Bool = true) {
+            self.data = data
+            self.identity = identity
+            self.parent = parent
+            self.fileFormat = fileFormat
+            self.fileFormatValid = fileFormatValid
+        }
+        var fields: [String: Any] {
+            var result: [String: Any] = ["file_identity": identity.object, "file_version": identity.version,
+                                         "parent_identity": parent.object]
+            if let fileFormat { result["file_format"] = fileFormat }
+            return result
+        }
     }
     struct TextEditSnapshot {
         let beforeData: Data?
@@ -168,10 +183,13 @@ final class BoundFileOperation {
             if part.isEmpty { break }
             data.append(part)
         }
+        let format = try FileFormatVerifier.attestation(fileDescriptor: fd, size: expected.info.st_size, filename: name)
+        let formatValid = FileFormatVerifier.expectedFormat(for: name) == nil || format != nil
         try hook(.inspected)
         try checkParent()
         guard try Self.identity(fd) == expected, try entry(name) == expected else { throw conflict("the file changed during inspection") }
-        return Snapshot(data: data, identity: expected, parent: parentIdentity)
+        return Snapshot(data: data, identity: expected, parent: parentIdentity, fileFormat: format,
+                        fileFormatValid: formatValid)
     }
     func inspect(kind: String, expected: Data?) throws -> (Bool, [String: Any]) {
         try checkParent()
@@ -191,7 +209,7 @@ final class BoundFileOperation {
             return (true, Snapshot(data: Data(), identity: identity, parent: parentIdentity).fields)
         }
         let snapshot = try read(limit: kind == "file_contents" ? expected!.count + 1 : 0)
-        return (kind != "file_contents" || snapshot.data == expected!, snapshot.fields)
+        return (snapshot.fileFormatValid && (kind != "file_contents" || snapshot.data == expected!), snapshot.fields)
     }
     func replace(with data: Data, append: Bool, mustBeAbsent: Bool) throws -> (Int, [String: Any]) {
         let result = try replaceInternal(with: data, append: append, mustBeAbsent: mustBeAbsent,
@@ -246,6 +264,12 @@ final class BoundFileOperation {
         }
         try Self.write(staged, data)
         guard fsync(staged) == 0 else { throw Self.systemError("flush staged file") }
+        let stagedSize = try Self.identity(staged).info.st_size
+        let stagedFormat = try FileFormatVerifier.attestation(fileDescriptor: staged, size: stagedSize, filename: name)
+        if FileFormatVerifier.expectedFormat(for: name) != nil, stagedFormat == nil {
+            let format = FileFormatVerifier.expectedFormat(for: name)!.uppercased()
+            throw TaskToolError.invalidAction("The staged contents do not match the requested \(format) format")
+        }
         let stagedHash = try Self.copyAndHash(staged)
         let stagedIdentity = try Self.identity(staged)
         try hook(.staged)
@@ -332,6 +356,7 @@ final class BoundFileOperation {
             }
             let fields = Snapshot(data: Data(), identity: committed, parent: parentIdentity).fields
                 .merging(["file_sha256": stagedHash]) { _, new in new }
+                .merging(stagedFormat.map { ["file_format": $0] } ?? [:]) { _, new in new }
             return (Int(committed.info.st_size), fields, textSnapshot)
         } catch {
             if error is CancellationError { throw error }

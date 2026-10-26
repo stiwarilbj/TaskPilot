@@ -110,6 +110,42 @@ class EvidenceLedgerTests(unittest.TestCase):
             with self.assertRaises(runtime.NativeProtocolError): ledger.record_action(action, native_result(action, **{**written(action), **changes}))
             self.assertFalse(ledger.evidence, changes)
 
+    def test_document_output_evidence_requires_matching_verified_format_attestation(self):
+        action = write('/fixture/report.pdf', 'synthetic PDF bytes')
+        ledger = TaskEvidenceLedger('Create /fixture/report.pdf', 'task-a')
+        ledger.add_requirements([requirement(ledger.task, 'file_contents', path=action['path'], content=action['content'])])
+
+        missing = native_result(action)
+        missing.pop('file_format')
+        with self.assertRaisesRegex(runtime.NativeProtocolError, 'file_format is required'):
+            ledger.record_action(action, missing)
+        self.assertFalse(ledger.evidence)
+
+        mismatched = native_result(action, file_format={'format': 'xlsx', 'verified': True})
+        with self.assertRaisesRegex(runtime.NativeProtocolError, 'must verify the requested PDF format'):
+            ledger.record_action(action, mismatched)
+        self.assertFalse(ledger.evidence)
+
+        valid = native_result(action, file_format={'format': 'pdf', 'verified': True})
+        ledger.record_action(action, valid)
+        self.assertEqual(ledger.requirements['r1']['state'], 'proven')
+        self.assertTrue(all(record['fact'].get('file_format') == {'format': 'pdf', 'verified': True}
+                            for record in ledger.evidence.values()
+                            if record['fact'].get('path') == action['path']))
+
+        check = {'type': 'file_exists', 'path': action['path']}
+        forged_check = native_check(check)
+        forged_check.pop('file_format')
+        self.assertFalse(ledger.check_matches(check, forged_check))
+        with self.assertRaisesRegex(runtime.NativeProtocolError, 'file_format is required'):
+            runtime.validate_native_payload('check_result', forged_check)
+
+    def test_file_format_attestations_are_rejected_for_unrelated_extensions(self):
+        action = write('/fixture/result.txt', 'plain text')
+        result = native_result(action, file_format={'format': 'pdf', 'verified': True})
+        with self.assertRaisesRegex(runtime.NativeProtocolError, 'not valid for this destination'):
+            runtime.validate_native_result(result, action)
+
     def test_later_mutation_invalidates_state_but_retains_history_and_recheck_targets(self):
         ledger = self.ledger(); action = write(); ledger.record_action(action, written(action))
         original = len(ledger.evidence)

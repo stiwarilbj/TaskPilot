@@ -22,7 +22,8 @@ let package = Package(
                 .linkedFramework("ScreenCaptureKit"),
                 .linkedFramework("QuickLookUI"),
                 .linkedFramework("UserNotifications"),
-                .linkedFramework("Vision")
+                .linkedFramework("Vision"),
+                .linkedLibrary("compression")
             ]
         ),
         .testTarget(

@@ -171,6 +171,7 @@ class ExpectedEffect:
                     and result.get('content_sha256') == hashlib.sha256(content_bytes(action)).hexdigest():
                 if self.kind == 'file_exists' or (self.kind == 'file_contents' and content_bytes(action) == content_bytes(self.spec)):
                     actual = {'type': self.kind, 'path': result['path'], 'verified': True, 'content_sha256': result['content_sha256']}
+                    if 'file_format' in result: actual['file_format'] = result['file_format']
             elif kind == 'read_file' and result.get('truncated') is False and result.get('encoding') in {'utf-8', 'base64'} \
                     and type(result.get('bytes_returned')) is int:
                 try: data = content_bytes(result)
@@ -178,6 +179,7 @@ class ExpectedEffect:
                 if len(data) == result['bytes_returned'] and hashlib.sha256(data).hexdigest() == result.get('content_sha256') \
                         and self.kind == 'file_contents' and data == content_bytes(self.spec):
                     actual = {'type': self.kind, 'path': result['path'], 'verified': True, 'content_sha256': result['content_sha256']}
+                    if 'file_format' in result: actual['file_format'] = result['file_format']
         if actual:
             actual.update(outcome='verified' if actual['verified'] else 'delivered_unconfirmed', verification_scope=self.kind)
             actual.update({key: result[key] for key in ('file_identity','file_version','parent_identity') if key in result})
