@@ -73,3 +73,27 @@ capacity, aggregate overflow, stale sessions/generations, EOF, stalled/closed
 pipes, Stop escalation, and receipt reconciliation without replay. Fake ACP
 executables and native pipe fixtures do not contact providers or control apps.
 Live desktop/provider accuracy validation remains incomplete.
+
+## Local deadline admission
+
+The writer captures the caller's existing local-operation budget across I/O
+queue submission. Runtime messages check it before JSON encoding; writer payloads
+are evaluated lazily only after admission, then checked again before queueing.
+An untouched queued frame is checked before its first write. Expiration settles
+its completion and queue ticket once through the existing classified transport
+failure path. It does not prove that an associated action failed. A frame with
+any bytes already written finishes its suffix under the existing transport
+write timeout, preserving framing and receipt reconciliation.
+
+Capture reservations check the stored caller deadline before grant, without
+borrowing the cancellation state of the task releasing the previous slot.
+Acquisition checks again before pixels are requested. Compression checks before
+scratch setup, job admission and worker start. Expired queued jobs release their
+accounting and continuation without encoding; running native compression still
+drains before releasing capacity, and late artifacts are discarded. These
+checks add no timers, captures, or model calls and never reset the allowance.
+
+Offline regression: `swift test --package-path ProjectFiles --filter
+'CapturePipelineTests|RuntimeTransportTests|LocalOperationBudgetTests'` includes
+fake-clock admission, queued expiry, partial-frame delivery, successor isolation,
+and the distinction between rejected and dispatched/unconfirmed receipts.

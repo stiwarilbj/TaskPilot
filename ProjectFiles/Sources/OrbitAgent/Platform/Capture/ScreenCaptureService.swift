@@ -89,6 +89,7 @@ actor ScreenCaptureService {
             do { reservation = try await acquisitionQueue.acquire(.evidence, waitTicket: waitTicket) }
             catch { waitTicket.discard(error is CancellationError ? .cancelled : .rejected); throw error }
             do {
+                try reservation.check(); try LocalOperationBudget.check("capture_acquisition")
                 let status = try await verifyAuthorizationPixels()
                 await acquisitionQueue.acquired(reservation)
                 try reservation.check()
@@ -277,7 +278,7 @@ actor ScreenCaptureService {
         do { reservation = try await acquisitionQueue.acquire(.preview, waitTicket: waitTicket) }
         catch { waitTicket.discard(error is CancellationError ? .cancelled : .rejected); throw error }
         do {
-            try reservation.check()
+            try reservation.check(); try LocalOperationBudget.check("capture_acquisition")
             let image: CGImage
             if let acquirer { image = try await acquirer(display, false, true) }
             else { image = try await acquirePreviewImage(display: display) }

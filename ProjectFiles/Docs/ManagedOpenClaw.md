@@ -138,3 +138,19 @@ offline prompt regressions passed. The rebuilt signed bundle completed headless
 ACP image/JSON verification using 3.5 Flash-Lite in one generation call, with
 zero repairs or model fallback. Its Gateway stopped after the checker released
 its client lease. Live desktop and visual validation remain incomplete.
+
+The Gateway host keeps bounded vnode watches for the active sealed entry points,
+integrity manifest, private descriptor/configuration/wrapper/token/fingerprint,
+and their private parent directories. File write/replacement events dirty the
+appropriate in-memory cache scope; directory events first compare relevant
+children so health/process-ledger bookkeeping cannot trigger an audit loop.
+Installation hints use the existing forced-full Python audit, bypassing digest
+reuse while preserving the seal and cached inode baseline. Configuration hints
+run the existing settings/credential validation. Hints coalesce for five seconds,
+never establish readiness, and cannot reset recovery budgets. Changes arriving
+during validation remain pending. Successful validation is followed by the
+existing authenticated health path. Watches rearm after replacement and timed
+audits, close with the host, follow no external paths, and perform no recursive
+scans. Vnode delivery is not recursive or guaranteed: missing/unsupported watches
+retain five-minute configuration checks, per-validation file metadata checks,
+and hourly full integrity audits. No generation requests are added.

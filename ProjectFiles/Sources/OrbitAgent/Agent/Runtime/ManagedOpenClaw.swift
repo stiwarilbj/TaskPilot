@@ -231,6 +231,8 @@ enum ManagedGatewayHost {
         var nextHealth: TimeInterval = 0
         var nextAudit: TimeInterval = 0
         var integritySchedule = FullIntegrityAuditSchedule()
+        let fileHints = ManagedRuntimeFileHints(root: root)
+        defer { fileHints.close() }
         let resources = runtimeURL.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("OpenClaw/managed")
         var acpVerified = false
         var repair = false
@@ -282,8 +284,10 @@ enum ManagedGatewayHost {
                     integritySchedule.reset(); repair = false
                     writeHealth(current, state:"recovering", detail:"Preparing private Gateway connectivity", root:root)
                 }
+                fileHints.configure(ManagedRuntimeFileHints.targets(current, descriptorURL: descriptorURL))
                 let now = Date().timeIntervalSince1970
                 let monotonicNow = ProcessInfo.processInfo.systemUptime
+                let dirtyMetadata = fileHints.takeChanges(at: monotonicNow)
                 let configurationRequest = root.appendingPathComponent("configuration-request.json")
                 if let data = try? Data(contentsOf:configurationRequest),
                    let value = try? JSONSerialization.jsonObject(with:data) as? [String:Any],
@@ -315,14 +319,19 @@ enum ManagedGatewayHost {
                 // Offline repair is excluded from every native delivery commit.
                 let fullIntegrityAuditDue = integritySchedule.shouldRun(at:monotonicNow)
                 let forceFullIntegrityAudit = integritySchedule.shouldRun(
-                    at:monotonicNow, forced:faultRequested || repair)
-                if now >= nextAudit || faultRequested || requested && repair || fullIntegrityAuditDue {
+                    at:monotonicNow, forced:faultRequested || repair || dirtyMetadata.contains(.installation))
+                if now >= nextAudit || faultRequested || requested && repair || fullIntegrityAuditDue || !dirtyMetadata.isEmpty {
+                    if !dirtyMetadata.isEmpty {
+                        writeHealth(current, state:"recovering", detail:"Checking private runtime changes", root:root)
+                        nextHealth = 0
+                    }
                     nextAudit = now + 300
                     var auditArguments = ["--managed-openclaw", "audit", "--managed-descriptor", descriptorURL.path]
                     if forceFullIntegrityAudit { auditArguments.append("--force-integrity-audit") }
                     let audit = ownedCommand(root:root, executable:runtimeURL,
                         arguments:auditArguments, timeout:90)
                     let auditResult = Self.object(audit.output)
+                    fileHints.refresh()
                     if forceFullIntegrityAudit {
                         integritySchedule.record(at:ProcessInfo.processInfo.systemUptime,
                             succeeded:auditResult?["full_integrity_ok"] as? Bool == true)

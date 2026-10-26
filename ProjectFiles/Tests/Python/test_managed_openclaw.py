@@ -123,6 +123,23 @@ class ManagedRuntimeTests(unittest.TestCase):
             self.assertEqual(stats['files_hashed'],3)
             self.assertEqual(hint.call_count,2)
 
+    def test_notification_forced_audit_ignores_digest_reuse_but_retains_identity_baseline(self):
+        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
+        metadata=managed._regular_file_metadata(f.stat())
+        f.write_bytes(b'evil')
+        # A notification must force actual reads even if cached metadata looks unchanged.
+        with patch.object(managed,'_regular_file_metadata',return_value=metadata):
+            stats={}
+            self.assertFalse(managed.validate_install(install,'pin',force_full=True,
+                now_monotonic_ns=200,stats=stats))
+            self.assertEqual(stats['audit_mode'],'full')
+            self.assertEqual(stats['files_hashed'],1)
+            self.assertEqual(stats['cache_hits'],0)
+        cache=json.loads(next((install.parent/'.integrity-cache').glob('*.json')).read_text())
+        self.assertEqual(cache['last_full_audit_monotonic_ns'],100)
+
     def test_integrity_cache_skips_unchanged_content_reads_and_rehashes_changed_metadata(self):
         install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})

@@ -16,6 +16,76 @@ final class RuntimeTransportTests: XCTestCase {
         func now() -> TimeInterval { lock.withLock { value } }
         func advance(_ seconds: TimeInterval) { lock.withLock { value += seconds } }
     }
+    func testExpiredAdmissionNeverBuildsPayloadAndSettlesOnce() {
+        let queue = DispatchQueue(label: "fixture.expired-admission"), pipe = Pipe(), clock = FakeClock()
+        let telemetry = BackendTelemetry(now: { clock.now() })
+        let budget = LocalOperationBudget(seconds: 1, phase: "preflight", now: { clock.now() })
+        var builds = 0, callbacks = 0, failures: [String] = []
+        func payload() -> Data { builds += 1; return Data(repeating: 1, count: 100_000) }
+        clock.advance(1)
+        queue.sync {
+            let writer = RuntimePipeWriter(handle: pipe.fileHandleForWriting, queue: queue, telemetry: telemetry) { failures.append($0) }
+            writer.enqueue(payload(), budget: budget) { success in XCTAssertFalse(success); callbacks += 1 }
+            XCTAssertEqual(writer.pendingBytes, 0); writer.cancel()
+        }
+        XCTAssertEqual(builds, 0); XCTAssertEqual(callbacks, 1)
+        XCTAssertEqual(failures, ["transport_local_deadline"])
+        let histogram = telemetry.queueWaitHistograms().first { $0.queue == .pipeFirstWrite }
+        XCTAssertEqual(histogram?.countsByDisposition[.rejected]?.reduce(0, +), 1)
+        XCTAssertNil(histogram?.countsByDisposition[.started])
+    }
+
+    func testExpiryDuringPayloadConstructionCannotEnqueueOrWrite() {
+        let queue = DispatchQueue(label: "fixture.payload-expiry"), pipe = Pipe(), clock = FakeClock()
+        let budget = LocalOperationBudget(seconds: 1, phase: "preflight", now: { clock.now() })
+        var callbacks = 0
+        func payload() -> Data { clock.advance(1); return Data([1]) }
+        queue.sync {
+            let writer = RuntimePipeWriter(handle: pipe.fileHandleForWriting, queue: queue,
+                writeOperation: { _, _, _ in XCTFail("Expired frame written"); return 0 }) {
+                    XCTAssertEqual($0, "transport_local_deadline")
+                }
+            writer.enqueue(payload(), budget: budget) { XCTAssertFalse($0); callbacks += 1 }
+            XCTAssertEqual(writer.pendingBytes, 0); writer.cancel()
+        }
+        XCTAssertEqual(callbacks, 1)
+    }
+
+    func testExpiredQueuedFrameIsDroppedBeforeWriteButNextFrameCompletes() throws {
+        let queue = DispatchQueue(label: "fixture.queued-expiry"), pipe = Pipe(), clock = FakeClock()
+        let budget = LocalOperationBudget(seconds: 1, phase: "preflight", now: { clock.now() })
+        let settled = expectation(description: "Both settled"); settled.expectedFulfillmentCount = 2
+        var writer: RuntimePipeWriter!, failures: [String] = []
+        queue.sync {
+            writer = RuntimePipeWriter(handle: pipe.fileHandleForWriting, queue: queue) { failures.append($0) }
+            writer.enqueue(Data("expired".utf8), budget: budget) { XCTAssertFalse($0); settled.fulfill() }
+            writer.enqueue(Data("next".utf8)) { XCTAssertTrue($0); settled.fulfill() }
+            clock.advance(1) // The queue is held until after expiry.
+        }
+        wait(for: [settled], timeout: 2)
+        XCTAssertEqual(try pipe.fileHandleForReading.read(upToCount: 4), Data("next".utf8))
+        queue.sync { XCTAssertEqual(writer.pendingBytes, 0); XCTAssertEqual(failures, ["transport_local_deadline"]); writer.cancel() }
+    }
+
+    func testPartialFrameFinishesAfterLocalDeadlineWithoutTruncation() {
+        let queue = DispatchQueue(label: "fixture.partial-expiry"), pipe = Pipe(), clock = FakeClock()
+        let budget = LocalOperationBudget(seconds: 1, phase: "preflight", now: { clock.now() })
+        let settled = expectation(description: "Frame completed")
+        var writer: RuntimePipeWriter!, bytes = Data(), calls = 0
+        queue.sync {
+            writer = RuntimePipeWriter(handle: pipe.fileHandleForWriting, queue: queue, writeOperation: { _, pointer, count in
+                calls += 1
+                let length = calls == 1 ? 1 : count
+                bytes.append(pointer.assumingMemoryBound(to: UInt8.self), count: length)
+                clock.advance(2)
+                return length
+            }) { XCTFail($0) }
+            writer.enqueue(Data("complete-frame".utf8), budget: budget) { XCTAssertTrue($0); settled.fulfill() }
+        }
+        wait(for: [settled], timeout: 2)
+        queue.sync { XCTAssertEqual(bytes, Data("complete-frame".utf8)); XCTAssertEqual(calls, 2); writer.cancel() }
+    }
+
     func testUnterminatedFloodNeverRetainsMoreThanOneFrame() {
         var buffer = RuntimeLineBuffer(frameLimit: 64)
         XCTAssertTrue(buffer.append(Data(repeating: 0x78, count: 64)).isEmpty)

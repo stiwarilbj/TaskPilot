@@ -4,6 +4,89 @@ import XCTest
 @testable import OrbitAgent
 
 final class ManagedOpenClawTests: XCTestCase {
+    private func hintFixture() throws -> URL {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
+        addTeardownBlock { try? FileManager.default.removeItem(at:root) }
+        return root
+    }
+    private func waitForHints(_ hints: ManagedRuntimeFileHints, at now: TimeInterval = 0) -> ManagedRuntimeFileHints.Changes {
+        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        repeat {
+            let changes = hints.takeChanges(at:now)
+            if !changes.isEmpty { return changes }
+            Thread.sleep(forTimeInterval:0.01)
+        } while ProcessInfo.processInfo.systemUptime < deadline
+        XCTFail("Expected filesystem invalidation hint")
+        return []
+    }
+    func testFileHintsObserveWritesAndAtomicReplacementAndRearm() throws {
+        let root = try hintFixture(), file = root.appendingPathComponent("code")
+        try Data("first".utf8).write(to:file)
+        let hints = ManagedRuntimeFileHints(root:root); defer { hints.close() }
+        hints.configure([file:.installation])
+        XCTAssertTrue(hints.takeChanges(at:0).isEmpty)
+        try Data("second".utf8).write(to:file)
+        XCTAssertEqual(waitForHints(hints),.installation)
+        try Data("replacement".utf8).write(to:file,options:.atomic)
+        XCTAssertEqual(waitForHints(hints,at:5),.installation)
+        try Data("third".utf8).write(to:file)
+        XCTAssertEqual(waitForHints(hints,at:10),.installation)
+    }
+    func testFileHintsCoalesceAndIgnoreUnrelatedBookkeeping() throws {
+        let root = try hintFixture(), file = root.appendingPathComponent("config")
+        try Data("first".utf8).write(to:file)
+        let hints = ManagedRuntimeFileHints(root:root); defer { hints.close() }
+        hints.configure([file:.configuration])
+        try Data("health".utf8).write(to:root.appendingPathComponent("health.json"),options:.atomic)
+        hints.refresh()
+        XCTAssertTrue(hints.takeChanges(at:0).isEmpty)
+        try Data("changed".utf8).write(to:file)
+        hints.refresh()
+        XCTAssertEqual(hints.takeChanges(at:0),.configuration)
+        try Data("changed again".utf8).write(to:file)
+        hints.refresh()
+        XCTAssertTrue(hints.takeChanges(at:4).isEmpty)
+        XCTAssertEqual(hints.takeChanges(at:5),.configuration)
+    }
+    func testFileHintsDetectMissingDirectoriesAndStopWatchingOldTargets() throws {
+        let root = try hintFixture(), folder = root.appendingPathComponent("instance")
+        let file = folder.appendingPathComponent("config")
+        let hints = ManagedRuntimeFileHints(root:root); defer { hints.close() }
+        hints.configure([file:.configuration])
+        try FileManager.default.createDirectory(at:folder,withIntermediateDirectories:true)
+        try Data("created".utf8).write(to:file)
+        XCTAssertEqual(waitForHints(hints),.configuration)
+        let replacement = root.appendingPathComponent("other")
+        try Data("other".utf8).write(to:replacement)
+        hints.configure([replacement:.installation])
+        try Data("old".utf8).write(to:file)
+        hints.refresh()
+        XCTAssertTrue(hints.takeChanges(at:10).isEmpty)
+        hints.close()
+        try Data("closed".utf8).write(to:replacement)
+        hints.refresh()
+        XCTAssertTrue(hints.takeChanges(at:20).isEmpty)
+    }
+    func testUnsupportedWatchesRetainTimedRefreshAndDoNotFollowOutsidePaths() throws {
+        let root = try hintFixture(), file = root.appendingPathComponent("config")
+        try Data("initial".utf8).write(to:file)
+        let hints = ManagedRuntimeFileHints(root:root,openDescriptor:{ _ in -1 }); defer { hints.close() }
+        hints.configure([file:.configuration])
+        try Data("changed".utf8).write(to:file)
+        XCTAssertTrue(hints.takeChanges(at:0).isEmpty)
+        hints.refresh() // Existing timed audit is still a validation/rearm boundary.
+        XCTAssertEqual(hints.takeChanges(at:0),.configuration)
+        let outside = try hintFixture().appendingPathComponent("other")
+        try Data("outside".utf8).write(to:outside)
+        hints.configure([outside:.installation])
+        hints.refresh()
+        XCTAssertTrue(hints.takeChanges(at:10).isEmpty)
+        var schedule = FullIntegrityAuditSchedule()
+        schedule.record(at:100,succeeded:true)
+        XCTAssertTrue(schedule.shouldRun(at:3700))
+    }
+
     func testFullIntegrityAuditScheduleUsesMonotonicTimeAndSuccessfulPassesOnly() {
         var schedule = FullIntegrityAuditSchedule()
         XCTAssertTrue(schedule.shouldRun(at:100)) // Gateway host startup.

@@ -792,6 +792,11 @@ final class LocalOperationBudget: @unchecked Sendable {
     var remaining: TimeInterval { max(0, deadline - now()) }
     func check(phase next: String? = nil) throws {
         try Task.checkCancellation()
+        try checkDeadline(phase: next)
+    }
+    /// Queues check their stored caller deadline independently of whichever
+    /// task happens to pump them; cancellation is owned by that item's token.
+    func checkDeadline(phase next: String? = nil) throws {
         try lock.withLock {
             guard now() < deadline else { throw Exhausted(phase: phase) }
             if let next { phase = next }

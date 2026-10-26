@@ -10,6 +10,7 @@ final class RuntimePipeWriter {
         var offset = 0
         let completion: (Bool) -> Void
         let waitTicket: BackendTelemetry.QueueTicket
+        let budget: LocalOperationBudget?
     }
     private let descriptor: Int32
     private let queue: DispatchQueue
@@ -44,10 +45,19 @@ final class RuntimePipeWriter {
         }
     }
 
-    func enqueue(_ data: Data, priority: Bool = false, completion: @escaping (Bool) -> Void = { _ in }) {
-        guard !data.isEmpty else { completion(!closed); return }
+    // Defer payload construction/copying until admission. Task-local budgets
+    // must be captured explicitly when crossing a DispatchQueue boundary.
+    func enqueue(_ payload: @autoclosure () -> Data, priority: Bool = false,
+                 budget: LocalOperationBudget? = LocalOperationBudget.current,
+                 completion: @escaping (Bool) -> Void = { _ in }) {
         let waitTicket = telemetry.beginQueueWait(.pipeFirstWrite)
         guard !closed else { waitTicket.discard(.rejected); completion(false); return }
+        do { try budget?.check(phase: "pipe_queue") }
+        catch { rejectExpired(waitTicket, completion: completion, error: error); return }
+        let data = payload()
+        do { try budget?.check(phase: "pipe_queue") }
+        catch { rejectExpired(waitTicket, completion: completion, error: error); return }
+        guard !data.isEmpty else { waitTicket.discard(.abandoned); completion(true); return }
         guard data.count <= RuntimeLineBuffer.maximumFrameBytes + 1 else {
             waitTicket.discard(.rejected)
             completion(false); fail("transport_frame_limit"); return
@@ -56,13 +66,20 @@ final class RuntimePipeWriter {
             waitTicket.discard(.rejected)
             completion(false); fail("transport_buffer_limit"); return
         }
-        frames.append(Frame(data: data, completion: completion, waitTicket: waitTicket)); bytes += data.count
+        frames.append(Frame(data: data, completion: completion, waitTicket: waitTicket, budget: budget)); bytes += data.count
         if source == nil {
             let source = DispatchSource.makeWriteSource(fileDescriptor: descriptor, queue: queue)
             source.setEventHandler { [weak self] in self?.pump() }
             self.source = source; source.resume()
             armDeadline()
         }
+    }
+
+    private func rejectExpired(_ ticket: BackendTelemetry.QueueTicket,
+                               completion: (Bool) -> Void, error: Error) {
+        ticket.discard(error is CancellationError ? .cancelled : .rejected)
+        completion(false)
+        failure(error is CancellationError ? "transport_local_cancelled" : "transport_local_deadline")
     }
 
     private func armDeadline() {
@@ -76,6 +93,18 @@ final class RuntimePipeWriter {
     private func pump() {
         var allowance = 64 * 1024
         while frameHead < frames.count && allowance > 0 && !closed {
+            // Once any bytes are dispatched, finish the frame under the
+            // existing transport timeout. Dropping its suffix corrupts framing
+            // and cannot establish that an associated action failed.
+            if frames[frameHead].offset == 0 {
+                do { try frames[frameHead].budget?.check(phase: "pipe_queue") }
+                catch {
+                    let frame = frames[frameHead]; frameHead += 1; bytes -= frame.data.count
+                    compactConsumedPrefixIfNeeded()
+                    rejectExpired(frame.waitTicket, completion: frame.completion, error: error)
+                    continue
+                }
+            }
             frames[frameHead].waitTicket.start()
             let written = frames[frameHead].data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
                 writeOperation(descriptor, buffer.baseAddress!.advanced(by: frames[frameHead].offset),

@@ -82,6 +82,71 @@ final class CapturePipelineTests: XCTestCase {
         var released: Bool { lock.withLock { value == nil } }
     }
 
+    func testExpiredAcquisitionDoesNotReservePixelsOrReplacePreview() async throws {
+        let queue = CaptureAcquisitionQueue(), clock = Clock()
+        var blocker: CaptureAcquisitionQueue.Reservation? = try await queue.acquire(.evidence)
+        let preview = Task { try await queue.acquire(.preview) }
+        await eventually { await queue.statistics.waitingPreview == 1 }
+        let budget = LocalOperationBudget(seconds: 1, phase: "preflight", now: { clock.now() })
+        clock.advance(1)
+        do {
+            _ = try await LocalOperationBudget.$current.withValue(budget) { try await queue.acquire(.preview) }
+            XCTFail("Expired request acquired pixels")
+        } catch { XCTAssertTrue(error is LocalOperationBudget.Exhausted) }
+        let stats = await queue.statistics
+        XCTAssertEqual(stats.waitingPreview, 1); XCTAssertEqual(stats.previewFrames, 0)
+        await queue.acquired(blocker!); blocker = nil
+        let accepted = try await preview.value; try accepted.check(); await queue.acquired(accepted)
+    }
+
+    func testExpiredEncodingNeverCreatesScratchOrStartsCompression() async throws {
+        let clock = Clock(), budget = LocalOperationBudget(seconds: 1, phase: "preflight", now: { clock.now() })
+        let telemetry = BackendTelemetry(now: { clock.now() }), ticket = telemetry.beginQueueWait(.pngCompression)
+        let root = try directory().appendingPathComponent("not-created")
+        let encoder = CapturePNGEncoder(directory: root, writer: { _, _ in XCTFail("Expired compression invoked") })
+        let pixels = try image(1), service = ScreenCaptureService(acquirer: { _, _, _ in pixels })
+        let frame = try await service.acquire(display: display)
+        clock.advance(1)
+        do {
+            _ = try await LocalOperationBudget.$current.withValue(budget) {
+                try await encoder.encode(frame, telemetry: telemetry, waitTicket: ticket)
+            }
+            XCTFail("Expired compression accepted")
+        } catch { XCTAssertTrue(error is LocalOperationBudget.Exhausted) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+        let active = await encoder.activeCount, pending = await encoder.pendingCount
+        XCTAssertEqual(active, 0); XCTAssertEqual(pending, 0)
+        let histogram = telemetry.queueWaitHistograms().first { $0.queue == .pngCompression }
+        XCTAssertEqual(histogram?.countsByDisposition[.rejected]?.reduce(0, +), 1)
+        XCTAssertNil(histogram?.countsByDisposition[.started])
+        try frame.check() // Expiry does not cancel a separately owned accepted frame.
+    }
+
+    func testQueuedEncodingExpiresBeforeWorkerAllocationAndCanBeRetriedFresh() async throws {
+        let started = expectation(description: "First encode running"), writer = BlockedWriter(started)
+        defer { writer.release.signal() }
+        let root = try directory(), encoder = CapturePNGEncoder(directory: root, writer: { try writer.write($0, to: $1) })
+        let pixels = try image(1), service = ScreenCaptureService(acquirer: { _, _, _ in pixels })
+        let first = try await service.acquire(display: display), second = try await service.acquire(display: display)
+        let running = Task { try await encoder.encode(first) }
+        await fulfillment(of: [started], timeout: 2)
+        let clock = Clock(), budget = LocalOperationBudget(seconds: 1, phase: "preflight", now: { clock.now() })
+        let telemetry = BackendTelemetry(now: { clock.now() }), ticket = telemetry.beginQueueWait(.pngCompression)
+        let queued = Task {
+            try await LocalOperationBudget.$current.withValue(budget) {
+                try await encoder.encode(second, telemetry: telemetry, waitTicket: ticket)
+            }
+        }
+        await eventually { await encoder.pendingCount == 1 }
+        clock.advance(1); writer.release.signal(); _ = try await running.value
+        do { _ = try await queued.value; XCTFail("Expired compression ran") }
+        catch { XCTAssertTrue(error is LocalOperationBudget.Exhausted) }
+        XCTAssertEqual(writer.count, 1)
+        XCTAssertEqual(telemetry.queueWaitHistograms().first { $0.queue == .pngCompression }?.countsByDisposition[.rejected]?.reduce(0, +), 1)
+        _ = try await encoder.encode(second)
+        XCTAssertEqual(writer.count, 2)
+    }
+
     func testEvidencePrecedesLatestPreviewAndOldPreviewsAreCoalesced() async throws {
         let queue = CaptureAcquisitionQueue()
         var blocker: CaptureAcquisitionQueue.Reservation? = try await queue.acquire(.preview)

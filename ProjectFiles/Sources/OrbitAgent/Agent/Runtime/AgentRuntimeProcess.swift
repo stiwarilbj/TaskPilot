@@ -1117,9 +1117,18 @@ final class AgentRuntimeProcess {
     }
 
     private func send(_ object: [String: Any], for run: Invocation, bridgeSpan: BackendTelemetry.Span? = nil) {
+        let budget = LocalOperationBudget.current
         enqueueIO { [weak self] in
             guard let self, self.invocation === run, run.lease.accepts(object["task_generation_id"] as? String) else {
                 bridgeSpan?.finish(.cancelled); return
+            }
+            // Reject before JSON serialization allocates a potentially large
+            // frame. Already-dispatched bridge results retain their existing
+            // receipt/reconciliation path; a deadline is never effect evidence.
+            do { try budget?.check(phase: "pipe_queue") }
+            catch {
+                bridgeSpan?.finish(.cancelled)
+                self.failTransport("transport_local_deadline", for: run); return
             }
             let recordSize = object["kind"] as? String != "user_input_response"
             guard var data = try? self.telemetry.encodeJSON(object, recordSize: recordSize) else { bridgeSpan?.finish(.failed); return }
@@ -1127,7 +1136,7 @@ final class AgentRuntimeProcess {
             let span = self.telemetry.begin(.ipcSend, inputBytes: recordSize ? data.count : nil)
             let count = data.count
             let priority = ["bridge_response", "user_input_response"].contains(object["kind"] as? String ?? "")
-            run.writer?.enqueue(data, priority: priority) { delivered in
+            run.writer?.enqueue(data, priority: priority, budget: budget) { delivered in
                 if recordSize && delivered { span.record(outputBytes: count) }
                 span.finish(delivered ? .succeeded : .failed)
                 if delivered { bridgeSpan?.record(outputBytes: count) }

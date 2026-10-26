@@ -306,6 +306,9 @@ def validate_install(directory, fingerprint, *, force_full=False, now_monotonic_
 
     Cache failures never authorize a file: they cause a full uncached hash pass.
     A changed file is always rehashed against the immutable integrity manifest.
+    The native host also passes force_full for installation notification hints:
+    discard digest reuse, not the prior inode baseline or expected seal values.
+    Missed/unsupported notifications never replace metadata checks or audit age.
     """
     result = stats if stats is not None else {}
     result.clear()
