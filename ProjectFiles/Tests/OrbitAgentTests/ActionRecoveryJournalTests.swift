@@ -105,17 +105,19 @@ final class ActionRecoveryJournalTests: XCTestCase {
         try token.dispatched()
         try token.complete(Self.result.merging(["message": "never-store-native-response"]) { _, new in new })
         let bytes = try Data(contentsOf: root.appendingPathComponent("receipts.json"))
+        let walBytes = try Data(contentsOf: root.appendingPathComponent("receipts.wal"))
         let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
         let content = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(envelope["data"] as? String)))
         let text = String(decoding: content, as: UTF8.self)
         for forbidden in ["private-control-label", "never-store-entered-text", "never-store-generation", "never-store-native-response", authorization().request, "focus"] {
             XCTAssertFalse(text.contains(forbidden), forbidden)
             XCTAssertFalse(String(decoding: bytes, as: UTF8.self).contains(forbidden), forbidden)
+            XCTAssertFalse(String(decoding: walBytes, as: UTF8.self).contains(forbidden), forbidden)
         }
         let key = SymmetricKey(data: try Data(contentsOf: root.appendingPathComponent("key")))
         XCTAssertTrue(HMAC<SHA256>.isValidAuthenticationCode(try XCTUnwrap(Data(base64Encoded: envelope["authentication"] as! String)), authenticating: content, using: key))
         XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: root.path)[.posixPermissions] as? NSNumber)?.intValue, 0o700)
-        for name in ["key", "receipts.json", "owner.lock"] {
+        for name in ["key", "receipts.json", "receipts.wal", "owner.lock"] {
             XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: root.appendingPathComponent(name).path)[.posixPermissions] as? NSNumber)?.intValue, 0o600)
         }
     }
@@ -173,8 +175,8 @@ final class ActionRecoveryJournalTests: XCTestCase {
         try journal.register(authorization())
         let lease = TaskLease(recoveryJournal: journal, recoveryTask: Self.taskID)
         let receipt = try token(lease.actionReceipts)
-        try FileManager.default.removeItem(at: root.appendingPathComponent("receipts.json"))
-        try FileManager.default.createDirectory(at: root.appendingPathComponent("receipts.json"), withIntermediateDirectories: false)
+        try FileManager.default.removeItem(at: root.appendingPathComponent("receipts.wal"))
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("receipts.wal"), withIntermediateDirectories: false)
         var effects = 0
         XCTAssertThrowsError(try TaskOwnership.$current.withValue(lease) {
             try TaskOwnership.$actionReceipt.withValue(receipt) { try TaskOwnership.commit { effects += 1 } }
@@ -294,6 +296,10 @@ final class ActionRecoveryJournalTests: XCTestCase {
         do {
             let journal = try ActionRecoveryJournal(directory: root)
             try journal.register(authorization())
+            let store = ActionReceiptStore(generation: "fixture", journal: journal, recoveryTask: Self.taskID)
+            for _ in 0..<64 {
+                try token(store, id: UUID().uuidString).complete(Self.result)
+            }
         }
         let file = root.appendingPathComponent("receipts.json")
         let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])
@@ -306,6 +312,9 @@ final class ActionRecoveryJournalTests: XCTestCase {
         let key = SymmetricKey(data: try Data(contentsOf: root.appendingPathComponent("key")))
         try JSONSerialization.data(withJSONObject: ["data": bytes.base64EncodedString(),
             "authentication": Data(HMAC<SHA256>.authenticationCode(for: bytes, using: key)).base64EncodedString()]).write(to: file)
+        // The fixture replaces the compacted snapshot with a synthetic full
+        // uncertain set, so discard the suffix it no longer represents.
+        try Data().write(to: root.appendingPathComponent("receipts.wal"))
         let journal = try ActionRecoveryJournal(directory: root)
         let before = try Data(contentsOf: file)
         let store = ActionReceiptStore(generation: "fixture", journal: journal, recoveryTask: Self.taskID)
@@ -328,7 +337,104 @@ final class ActionRecoveryJournalTests: XCTestCase {
         }
         store.discard()
         XCTAssertEqual(journal.summary().uncertain, 1)
-        XCTAssertEqual(journal.summary().terminal, 128)
+        XCTAssertEqual(journal.summary().terminal, 132)
+    }
+
+    func testCompactedLineageBlocksReplayAfterRestartAndWALStaysBounded() throws {
+        let root = try root()
+        let retiredAction = UUID().uuidString.lowercased()
+        do {
+            let journal = try ActionRecoveryJournal(directory: root)
+            try journal.register(authorization())
+            let store = ActionReceiptStore(generation: "fixture", journal: journal, recoveryTask: Self.taskID)
+            try token(store, id: retiredAction).complete(Self.result)
+            for _ in 1..<160 {
+                try token(store, id: UUID().uuidString).complete(Self.result)
+            }
+            store.discard()
+            XCTAssertEqual(journal.summary(task: Self.taskID).terminal, 160)
+        }
+
+        let wal = root.appendingPathComponent("receipts.wal")
+        XCTAssertLessThan(try Data(contentsOf: wal).count, ActionRecoveryJournal.maximumWALBytes)
+        XCTAssertLessThan(try Data(contentsOf: root.appendingPathComponent("receipts.json")).count, 128 * 1024)
+
+        let restored = try ActionRecoveryJournal(directory: root)
+        XCTAssertEqual(restored.summary(task: Self.taskID).terminal, 160)
+        let next = AgentTaskAuthorization(request: "A later authorized task", wasQueued: false)
+        try restored.register(next)
+        XCTAssertThrowsError(try restored.prepare(task: next.id, action: retiredAction, payload: Data("safe".utf8)))
+        XCTAssertEqual(restored.summary(task: Self.taskID).terminal, 160)
+    }
+
+    func testIncompleteFinalWALFrameIsDiscardedWithoutLosingPriorTransitions() throws {
+        let root = try root()
+        do {
+            let journal = try ActionRecoveryJournal(directory: root)
+            try journal.register(authorization())
+            _ = try token(ActionReceiptStore(generation: "fixture", journal: journal, recoveryTask: Self.taskID))
+            let wal = root.appendingPathComponent("receipts.wal")
+            let handle = try FileHandle(forWritingTo: wal)
+            try handle.seekToEnd(); try handle.write(contentsOf: Data([0, 0])); try handle.synchronize(); try handle.close()
+        }
+        let restored = try ActionRecoveryJournal(directory: root)
+        XCTAssertEqual(restored.summary(task: Self.taskID).prepared, 1)
+        XCTAssertEqual(restored.summary(task: Self.taskID).uncertain, 0)
+        let walBytes = try Data(contentsOf: root.appendingPathComponent("receipts.wal"))
+        XCTAssertFalse(walBytes.suffix(2) == Data([0, 0]))
+    }
+
+    func testLegacySnapshotMigratesAndWALAuthenticationFailsClosed() throws {
+        let root = try root()
+        let legacy = root.appendingPathComponent("legacy", isDirectory: true)
+        try FileManager.default.createDirectory(at: legacy, withIntermediateDirectories: true)
+        let keyBytes = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
+        try PrivateDurableFile.replace(keyBytes, at: legacy.appendingPathComponent("key"))
+        let legacyBytes = try JSONSerialization.data(withJSONObject: [
+            "version": 1,
+            "authorizations": [["task": Self.taskID.uuidString,
+                                "fingerprint": String(repeating: "a", count: 64), "closed": false]],
+            "records": []
+        ])
+        let key = SymmetricKey(data: keyBytes)
+        let envelope = try JSONSerialization.data(withJSONObject: [
+            "data": legacyBytes.base64EncodedString(),
+            "authentication": Data(HMAC<SHA256>.authenticationCode(for: legacyBytes, using: key)).base64EncodedString()
+        ])
+        try PrivateDurableFile.replace(envelope, at: legacy.appendingPathComponent("receipts.json"))
+        do {
+            let migrated = try ActionRecoveryJournal(directory: legacy)
+            XCTAssertEqual(migrated.summary().count, 0)
+        }
+        let migratedEnvelope = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: Data(contentsOf: legacy.appendingPathComponent("receipts.json"))) as? [String: Any])
+        let migratedContent = try XCTUnwrap(Data(base64Encoded: migratedEnvelope["data"] as! String))
+        let migratedSnapshot = try XCTUnwrap(JSONSerialization.jsonObject(with: migratedContent) as? [String: Any])
+        XCTAssertEqual(migratedSnapshot["version"] as? Int, 2)
+        XCTAssertTrue((try Data(contentsOf: legacy.appendingPathComponent("receipts.wal"))).isEmpty)
+
+        let damaged = try self.root().appendingPathComponent("damaged", isDirectory: true)
+        do {
+            let journal = try ActionRecoveryJournal(directory: damaged)
+            try journal.register(authorization())
+            _ = try token(ActionReceiptStore(generation: "fixture", journal: journal, recoveryTask: Self.taskID))
+        }
+        let wal = damaged.appendingPathComponent("receipts.wal")
+        var walData = try Data(contentsOf: wal)
+        walData[walData.count - 1] ^= 1
+        try walData.write(to: wal)
+        XCTAssertThrowsError(try ActionRecoveryJournal(directory: damaged))
+    }
+
+    func testMissingWALCannotHideACommittedTransition() throws {
+        let root = try root()
+        do {
+            let journal = try ActionRecoveryJournal(directory: root)
+            try journal.register(authorization())
+            _ = try token(ActionReceiptStore(generation: "fixture", journal: journal, recoveryTask: Self.taskID))
+        }
+        try FileManager.default.removeItem(at: root.appendingPathComponent("receipts.wal"))
+        XCTAssertThrowsError(try ActionRecoveryJournal(directory: root))
     }
 
     func testSymlinksAndHardlinksCannotRedirectJournalFiles() throws {
