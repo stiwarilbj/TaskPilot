@@ -10,6 +10,14 @@ requested executable runs. There is no optimistic parent-side `setpgid` repair
 or fallback to signaling an arbitrary PID. Unrelated descriptors are closed at
 exec, working directories and literal argument arrays are preserved, and the
 child receives a fresh signal mask and default dispositions.
+Controller-owned runtime and command pipes are created with `FD_CLOEXEC` on
+both ends before readers or writers receive them. Spawn retains its
+`POSIX_SPAWN_CLOEXEC_DEFAULT` allowlist, maps only the intended standard streams,
+and explicitly closes their source descriptors once each after mapping (including
+shared stdout/stderr). Caller-supplied handles retain their original flags and
+ownership; an already-closed unused pipe end is never inspected. No extra
+inherited descriptors are required by this launch contract.
+
 The child starts suspended and is released only after ownership and kernel
 observers are installed. A failed release is reaped before launch failure returns.
 
@@ -84,3 +92,9 @@ before configuration or model requests. Existing command, receipt, ownership,
 transport, and output-buffer regressions remain in the suites. No fixer,
 live-control tester, Chrome, desktop task, or provider request is run; live
 accuracy validation remains incomplete.
+
+Descriptor regression fixtures launch synthetic children with deliberately
+inheritable unrelated handles and standard-stream source handles. They verify
+that none survive exec, intended stdin/stdout/stderr still work, merged output
+is preserved, and runtime completion without a final newline is drained exactly
+once. These fixtures require no desktop interactions or provider calls.

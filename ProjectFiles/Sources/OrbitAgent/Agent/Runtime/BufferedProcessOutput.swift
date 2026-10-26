@@ -30,13 +30,14 @@ final class BufferedProcessOutput: @unchecked Sendable {
         }
     }
     private final class Stream {
-        let pipe = Pipe()
+        let pipe: Pipe
         var source: DispatchSourceRead?
         var memory = Data()
         var spill: FileHandle?
         var retained = 0
         var drained: UInt64 = 0
         var eof = false
+        init() throws { pipe = try SubprocessSupervisor.makePrivatePipe() }
     }
 
     private let queue = DispatchQueue(label: "com.orbitagent.buffered-process-output", qos: .utility)
@@ -67,7 +68,7 @@ final class BufferedProcessOutput: @unchecked Sendable {
         self.memoryThreshold = memoryThreshold
         self.spillRoot = spillRoot
         self.onInterruption = onInterruption
-        streams = merged ? [Stream()] : [Stream(), Stream()]
+        streams = try (0..<(merged ? 1 : 2)).map { _ in try Stream() }
         do {
             for stream in streams {
                 let handle = stream.pipe.fileHandleForReading

@@ -234,11 +234,11 @@ final class AgentRuntimeProcess {
             throw RuntimeProcessError.runtimeMissing
         }
 
-        try bridge.bind(lease)
         let process = SubprocessSupervisor()
-        let input = Pipe()
-        let output = Pipe()
-        let error = Pipe()
+        let input = try SubprocessSupervisor.makePrivatePipe()
+        let output = try SubprocessSupervisor.makePrivatePipe()
+        let error = try SubprocessSupervisor.makePrivatePipe()
+        try bridge.bind(lease)
         process.executableURL = runtimeURL
         process.arguments = [
             "--task", task,

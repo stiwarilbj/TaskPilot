@@ -259,7 +259,7 @@ final class OpenClawService {
             process.executableURL = executable
             process.arguments = arguments
             process.environment = environment
-            let pipe = input.map { _ in Pipe() }
+            let pipe = try input.map { _ in try SubprocessSupervisor.makePrivatePipe() }
             if let pipe { process.standardInput = pipe }
             let exit = ProcessExitNotification(process)
             cancellation?.bind(process, exit: exit)

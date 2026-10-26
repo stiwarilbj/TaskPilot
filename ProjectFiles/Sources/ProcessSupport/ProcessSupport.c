@@ -30,6 +30,14 @@ int tp_spawn(pid_t *pid, const char *path, char *const argv[], char *const env[]
     CHECK(posix_spawn_file_actions_adddup2(&actions, input, STDIN_FILENO));
     CHECK(posix_spawn_file_actions_adddup2(&actions, output, STDOUT_FILENO));
     CHECK(posix_spawn_file_actions_adddup2(&actions, error, STDERR_FILENO));
+    // The only inherited handles are 0/1/2. Close their source copies after
+    // all mappings, once each (stdout and stderr may share a pipe). Keep the
+    // CLOEXEC_DEFAULT allowlist above for every unrelated controller handle.
+    if (input > STDERR_FILENO) CHECK(posix_spawn_file_actions_addclose(&actions, input));
+    if (output > STDERR_FILENO && output != input)
+        CHECK(posix_spawn_file_actions_addclose(&actions, output));
+    if (error > STDERR_FILENO && error != input && error != output)
+        CHECK(posix_spawn_file_actions_addclose(&actions, error));
     result = posix_spawn(pid, path, &actions, &attributes, argv, env);
 done:
     posix_spawn_file_actions_destroy(&actions);

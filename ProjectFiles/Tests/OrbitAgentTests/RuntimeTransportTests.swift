@@ -367,6 +367,48 @@ final class RuntimeTransportTests: XCTestCase {
         return url
     }
 
+    @MainActor func testRuntimeLaunchClosesUnrelatedDescriptorsAndDrainsFinalCompletion() async throws {
+        let source = open("/dev/null", O_RDONLY)
+        guard source >= 0 else { return XCTFail("Cannot open sentinel") }
+        defer { close(source) }
+        let unrelated = fcntl(source, F_DUPFD, 256)
+        guard unrelated >= 0 else { return XCTFail("Cannot duplicate sentinel") }
+        defer { close(unrelated) }
+        let executable = try helper("""
+        import os, errno
+        try: os.fstat(\(unrelated))
+        except OSError as error: assert error.errno == errno.EBADF
+        else: raise AssertionError('unrelated descriptor inherited')
+        emit('bridge_request', request_id='gate', method='completion_gate', params={})
+        response = json.loads(sys.stdin.readline())
+        assert response.get('ok') and response.get('result', {}).get('accepted') is True
+        frame = dict(kind='complete', message='isolated and drained',
+                     task_generation_id=config['task_generation_id'], instruction_revision=0,
+                     working_document_revision=0)
+        sys.stdout.write(json.dumps(frame))
+        sys.stderr.write('final diagnostic')
+        """)
+        let terminal = expectation(description: "Final completion drained")
+        var terminalCount = 0
+        let runtime = AgentRuntimeProcess(bridge: bridge()) { request in
+            XCTAssertEqual(request["method"] as? String, "completion_gate")
+            let owner = TaskOwnership.current!
+            return ["kind": "bridge_response", "task_generation_id": owner.id,
+                    "request_id": request["request_id"]!, "ok": true,
+                    "result": ["accepted": owner.claimCompletion(instructionRevision: 0)]]
+        }
+        runtime.onEvent = { event in
+            if case .completed(let message) = event {
+                XCTAssertEqual(message, "isolated and drained"); terminalCount += 1; terminal.fulfill()
+            }
+            if case .failed(let message) = event { XCTFail(message); terminal.fulfill() }
+        }
+        try runtime.start(task: "fixture", display: display, runtimeURL: executable, openClawURL: executable, geminiAPIKey: "")
+        await fulfillment(of: [terminal], timeout: 5)
+        XCTAssertEqual(terminalCount, 1)
+        XCTAssertEqual(fcntl(unrelated, F_GETFD), 0)
+    }
+
     @MainActor func testOversizedUnterminatedHelperOutputFailsWithoutAnAction() async throws {
         let executable = try helper("sys.stdout.write('x' * (8*1024*1024+1)); sys.stdout.flush(); time.sleep(20)")
         let failed = expectation(description: "Classified framing failure")

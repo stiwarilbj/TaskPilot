@@ -38,6 +38,77 @@ final class SubprocessSupervisorTests: XCTestCase {
         XCTAssertTrue(process.snapshot.outputDrained)
     }
 
+    func testPrivatePipesProtectBothControllerEnds() throws {
+        let pipe = try SubprocessSupervisor.makePrivatePipe()
+        defer { try? pipe.fileHandleForReading.close(); try? pipe.fileHandleForWriting.close() }
+        for handle in [pipe.fileHandleForReading, pipe.fileHandleForWriting] {
+            XCTAssertNotEqual(fcntl(handle.fileDescriptor, F_GETFD) & FD_CLOEXEC, 0)
+        }
+    }
+
+    func testSpawnClosesUnrelatedAndStandardStreamSourceDescriptors() throws {
+        let capture = try BufferedProcessOutput()
+        defer { capture.close() }
+        let input = try SubprocessSupervisor.makePrivatePipe()
+        defer { try? input.fileHandleForReading.close(); try? input.fileHandleForWriting.close() }
+        let sources = [input.fileHandleForReading, capture.stdout, capture.stderr]
+        let handles = try sources.map { source -> FileHandle in
+            let fd = fcntl(source.fileDescriptor, F_DUPFD, 128)
+            guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+            return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        }
+        defer { handles.forEach { try? $0.close() } }
+        let unrelated = open("/dev/null", O_RDONLY)
+        XCTAssertGreaterThanOrEqual(unrelated, 0)
+        defer { close(unrelated) }
+        // Deliberately inheritable descriptors stay open in the controller.
+        let descriptors = handles.map(\.fileDescriptor) + [unrelated]
+        let process = process("")
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = ["-c", """
+        import os, sys, errno
+        for fd in map(int, sys.argv[1:]):
+            try: os.fstat(fd)
+            except OSError as error: assert error.errno == errno.EBADF
+            else: raise AssertionError('inherited descriptor: %s' % fd)
+        assert sys.stdin.readline() == 'input\\n'
+        sys.stdout.write('last stdout')
+        sys.stderr.write('last stderr')
+        """] + descriptors.map(String.init)
+        process.standardInput = handles[0]; process.standardOutput = handles[1]; process.standardError = handles[2]
+        try input.fileHandleForWriting.write(contentsOf: Data("input\n".utf8))
+        let exit = ProcessExitNotification(process)
+        try process.run()
+        XCTAssertTrue(process.snapshot.groupAcknowledged)
+        for fd in descriptors { XCTAssertEqual(fcntl(fd, F_GETFD), 0, "Caller flags must remain unchanged") }
+        handles.forEach { try? $0.close() }
+        capture.closeWriters()
+        XCTAssertEqual(exit.waitForExit(until: .now() + 3), 0)
+        guard case .finished = process.waitForTree(until: .now() + 3) else { return XCTFail("Tree did not finish") }
+        let output = try capture.finish()
+        process.markOutputDrained()
+        XCTAssertEqual(output.stdout.text, "last stdout")
+        XCTAssertEqual(output.stderr.text, "last stderr")
+        XCTAssertTrue(process.snapshot.outputDrained)
+    }
+
+    func testMergedOutputAndAlreadyClosedUnusedInputEnd() throws {
+        let capture = try BufferedProcessOutput(merged: true)
+        defer { capture.close() }
+        let input = Pipe()
+        try input.fileHandleForWriting.close()
+        let process = process("read value; printf out; printf err >&2")
+        process.standardInput = input
+        process.standardOutput = capture.stdout; process.standardError = capture.stderr
+        let exit = ProcessExitNotification(process)
+        try process.run()
+        capture.closeWriters()
+        XCTAssertEqual(exit.waitForExit(until: .now() + 3), 0)
+        guard case .finished = process.waitForTree(until: .now() + 3) else { return XCTFail("Tree did not finish") }
+        XCTAssertEqual(try capture.finish().stdout.text, "outerr")
+        process.markOutputDrained()
+    }
+
     func testFailedGroupSetupCannotRunRequestedProgram() throws {
         let marker = try fixture().appendingPathComponent("must-not-exist")
         let process = SubprocessSupervisor(launchCheck: { throw SubprocessSupervisor.Failure.launch(EPERM) })

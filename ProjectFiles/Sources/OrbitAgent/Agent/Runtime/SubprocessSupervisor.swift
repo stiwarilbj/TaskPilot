@@ -57,6 +57,30 @@ final class SubprocessSupervisor: @unchecked Sendable {
     var isRunning: Bool { condition.withLock { state.launched && !state.parentExited } }
     var terminationStatus: Int32 { condition.withLock { parentStatus } }
 
+    /// Foundation's Pipe does not set FD_CLOEXEC. Protect both controller
+    /// copies before registering readers or publishing the pipe to a writer.
+    static func makePrivatePipe() throws -> Pipe {
+        let pipe = Pipe()
+        do { try protectPipeDescriptors(pipe); return pipe }
+        catch {
+            try? pipe.fileHandleForReading.close()
+            try? pipe.fileHandleForWriting.close()
+            throw error
+        }
+    }
+
+    private static func protectPipeDescriptors(_ pipe: Pipe) throws {
+        for handle in [pipe.fileHandleForReading, pipe.fileHandleForWriting] {
+            let descriptor = handle.fileDescriptor
+            let flags = Darwin.fcntl(descriptor, F_GETFD)
+            guard flags >= 0 else { throw Failure.launch(errno) }
+            if flags & FD_CLOEXEC == 0,
+               Darwin.fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) == -1 {
+                throw Failure.launch(errno)
+            }
+        }
+    }
+
     func run() throws {
         do { try queue.sync {
             try launchCheck()
