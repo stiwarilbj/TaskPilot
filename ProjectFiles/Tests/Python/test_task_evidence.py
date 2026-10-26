@@ -62,6 +62,38 @@ class EvidenceLedgerTests(unittest.TestCase):
         validate_response(result, 'verification', ledger=ledger)
         self.assertTrue(ledger.audit(result))
 
+    def test_requirement_and_target_indexes_track_evidence_and_refresh_avoids_ledger_scans(self):
+        ledger = self.ledger()
+        action = write()
+        ledger.record_action(action, written(action))
+
+        file_contents_id = next(identifier for identifier, evidence in ledger.evidence.items()
+                                 if evidence['fact']['type'] == 'file_contents')
+        requirement_records = ledger._evidence_by_requirement['r1']
+        self.assertEqual(list(requirement_records), [file_contents_id])
+        target_records = ledger._target_evidence('path', '/fixture/a.txt')
+        self.assertEqual([record['fact']['type'] for record in target_records],
+                         ['file_written', 'file_contents', 'file_exists'])
+        file_identity = ledger.evidence[file_contents_id]['fact']['file_identity']
+        self.assertIn(ledger.evidence[file_contents_id], ledger._target_evidence('file_identity', file_identity))
+
+        ledger.add_requirements([requirement(TASK, 'file_exists', path='/fixture/a.txt')])
+        added_requirement_id = next(identifier for identifier in ledger.requirements if identifier not in {'r1', 'r2'})
+        self.assertTrue(ledger._evidence_by_requirement[added_requirement_id])
+
+        # Once evidence is indexed, completion refresh uses the requirement
+        # index directly instead of reevaluating every evidence record.
+        with mock.patch.object(ledger, 'requirement_matches', wraps=ledger.requirement_matches) as matches:
+            ledger.refresh()
+            matches.assert_not_called()
+
+        ledger.before_action(write('/fixture/other.txt', 'Other'))
+        self.assertNotIn(file_contents_id, ledger._evidence_by_requirement.get('r1', {}))
+        self.assertIn(file_contents_id, ledger._historical_evidence_by_requirement['r1'])
+        self.assertNotIn(file_contents_id, {key for records in ledger._active_evidence_by_target.values() for key in records})
+        self.assertIn(file_contents_id, {key for records in ledger._evidence_by_target.values() for key in records})
+        self.assertEqual(ledger.requirements['r1']['state'], 'invalidated')
+
     def test_existence_and_wrong_contents_do_not_prove_file_contents(self):
         ledger = self.ledger()
         ledger.add_evidence({'type': 'file_exists', 'path': '/fixture/a.txt'}, mutable=True)

@@ -546,6 +546,16 @@ class TaskEvidenceLedger:
         self.requirements: dict[str, dict] = {}
         self.instruction_revision = 0
         self.evidence: dict[str, dict] = {}
+        # Derived task-local indexes. Ordered dicts preserve evidence order;
+        # the existing predicates remain the authority for all proof claims.
+        self._evidence_by_requirement: dict[str, dict[str, dict]] = {}
+        self._semantic_evidence_by_requirement: dict[str, dict[str, dict]] = {}
+        self._current_evidence_by_requirement: dict[str, dict[str, dict]] = {}
+        self._historical_evidence_by_requirement: dict[str, dict[str, dict]] = {}
+        self._evidence_by_target: dict[tuple[str, str], dict[str, dict]] = {}
+        self._active_evidence_by_target: dict[tuple[str, str], dict[str, dict]] = {}
+        self._evidence_target_keys: dict[str, tuple[tuple[str, str], ...]] = {}
+        self._evidence_requirement_memberships: dict[str, dict[str, tuple[str, ...]]] = {}
         self.coverage_complete = False
         self.local_complete_grammar = False
         self.observation_id: str | None = None
@@ -582,6 +592,121 @@ class TaskEvidenceLedger:
             self.local_complete_grammar = True
             self.add_requirements([{"source": task, "description": "Return the exact largest top-level Downloads file and size",
                                     "check": {"type": "answer", "expected": task}}])
+
+    @staticmethod
+    def _target_keys_from_payload(payload: dict) -> tuple[tuple[str, str], ...]:
+        """Return bounded, exact identity keys without indexing user content."""
+        keys = []
+        path = payload.get("path")
+        if isinstance(path, str) and path and len(path) <= 4096:
+            keys.append(("path", path_key(path)))
+        for field in ("file_identity", "parent_identity", "file_version", "pid", "window_id",
+                      "window_identity", "bundle_id", "application_id", "document_url",
+                      "element_id", "route_id", "target_identity"):
+            value = payload.get(field)
+            if type(value) is int and field in {"pid", "window_id"} and value > 0:
+                keys.append((field, str(value)))
+            elif isinstance(value, str) and value and len(value) <= 4096:
+                keys.append((field, value))
+        return tuple(dict.fromkeys(keys))
+
+    @classmethod
+    def _target_keys_for_evidence(cls, evidence: dict) -> tuple[tuple[str, str], ...]:
+        keys = []
+        fact = evidence.get("fact")
+        action = evidence.get("action")
+        if isinstance(fact, dict):
+            keys.extend(cls._target_keys_from_payload(fact))
+        if isinstance(action, dict):
+            keys.extend(cls._target_keys_from_payload(action))
+        return tuple(dict.fromkeys(keys))
+
+    def _clear_evidence_indexes(self) -> None:
+        self._evidence_by_requirement.clear()
+        self._semantic_evidence_by_requirement.clear()
+        self._current_evidence_by_requirement.clear()
+        self._historical_evidence_by_requirement.clear()
+        self._evidence_by_target.clear()
+        self._active_evidence_by_target.clear()
+        self._evidence_target_keys.clear()
+        self._evidence_requirement_memberships.clear()
+
+    def _index_requirement_record(self, evidence_id: str, evidence: dict) -> None:
+        if evidence.get("generation") != self.generation:
+            return
+        memberships = {"active": [], "semantic": [], "current": [], "historical": []}
+        valid = evidence.get("valid") is True
+        historical = evidence if valid else {**evidence, "valid": True}
+        for requirement_id, requirement in self.requirements.items():
+            if requirement.get("state") == "superseded":
+                continue
+            if not valid:
+                if self.requirement_matches(requirement_id, historical):
+                    self._historical_evidence_by_requirement.setdefault(requirement_id, {})[evidence_id] = evidence
+                    memberships["historical"].append(requirement_id)
+                continue
+            if self.requirement_matches(requirement_id, evidence):
+                self._evidence_by_requirement.setdefault(requirement_id, {})[evidence_id] = evidence
+                self._historical_evidence_by_requirement.setdefault(requirement_id, {})[evidence_id] = evidence
+                memberships["active"].append(requirement_id)
+                memberships["historical"].append(requirement_id)
+            if self.requirement_matches(requirement_id, evidence, semantic=True):
+                self._semantic_evidence_by_requirement.setdefault(requirement_id, {})[evidence_id] = evidence
+                memberships["semantic"].append(requirement_id)
+            if self.requirement_matches(requirement_id, evidence, current=True):
+                self._current_evidence_by_requirement.setdefault(requirement_id, {})[evidence_id] = evidence
+                memberships["current"].append(requirement_id)
+        self._evidence_requirement_memberships[evidence_id] = {
+            name: tuple(identifiers) for name, identifiers in memberships.items()
+        }
+
+    def _index_evidence(self, evidence_id: str, evidence: dict) -> None:
+        target_keys = self._target_keys_for_evidence(evidence)
+        self._evidence_target_keys[evidence_id] = target_keys
+        for target_key in target_keys:
+            self._evidence_by_target.setdefault(target_key, {})[evidence_id] = evidence
+            if evidence.get("valid"):
+                self._active_evidence_by_target.setdefault(target_key, {})[evidence_id] = evidence
+        self._index_requirement_record(evidence_id, evidence)
+
+    def _rebuild_requirement_indexes(self) -> None:
+        self._evidence_by_requirement.clear()
+        self._semantic_evidence_by_requirement.clear()
+        self._current_evidence_by_requirement.clear()
+        self._historical_evidence_by_requirement.clear()
+        self._evidence_requirement_memberships.clear()
+        for evidence_id, evidence in self.evidence.items():
+            self._index_requirement_record(evidence_id, evidence)
+
+    def _unindex_active_evidence(self, evidence_id: str) -> None:
+        memberships = self._evidence_requirement_memberships.get(evidence_id, {})
+        for name, index in (("active", self._evidence_by_requirement),
+                            ("semantic", self._semantic_evidence_by_requirement),
+                            ("current", self._current_evidence_by_requirement)):
+            for requirement_id in memberships.get(name, ()):
+                records = index.get(requirement_id)
+                if records is not None:
+                    records.pop(evidence_id, None)
+        evidence = self.evidence.get(evidence_id)
+        if evidence is not None:
+            for target_key in self._evidence_target_keys.get(evidence_id, ()):
+                records = self._active_evidence_by_target.get(target_key)
+                if records is not None:
+                    records.pop(evidence_id, None)
+
+    def _invalidate_evidence(self, evidence_id: str, evidence: dict) -> bool:
+        if not evidence.get("valid"):
+            return False
+        evidence["valid"] = False
+        self._unindex_active_evidence(evidence_id)
+        return True
+
+    def _target_evidence(self, kind: str, value: Any, *, include_invalidated=False) -> list[dict]:
+        if not isinstance(value, (str, int)) or isinstance(value, bool):
+            return []
+        normalized = path_key(value) if kind == "path" and isinstance(value, str) else str(value)
+        index = self._evidence_by_target if include_invalidated else self._active_evidence_by_target
+        return list(index.get((kind, normalized), {}).values())
 
     def initialize_continuation(self, checkpoint: dict) -> None:
         """Start from checkpoint definitions, never historical evidence or actions."""
@@ -652,6 +777,8 @@ class TaskEvidenceLedger:
         dependency_order(imported)
         self.requirements = imported
         self.evidence.clear()
+        self._clear_evidence_indexes()
+        self._rebuild_requirement_indexes()
         self.coverage_complete = False
         self.local_complete_grammar = False
         self.batch_initialized = False
@@ -789,9 +916,7 @@ class TaskEvidenceLedger:
             if is_prior_recheckable:
                 entry["previously_proven"] = True
                 if check_type in FILE_CHECKS:
-                    candidates = [evidence for evidence in self.evidence.values()
-                                  if evidence.get("generation") == self.generation and
-                                  self.requirement_matches(identifier, {**evidence, "valid": True})]
+                    candidates = list(self._historical_evidence_by_requirement.get(identifier, {}).values())
                     if candidates:
                         identity = {key: candidates[-1]["fact"][key] for key in
                                     ("file_identity", "file_version", "parent_identity")
@@ -853,12 +978,7 @@ class TaskEvidenceLedger:
             return False
         if requirement.get("state") == "proven" and requirement.get("evidence_ids"):
             return True
-        for evidence in self.evidence.values():
-            if evidence.get("generation") != self.generation:
-                continue
-            if self.requirement_matches(identifier, {**evidence, "valid": True}):
-                return True
-        return False
+        return bool(self._historical_evidence_by_requirement.get(identifier))
 
     def add_requirements(self, entries: list[dict], observation: dict | None = None, *, path="requirements") -> bool:
         previous_outcomes = {identifier for identifier, requirement in self.requirements.items()
@@ -868,6 +988,8 @@ class TaskEvidenceLedger:
         self.validate_observation_checks(proposed, observation)
         changed = proposed != self.requirements
         self.requirements = proposed
+        if changed:
+            self._rebuild_requirement_indexes()
         current_outcomes = {identifier for identifier, requirement in self.requirements.items()
                             if requirement.get("state") != "superseded" and
                             requirement.get("scope", "outcome") != "prerequisite"}
@@ -1079,9 +1201,9 @@ class TaskEvidenceLedger:
         self.observation_checks.clear()
         # Immutable action facts remain useful when a correction leaves their
         # scope unchanged. Mutable screen/file state must be inspected again.
-        for evidence in self.evidence.values():
+        for evidence_id, evidence in self.evidence.items():
             if evidence["mutable"]:
-                evidence["valid"] = False
+                self._invalidate_evidence(evidence_id, evidence)
         for requirement in self.requirements.values():
             if requirement.get("state") != "superseded":
                 requirement["state"] = "invalidated" if requirement.get("evidence_ids") else "pending"
@@ -1096,9 +1218,9 @@ class TaskEvidenceLedger:
         self.current_observation = None
         self.observation_checks.clear()
         target_sensitive = OBSERVATION_CHECKS | {"observation", "requirement_observed"}
-        for evidence in self.evidence.values():
+        for evidence_id, evidence in self.evidence.items():
             if evidence["valid"] and (evidence["mutable"] or evidence["fact"].get("type") in target_sensitive):
-                evidence["valid"] = False
+                self._invalidate_evidence(evidence_id, evidence)
         for requirement in self.requirements.values():
             if requirement.get("state") == "superseded":
                 continue
@@ -1240,8 +1362,11 @@ class TaskEvidenceLedger:
         required = self.prerequisites(identifiers)
         direct = {ref for identifier in identifiers for ref in self.requirements[identifier].get("depends_on", [])}
         self.refresh()
-        refs = {ref: [key for key, e in self.evidence.items() if self.requirement_matches(ref, e, current=ref in direct)]
-                for ref in required}
+        refs = {
+            ref: list((self._current_evidence_by_requirement if ref in direct else self._evidence_by_requirement)
+                      .get(ref, {}).keys())
+            for ref in required
+        }
         blocked = [ref for ref in required if not refs[ref] or self.requirements[ref]["state"] != "proven"]
         if blocked: return {"blocked_by": blocked, "reason": "prerequisite_unproven"}
         action = decision.get("action", {})
@@ -1287,6 +1412,7 @@ class TaskEvidenceLedger:
                     "fact_fingerprint": digest(fact), "action_fingerprint": digest(action)}
         validate_native_evidence(evidence)
         self.evidence[identifier] = evidence
+        self._index_evidence(identifier, evidence)
         self.refresh()
         return identifier
 
@@ -1306,10 +1432,9 @@ class TaskEvidenceLedger:
 
     def invalidate(self, predicate) -> None:
         changed = False
-        for evidence in self.evidence.values():
+        for identifier, evidence in self.evidence.items():
             if evidence["valid"] and predicate(evidence):
-                evidence["valid"] = False
-                changed = True
+                changed = self._invalidate_evidence(identifier, evidence) or changed
         if changed: self.coverage_complete = False
         self.refresh()
 
@@ -1386,7 +1511,7 @@ class TaskEvidenceLedger:
         identifier = self.add_evidence({'type': 'command_operation', 'operation': operation},
                                        mutable=any(c['type'] in FILE_CHECKS for c in expected), action=action)
         if not proven:
-            self.evidence[identifier]['valid'] = False
+            self._invalidate_evidence(identifier, self.evidence[identifier])
             self.refresh()
 
     @staticmethod
@@ -1427,7 +1552,7 @@ class TaskEvidenceLedger:
                     actual.get(key) != value for key, value in expected.items()
                 ):
                     return
-        if any(self.matches(check, evidence) for evidence in self.evidence.values()): return
+        if any(self.matches(check, evidence) for evidence in self._target_evidence("path", check["path"])): return
         self.checks += 1
         self.readback = True
         previous = set(self.evidence)
@@ -1470,10 +1595,11 @@ class TaskEvidenceLedger:
             if requirement.get("state") == "superseded":
                 requirement["evidence_ids"] = []
                 continue
-            refs = [ref for ref, e in self.evidence.items() if self.requirement_matches(identifier, e)]
+            refs = list(self._evidence_by_requirement.get(identifier, {}).keys())
             old = requirement["evidence_ids"]
             if requirement["check"]["type"] in {"visual", "answer"}:
-                refs = [ref for ref in old if self.requirement_matches(identifier, self.evidence[ref], semantic=True)]
+                semantic_refs = self._semantic_evidence_by_requirement.get(identifier, {})
+                refs = [ref for ref in old if ref in semantic_refs]
             if any(self.requirements[ref]["state"] != "proven" for ref in requirement.get("depends_on", [])):
                 refs = []
             requirement["state"] = "proven" if refs else ("invalidated" if old or requirement["state"] == "invalidated" else "pending")
@@ -1525,10 +1651,10 @@ class TaskEvidenceLedger:
 
     def recheck_actions(self) -> list[dict]:
         selected = {}
-        for requirement in self.requirements.values():
+        for requirement_id, requirement in self.requirements.items():
             if requirement.get("state") == "superseded": continue
             if requirement["check"]["type"] in {"answer", "visual", "command_executed", "stdout_equals", "file_append", "file_written"}: continue
-            for evidence in reversed(list(self.evidence.values())):
+            for evidence in reversed(list(self._historical_evidence_by_requirement.get(requirement_id, {}).values())):
                 action = evidence["action"]
                 if not action or not evidence["mutable"] or evidence.get('effect_check'): continue
                 # Match a revoked fact's identity without promoting it to proof.
@@ -1539,9 +1665,9 @@ class TaskEvidenceLedger:
 
     def recheck_effects(self) -> list[dict]:
         selected = {}
-        for requirement in self.requirements.values():
+        for requirement_id, requirement in self.requirements.items():
             if requirement.get("state") == "superseded": continue
-            for evidence in self.evidence.values():
+            for evidence in self._historical_evidence_by_requirement.get(requirement_id, {}).values():
                 check = evidence.get('effect_check')
                 if check and self.matches(requirement['check'], {**evidence, 'valid': True}):
                     selected[digest(check)] = deepcopy(check)
@@ -1882,13 +2008,12 @@ class TaskEvidenceLedger:
                 selected_identity = {field: fact[field] for field in identity_fields if field in fact}
                 fresh_object_support = any(
                     candidate.get("valid") is True and candidate.get("generation") == self.generation and
-                    candidate.get("fact", {}).get("path") == path_key_value and
                     candidate.get("fact", {}).get("type") in {
                         "file_read", "file_contents", "file_append", "file_exists", "directory_exists",
                     } and
                     all(candidate.get("fact", {}).get(field) == value
                         for field, value in selected_identity.items())
-                    for candidate in self.evidence.values()
+                    for candidate in self._target_evidence("path", path_key_value)
                 )
                 status = ("verified" if has_current_requirement_proof and fresh_object_support
                           else "needs_recheck")
