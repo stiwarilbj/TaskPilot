@@ -31,19 +31,47 @@ struct TaskRemixReview: Equatable {
     let changes: [TaskRemixInputChange]
     let wordingChanged: Bool
 
+    struct CacheKey: Equatable {
+        struct Reference: Equatable {
+            let id: UUID
+            let kind: String
+            let value: String
+            let userRole: String?
+        }
+
+        let prose: String
+        let references: [Reference]
+    }
+
+    static func cacheKey(for draft: TaskComposerDraft) -> CacheKey {
+        var prose = ""
+        var references: [CacheKey.Reference] = []
+        for segment in draft.segments {
+            switch segment {
+            case .text(let value): prose += value
+            case .reference(let reference):
+                references.append(CacheKey.Reference(id: reference.id,
+                    kind: reference.kind.rawValue, value: reference.value,
+                    userRole: reference.userRole?.rawValue))
+            }
+        }
+        return CacheKey(prose: prose, references: references)
+    }
+
     static func make(baseline: TaskComposerDraft, current: TaskComposerDraft) -> Self {
         let oldReferences = baseline.references
         let newReferences = current.references
-        var usedOld = Set<UUID>()
-        var usedNew = Set<UUID>()
+        var usedOld = Set<Int>()
+        var usedNew = Set<Int>()
         var changes: [TaskRemixInputChange] = []
 
-        var newByID: [UUID: TaskComposerReference] = [:]
-        for reference in newReferences { newByID[reference.id] = reference }
-        for old in oldReferences {
-            guard let new = newByID[old.id] else { continue }
-            usedOld.insert(old.id)
-            usedNew.insert(new.id)
+        let newIndexByID = Dictionary(newReferences.enumerated().map { ($0.element.id, $0.offset) },
+                                      uniquingKeysWith: { first, _ in first })
+        for (oldIndex, old) in oldReferences.enumerated() {
+            guard let newIndex = newIndexByID[old.id], !usedNew.contains(newIndex) else { continue }
+            let new = newReferences[newIndex]
+            usedOld.insert(oldIndex)
+            usedNew.insert(newIndex)
             if old.kind != new.kind || old.value != new.value {
                 changes.append(TaskRemixInputChange(id: old.id, kind: .replaced,
                                                     oldReference: old, newReference: new))
@@ -53,27 +81,64 @@ struct TaskRemixReview: Equatable {
             }
         }
 
-        // Clipboard moves create new editor identities. Match unchanged values
-        // as a multiset so moving a chip does not appear as a replacement.
-        for old in oldReferences where !usedOld.contains(old.id) {
-            guard let new = newReferences.first(where: {
-                !usedNew.contains($0.id) && $0.kind == old.kind && $0.value == old.value
-            }) else { continue }
-            usedOld.insert(old.id)
-            usedNew.insert(new.id)
+        // Clipboard moves create new editor identities. First retain exact
+        // resource and explicit-role matches as a multiset.
+        struct ExactKey: Hashable {
+            let kind: String
+            let value: String
+            let userRole: String?
+        }
+        var newIndicesByExactKey: [ExactKey: [Int]] = [:]
+        for (index, reference) in newReferences.enumerated() where !usedNew.contains(index) {
+            let key = ExactKey(kind: reference.kind.rawValue, value: reference.value,
+                               userRole: reference.userRole?.rawValue)
+            newIndicesByExactKey[key, default: []].append(index)
+        }
+        var exactKeyOffsets: [ExactKey: Int] = [:]
+        for (oldIndex, old) in oldReferences.enumerated() where !usedOld.contains(oldIndex) {
+            let key = ExactKey(kind: old.kind.rawValue, value: old.value,
+                               userRole: old.userRole?.rawValue)
+            guard let candidates = newIndicesByExactKey[key] else { continue }
+            let offset = exactKeyOffsets[key, default: 0]
+            guard offset < candidates.count else { continue }
+            let newIndex = candidates[offset]
+            exactKeyOffsets[key] = offset + 1
+            usedOld.insert(oldIndex)
+            usedNew.insert(newIndex)
         }
 
-        for old in oldReferences where !usedOld.contains(old.id) {
-            if let replacement = newReferences.first(where: { !usedNew.contains($0.id) && $0.id == old.id }) {
-                usedNew.insert(replacement.id)
-                changes.append(TaskRemixInputChange(id: old.id, kind: .replaced,
-                                                    oldReference: old, newReference: replacement))
-            } else {
-                changes.append(TaskRemixInputChange(id: old.id, kind: .removed,
-                                                    oldReference: old, newReference: nil))
-            }
+        // A changed role is attributable only when one unmatched occurrence
+        // of that exact resource remains on each side. Duplicates stay as
+        // additions/removals rather than receiving an invented pairing.
+        struct ResourceKey: Hashable {
+            let kind: String
+            let value: String
         }
-        for new in newReferences where !usedNew.contains(new.id) {
+        var oldByResource: [ResourceKey: [Int]] = [:]
+        var newByResource: [ResourceKey: [Int]] = [:]
+        for (index, reference) in oldReferences.enumerated() where !usedOld.contains(index) {
+            oldByResource[ResourceKey(kind: reference.kind.rawValue, value: reference.value), default: []].append(index)
+        }
+        for (index, reference) in newReferences.enumerated() where !usedNew.contains(index) {
+            newByResource[ResourceKey(kind: reference.kind.rawValue, value: reference.value), default: []].append(index)
+        }
+        for (oldIndex, old) in oldReferences.enumerated() where !usedOld.contains(oldIndex) {
+            let key = ResourceKey(kind: old.kind.rawValue, value: old.value)
+            guard let oldIndices = oldByResource[key], oldIndices.count == 1,
+                  let newIndices = newByResource[key], newIndices.count == 1,
+                  let newIndex = newIndices.first else { continue }
+            let new = newReferences[newIndex]
+            usedOld.insert(oldIndex)
+            usedNew.insert(newIndex)
+            changes.append(TaskRemixInputChange(id: old.id, kind: .roleChanged,
+                                                oldReference: old, newReference: new))
+        }
+
+        for (oldIndex, old) in oldReferences.enumerated() where !usedOld.contains(oldIndex) {
+            changes.append(TaskRemixInputChange(id: old.id, kind: .removed,
+                                                oldReference: old, newReference: nil))
+        }
+        for (newIndex, new) in newReferences.enumerated() where !usedNew.contains(newIndex) {
             changes.append(TaskRemixInputChange(id: new.id, kind: .added,
                                                 oldReference: nil, newReference: new))
         }
@@ -81,6 +146,35 @@ struct TaskRemixReview: Equatable {
         return TaskRemixReview(changes: changes,
                                wordingChanged: baseline.proseText != current.proseText)
     }
+}
+
+struct TaskRemixReviewCache {
+    private struct Entry {
+        let sessionID: UUID
+        let baselineKey: TaskRemixReview.CacheKey
+        let currentKey: TaskRemixReview.CacheKey
+        let review: TaskRemixReview
+    }
+
+    private var entry: Entry?
+    private(set) var buildCount = 0
+
+    mutating func review(sessionID: UUID, baseline: TaskComposerDraft,
+                         current: TaskComposerDraft) -> TaskRemixReview {
+        let baselineKey = TaskRemixReview.cacheKey(for: baseline)
+        let currentKey = TaskRemixReview.cacheKey(for: current)
+        if let entry, entry.sessionID == sessionID,
+           entry.baselineKey == baselineKey, entry.currentKey == currentKey {
+            return entry.review
+        }
+        let review = TaskRemixReview.make(baseline: baseline, current: current)
+        entry = Entry(sessionID: sessionID, baselineKey: baselineKey,
+                      currentKey: currentKey, review: review)
+        buildCount += 1
+        return review
+    }
+
+    mutating func clear() { entry = nil }
 }
 
 extension TaskComposerDraft {

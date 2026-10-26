@@ -104,6 +104,89 @@ final class TaskRemixTests: XCTestCase {
         XCTAssertEqual(review.changes.first?.newReference?.userRole, .referenceExample)
     }
 
+    func testRemixComparisonFindsRoleChangeAfterClipboardCreatesNewOccurrenceID() {
+        let original = TaskComposerReference(kind: .file, value: "/tmp/budget.xlsx", userRole: .source)
+        let copied = TaskComposerReference(kind: .file, value: original.value, userRole: .destination)
+        XCTAssertNotEqual(original.id, copied.id)
+
+        let review = TaskRemixReview.make(
+            baseline: TaskComposerDraft(segments: [.text("Use "), .reference(original)]),
+            current: TaskComposerDraft(segments: [.text("Use "), .reference(copied)])
+        )
+
+        XCTAssertEqual(review.changes.map(\.kind), [.roleChanged])
+        XCTAssertEqual(review.changes.first?.oldReference?.value, original.value)
+        XCTAssertEqual(review.changes.first?.oldReference?.userRole, .source)
+        XCTAssertEqual(review.changes.first?.newReference?.userRole, .destination)
+    }
+
+    func testRemixComparisonDoesNotGuessAmbiguousDuplicateRolePairings() {
+        let baselineReferences = [
+            TaskComposerReference(kind: .file, value: "/tmp/report.txt", userRole: .source),
+            TaskComposerReference(kind: .file, value: "/tmp/report.txt", userRole: .destination)
+        ]
+        let currentReferences = [
+            TaskComposerReference(kind: .file, value: "/tmp/report.txt", userRole: .referenceExample),
+            TaskComposerReference(kind: .file, value: "/tmp/report.txt", userRole: nil)
+        ]
+        let review = TaskRemixReview.make(
+            baseline: TaskComposerDraft(segments: baselineReferences.map(TaskComposerSegment.reference)),
+            current: TaskComposerDraft(segments: currentReferences.map(TaskComposerSegment.reference))
+        )
+
+        XCTAssertEqual(review.changes.map(\.kind), [.removed, .removed, .added, .added])
+    }
+
+    func testRemixReviewCacheReusesSemanticComparisonAndTracksExplicitRoles() {
+        var cache = TaskRemixReviewCache()
+        let sessionID = UUID()
+        let id = UUID()
+        let baselineReference = TaskComposerReference(id: id, kind: .file,
+            value: "/tmp/report.txt", userRole: .source)
+        let baseline = TaskComposerDraft(segments: [.text("Edit "), .reference(baselineReference)])
+        let currentReference = TaskComposerReference(id: id, kind: .file,
+            value: "/tmp/report.txt", userRole: .destination, presentedRole: .source,
+            roleOrigin: .chosen, inferredRole: .source)
+        let current = TaskComposerDraft(segments: [.text("Edit "), .reference(currentReference)])
+
+        let first = cache.review(sessionID: sessionID, baseline: baseline, current: current)
+        let second = cache.review(sessionID: sessionID, baseline: baseline, current: current)
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(cache.buildCount, 1)
+
+        let presentationOnlyUpdate = TaskComposerDraft(segments: [.text("Edit "), .reference(
+            TaskComposerReference(id: id, kind: .file, value: "/tmp/report.txt",
+                userRole: .destination, presentedRole: .referenceExample,
+                roleOrigin: .chosen, inferredRole: .referenceExample))])
+        _ = cache.review(sessionID: sessionID, baseline: baseline, current: presentationOnlyUpdate)
+        XCTAssertEqual(cache.buildCount, 1)
+
+        let changedRole = TaskComposerDraft(segments: [.text("Edit "), .reference(
+            TaskComposerReference(id: id, kind: .file, value: "/tmp/report.txt", userRole: nil))])
+        let updated = cache.review(sessionID: sessionID, baseline: baseline, current: changedRole)
+        XCTAssertEqual(updated.changes.map(\.kind), [.roleChanged])
+        XCTAssertEqual(cache.buildCount, 2)
+    }
+
+    func testRemixCacheReuses128MovedChipComparisonAcrossStatusRefreshes() {
+        let originalReferences = (0..<128).map { index in
+            TaskComposerReference(kind: .file, value: "/tmp/Reports/report-\(index).txt")
+        }
+        let baseline = TaskComposerDraft(segments: originalReferences.map(TaskComposerSegment.reference))
+        let moved = TaskComposerDraft(segments: originalReferences.reversed().map(TaskComposerSegment.reference))
+        var cache = TaskRemixReviewCache()
+        let sessionID = UUID()
+        let start = DispatchTime.now().uptimeNanoseconds
+        let review = cache.review(sessionID: sessionID, baseline: baseline, current: moved)
+        let calculationTime = DispatchTime.now().uptimeNanoseconds - start
+        for _ in 0..<50 {
+            _ = cache.review(sessionID: sessionID, baseline: baseline, current: moved)
+        }
+        XCTAssertTrue(review.changes.isEmpty)
+        XCTAssertEqual(cache.buildCount, 1)
+        print("Remix cache benchmark: 128 moved chips, one fresh comparison in \(Double(calculationTime) / 1_000_000) ms; 50 cached refreshes")
+    }
+
     func testReferenceReorderingAloneDoesNotShowChangedInputs() {
         let first = TaskComposerReference(kind: .file, value: "/tmp/a.pdf")
         let second = TaskComposerReference(kind: .folder, value: "/tmp/Reports")

@@ -690,4 +690,239 @@ final class AgentTaskSubmissionTests: XCTestCase {
         XCTAssertEqual(extracted.references.count, 1)
         print("Composer extraction benchmark: 41K-character fixture, 50 passes, \(Double(elapsed) / 1_000_000) ms")
     }
+
+    @MainActor
+    func testComposerUndoDoesNotCrossLoadedOrIdenticalTextDraftBoundaries() throws {
+        let firstSessionID = UUID()
+        let initial = TaskComposerDraft(plainText: "same request")
+        let initialComposer = TaskRequestComposer(draft: .constant(initial), fontSize: 14,
+            focusRequested: false, editorSessionID: firstSessionID,
+            onFocusChanged: { _ in }, accessibilityLabel: "Request")
+        let coordinator = TaskRequestComposer.Coordinator(parent: initialComposer)
+        let textView = TaskComposerTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 100))
+        textView.isRichText = true
+        textView.allowsUndo = true
+        textView.composerCoordinator = coordinator
+        coordinator.textView = textView
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 100),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = textView
+        coordinator.render(initial, in: textView)
+
+        textView.insertText("!", replacementRange: NSRange(location: textView.attributedString().length, length: 0))
+        XCTAssertTrue(textView.undoManager?.canUndo == true)
+
+        let loaded = TaskComposerDraft(plainText: "a different request")
+        let loadedComposer = TaskRequestComposer(draft: .constant(loaded), fontSize: 14,
+            focusRequested: false, editorSessionID: UUID(),
+            onFocusChanged: { _ in }, accessibilityLabel: "Request")
+        coordinator.parent = loadedComposer
+        coordinator.update(loaded, in: textView)
+        XCTAssertFalse(textView.undoManager?.canUndo ?? true)
+        textView.undo(nil)
+        XCTAssertEqual(textView.attributedString().string, loaded.expandedText)
+
+        textView.insertText("!", replacementRange: NSRange(location: textView.attributedString().length, length: 0))
+        let identicalTextReplacement = TaskComposerDraft(plainText: "a different request!")
+        coordinator.parent = TaskRequestComposer(draft: .constant(identicalTextReplacement), fontSize: 14,
+            focusRequested: false, editorSessionID: UUID(),
+            onFocusChanged: { _ in }, accessibilityLabel: "Request")
+        coordinator.update(identicalTextReplacement, in: textView)
+        XCTAssertFalse(textView.undoManager?.canUndo ?? true)
+        textView.undo(nil)
+        XCTAssertEqual(textView.attributedString().string, identicalTextReplacement.expandedText)
+        withExtendedLifetime(window) {}
+    }
+
+    @MainActor
+    func testComposerUndoManagersAreIsolatedAndExternalSharedUpdateClearsStaleActions() throws {
+        let sessionID = UUID()
+        let initial = TaskComposerDraft(plainText: "queued request")
+        let first = TaskComposerTextView(frame: .zero)
+        let second = TaskComposerTextView(frame: .zero)
+        XCTAssertFalse(first.undoManager === second.undoManager)
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 500, height: 120))
+        first.frame = NSRect(x: 0, y: 60, width: 500, height: 60)
+        second.frame = NSRect(x: 0, y: 0, width: 500, height: 60)
+        container.addSubview(first)
+        container.addSubview(second)
+        let sharedWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 120),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        sharedWindow.contentView = container
+
+        let firstComposer = TaskRequestComposer(draft: .constant(initial), fontSize: 14,
+            focusRequested: false, editorSessionID: sessionID,
+            onFocusChanged: { _ in }, accessibilityLabel: "First editor")
+        let firstCoordinator = TaskRequestComposer.Coordinator(parent: firstComposer)
+        firstCoordinator.textView = first
+        first.composerCoordinator = firstCoordinator
+        firstCoordinator.render(initial, in: first)
+        first.insertText(" updated", replacementRange: NSRange(location: initial.expandedText.utf16.count, length: 0))
+        let externallyUpdated = TaskRequestComposer.Coordinator.draft(from: first.attributedString())
+        XCTAssertTrue(first.undoManager?.canUndo == true)
+
+        let secondComposer = TaskRequestComposer(draft: .constant(initial), fontSize: 14,
+            focusRequested: false, editorSessionID: sessionID,
+            onFocusChanged: { _ in }, accessibilityLabel: "Second editor")
+        let secondCoordinator = TaskRequestComposer.Coordinator(parent: secondComposer)
+        secondCoordinator.textView = second
+        second.composerCoordinator = secondCoordinator
+        secondCoordinator.render(initial, in: second)
+        second.insertText(" local", replacementRange: NSRange(location: initial.expandedText.utf16.count, length: 0))
+        XCTAssertTrue(second.undoManager?.canUndo == true)
+
+        secondCoordinator.parent = TaskRequestComposer(draft: .constant(externallyUpdated), fontSize: 14,
+            focusRequested: false, editorSessionID: sessionID,
+            onFocusChanged: { _ in }, accessibilityLabel: "Second editor")
+        secondCoordinator.update(externallyUpdated, in: second)
+        XCTAssertFalse(second.undoManager?.canUndo ?? true)
+        second.undo(nil)
+        XCTAssertEqual(second.attributedString().string, externallyUpdated.expandedText)
+        XCTAssertTrue(first.undoManager?.canUndo == true)
+        withExtendedLifetime(sharedWindow) {}
+    }
+
+    @MainActor
+    func testExternalRoleUpdateInvalidatesAnotherComposersUndoStack() throws {
+        let sessionID = UUID()
+        let reference = TaskComposerReference(kind: .file, value: "/tmp/report.txt")
+        let initial = TaskComposerDraft(segments: [.text("Use "), .reference(reference)])
+        let first = TaskComposerTextView(frame: NSRect(x: 0, y: 50, width: 400, height: 50))
+        let second = TaskComposerTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 50))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 100))
+        container.addSubview(first)
+        container.addSubview(second)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 100),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = container
+
+        let firstCoordinator = TaskRequestComposer.Coordinator(parent: TaskRequestComposer(
+            draft: .constant(initial), fontSize: 14, focusRequested: false, editorSessionID: sessionID,
+            onFocusChanged: { _ in }, accessibilityLabel: "First editor"))
+        firstCoordinator.textView = first
+        first.composerCoordinator = firstCoordinator
+        firstCoordinator.render(initial, in: first)
+
+        let secondCoordinator = TaskRequestComposer.Coordinator(parent: TaskRequestComposer(
+            draft: .constant(initial), fontSize: 14, focusRequested: false, editorSessionID: sessionID,
+            onFocusChanged: { _ in }, accessibilityLabel: "Second editor"))
+        secondCoordinator.textView = second
+        second.composerCoordinator = secondCoordinator
+        secondCoordinator.render(initial, in: second)
+        second.insertText(" local", replacementRange: NSRange(location: initial.expandedText.utf16.count, length: 0))
+        XCTAssertTrue(second.undoManager?.canUndo == true)
+
+        XCTAssertTrue(firstCoordinator.applyRoleCorrection(.source, to: reference, in: first))
+        let remotelyUpdated = TaskRequestComposer.Coordinator.draft(from: first.attributedString())
+        secondCoordinator.parent = TaskRequestComposer(draft: .constant(remotelyUpdated), fontSize: 14,
+            focusRequested: false, editorSessionID: sessionID,
+            onFocusChanged: { _ in }, accessibilityLabel: "Second editor")
+        secondCoordinator.update(remotelyUpdated, in: second)
+
+        XCTAssertEqual(secondCoordinator.lastRenderedDraft?.references.first?.userRole, .source)
+        XCTAssertFalse(second.undoManager?.canUndo ?? true)
+        second.undo(nil)
+        XCTAssertEqual(secondCoordinator.lastRenderedDraft, remotelyUpdated)
+        withExtendedLifetime(window) {}
+    }
+
+    @MainActor
+    func testComposerReportsActualFocusBeforeTyping() async throws {
+        let focused = expectation(description: "focus acquired before typing")
+        let resigned = expectation(description: "focus resigned after another responder takes focus")
+        var focusStates: [Bool] = []
+        let focusHandler: (Bool) -> Void = { value in
+            focusStates.append(value)
+            if value { focused.fulfill() }
+            else { resigned.fulfill() }
+        }
+        let draft = TaskComposerDraft(plainText: "request")
+        let composer = TaskRequestComposer(draft: .constant(draft), fontSize: 14,
+            focusRequested: false, onFocusChanged: focusHandler,
+            accessibilityLabel: "Request")
+        let coordinator = TaskRequestComposer.Coordinator(parent: composer)
+        let textView = TaskComposerTextView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
+        textView.isRichText = true
+        textView.composerCoordinator = coordinator
+        coordinator.textView = textView
+        coordinator.render(draft, in: textView)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 80),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        let alternate = TaskComposerTextView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
+        container.addSubview(textView)
+        container.addSubview(alternate)
+        window.contentView = container
+
+        XCTAssertTrue(window.makeFirstResponder(textView))
+        XCTAssertTrue(textView.attributedString().string == draft.expandedText)
+        await fulfillment(of: [focused], timeout: 1)
+        coordinator.parent = TaskRequestComposer(draft: .constant(draft), fontSize: 14,
+            focusRequested: true, onFocusChanged: focusHandler, accessibilityLabel: "Request")
+        coordinator.updateFocusRequest(true, managesFocus: true, in: textView)
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(window.makeFirstResponder(alternate))
+        XCTAssertTrue(window.firstResponder === alternate)
+        XCTAssertTrue(window.makeFirstResponder(textView))
+        XCTAssertTrue(window.firstResponder === textView)
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(focusStates, [true], "A stale deferred resignation must not overwrite current focus")
+        XCTAssertTrue(window.makeFirstResponder(alternate))
+        XCTAssertTrue(window.firstResponder === alternate)
+        await fulfillment(of: [resigned], timeout: 1)
+        XCTAssertEqual(focusStates, [true, false])
+        coordinator.updateFocusRequest(true, managesFocus: true, in: textView)
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertTrue(window.firstResponder === alternate, "An unchanged focus request must not steal focus during refresh")
+        withExtendedLifetime(window) {}
+    }
+
+    @MainActor
+    func testAttachmentAttributesMatchAcrossDropPasteRestoreAndReplacement() throws {
+        let composer = TaskRequestComposer(draft: .constant(TaskComposerDraft()), fontSize: 16,
+            focusRequested: false, onFocusChanged: { _ in }, accessibilityLabel: "Request")
+        let coordinator = TaskRequestComposer.Coordinator(parent: composer)
+        let textView = TaskComposerTextView(frame: NSRect(x: 0, y: 0, width: 500, height: 100))
+        textView.isRichText = true
+        textView.allowsUndo = true
+        textView.isEditable = true
+        textView.composerCoordinator = coordinator
+        coordinator.textView = textView
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 100),
+            styleMask: .borderless, backing: .buffered, defer: false)
+        window.contentView = textView
+
+        let value = "/tmp/alignment-check.txt"
+        coordinator.insertDropped([URL(fileURLWithPath: value)], at: 0, in: textView)
+        let dropDraft = TaskRequestComposer.Coordinator.draft(from: textView.attributedString())
+        let droppedReference = try XCTUnwrap(dropDraft.references.first)
+        let dropAttributes = try XCTUnwrap(textView.attributedString().attributes(at: 0, effectiveRange: nil)[.baselineOffset] as? NSNumber)
+        XCTAssertEqual(dropAttributes.doubleValue, -3)
+
+        let restored = TaskComposerDraft(submission: dropDraft.submission())
+        coordinator.parent = TaskRequestComposer(draft: .constant(restored), fontSize: 16,
+            focusRequested: false, onFocusChanged: { _ in }, accessibilityLabel: "Request")
+        coordinator.update(restored, in: textView)
+        let restoredAttributes = try XCTUnwrap(textView.attributedString().attributes(at: 0, effectiveRange: nil)[.baselineOffset] as? NSNumber)
+        XCTAssertEqual(restoredAttributes.doubleValue, dropAttributes.doubleValue)
+
+        let updated = TaskComposerReference(id: droppedReference.id, kind: .folder, value: "/tmp/alignment-folder")
+        coordinator.replace(droppedReference.id, with: updated, in: textView)
+        let replacedAttributes = try XCTUnwrap(textView.attributedString().attributes(at: 0, effectiveRange: nil)[.baselineOffset] as? NSNumber)
+        XCTAssertEqual(replacedAttributes.doubleValue, dropAttributes.doubleValue)
+
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("TaskPilotComposerPaste-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        pasteboard.setString(value, forType: .string)
+        let pasteView = TaskComposerTextView(frame: NSRect(x: 0, y: 0, width: 500, height: 100))
+        pasteView.isRichText = true
+        pasteView.isEditable = true
+        pasteView.composerCoordinator = coordinator
+        coordinator.textView = pasteView
+        coordinator.render(TaskComposerDraft(), in: pasteView)
+        coordinator.paste(into: pasteView, from: pasteboard)
+        let pastedAttributes = try XCTUnwrap(pasteView.attributedString().attributes(at: 0, effectiveRange: nil)[.baselineOffset] as? NSNumber)
+        XCTAssertEqual(pastedAttributes.doubleValue, dropAttributes.doubleValue)
+        withExtendedLifetime(window) {}
+    }
 }

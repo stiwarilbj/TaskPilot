@@ -7,6 +7,7 @@ enum QueuedTaskEditSurface: Equatable {
 
 struct QueuedTaskEditSession: Equatable {
     let taskID: UUID
+    let editorSessionID = UUID()
     let originalTask: QueuedAgentTask
     var draft: TaskComposerDraft
     var errorMessage: String?

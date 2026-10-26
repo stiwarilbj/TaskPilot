@@ -38,6 +38,7 @@ struct TaskCorrectionEditorView: View {
                 draft: draft,
                 fontSize: fontSize,
                 focusRequested: focusRequested && canEdit,
+                editorSessionID: session.editorSessionID,
                 onFocusChanged: { focusRequested = $0 },
                 accessibilityLabel: "Correction to the current task"
             )

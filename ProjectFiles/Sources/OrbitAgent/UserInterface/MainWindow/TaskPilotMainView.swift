@@ -325,6 +325,7 @@ struct TaskPilotMainView: View {
                     draft: $model.taskDraft,
                     fontSize: TaskPilotAppearancePreferences.clampedInputFontSize(inputFontSize),
                     focusRequested: promptFocused,
+                    editorSessionID: model.taskDraftEditorSessionID,
                     onFocusChanged: { promptFocused = $0 },
                     accessibilityLabel: "What should the agent do?"
                 )

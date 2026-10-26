@@ -215,6 +215,26 @@ struct TaskComposerDraft: Equatable {
         return true
     }
 
+    /// Compares the editable request rather than presentation-only role state.
+    /// An explicit role is part of the draft and must invalidate another
+    /// editor's stale undo history; inferred and pending labels are not edits.
+    func hasSameEditorContent(as other: TaskComposerDraft) -> Bool {
+        guard segments.count == other.segments.count else { return false }
+        for (left, right) in zip(segments, other.segments) {
+            switch (left, right) {
+            case (.text(let lhs), .text(let rhs)) where lhs == rhs:
+                continue
+            case (.reference(let lhs), .reference(let rhs))
+                where lhs.id == rhs.id && lhs.kind == rhs.kind && lhs.value == rhs.value &&
+                    lhs.userRole == rhs.userRole:
+                continue
+            default:
+                return false
+            }
+        }
+        return true
+    }
+
     func submission() -> AgentTaskSubmission {
         if let invalidRestoredSubmission { return invalidRestoredSubmission }
         var text = ""
@@ -333,6 +353,7 @@ struct TaskRequestComposer: NSViewRepresentable {
     let fontSize: CGFloat
     let focusRequested: Bool
     var managesFocus = true
+    var editorSessionID: UUID? = nil
     let onFocusChanged: (Bool) -> Void
     let accessibilityLabel: String
     var isReadOnly = false
@@ -394,15 +415,11 @@ struct TaskRequestComposer: NSViewRepresentable {
         context.coordinator.applyFont(fontSize, to: textView)
         context.coordinator.update(draft, in: textView)
         context.coordinator.refreshActivePopover(using: draft, in: textView)
-        if focusRequested, textView.window?.firstResponder !== textView {
-            textView.window?.makeFirstResponder(textView)
-        } else if managesFocus, !focusRequested, textView.window?.firstResponder === textView {
-            textView.window?.makeFirstResponder(nil)
-        }
+        context.coordinator.updateFocusRequest(focusRequested, managesFocus: managesFocus, in: textView)
     }
 
     static func dismantleNSView(_ scrollView: NSScrollView, coordinator: Coordinator) {
-        coordinator.dismissActivePopover()
+        coordinator.detach()
     }
 
     @MainActor
@@ -417,11 +434,21 @@ struct TaskRequestComposer: NSViewRepresentable {
         private var lastPopoverCanChangeRole: Bool?
         private var lastPopoverHasExistingCorrection: Bool?
         private var lastAppliedFontSize: CGFloat?
+        private var lastEditorSessionID: UUID?
+        private var lastFocusRequest: Bool?
+        private var lastManagesFocus: Bool?
+        private var focusRequestNeedsApplication = false
+        private var focusCallbackGeneration: UInt64 = 0
+        private var lastReportedFocusState: Bool?
+        private var isReplacingExternalContent = false
         private var labelCacheInputs: [TaskComposerLabelInput] = []
         private var labelCache: [UUID: String] = [:]
         private(set) var labelIndexBuildCount = 0
 
-        init(parent: TaskRequestComposer) { self.parent = parent }
+        init(parent: TaskRequestComposer) {
+            self.parent = parent
+            lastEditorSessionID = parent.editorSessionID
+        }
 
         func applyFont(_ size: CGFloat, to view: NSTextView) {
             guard lastAppliedFontSize != size else { return }
@@ -456,24 +483,46 @@ struct TaskRequestComposer: NSViewRepresentable {
                 case .text(let text):
                     result.append(NSAttributedString(string: text, attributes: attributes))
                 case .reference(let reference):
-                    let attachment = TaskComposerTextAttachment(reference: reference,
-                        label: labels[reference.id] ?? reference.value, fontSize: parent.fontSize)
-                    let value = NSMutableAttributedString(attachment: attachment)
-                    value.addAttributes(attributes, range: NSRange(location: 0, length: value.length))
-                    value.addAttribute(.baselineOffset, value: -3, range: NSRange(location: 0, length: value.length))
-                    result.append(value)
+                    result.append(Self.attributedAttachment(reference,
+                        label: labels[reference.id] ?? reference.value, fontSize: parent.fontSize))
                 }
             }
             textView.textStorage?.setAttributedString(result)
-            let location = min(selection.location, result.length)
-            let end = min(max(selection.location, 0) + selection.length, result.length)
-            textView.setSelectedRange(NSRange(location: location, length: max(0, end - location)))
+            let location = min(max(0, selection.location), result.length)
+            let available = result.length - location
+            let length = min(max(0, selection.length), available)
+            textView.setSelectedRange(NSRange(location: location, length: length))
             lastRenderedDraft = draft
             textView.typingAttributes = attributes
             refreshLabels(in: textView, draft: draft)
         }
 
         func update(_ draft: TaskComposerDraft, in textView: TaskComposerTextView) {
+            let sessionChanged = lastEditorSessionID != parent.editorSessionID
+            if sessionChanged {
+                lastEditorSessionID = parent.editorSessionID
+            }
+            let externalContentChanged = lastRenderedDraft.map { !$0.hasSameEditorContent(as: draft) } ?? false
+            if sessionChanged {
+                replaceLoadedDraft(draft, in: textView)
+                return
+            }
+            if externalContentChanged {
+                guard let previous = lastRenderedDraft else {
+                    replaceLoadedDraft(draft, in: textView)
+                    return
+                }
+                if previous.hasSameContent(as: draft) {
+                    // A role changed in another editor. Keep this editor's
+                    // attachment and selection, but invalidate its stale undo
+                    // entries before applying the shared role presentation.
+                    textView.undoManager?.removeAllActions()
+                    textView.breakUndoCoalescing()
+                } else {
+                    replaceLoadedDraft(draft, in: textView)
+                    return
+                }
+            }
             guard let previous = lastRenderedDraft, previous != draft else { return }
             guard previous.hasSameContent(as: draft) else {
                 render(draft, in: textView)
@@ -495,6 +544,90 @@ struct TaskRequestComposer: NSViewRepresentable {
             }
             for (attachment, reference) in updates { attachment.updateReference(reference) }
             lastRenderedDraft = draft
+        }
+
+        private func replaceLoadedDraft(_ draft: TaskComposerDraft, in textView: TaskComposerTextView) {
+            dismissActivePopover()
+            isReplacingExternalContent = true
+            if textView.hasMarkedText() {
+                textView.inputContext?.discardMarkedText()
+            }
+            textView.undoManager?.removeAllActions()
+            textView.breakUndoCoalescing()
+            render(draft, in: textView)
+            isReplacingExternalContent = false
+        }
+
+        func detach() {
+            focusCallbackGeneration &+= 1
+            dismissActivePopover()
+            textView?.composerCoordinator = nil
+            textView = nil
+        }
+
+        func updateFocusRequest(_ requested: Bool, managesFocus: Bool,
+                                in textView: TaskComposerTextView) {
+            guard lastFocusRequest != requested || lastManagesFocus != managesFocus else { return }
+            lastFocusRequest = requested
+            lastManagesFocus = managesFocus
+            focusCallbackGeneration &+= 1
+            guard managesFocus, requested else {
+                focusRequestNeedsApplication = false
+                return
+            }
+            focusRequestNeedsApplication = true
+            attemptRequestedFocus(in: textView)
+        }
+
+        func attemptRequestedFocus(in textView: TaskComposerTextView) {
+            guard focusRequestNeedsApplication, parent.managesFocus, parent.focusRequested else { return }
+            focusCallbackGeneration &+= 1
+            let generation = focusCallbackGeneration
+            DispatchQueue.main.async { [weak self, weak textView] in
+                guard let self, let textView, self.focusCallbackGeneration == generation,
+                      self.textView === textView, self.parent.managesFocus,
+                      self.focusRequestNeedsApplication, self.parent.focusRequested,
+                      let window = textView.window else { return }
+                if window.firstResponder === textView {
+                    self.focusRequestNeedsApplication = false
+                } else if window.makeFirstResponder(textView) {
+                    self.focusRequestNeedsApplication = false
+                }
+            }
+        }
+
+        func textView(_ textView: TaskComposerTextView, didChangeFirstResponder focused: Bool) {
+            focusCallbackGeneration &+= 1
+            let generation = focusCallbackGeneration
+            DispatchQueue.main.async { [weak self, weak textView] in
+                guard let self, let textView, self.focusCallbackGeneration == generation,
+                      self.textView === textView, let window = textView.window,
+                      (window.firstResponder === textView) == focused else { return }
+                guard self.lastReportedFocusState != focused else { return }
+                self.lastReportedFocusState = focused
+                if focused { self.focusRequestNeedsApplication = false }
+                self.parent.onFocusChanged(focused)
+            }
+        }
+
+        func textViewDidMoveToWindow(_ textView: TaskComposerTextView) {
+            guard textView.window != nil else {
+                guard lastReportedFocusState == true else { return }
+                focusCallbackGeneration &+= 1
+                let generation = focusCallbackGeneration
+                DispatchQueue.main.async { [weak self, weak textView] in
+                    guard let self, let textView, self.focusCallbackGeneration == generation,
+                          self.textView === textView, textView.window == nil,
+                          self.lastReportedFocusState == true else { return }
+                    self.lastReportedFocusState = false
+                    self.parent.onFocusChanged(false)
+                }
+                return
+            }
+            if textView.window?.firstResponder === textView {
+                self.textView(textView, didChangeFirstResponder: true)
+            }
+            attemptRequestedFocus(in: textView)
         }
 
         func dismissActivePopover() {
@@ -522,6 +655,7 @@ struct TaskRequestComposer: NSViewRepresentable {
         }
 
         func textDidChange(_ notification: Notification) {
+            guard !isReplacingExternalContent else { return }
             guard let textView = notification.object as? TaskComposerTextView else { return }
             let updated = Self.draft(from: textView.attributedString())
             if let activePopoverReferenceID,
@@ -532,9 +666,6 @@ struct TaskRequestComposer: NSViewRepresentable {
             lastRenderedDraft = updated
             refreshLabels(in: textView, draft: updated)
         }
-
-        func textDidBeginEditing(_ notification: Notification) { parent.onFocusChanged(true) }
-        func textDidEndEditing(_ notification: Notification) { parent.onFocusChanged(false) }
 
         func handleChip(_ reference: TaskComposerReference, anchor: NSRect, in textView: TaskComposerTextView) {
             dismissActivePopover()
@@ -614,9 +745,9 @@ struct TaskRequestComposer: NSViewRepresentable {
                 guard case .reference(let current) = segment, current.id == id else { return segment }
                 return .reference(updated)
             })
-            let attachment = TaskComposerTextAttachment(reference: updated,
+            let attributed = Self.attributedAttachment(updated,
                 label: labelIndex(for: projectedDraft)[updated.id] ?? updated.value, fontSize: parent.fontSize)
-            textView.insertText(NSAttributedString(attachment: attachment), replacementRange: range)
+            textView.insertText(attributed, replacementRange: range)
         }
 
         @discardableResult
@@ -729,9 +860,8 @@ struct TaskRequestComposer: NSViewRepresentable {
             let insertion = NSMutableAttributedString(string: "")
             for (position, reference) in references.enumerated() {
                 if position > 0 { insertion.append(NSAttributedString(string: " ", attributes: attributes)) }
-                let attachment = TaskComposerTextAttachment(reference: reference,
-                    label: labels[reference.id] ?? reference.value, fontSize: parent.fontSize)
-                insertion.append(NSAttributedString(attachment: attachment))
+                insertion.append(Self.attributedAttachment(reference,
+                    label: labels[reference.id] ?? reference.value, fontSize: parent.fontSize))
             }
             textView.insertText(insertion, replacementRange: range)
         }
@@ -812,16 +942,21 @@ struct TaskRequestComposer: NSViewRepresentable {
                 case .text(let text):
                     result.append(NSAttributedString(string: text, attributes: textAttributes))
                 case .reference(let reference):
-                    let attachment = TaskComposerTextAttachment(reference: reference,
-                        label: labels[reference.id] ?? reference.value, fontSize: fontSize)
-                    let attributedAttachment = NSMutableAttributedString(attachment: attachment)
-                    attributedAttachment.addAttributes(textAttributes,
-                        range: NSRange(location: 0, length: attributedAttachment.length))
-                    attributedAttachment.addAttribute(.baselineOffset, value: -3,
-                        range: NSRange(location: 0, length: attributedAttachment.length))
-                    result.append(attributedAttachment)
+                    result.append(attributedAttachment(reference,
+                        label: labels[reference.id] ?? reference.value, fontSize: fontSize))
                 }
             }
+            return result
+        }
+
+        private static func attributedAttachment(_ reference: TaskComposerReference,
+                                                 label: String, fontSize: CGFloat) -> NSAttributedString {
+            let attachment = TaskComposerTextAttachment(reference: reference, label: label, fontSize: fontSize)
+            let result = NSMutableAttributedString(attachment: attachment)
+            let range = NSRange(location: 0, length: result.length)
+            result.addAttributes([.font: NSFont.systemFont(ofSize: fontSize),
+                                  .foregroundColor: NSColor.labelColor], range: range)
+            result.addAttribute(.baselineOffset, value: -3, range: range)
             return result
         }
 
@@ -989,8 +1124,32 @@ final class TaskComposerChipCell: NSTextAttachmentCell {
 
 final class TaskComposerTextView: NSTextView {
     weak var composerCoordinator: TaskRequestComposer.Coordinator?
+    private let composerUndoManager = UndoManager()
+
+    override var undoManager: UndoManager? { composerUndoManager }
 
     override var acceptsFirstResponder: Bool { true }
+
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted {
+            composerCoordinator?.textView(self, didChangeFirstResponder: true)
+        }
+        return accepted
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let accepted = super.resignFirstResponder()
+        if accepted {
+            composerCoordinator?.textView(self, didChangeFirstResponder: false)
+        }
+        return accepted
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        composerCoordinator?.textViewDidMoveToWindow(self)
+    }
 
     override func mouseDown(with event: NSEvent) {
         let selectionModifiers: NSEvent.ModifierFlags = [.command, .shift, .option, .control, .function]

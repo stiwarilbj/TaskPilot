@@ -50,6 +50,7 @@ struct PendingTaskInputRoleCorrection: Equatable {
 
 struct TaskCorrectionSession: Equatable, Identifiable {
     let generationID: String
+    let editorSessionID = UUID()
     var draft: TaskComposerDraft
     var state: TaskCorrectionEditorState = .editing
     var correctionID: UUID?

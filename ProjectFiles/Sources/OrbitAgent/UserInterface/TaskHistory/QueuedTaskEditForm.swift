@@ -31,6 +31,7 @@ struct QueuedTaskEditForm: View {
                 draft: draftBinding,
                 fontSize: TaskPilotAppearancePreferences.clampedInputFontSize(inputFontSize),
                 focusRequested: shouldFocus,
+                editorSessionID: session?.editorSessionID,
                 onFocusChanged: { focused in
                     focusRequested = focused
                     if focused {

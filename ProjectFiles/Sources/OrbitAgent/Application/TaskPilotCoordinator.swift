@@ -45,12 +45,17 @@ final class TaskPilotCoordinator: ObservableObject {
     // MARK: - Observable app state
 
     @Published var taskDraft = TaskComposerDraft()
-    @Published private(set) var remixSession: TaskRemixSession?
+    @Published private(set) var taskDraftEditorSessionID = UUID()
+    @Published private(set) var remixSession: TaskRemixSession? {
+        didSet {
+            if oldValue?.id != remixSession?.id { remixReviewCache.clear() }
+        }
+    }
     @Published private(set) var pendingRemixHistoryEntryID: UUID?
     @Published private(set) var requestSubmissionError: String?
     var prompt: String {
         get { taskDraft.expandedText }
-        set { taskDraft = TaskComposerDraft(plainText: newValue) }
+        set { replaceTaskDraftForNewEditorSession(TaskComposerDraft(plainText: newValue)) }
     }
     @Published private(set) var runState: RunState = .idle
     @Published private(set) var status = "Checking your agent screen…"
@@ -132,6 +137,7 @@ final class TaskPilotCoordinator: ObservableObject {
     @Published private(set) var taskWaitDetails: AgentTaskWaitSnapshot?
     @Published private(set) var taskDestination: AgentTaskDestinationSnapshot?
     @Published private(set) var workingDocumentPresentation: WorkingDocumentPresentation?
+    private var remixReviewCache = TaskRemixReviewCache()
     @Published private(set) var workingDocumentNotice: String?
     private var pendingWorkingDocumentUpdateID: String?
     private var pendingContinuationCheckpoint: AgentTaskContinuationCheckpoint?
@@ -216,7 +222,15 @@ final class TaskPilotCoordinator: ObservableObject {
 
     var remixReview: TaskRemixReview? {
         guard let remixSession else { return nil }
-        return TaskRemixReview.make(baseline: remixSession.baselineDraft, current: taskDraft)
+        return remixReviewCache.review(sessionID: remixSession.id,
+            baseline: remixSession.baselineDraft, current: taskDraft)
+    }
+
+    var remixReviewBuildCount: Int { remixReviewCache.buildCount }
+
+    private func replaceTaskDraftForNewEditorSession(_ draft: TaskComposerDraft) {
+        taskDraft = draft
+        taskDraftEditorSessionID = UUID()
     }
 
     var geminiAPIKeyLooksComplete: Bool {
@@ -1113,7 +1127,7 @@ final class TaskPilotCoordinator: ObservableObject {
         let draft = TaskComposerDraft(remixing: submission)
         remixSession = TaskRemixSession(sourceEntryID: entry.id, sourceRequest: entry.request,
                                         baselineDraft: draft, preservedDraft: taskDraft)
-        taskDraft = draft
+        replaceTaskDraftForNewEditorSession(draft)
         pendingRemixHistoryEntryID = nil
         requestSubmissionError = nil
         return true
@@ -1126,7 +1140,7 @@ final class TaskPilotCoordinator: ObservableObject {
     @discardableResult
     func discardRemixAndLoadPendingHistoryEntry() -> Bool {
         guard let id = pendingRemixHistoryEntryID, let session = remixSession else { return false }
-        taskDraft = session.preservedDraft
+        replaceTaskDraftForNewEditorSession(session.preservedDraft)
         remixSession = nil
         pendingRemixHistoryEntryID = nil
         return beginHistoryRemix(id: id)
@@ -1134,7 +1148,7 @@ final class TaskPilotCoordinator: ObservableObject {
 
     func cancelHistoryRemix() {
         guard let session = remixSession else { return }
-        taskDraft = session.preservedDraft
+        replaceTaskDraftForNewEditorSession(session.preservedDraft)
         remixSession = nil
         pendingRemixHistoryEntryID = nil
         requestSubmissionError = nil
@@ -1149,7 +1163,7 @@ final class TaskPilotCoordinator: ObservableObject {
         } else if isReady && !windowsPresentedOnMain {
             startTask(submission: entry.effectiveSubmission, queuedTask: nil)
         } else {
-            taskDraft = TaskComposerDraft(submission: entry.effectiveSubmission)
+            replaceTaskDraftForNewEditorSession(TaskComposerDraft(submission: entry.effectiveSubmission))
             showingSetup = true
         }
     }
@@ -1509,7 +1523,7 @@ final class TaskPilotCoordinator: ObservableObject {
         if remixSession != nil {
             cancelHistoryRemix()
         } else {
-            taskDraft = TaskComposerDraft()
+            replaceTaskDraftForNewEditorSession(TaskComposerDraft())
         }
         requestSubmissionError = nil
     }
