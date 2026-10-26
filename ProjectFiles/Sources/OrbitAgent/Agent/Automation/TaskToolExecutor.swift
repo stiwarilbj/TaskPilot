@@ -7,6 +7,7 @@ enum TaskToolError: LocalizedError {
     case operationFailed(String)
     case uncertainDelivery(String)
     case commandCapability(String, String)
+    case fileContentsNotLocal
 
     var code: String {
         switch self {
@@ -14,6 +15,7 @@ enum TaskToolError: LocalizedError {
         case .operationFailed: return "delivery_rejected"
         case .uncertainDelivery: return "delivery_uncertain"
         case .commandCapability(let code, _): return code
+        case .fileContentsNotLocal: return "file_contents_not_local"
         }
     }
 
@@ -22,6 +24,7 @@ enum TaskToolError: LocalizedError {
         case .invalidAction(let message), .operationFailed(let message), .uncertainDelivery(let message):
             return message
         case .commandCapability(_, let message): return message
+        case .fileContentsNotLocal: return "File contents are not available locally yet. Wait for the cloud provider to finish downloading the file, then inspect it again."
         }
     }
 }
@@ -51,12 +54,15 @@ final class TaskToolExecutor {
     private var pressureRegistration: MemoryPressureMonitor.Registration?
     private let profileProvider: (String, [String?]) -> CommandCapabilities.Profile?
     private let outputSpillRoot: URL
+    private let fileDownloadStatus: FileInputAvailability.DownloadStatusReader
 
     init(profileProvider: @escaping (String, [String?]) -> CommandCapabilities.Profile? = CommandCapabilities.profile,
          outputSpillRoot: URL = FileManager.default.temporaryDirectory,
+         fileDownloadStatus: @escaping FileInputAvailability.DownloadStatusReader = FileInputAvailability.downloadStatus,
          memoryPressure: MemoryPressureMonitor = .shared) {
         self.profileProvider = profileProvider
         self.outputSpillRoot = outputSpillRoot
+        self.fileDownloadStatus = fileDownloadStatus
         pressureRegistration = memoryPressure.register { [weak self] in self?.evictDisposableCaches() }
     }
 
@@ -171,7 +177,8 @@ final class TaskToolExecutor {
                 expected = check["encoding"] as? String == "base64" ? Data(base64Encoded: content)! : Data(content.utf8)
             }
             checks.append(CommandExecutionPolicy.Check(type: check["type"] as! String, path: path,
-                                                       expected: expected, text: nil).evaluate(stdout: "", stdoutTruncated: false))
+                                                       expected: expected, text: nil).evaluate(stdout: "", stdoutTruncated: false,
+                                                                                            downloadStatus: fileDownloadStatus))
         }
         try TaskOwnership.check()
         let verified = !checks.isEmpty && checks.allSatisfy { $0["verified"] as? Bool == true }
@@ -204,7 +211,7 @@ final class TaskToolExecutor {
         let url = try Self.fileURL(from: action)
         let requestedLimit = (action["max_bytes"] as? NSNumber)?.intValue ?? (ActionContract.defaultValue(.read_file, "max_bytes") as! NSNumber).intValue
         let limit = min(Self.maximumReadBytes, max(1, requestedLimit))
-        let snapshot = try BoundFileOperation(url).read(limit: limit + 1)
+        let snapshot = try BoundFileOperation(url, downloadStatus: fileDownloadStatus).read(limit: limit + 1)
         let data = snapshot.data
         let truncated = data.count > limit
         let bounded = Data(data.prefix(limit))
@@ -259,7 +266,7 @@ final class TaskToolExecutor {
             throw TaskToolError.invalidAction("write_file mode must be overwrite or append")
         }
         let createParents = action["create_parents"] as? Bool ?? ActionContract.defaultValue(.write_file, "create_parents") as! Bool
-        let operation = try BoundFileOperation(url, createParents: createParents)
+        let operation = try BoundFileOperation(url, createParents: createParents, downloadStatus: fileDownloadStatus)
         let (finalSize, identity, textSnapshot) = try operation.replaceCapturingText(with: data,
             append: mode == "append", mustBeAbsent: action["precondition"] as? String == "absent")
         let formatName = (identity["file_format"] as? [String: Any])?["format"] as? String
@@ -483,7 +490,8 @@ final class TaskToolExecutor {
                                            policy: policy, environment: environment,
                                            prefix: "command", timeout: policy.timeout,
                                            validate: { try binding?.validate() })
-        let checks = policy.checks.map { $0.evaluate(stdout: execution.stdout.text, stdoutTruncated: execution.stdout.truncated) }
+        let checks = policy.checks.map { $0.evaluate(stdout: execution.stdout.text, stdoutTruncated: execution.stdout.truncated,
+                                                    downloadStatus: fileDownloadStatus) }
         let executed = !execution.timedOut && execution.status == 0
         let verified = executed && !checks.isEmpty && checks.allSatisfy { $0["verified"] as? Bool == true }
         var result: [String: Any] = [

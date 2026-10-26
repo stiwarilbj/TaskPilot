@@ -22,7 +22,8 @@ struct CommandExecutionPolicy {
         let expected: Data?
         let text: String?
 
-        func evaluate(stdout: String, stdoutTruncated: Bool) -> [String: Any] {
+        func evaluate(stdout: String, stdoutTruncated: Bool,
+                      downloadStatus: @escaping FileInputAvailability.DownloadStatusReader = FileInputAvailability.downloadStatus) -> [String: Any] {
             var result: [String: Any] = ["type": type, "verified": false,
                 "outcome": "delivered_unconfirmed", "verification_scope": type]
             if let path { result["path"] = path.path }
@@ -33,7 +34,7 @@ struct CommandExecutionPolicy {
                 case .stdout_equals:
                     matches = !stdoutTruncated && stdout == text
                 case .path_absent, .file_exists, .directory_exists, .file_contents:
-                    let inspection = try BoundFileOperation(path!).inspect(kind: type, expected: expected)
+                    let inspection = try BoundFileOperation(path!, downloadStatus: downloadStatus).inspect(kind: type, expected: expected)
                     matches = inspection.0
                     if matches { result.merge(inspection.1) { _, new in new } }
                 }
@@ -46,6 +47,8 @@ struct CommandExecutionPolicy {
                     result["text_sha256"] = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
                 }
                 if !matches { result["reason"] = "The requested outcome did not match" }
+            } catch TaskToolError.fileContentsNotLocal {
+                result["reason"] = TaskToolError.fileContentsNotLocal.localizedDescription
             } catch is BoundFileOperation.Conflict {
                 result["reason"] = "Filesystem conflict; fresh inspection is required"
             } catch {

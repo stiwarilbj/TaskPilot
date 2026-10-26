@@ -16,7 +16,7 @@ final class BoundFileOperation {
             lhs.object == rhs.object && lhs.version == rhs.version
         }
         var object: String { digest("\(info.st_dev):\(info.st_ino):\(info.st_birthtimespec.tv_sec):\(info.st_birthtimespec.tv_nsec)") }
-        var version: String { digest("\(object):\(info.st_size):\(info.st_mtimespec.tv_sec):\(info.st_mtimespec.tv_nsec):\(info.st_ctimespec.tv_sec):\(info.st_ctimespec.tv_nsec):\(info.st_mode)") }
+        var version: String { digest("\(object):\(info.st_size):\(info.st_mtimespec.tv_sec):\(info.st_mtimespec.tv_nsec):\(info.st_ctimespec.tv_sec):\(info.st_ctimespec.tv_nsec):\(info.st_mode):\(info.st_flags)") }
         var regular: Bool { info.st_mode & S_IFMT == S_IFREG }
     }
     struct Snapshot {
@@ -58,10 +58,14 @@ final class BoundFileOperation {
     private let parent: Int32
     private let parentIdentity: Identity
     private let hook: Hook
+    private let downloadStatus: FileInputAvailability.DownloadStatusReader
 
-    init(_ input: URL, createParents: Bool = false, hook: @escaping Hook = { _ in }) throws {
+    init(_ input: URL, createParents: Bool = false,
+         downloadStatus: @escaping FileInputAvailability.DownloadStatusReader = FileInputAvailability.downloadStatus,
+         hook: @escaping Hook = { _ in }) throws {
         self.input = input
         self.hook = hook
+        self.downloadStatus = downloadStatus
         name = input.lastPathComponent
         guard !name.isEmpty, name != ".", name != ".." else { throw TaskToolError.invalidAction("A file name is required") }
         // Resolve directory aliases once (including macOS /tmp and /var).
@@ -126,15 +130,24 @@ final class BoundFileOperation {
         guard let expected = try entry(name), expected.regular else {
             throw conflict("the target is missing, a symbolic link, or not a regular file")
         }
+        try FileInputAvailability.requireLocal(flags: expected.info.st_flags)
+        let cloudStatus = try? downloadStatus(parentURL.appendingPathComponent(name))
+        // Provider metadata is pathname-based; don't apply another object's
+        // cloud state if the entry changed while it was collected.
+        try checkParent()
+        guard try entry(name) == expected else { throw conflict("the target changed during availability inspection") }
+        try FileInputAvailability.requireLocal(flags: expected.info.st_flags, downloadStatus: cloudStatus)
         let fd = openat(parent, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { throw conflict("the target could not be bound") }
         do {
             let actual = try Self.identity(fd)
+            try FileInputAvailability.requireLocal(flags: actual.info.st_flags)
             guard actual == expected, actual.regular else { throw conflict("the target changed while opening") }
             return (fd, actual)
         } catch { close(fd); throw error }
     }
     private static func read(_ fd: Int32, offset: Int64, count: Int) throws -> Data {
+        try FileInputAvailability.requireLocal(flags: identity(fd).info.st_flags)
         var output = Data(count: count)
         let got = output.withUnsafeMutableBytes { pread(fd, $0.baseAddress, count, off_t(offset)) }
         if got < 0 { throw systemError("read bound file") }
@@ -159,7 +172,9 @@ final class BoundFileOperation {
     }
     private static func copyAndHash(_ fd: Int32, to destination: Int32?, capture: inout Data?) throws -> String {
         var hash = SHA256(), offset: Int64 = 0
-        let size = try identity(fd).info.st_size
+        let info = try identity(fd).info
+        try FileInputAvailability.requireLocal(flags: info.st_flags)
+        let size = info.st_size
         while offset < size {
             try TaskOwnership.check()
             let bytes = try read(fd, offset: offset, count: Int(min(65536, size - offset)))
@@ -183,6 +198,7 @@ final class BoundFileOperation {
             if part.isEmpty { break }
             data.append(part)
         }
+        try FileInputAvailability.requireLocal(flags: Self.identity(fd).info.st_flags)
         let format = try FileFormatVerifier.attestation(fileDescriptor: fd, size: expected.info.st_size, filename: name)
         let formatValid = FileFormatVerifier.expectedFormat(for: name) == nil || format != nil
         try hook(.inspected)
