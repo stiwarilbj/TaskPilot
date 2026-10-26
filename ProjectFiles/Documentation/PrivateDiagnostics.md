@@ -25,6 +25,16 @@ Task history stores the typed `AgentRequestMetrics` value. The history writer
 validates every metric again before encoding, so only allowlisted integer
 counters can be persisted.
 
+## In-memory stage high-water marks
+
+`BackendTelemetry.memoryHighWaterMarks()` exposes fixed numeric peaks for
+queued capture frames, active PNG encodes, and runtime snapshots waiting for
+main-queue delivery. Capture byte counts use each `CGImage` row stride times
+height; snapshot bytes use the existing bounded event-size estimate. Counts
+and byte peaks are kept only in the recorder's memory and are not written to
+task history, diagnostic files, or exported reports. The fixed stage enum
+cannot retain task data, paths, identifiers, or image contents.
+
 ## Action diagnostics
 
 `automation-diagnostics.jsonl` records are projected onto this exact set of

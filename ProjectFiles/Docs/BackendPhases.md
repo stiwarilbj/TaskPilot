@@ -62,6 +62,18 @@ spans measure work after it begins. Overlapping wall-time spans must not be
 subtracted or summed to infer CPU time. Signposts use fixed queue names and
 numeric disposition and wait fields only.
 
+## Memory high-water marks
+
+The in-process recorder also keeps fixed stage peaks accessible through
+`BackendTelemetry.memoryHighWaterMarks()`. It reports the maximum simultaneous
+count and byte estimate for frames waiting in the bounded PNG queue, active
+PNG input buffers, and runtime events retained for main-queue delivery after
+snapshot filtering. A capture frame's byte estimate is `bytesPerRow × height`;
+a runtime event uses its bounded event-size estimate. Tickets close on cancellation,
+coalescing, completion, and abandonment, so the stage gauge falls as ownership
+ends while its maxima remain for the recorder lifetime. These counters stay in
+memory and contain no task identifiers or payloads.
+
 ## Offline baseline
 
 Measured on 2026-10-13 with the SwiftPM debug build on this Apple Silicon Mac.

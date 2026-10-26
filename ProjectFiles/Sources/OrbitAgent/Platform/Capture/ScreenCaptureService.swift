@@ -153,7 +153,8 @@ actor ScreenCaptureService {
             try reservation.check()
             let coordinates = try ScreenCoordinateMapping(displayID: display.id, displayBounds: display.frame,
                 imageSize: CGSize(width: image.width, height: image.height))
-            let frame = CapturedFrame(image: image, coordinates: coordinates, reservation: reservation)
+            let frame = CapturedFrame(image: image, imageStorageBytes: Self.imageStorageBytes(image),
+                                      coordinates: coordinates, reservation: reservation)
             await acquisitionQueue.acquired(reservation)
             try frame.check(); try LocalOperationBudget.check("capture_acquisition")
             return frame
@@ -258,6 +259,13 @@ actor ScreenCaptureService {
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
             span.record(outputBytes: size, items: image.width * image.height)
         }
+    }
+
+    /// Uses the acquired bitmap's stride rather than width × height so the
+    /// queue gauge includes row padding and matches the buffer held by encoders.
+    private static func imageStorageBytes(_ image: CGImage) -> Int {
+        let (bytes, overflow) = image.bytesPerRow.multipliedReportingOverflow(by: image.height)
+        return overflow ? Int.max : max(0, bytes)
     }
 
     /// Captures a local-only viewer frame. Unlike the OpenClaw frame, this keeps

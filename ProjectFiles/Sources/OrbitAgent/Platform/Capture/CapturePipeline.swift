@@ -139,10 +139,14 @@ actor CaptureAcquisitionQueue {
 final class CapturedFrame: @unchecked Sendable {
     let id = UUID()
     let image: CGImage
+    /// Estimated resident pixel storage, including row padding.
+    let imageStorageBytes: Int
     let coordinates: ScreenCoordinateMapping
     let reservation: CaptureAcquisitionQueue.Reservation
-    init(image: CGImage, coordinates: ScreenCoordinateMapping, reservation: CaptureAcquisitionQueue.Reservation) {
-        self.image = image; self.coordinates = coordinates; self.reservation = reservation
+    init(image: CGImage, imageStorageBytes: Int, coordinates: ScreenCoordinateMapping,
+         reservation: CaptureAcquisitionQueue.Reservation) {
+        self.image = image; self.imageStorageBytes = max(0, imageStorageBytes)
+        self.coordinates = coordinates; self.reservation = reservation
     }
     func check() throws {
         try reservation.check()
@@ -164,6 +168,7 @@ actor CapturePNGEncoder {
         let observer: UUID?
         let telemetry: BackendTelemetry
         let waitTicket: BackendTelemetry.QueueTicket
+        let queuedMemory: BackendTelemetry.MemoryTicket
         let budget: LocalOperationBudget?
         let continuation: CheckedContinuation<URL, Error>
         func removeObserver() { if let observer { frame.reservation.owner?.removeRevocationObserver(observer) } }
@@ -172,6 +177,7 @@ actor CapturePNGEncoder {
     private let directory: URL
     private var waiting: [Job] = []
     private var active: Job?
+    private var activeMemory: BackendTelemetry.MemoryTicket?
     private var frameIDs: Set<UUID> = []
     private var worker: Task<Void, Never>?
     init(directory: URL = FileManager.default.temporaryDirectory.appendingPathComponent("OrbitAgent", isDirectory: true),
@@ -207,6 +213,7 @@ actor CapturePNGEncoder {
                 let job = Job(id: id, frame: frame, directory: outputDirectory,
                     url: outputDirectory.appendingPathComponent("screen-\(UUID().uuidString).png"),
                     cancellation: cancellation, observer: observer, telemetry: telemetry, waitTicket: waitTicket,
+                    queuedMemory: telemetry.beginMemory(.queuedCaptureFrames, bytes: frame.imageStorageBytes),
                     budget: LocalOperationBudget.current, continuation: continuation)
                 frameIDs.insert(frame.id); waiting.append(job); pump()
             }
@@ -217,7 +224,8 @@ actor CapturePNGEncoder {
     }
     private func cancel(_ id: UUID) {
         if let index = waiting.firstIndex(where: { $0.id == id }) {
-            let job = waiting.remove(at: index); job.waitTicket.discard(.cancelled); frameIDs.remove(job.frame.id); job.removeObserver()
+            let job = waiting.remove(at: index); job.waitTicket.discard(.cancelled)
+            job.queuedMemory.finish(); frameIDs.remove(job.frame.id); job.removeObserver()
             job.continuation.resume(throwing: CancellationError())
         }
         if active?.id == id {
@@ -227,7 +235,10 @@ actor CapturePNGEncoder {
     }
     private func pump() {
         guard active == nil, !waiting.isEmpty else { return }
-        let job = waiting.removeFirst(); active = job
+        let job = waiting.removeFirst()
+        job.queuedMemory.finish()
+        activeMemory = job.telemetry.beginMemory(.activeCaptureEncodes, bytes: job.frame.imageStorageBytes)
+        active = job
         let writer = writer, directory = job.directory
         worker = Task.detached(priority: .userInitiated) {
             job.waitTicket.start()
@@ -261,7 +272,8 @@ actor CapturePNGEncoder {
     }
     private func finished(_ job: Job, result: Result<URL, Error>) {
         guard active?.id == job.id else { return }
-        active = nil; worker = nil; frameIDs.remove(job.frame.id); job.removeObserver()
+        active = nil; activeMemory?.finish(); activeMemory = nil
+        worker = nil; frameIDs.remove(job.frame.id); job.removeObserver()
         do {
             try job.cancellation.check(); try job.frame.check(); try LocalOperationBudget.check("capture_encoding")
             let url = try result.get(); job.continuation.resume(returning: url)

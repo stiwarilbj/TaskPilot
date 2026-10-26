@@ -1220,7 +1220,9 @@ final class AgentRuntimeProcess {
         }
         run.queuedEventCount += 1; run.queuedEventBytes += bytes
         let deliveryWait = telemetry.beginQueueWait(.eventDelivery)
+        let snapshotMemory = run.snapshots.beginInFlightSnapshot(byteCount: bytes, telemetry: telemetry)
         DispatchQueue.main.async { [weak self] in
+            defer { snapshotMemory.finish() }
             deliveryWait.start()
             guard let self else { return }
             let delivery = self.syncIO {

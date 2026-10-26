@@ -51,6 +51,26 @@ final class BackendTelemetry: @unchecked Sendable {
     }
     enum QueueDisposition: Int, CaseIterable, Codable { case started, cancelled, rejected, coalesced, abandoned }
 
+    /// Fixed, in-memory gauges for bounded stages that retain image or event
+    /// payloads. Only maxima are exposed; no task or payload identity is kept.
+    enum MemoryStage: String, CaseIterable {
+        case queuedCaptureFrames, activeCaptureEncodes, inFlightSnapshots
+        var name: StaticString {
+            switch self {
+            case .queuedCaptureFrames: return "Queued Capture Frames"
+            case .activeCaptureEncodes: return "Active Capture Encodes"
+            case .inFlightSnapshots: return "In-Flight Runtime Snapshots"
+            }
+        }
+    }
+    struct MemoryHighWaterMark {
+        let stage: MemoryStage
+        let currentCount: Int
+        let currentBytes: Int
+        let peakCount: Int
+        let peakBytes: Int
+    }
+
     /// Allowlist for the private request-metrics frame that is retained in task
     /// history. This intentionally excludes strings, arrays, and nested payloads.
     enum DiagnosticSchema {
@@ -185,6 +205,34 @@ final class BackendTelemetry: @unchecked Sendable {
             maximumMilliseconds = max(maximumMilliseconds, milliseconds)
         }
     }
+    private struct MemoryUsage {
+        var count = 0
+        var bytes = 0
+        var peakCount = 0
+        var peakBytes = 0
+    }
+    /// A numeric-only ownership ticket. Finishing it releases the stage's
+    /// current gauge exactly once; deinitialization covers discarded work.
+    final class MemoryTicket: @unchecked Sendable {
+        private let owner: BackendTelemetry
+        private let stage: MemoryStage
+        private let bytes: Int
+        private let lock = NSLock()
+        private var active = true
+        fileprivate init(_ owner: BackendTelemetry, _ stage: MemoryStage, bytes: Int) {
+            self.owner = owner; self.stage = stage; self.bytes = max(0, bytes)
+            owner.adjustMemory(stage, countDelta: 1, byteDelta: self.bytes)
+        }
+        func finish() {
+            let shouldFinish = lock.withLock {
+                guard active else { return false }
+                active = false
+                return true
+            }
+            if shouldFinish { owner.adjustMemory(stage, countDelta: -1, byteDelta: -bytes) }
+        }
+        deinit { finish() }
+    }
     final class QueueTicket: @unchecked Sendable {
         private let owner: BackendTelemetry
         private let queue: Queue
@@ -263,6 +311,7 @@ final class BackendTelemetry: @unchecked Sendable {
     private let now: @Sendable () -> TimeInterval
     private var rings: [Phase: Ring] = [:]
     private var queueCounts: [Queue: QueueCounts] = [:]
+    private var memoryUsage: [MemoryStage: MemoryUsage] = [:]
     private static let waitUpperBoundsMilliseconds: [Double] = [0.1, 1, 5, 10, 50, 100, 500, 1_000, 5_000]
     init(capacity: Int = 128, now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.capacity = max(1, min(1024, capacity)); self.now = now
@@ -271,6 +320,9 @@ final class BackendTelemetry: @unchecked Sendable {
         Span(self, phase, inputBytes: inputBytes, items: items)
     }
     func beginQueueWait(_ queue: Queue) -> QueueTicket { QueueTicket(self, queue) }
+    func beginMemory(_ stage: MemoryStage, bytes: Int) -> MemoryTicket {
+        MemoryTicket(self, stage, bytes: bytes)
+    }
     func measure<T>(_ phase: Phase, inputBytes: Int? = nil, items: Int? = nil, _ body: (Span) throws -> T) rethrows -> T {
         let span = begin(phase, inputBytes: inputBytes, items: items)
         do { let result = try body(span); span.finish(.succeeded); return result }
@@ -293,12 +345,40 @@ final class BackendTelemetry: @unchecked Sendable {
                 bucketCount: Self.waitUpperBoundsMilliseconds.count + 1)
         }
     }
+    private func adjustMemory(_ stage: MemoryStage, countDelta: Int, byteDelta: Int) {
+        lock.withLock {
+            var usage = memoryUsage[stage] ?? MemoryUsage()
+            usage.count = Self.saturatingAdjustment(usage.count, by: countDelta)
+            usage.bytes = Self.saturatingAdjustment(usage.bytes, by: byteDelta)
+            usage.peakCount = max(usage.peakCount, usage.count)
+            usage.peakBytes = max(usage.peakBytes, usage.bytes)
+            memoryUsage[stage] = usage
+        }
+    }
+    private static func saturatingAdjustment(_ value: Int, by delta: Int) -> Int {
+        if delta >= 0 {
+            let (sum, overflow) = value.addingReportingOverflow(delta)
+            return overflow ? Int.max : sum
+        }
+        return max(0, value - min(value, -delta))
+    }
     func queueWaitHistograms() -> [QueueWaitHistogram] {
         lock.withLock {
             Queue.allCases.compactMap { queue in
                 guard let counts = queueCounts[queue] else { return nil }
                 return QueueWaitHistogram(queue: queue, upperBoundsMilliseconds: Self.waitUpperBoundsMilliseconds,
                     countsByDisposition: counts.byDisposition, maximumMilliseconds: counts.maximumMilliseconds)
+            }
+        }
+    }
+    /// Returns fixed-size peak counts and byte estimates. CGImage bytes use
+    /// row stride; runtime snapshots use the existing event-size estimate.
+    func memoryHighWaterMarks() -> [MemoryHighWaterMark] {
+        lock.withLock {
+            MemoryStage.allCases.map { stage in
+                let usage = memoryUsage[stage] ?? MemoryUsage()
+                return MemoryHighWaterMark(stage: stage, currentCount: usage.count, currentBytes: usage.bytes,
+                    peakCount: usage.peakCount, peakBytes: usage.peakBytes)
             }
         }
     }

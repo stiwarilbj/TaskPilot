@@ -11,6 +11,13 @@ struct RuntimeSnapshotFilter {
     private var taskInputRoles: AgentTaskInputRolesSnapshot?
     private var continuationCheckpoint: (generationID: String, revision: UInt64, fingerprint: String)?
 
+    /// Accounts for a runtime event that has passed snapshot filtering and is
+    /// about to be retained by the main-queue delivery closure. The ticket
+    /// contains numeric size metadata only and releases on every exit path.
+    func beginInFlightSnapshot(byteCount: Int, telemetry: BackendTelemetry) -> BackendTelemetry.MemoryTicket {
+        telemetry.beginMemory(.inFlightSnapshots, bytes: max(0, byteCount))
+    }
+
     mutating func shouldSchedule(_ event: RuntimeEvent) -> Bool {
         switch event {
         case .status(let value):
