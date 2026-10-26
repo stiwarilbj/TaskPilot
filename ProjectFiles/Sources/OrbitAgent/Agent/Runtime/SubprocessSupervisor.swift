@@ -6,12 +6,26 @@ import ProcessSupport
 /// immediate parent's lifetime. No task text, arguments or output enter metrics.
 final class SubprocessSupervisor: @unchecked Sendable {
     enum Failure: LocalizedError {
-        case launch(Int32), inspection
+        case launch(Int32), inspection, localResourceExhausted
         var errorDescription: String? {
             switch self {
             case .launch(let code): return "Could not launch an owned process group (\(code)): \(String(cString: strerror(code)))"
             case .inspection: return "Process-tree inspection failed; ownership has not been released"
+            case .localResourceExhausted: return "local_resource_exhausted: Insufficient file descriptor headroom to launch a helper. No child was started."
             }
+        }
+    }
+    struct DescriptorHeadroom {
+        let available: UInt64
+        let softLimit: UInt64
+        // One /dev/null handle plus two advisory slots for transient spawn and
+        // dispatch monitoring. Caller-created pipes are already in the sample.
+        static let launchReserve: UInt64 = 3
+        var permitsLaunch: Bool { softLimit >= 3 && available >= Self.launchReserve }
+        static func read() -> Self? {
+            var available: UInt64 = 0, limit: UInt64 = 0
+            guard tp_descriptor_headroom(&available, &limit) == 1 else { return nil }
+            return Self(available: available, softLimit: limit)
         }
     }
     struct Snapshot {
@@ -51,9 +65,11 @@ final class SubprocessSupervisor: @unchecked Sendable {
     // Injection rejects before spawn, also exercising group-setup failures.
     private let launchCheck: () throws -> Void
     private let inspectionCheck: () -> Bool
+    private let resourceSnapshot: () -> DescriptorHeadroom?
 
-    init(launchCheck: @escaping () throws -> Void = {}, inspectionCheck: @escaping () -> Bool = { true }) {
-        self.launchCheck = launchCheck; self.inspectionCheck = inspectionCheck
+    init(launchCheck: @escaping () throws -> Void = {}, inspectionCheck: @escaping () -> Bool = { true },
+         resourceSnapshot: @escaping () -> DescriptorHeadroom? = { DescriptorHeadroom.read() }) {
+        self.launchCheck = launchCheck; self.inspectionCheck = inspectionCheck; self.resourceSnapshot = resourceSnapshot
     }
     var snapshot: Snapshot { condition.withLock { state } }
     var isRunning: Bool { condition.withLock { state.launched && !state.parentExited } }
@@ -87,6 +103,10 @@ final class SubprocessSupervisor: @unchecked Sendable {
         do { try queue.sync {
             try launchCheck()
             guard !snapshot.launched, let executableURL else { throw Failure.launch(EINVAL) }
+            // Advisory only: no limit changes or descriptor reservations. A
+            // concurrent launch can consume headroom after this read; retain
+            // all existing OS launch errors and partial-launch drainage.
+            if let resources = resourceSnapshot(), !resources.permitsLaunch { throw Failure.localResourceExhausted }
             let argv = ([executableURL.path] + arguments).map { strdup($0) } + [nil]
             let env = (environment ?? ProcessInfo.processInfo.environment).sorted { $0.key < $1.key }.map { strdup("\($0.key)=\($0.value)") } + [nil]
             defer { argv.forEach { free($0) }; env.forEach { free($0) } }

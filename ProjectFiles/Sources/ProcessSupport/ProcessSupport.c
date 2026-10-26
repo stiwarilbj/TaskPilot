@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/resource.h>
 
 int tp_spawn(pid_t *pid, const char *path, char *const argv[], char *const env[],
              const char *directory, int input, int output, int error) {
@@ -44,6 +45,24 @@ done:
     posix_spawnattr_destroy(&attributes);
     return result;
 #undef CHECK
+}
+
+int tp_descriptor_headroom(uint64_t *available, uint64_t *soft_limit) {
+    struct rlimit limit;
+    if (!available || !soft_limit || getrlimit(RLIMIT_NOFILE, &limit) != 0) return 0;
+    // No filesystem enumeration, temporary handles or dynamically sized buffer.
+    struct proc_fdinfo descriptors[4096];
+    int bytes = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, descriptors, sizeof(descriptors));
+    if (bytes <= 0 || bytes >= (int)sizeof(descriptors) || bytes % sizeof(descriptors[0])) return 0;
+    uint64_t used = 0;
+    *soft_limit = limit.rlim_cur == RLIM_INFINITY ? UINT64_MAX : (uint64_t)limit.rlim_cur;
+    for (int i = 0; i < bytes / (int)sizeof(descriptors[0]); ++i) {
+        // Existing descriptors above a subsequently lowered limit do not occupy
+        // slots available to open(). The child still needs destinations 0/1/2.
+        if ((uint64_t)descriptors[i].proc_fd < *soft_limit) ++used;
+    }
+    *available = *soft_limit > used ? *soft_limit - used : 0;
+    return 1;
 }
 
 int tp_process_identity(pid_t pid, TPProcessIdentity *identity) {

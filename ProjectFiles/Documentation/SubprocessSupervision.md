@@ -107,3 +107,32 @@ inheritable unrelated handles and standard-stream source handles. They verify
 that none survive exec, intended stdin/stdout/stderr still work, merged output
 is preserved, and runtime completion without a final newline is drained exactly
 once. These fixtures require no desktop interactions or provider calls.
+
+## Advisory descriptor headroom
+
+Immediately before allocating launch arguments, `/dev/null` or a child,
+`SubprocessSupervisor` reads its process's `RLIMIT_NOFILE` soft limit and a
+bounded `PROC_PIDLISTFDS` snapshot. The C helper uses a fixed 4,096-entry buffer,
+opens no handles, and collects no paths or descriptor contents. Only descriptors
+below the soft limit occupy available slots; existing descriptors above a
+subsequently lowered limit do not consume those slots.
+
+Launch requires room for three standard descriptor destinations in the child
+and three additional parent slots: one for `/dev/null` and a small two-slot
+reserve for transient spawn/dispatch monitoring. Caller-created pipes are
+already included in the count and are not charged again. A complete snapshot
+showing insufficient headroom returns typed `Failure.localResourceExhausted`
+with fixed `local_resource_exhausted` classification before spawn or
+acknowledgement. Caller-owned streams and process limits remain untouched.
+
+Unavailable, incomplete or over-capacity inspection skips this advisory guard;
+it does not manufacture a resource shortage. Concurrent activity may change
+headroom after inspection. The guard reserves nothing, calls no `setrlimit`,
+and cannot guarantee a launch: existing OS errors, suspended-start ownership,
+process-group acknowledgement, output drainage and teardown remain authoritative.
+No background sampler, user setting, payload diagnostics or model call is added.
+
+Offline `SubprocessSupervisorTests` inject unavailable, exhausted and exact-boundary
+snapshots, check zero launches on rejection, preserve pipe flags/limits, and
+retain normal supervision and OS failure handling. Tests do not lower the
+controller's resource limits or deliberately exhaust its descriptors.

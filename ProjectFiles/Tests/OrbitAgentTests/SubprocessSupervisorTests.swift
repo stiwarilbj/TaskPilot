@@ -4,6 +4,66 @@ import XCTest
 @testable import OrbitAgent
 
 final class SubprocessSupervisorTests: XCTestCase {
+    func testInsufficientHeadroomRejectsBeforeSpawnOrDescriptorChanges() throws {
+        let pipe = try SubprocessSupervisor.makePrivatePipe()
+        defer { try? pipe.fileHandleForReading.close(); try? pipe.fileHandleForWriting.close() }
+        let descriptors = [pipe.fileHandleForReading.fileDescriptor, pipe.fileHandleForWriting.fileDescriptor]
+        let flags = descriptors.map { fcntl($0, F_GETFD) }
+        var before = rlimit(), after = rlimit()
+        XCTAssertEqual(getrlimit(RLIMIT_NOFILE, &before), 0)
+        for resources in [SubprocessSupervisor.DescriptorHeadroom(available: 0, softLimit: 256),
+                          .init(available: 2, softLimit: 256), .init(available: 10, softLimit: 2)] {
+            var checks = 0, acknowledgements = 0
+            let process = SubprocessSupervisor(resourceSnapshot: { checks += 1; return resources })
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+            process.standardInput = pipe
+            process.onLaunchAcknowledged = { _ in acknowledgements += 1 }
+            XCTAssertThrowsError(try process.run()) { error in
+                guard case SubprocessSupervisor.Failure.localResourceExhausted = error else { return XCTFail("Wrong failure classification") }
+                XCTAssertTrue(error.localizedDescription.hasPrefix("local_resource_exhausted:"))
+            }
+            XCTAssertEqual(checks, 1); XCTAssertEqual(acknowledgements, 0)
+            XCTAssertEqual(process.processIdentifier, 0); XCTAssertFalse(process.snapshot.launched)
+            XCTAssertFalse(process.snapshot.groupAcknowledged); XCTAssertFalse(process.snapshot.teardownStarted)
+        }
+        XCTAssertEqual(descriptors.map { fcntl($0, F_GETFD) }, flags)
+        XCTAssertEqual(getrlimit(RLIMIT_NOFILE, &after), 0)
+        XCTAssertEqual(after.rlim_cur, before.rlim_cur); XCTAssertEqual(after.rlim_max, before.rlim_max)
+    }
+
+    func testAdvisoryUnknownAndExactHeadroomPermitNormalSupervision() throws {
+        for resources: SubprocessSupervisor.DescriptorHeadroom? in [nil, .init(available: 3, softLimit: 256)] {
+            let process = SubprocessSupervisor(resourceSnapshot: { resources })
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+            let exit = ProcessExitNotification(process)
+            try process.run()
+            defer { process.beginTeardown(); _ = process.waitForTree(until: .now() + 2, ignoreInterrupt: true) }
+            XCTAssertTrue(process.snapshot.groupAcknowledged)
+            XCTAssertEqual(exit.waitForExit(until: .now() + 2), 0)
+            guard case .finished = process.waitForTree(until: .now() + 2) else { return XCTFail("Tree did not finish") }
+            process.markOutputDrained(); XCTAssertTrue(process.snapshot.outputDrained)
+        }
+    }
+
+    func testAdvisoryApprovalDoesNotReplaceOSLaunchFailure() {
+        let process = SubprocessSupervisor(resourceSnapshot: { .init(available: 100, softLimit: 256) })
+        process.executableURL = URL(fileURLWithPath: "/nonexistent-taskpilot-fixture")
+        XCTAssertThrowsError(try process.run()) { error in
+            guard case SubprocessSupervisor.Failure.launch(let code) = error else { return XCTFail("OS failure was hidden") }
+            XCTAssertEqual(code, ENOENT)
+        }
+        XCTAssertFalse(process.snapshot.launched)
+    }
+
+    func testBoundedHeadroomReadDoesNotChangeProcessLimits() throws {
+        var before = rlimit(), after = rlimit()
+        XCTAssertEqual(getrlimit(RLIMIT_NOFILE, &before), 0)
+        let snapshot = try XCTUnwrap(SubprocessSupervisor.DescriptorHeadroom.read())
+        XCTAssertLessThanOrEqual(snapshot.available, snapshot.softLimit)
+        XCTAssertEqual(getrlimit(RLIMIT_NOFILE, &after), 0)
+        XCTAssertEqual(before.rlim_cur, after.rlim_cur); XCTAssertEqual(before.rlim_max, after.rlim_max)
+    }
+
     private func fixture() throws -> URL {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("taskpilot-supervisor-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
