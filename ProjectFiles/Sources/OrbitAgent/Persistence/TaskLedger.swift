@@ -277,6 +277,15 @@ struct AgentTaskLedgerStore: Sendable {
             .appendingPathComponent(fileName)
     }
 
+    /// Reclaims only private task scratch directories whose process-bound lease
+    /// is unlocked and whose recorded process birth identity is confirmed gone.
+    /// User output paths are outside this directory and are never enumerated.
+    func cleanupAbandonedTemporaryResources() {
+        let scratchRoot = fileURL.deletingLastPathComponent()
+            .appendingPathComponent(TaskTemporaryResourceLedger.directoryName, isDirectory: true)
+        _ = TaskTemporaryResourceLedger.reclaimAbandoned(root: scratchRoot)
+    }
+
     func load() throws -> AgentTaskLedgerSnapshot {
         try BackendTelemetry.current.measure(.persistenceRead) { span in
             guard FileManager.default.fileExists(atPath: fileURL.path) else {

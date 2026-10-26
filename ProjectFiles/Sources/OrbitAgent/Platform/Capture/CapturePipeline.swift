@@ -158,6 +158,7 @@ actor CapturePNGEncoder {
     private struct Job {
         let id: UUID
         let frame: CapturedFrame
+        let directory: URL
         let url: URL
         let cancellation: CaptureCancellation
         let observer: UUID?
@@ -183,6 +184,14 @@ actor CapturePNGEncoder {
                 waitTicket suppliedTicket: BackendTelemetry.QueueTicket? = nil) async throws -> URL {
         let waitTicket = suppliedTicket ?? BackendTelemetry.current.beginQueueWait(.pngCompression)
         do { try frame.check() } catch { waitTicket.discard(error is CancellationError ? .cancelled : .rejected); throw error }
+        let outputDirectory: URL
+        do {
+            outputDirectory = try frame.reservation.owner?.scratchDirectory()
+                .appendingPathComponent("capture", isDirectory: true) ?? directory
+        } catch {
+            waitTicket.discard(error is CancellationError ? .cancelled : .rejected)
+            throw error
+        }
         let id = UUID(), cancellation = CaptureCancellation()
         let telemetry = suppliedTelemetry ?? BackendTelemetry.current
         let url: URL = try await withTaskCancellationHandler {
@@ -195,7 +204,8 @@ actor CapturePNGEncoder {
                 let observer = frame.reservation.owner?.observeRevocation { [weak self] in
                     cancellation.cancel(); Task { await self?.cancel(id) }
                 }
-                let job = Job(id: id, frame: frame, url: directory.appendingPathComponent("screen-\(UUID().uuidString).png"),
+                let job = Job(id: id, frame: frame, directory: outputDirectory,
+                    url: outputDirectory.appendingPathComponent("screen-\(UUID().uuidString).png"),
                     cancellation: cancellation, observer: observer, telemetry: telemetry, waitTicket: waitTicket,
                     budget: LocalOperationBudget.current, continuation: continuation)
                 frameIDs.insert(frame.id); waiting.append(job); pump()
@@ -218,7 +228,7 @@ actor CapturePNGEncoder {
     private func pump() {
         guard active == nil, !waiting.isEmpty else { return }
         let job = waiting.removeFirst(); active = job
-        let writer = writer, directory = directory
+        let writer = writer, directory = job.directory
         worker = Task.detached(priority: .userInitiated) {
             job.waitTicket.start()
             let result: Result<URL, Error> = Result {

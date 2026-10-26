@@ -13,6 +13,8 @@ final class TaskLease: @unchecked Sendable {
     private var discarded = 0
     private var suspensions = 0
     private var artifacts: Set<URL> = []
+    private let scratchRoot: URL
+    private var scratchLease: TaskTemporaryResourceLease?
     private var screenText: (revision: String, suspension: Int, snapshot: ScreenTextSnapshot)?
     private var revocationObservers: [UUID: @Sendable () -> Void] = [:]
     private var pauseWaiters: [UUID: @Sendable () -> Void] = [:]
@@ -44,9 +46,11 @@ final class TaskLease: @unchecked Sendable {
     private var processCleanupStarted = false
     init(id: String = UUID().uuidString, taskRequest: String = "",
          exactInputReferences: [AgentTaskInputReference] = [], closePersistentProcesses: Bool = true,
-         recoveryJournal: ActionRecoveryJournal? = nil, recoveryTask: UUID? = nil) {
+         recoveryJournal: ActionRecoveryJournal? = nil, recoveryTask: UUID? = nil,
+         scratchRoot: URL = TaskTemporaryResourceLedger.defaultRoot) {
         self.id = id; self.actionReceipts = ActionReceiptStore(generation: id, journal: recoveryJournal, recoveryTask: recoveryTask)
         self.closePersistentProcesses = closePersistentProcesses
+        self.scratchRoot = scratchRoot
         boundaryRequest = taskRequest
         boundaryReferences = exactInputReferences
         stopBeforeBoundaries = StopBoundaryPolicy.detect(in: taskRequest, exactInputReferences: exactInputReferences)
@@ -56,6 +60,7 @@ final class TaskLease: @unchecked Sendable {
         permitsPersistentProcesses = text.range(of: "do not|don't|never|^(explain|describe|how|what|show me how)\\b", options: .regularExpression) == nil &&
             text.range(of: #"\b(start|launch|run)\b[^.!?\n]*\b(in (the )?background|background service)\b|\bkeep\b[^.!?\n]*\b(server|service|process)\b[^.!?\n]*\b(running|alive)\b|\b(start|launch|run)\b[^.!?\n]*\b(server|service)\b[^.!?\n]*\bkeep (it )?running\b"#, options: .regularExpression) != nil
     }
+    deinit { scratchLease?.removeDirectory() }
     func setProcessCleanup(_ enabled: Bool) {
         lock.lock(); defer { lock.unlock() }
         if !processCleanupStarted { closePersistentProcesses = enabled }
@@ -522,6 +527,16 @@ final class TaskLease: @unchecked Sendable {
         for waiter in waiters { waiter() }
         for observer in observers { observer() }
     }
+    /// Returns this task's private scratch directory, creating a process-bound
+    /// durable lease on first use. User output paths are never registered here.
+    func scratchDirectory() throws -> URL {
+        lock.lock(); defer { lock.unlock() }
+        guard value == .running || value == .paused else { throw CancellationError() }
+        if let scratchLease { return scratchLease.directoryURL }
+        let lease = try TaskTemporaryResourceLedger.makeLease(root: scratchRoot)
+        scratchLease = lease
+        return lease.directoryURL
+    }
     func observeRevocation(_ observer: @escaping @Sendable () -> Void) -> UUID {
         let token = UUID()
         lock.lock()
@@ -555,6 +570,7 @@ final class TaskLease: @unchecked Sendable {
     }
     func retire() {
         lock.lock(); value = .retired; let files = artifacts; artifacts.removeAll(); screenText = nil
+        let scratch = scratchLease; scratchLease = nil
         let observers = Array(revocationObservers.values); revocationObservers.removeAll()
         let waiters = Array(pauseWaiters.values); pauseWaiters.removeAll(); lock.unlock()
         for waiter in waiters { waiter() }
@@ -563,6 +579,7 @@ final class TaskLease: @unchecked Sendable {
         lock.lock(); persistentProcesses.removeAll(); lock.unlock()
         actionReceipts.discard()
         for url in files { try? FileManager.default.removeItem(at: url) }
+        scratch?.removeDirectory()
     }
     func accepts(_ id: String?) -> Bool {
         lock.lock(); defer { lock.unlock() }

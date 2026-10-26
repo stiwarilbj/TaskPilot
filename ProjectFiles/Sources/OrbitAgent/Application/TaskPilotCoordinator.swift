@@ -335,6 +335,7 @@ final class TaskPilotCoordinator: ObservableObject {
 
     init() {
         do {
+            taskLedgerStore.cleanupAbandonedTemporaryResources()
             let journal = try ActionRecoveryJournal()
             recoveryJournal = journal
             var ledger = try taskLedgerStore.load()

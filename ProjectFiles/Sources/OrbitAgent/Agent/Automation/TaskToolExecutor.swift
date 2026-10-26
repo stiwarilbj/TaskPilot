@@ -522,6 +522,14 @@ final class TaskToolExecutor {
                                 environment: [String: String], prefix: String, timeout: TimeInterval,
                                 probe: Bool = false, validate: () throws -> Void = {})
         throws -> (status: Int32, timedOut: Bool, persistent: Bool, stdout: (text: String, truncated: Bool), stderr: (text: String, truncated: Bool)) {
+        let lease = TaskOwnership.current
+        let spillRoot: URL
+        do {
+            spillRoot = try lease?.scratchDirectory()
+                .appendingPathComponent("command-output", isDirectory: true) ?? outputSpillRoot
+        } catch {
+            throw TaskToolError.operationFailed("Could not prepare private command-output storage; the command was not executed")
+        }
         let process = SubprocessSupervisor()
         process.executableURL = executable
         process.arguments = arguments
@@ -534,7 +542,7 @@ final class TaskToolExecutor {
         do {
             capture = try BufferedProcessOutput(maximumBytes: Self.maximumCommandOutputBytes,
                 combinedLimit: probe ? CommandCapabilities.outputLimit : nil,
-                spillRoot: outputSpillRoot, onInterruption: { exit.interrupt(); process.interrupt() })
+                spillRoot: spillRoot, onInterruption: { exit.interrupt(); process.interrupt() })
         } catch {
             throw TaskToolError.operationFailed("Could not prepare command output; the command was not executed")
         }
@@ -542,7 +550,6 @@ final class TaskToolExecutor {
         defer { if !retainedCapture { capture.close() } }
         process.standardOutput = capture.stdout
         process.standardError = capture.stderr
-        let lease = TaskOwnership.current
         let revocation = lease?.observeRevocation { exit.interrupt(); process.interrupt() }
         defer { if let revocation { lease?.removeRevocationObserver(revocation) } }
 
