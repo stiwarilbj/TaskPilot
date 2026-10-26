@@ -46,6 +46,83 @@ class ManagedRuntimeTests(unittest.TestCase):
         outside=self.root/'outside';outside.write_text('good');f.symlink_to(outside)
         self.assertFalse(managed.validate_install(install,'pin'))
 
+    def test_full_audits_hint_the_checked_descriptor_before_reading(self):
+        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+        actual_read=os.read; hinted=set(); reads=[]
+        def hint(fd, command, value):
+            self.assertEqual((command,value),(48,1))
+            self.assertEqual(os.fstat(fd).st_ino,f.stat().st_ino)
+            hinted.add(fd)
+        def read(fd,count):
+            self.assertIn(fd,hinted)
+            reads.append(fd)
+            return actual_read(fd,count)
+        with patch.object(managed.platform,'system',return_value='Darwin'), \
+                patch.object(managed.fcntl,'F_NOCACHE',48,create=True), \
+                patch.object(managed.fcntl,'fcntl',side_effect=hint) as hints, \
+                patch.object(managed.os,'read',side_effect=read):
+            for now,force in ((100,False),(200,True),
+                    (200+managed.FULL_INTEGRITY_AUDIT_SECONDS*1_000_000_000,False)):
+                hinted.clear(); reads.clear(); hints.reset_mock(); stats={}
+                self.assertTrue(managed.validate_install(install,'pin',force_full=force,
+                    now_monotonic_ns=now,stats=stats))
+                self.assertEqual(stats['audit_mode'],'full')
+                hints.assert_called_once()
+                self.assertTrue(reads)
+                with self.assertRaises(OSError):os.fstat(reads[0])
+
+    def test_incremental_rehash_and_sealing_do_not_request_uncached_reads(self):
+        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        with patch.object(managed,'_hint_uncached_audit_read') as hint:
+            managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+            hint.assert_not_called()
+            self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
+            hint.assert_called_once();hint.reset_mock()
+            self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=200))
+            before=f.stat();os.utime(f,ns=(before.st_atime_ns,before.st_mtime_ns+1_000_000))
+            stats={}
+            self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=300,stats=stats))
+            self.assertEqual(stats['audit_mode'],'incremental')
+            self.assertEqual(stats['files_hashed'],1)
+            hint.assert_not_called()
+
+    def test_unavailable_or_rejected_cache_hint_never_changes_digest_validation(self):
+        import errno
+        for system,command,error in (
+                ('Linux',48,None),('Darwin',None,None),
+                ('Darwin',48,errno.ENOTSUP),('Darwin',48,errno.EINVAL)):
+            with self.subTest(system=system,command=command,error=error):
+                install=self.root/str(len(list(self.root.iterdir())));install.mkdir()
+                f=install/'code';f.write_bytes(b'good')
+                managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+                with patch.object(managed.platform,'system',return_value=system), \
+                        patch.object(managed.fcntl,'F_NOCACHE',command,create=True), \
+                        patch.object(managed.fcntl,'fcntl',side_effect=OSError(error or 0,'hint rejected')) as hint:
+                    self.assertTrue(managed.validate_install(install,'pin',force_full=True,now_monotonic_ns=100))
+                    f.write_bytes(b'evil')
+                    self.assertFalse(managed.validate_install(install,'pin',force_full=True,now_monotonic_ns=200))
+                    self.assertEqual(hint.call_count,2 if system=='Darwin' and command is not None else 0)
+                caches=list((install.parent/'.integrity-cache').glob('*.json'))
+                matching=[json.loads(p.read_text()) for p in caches
+                          if json.loads(p.read_text())['directory']['path']==str(install.resolve())]
+                self.assertEqual(len(matching),1)
+                self.assertEqual(matching[0]['last_full_audit_monotonic_ns'],100)
+
+    def test_cache_write_failure_full_fallback_also_requests_uncached_reads(self):
+        install=self.root/'install';install.mkdir()
+        for name in ('first','second'):(install/name).write_bytes(b'good')
+        managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
+        f=install/'first';before=f.stat();os.utime(f,ns=(before.st_atime_ns,before.st_mtime_ns+1_000_000))
+        with patch.object(managed,'_write_integrity_cache',side_effect=OSError('unwritable')), \
+                patch.object(managed,'_hint_uncached_audit_read') as hint:
+            stats={}
+            self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=200,stats=stats))
+            self.assertEqual(stats['audit_mode'],'full')
+            self.assertEqual(stats['files_hashed'],3)
+            self.assertEqual(hint.call_count,2)
+
     def test_integrity_cache_skips_unchanged_content_reads_and_rehashes_changed_metadata(self):
         install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})

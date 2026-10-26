@@ -154,7 +154,19 @@ def _has_symlink_component(root, relative_name):
     return False
 
 
-def _hash_installation_file(directory, relative_name):
+def _hint_uncached_audit_read(descriptor):
+    """Best-effort macOS cache policy; never participates in integrity decisions."""
+    command = getattr(fcntl, 'F_NOCACHE', None)
+    if platform.system() != 'Darwin' or command is None:
+        return
+    try:
+        fcntl.fcntl(descriptor, command, 1)
+    except OSError:
+        # Filesystems may reject the hint. Keep the same checked hash path.
+        pass
+
+
+def _hash_installation_file(directory, relative_name, *, uncached=False):
     """Hash one sealed regular file and reject path or content races."""
     try:
         root = Path(directory).resolve(strict=True)
@@ -176,6 +188,8 @@ def _hash_installation_file(directory, relative_name):
             if not stat.S_ISREG(before.st_mode):
                 return None, None
             before_metadata = _regular_file_metadata(before)
+            if uncached:
+                _hint_uncached_audit_read(descriptor)
             hasher = hashlib.sha256()
             while True:
                 try:
@@ -376,7 +390,7 @@ def validate_install(directory, fingerprint, *, force_full=False, now_monotonic_
                     result['cache_hits'] += 1
                     continue
 
-            actual, metadata = _hash_installation_file(root, name)
+            actual, metadata = _hash_installation_file(root, name, uncached=do_full)
             result['files_hashed'] += 1
             if metadata is not None:
                 result['bytes_hashed'] += metadata['size']
@@ -421,7 +435,7 @@ def validate_install(directory, fingerprint, *, force_full=False, now_monotonic_
                         result['audit_mode'] = 'full'
                         retry_verified = {}
                         for name, expected in files.items():
-                            actual, metadata = _hash_installation_file(root, name)
+                            actual, metadata = _hash_installation_file(root, name, uncached=True)
                             result['files_hashed'] += 1
                             if metadata is not None:
                                 result['bytes_hashed'] += metadata['size']

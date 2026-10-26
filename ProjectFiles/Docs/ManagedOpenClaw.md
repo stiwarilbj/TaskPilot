@@ -108,6 +108,13 @@ every 60 minutes using a monotonic clock. A failed or interrupted full audit doe
 not advance that deadline. Cache write or lock failures fall back to uncached
 hash verification. The cache contains only sealed relative paths, digests, file
 metadata, and audit timing; it cannot establish runtime or provider readiness.
+Full content audits request macOS `F_NOCACHE` on each checked regular-file
+descriptor before sequential reads, including uncached fallback audits. This is
+a best-effort hint to reduce filesystem-cache pollution, not an integrity check.
+Unsupported platforms, missing constants, and filesystem rejection use ordinary
+reads with identical digest and before/after identity validation. Incremental
+rehashes and initial sealing retain their existing cache policy; periodic full
+audits and their successful-pass-only timestamp updates are unchanged.
 
 ACP first uses the managed wrapper and explicit endpoint/token file. After the
 failed child ends, it may try the sealed pinned Node executable and entry point,
