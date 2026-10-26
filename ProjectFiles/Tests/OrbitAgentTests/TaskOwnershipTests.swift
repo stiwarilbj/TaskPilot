@@ -235,14 +235,14 @@ final class TaskOwnershipTests: XCTestCase {
     }
     func testDiscardedScreenshotsAreRemovedAtRetirement() throws {
         let lease = TaskLease()
-        let path = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let directory = try lease.scratchDirectory().appendingPathComponent("capture", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let path = directory.appendingPathComponent("fixture.png")
         try Data([1]).write(to: path)
         try lease.ownArtifact(path)
         lease.revoke(); lease.retire(); lease.retire()
         XCTAssertFalse(FileManager.default.fileExists(atPath: path.path))
-        try Data([1]).write(to: path)
         XCTAssertThrowsError(try lease.ownArtifact(path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: path.path))
     }
     func testBridgeRejectsCrossTaskRequestBeforeCaptureOrActions() async throws {
         let lease = TaskLease(), other = TaskLease(), bridge = bridge()

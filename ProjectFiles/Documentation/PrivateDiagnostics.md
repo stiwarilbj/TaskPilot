@@ -79,3 +79,36 @@ The 1,200-status UTF-8 burst produces 19 sampled underestimates while preserving
 every status and the terminal event exactly once. Fake numeric measurements
 cover sampling, coalescing, invocation reset, invalid measurements, large
 shortfalls and concurrent aggregate updates.
+
+## Owned temporary capture retention
+
+Each `TaskLease` maintains a private capture ledger, with only file count and
+retained encoded byte totals exposed by `captureArtifactUsage`. The default
+per-owner limits are 128 registered files and 256 MiB. Registration uses regular
+file metadata, never image contents or directory scans. Re-registering an
+unchanged object is idempotent. Before admission, metadata checks reconcile
+paths already unlinked by runtime observation disposal. Limits apply to retained
+finished PNGs; the existing bounded encoder pipeline still controls transient
+compression work. A limit rejects the new capture and cleans its private PNG,
+without evicting a current observation or changing model request policy.
+
+Only `.png` paths immediately inside the owner's private scratch `capture`
+directory qualify. Foreign-owner paths, user destinations, symlinks, and
+nonregular files do not qualify. Cleanup checks recorded file identity before
+unlinking a registered path. No user output paths enter this policy.
+
+An artifact expires on explicit observation rejection/discard or task retirement
+after drainage. There is no wall-clock expiry for active task evidence. Native
+image sources/readers hold explicit reference tokens; expired referenced files
+remain accounted for until their last token is released. Encoder holds defer
+whole-scratch deletion until queued/running compression settles, including Stop
+and late failure paths. Retirement is idempotent and removes unreferenced expired
+captures; deferred releases finish cleanup without a timer. Unchanged live
+captures are never evicted merely to meet a cap. Existing private scratch leases
+and abandoned-process recovery remain authoritative after a crash.
+
+All bookkeeping is in memory. No filenames, images, ownership identifiers, or
+per-file measurements are added to diagnostics/history. Offline reproduction:
+`swift test --package-path ProjectFiles --filter 'CaptureArtifactLedgerTests|CapturePipelineTests|AgentActionMagnifierTests|TaskOwnershipTests'`.
+Fixtures cover independent owners, count/byte bounds, runtime unlink, native
+reader lifetime, partial encoding, retirement, cancellation, and excluded paths.

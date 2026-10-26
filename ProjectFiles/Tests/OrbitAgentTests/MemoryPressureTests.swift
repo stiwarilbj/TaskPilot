@@ -56,7 +56,9 @@ final class MemoryPressureTests: XCTestCase {
             try token.dispatched()
             try token.complete(["action_type": "focus", "outcome": "verified", "verified": true, "verification_scope": "focus"])
         } else { XCTFail("Missing new receipt") }
-        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let directory = try lease.scratchDirectory().appendingPathComponent("capture", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let file = directory.appendingPathComponent("accepted.png")
         try Data("accepted evidence".utf8).write(to: file)
         defer { try? FileManager.default.removeItem(at: file) }
         try lease.ownArtifact(file)
@@ -70,6 +72,7 @@ final class MemoryPressureTests: XCTestCase {
         XCTAssertEqual(lease.actionReceipts.lookup(id)["state"] as? String, "confirmed")
         if case .existing = try lease.actionReceipts.begin(id: id, payload: payload) {} else { XCTFail("Receipt was lost") }
         XCTAssertEqual(try String(contentsOf: file), "accepted evidence")
+        XCTAssertEqual(lease.captureArtifactUsage, .init(fileCount: 1, totalBytes: 17))
         lease.revoke(); lease.retire()
         XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
     }

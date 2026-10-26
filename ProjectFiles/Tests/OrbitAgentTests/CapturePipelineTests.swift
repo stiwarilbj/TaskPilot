@@ -296,6 +296,42 @@ final class CapturePipelineTests: XCTestCase {
         let replacement = try await service.acquire(display: display); try replacement.check()
         writer.release.signal(); _ = try await running.value
     }
+    func testOwnerRetentionLimitRejectsPNGAndCleansOnlyNewArtifact() async throws {
+        let lease = TaskLease(scratchRoot: try directory(), captureFileLimit: 1, captureByteLimit: 1_000_000)
+        let pixels = try image(1)
+        let service = ScreenCaptureService(acquirer: { _, _, _ in pixels })
+        let first = try await TaskOwnership.$current.withValue(lease) { try await service.acquire(display: display) }
+        let accepted = try await service.encode(first)
+        let usage = lease.captureArtifactUsage
+        XCTAssertEqual(usage.fileCount, 1); XCTAssertGreaterThan(usage.totalBytes, 0)
+        let second = try await TaskOwnership.$current.withValue(lease) { try await service.acquire(display: display) }
+        do { _ = try await service.encode(second); XCTFail("Retained PNG capacity exceeded") }
+        catch { guard case TaskLease.CaptureArtifactError.retentionLimit = error else { return XCTFail("\(error)") } }
+        let files = try FileManager.default.contentsOfDirectory(atPath: accepted.url.deletingLastPathComponent().path)
+        XCTAssertEqual(files, [accepted.url.lastPathComponent])
+        XCTAssertEqual(lease.captureArtifactUsage, usage)
+        lease.discardArtifact(accepted.url)
+        _ = try await service.encode(second)
+        XCTAssertEqual(lease.captureArtifactUsage.fileCount, 1)
+        lease.revoke(); lease.retire()
+    }
+    func testRetirementDuringCompressionKeepsScratchUntilWriterDrains() async throws {
+        let started = expectation(description: "Owned writer running"), writer = BlockedWriter(started)
+        defer { writer.release.signal() }
+        let lease = TaskLease(scratchRoot: try directory())
+        let encoder = CapturePNGEncoder(writer: { try writer.write($0, to: $1) })
+        let pixels = try image(1)
+        let service = ScreenCaptureService(encoder: encoder, acquirer: { _, _, _ in pixels })
+        let frame = try await TaskOwnership.$current.withValue(lease) { try await service.acquire(display: display) }
+        let pending = Task { try await service.encode(frame) }
+        await fulfillment(of: [started], timeout: 2)
+        let scratch = try lease.scratchDirectory()
+        lease.revoke(); lease.retire()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: scratch.path))
+        writer.release.signal(); await cancelled(pending)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: scratch.path))
+        XCTAssertEqual(lease.captureArtifactUsage, .init(fileCount: 0, totalBytes: 0))
+    }
     func testStoppedEncodingDrainsBeforeNextJobAndRemovesLateArtifact() async throws {
         let started = expectation(description: "Old encode running"), writer = BlockedWriter(started)
         defer { writer.release.signal() }

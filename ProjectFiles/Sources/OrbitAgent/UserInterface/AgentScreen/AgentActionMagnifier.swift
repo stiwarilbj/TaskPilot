@@ -74,8 +74,10 @@ final class AgentMagnifierImageSource: @unchecked Sendable {
     private let protectedTargets: [CGRect]
     private let lock = NSLock()
     private var descriptor: Int32
+    private let artifactHold: CaptureArtifactHold?
 
     init(url: URL, mapping: ScreenCoordinateMapping, protectedTargets: [CGRect]) throws {
+        let artifactHold = try TaskOwnership.current?.retainCaptureArtifact(url)
         var info = stat()
         let opened = Darwin.open(url.path, O_RDONLY | O_CLOEXEC)
         guard opened >= 0 else { throw POSIXError(.EIO) }
@@ -84,6 +86,7 @@ final class AgentMagnifierImageSource: @unchecked Sendable {
             Darwin.close(opened)
             throw POSIXError(.EFBIG)
         }
+        self.artifactHold = artifactHold
         self.descriptor = opened
         self.mapping = mapping
         self.protectedTargets = protectedTargets
@@ -94,7 +97,7 @@ final class AgentMagnifierImageSource: @unchecked Sendable {
         guard descriptor >= 0 else { return nil }
         let copy = Darwin.dup(descriptor)
         guard copy >= 0 else { return nil }
-        return AgentMagnifierImageReader(descriptor: copy, mapping: mapping, protectedTargets: protectedTargets)
+        return AgentMagnifierImageReader(descriptor: copy, mapping: mapping, protectedTargets: protectedTargets, artifactHold: artifactHold)
     }
 
     deinit {
@@ -104,11 +107,13 @@ final class AgentMagnifierImageSource: @unchecked Sendable {
 }
 
 final class AgentMagnifierImageReader: @unchecked Sendable {
+    private let artifactHold: CaptureArtifactHold?
     private let handle: FileHandle
     private let mapping: ScreenCoordinateMapping
     private let protectedTargets: [CGRect]
 
-    fileprivate init(descriptor: Int32, mapping: ScreenCoordinateMapping, protectedTargets: [CGRect]) {
+    fileprivate init(descriptor: Int32, mapping: ScreenCoordinateMapping, protectedTargets: [CGRect], artifactHold: CaptureArtifactHold?) {
+        self.artifactHold = artifactHold
         self.handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         self.mapping = mapping
         self.protectedTargets = protectedTargets

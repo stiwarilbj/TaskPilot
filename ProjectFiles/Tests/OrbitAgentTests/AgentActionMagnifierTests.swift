@@ -34,6 +34,24 @@ final class AgentActionMagnifierTests: XCTestCase {
         XCTAssertTrue(CGImageDestinationFinalize(destination))
     }
 
+    func testNativeReaderRetainsOwnedArtifactUntilAfterRetirement() throws {
+        let lease = TaskLease()
+        let directory = try lease.scratchDirectory().appendingPathComponent("capture", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("magnifier.png")
+        try makePNG(at: url); try lease.ownArtifact(url)
+        var source: AgentMagnifierImageSource? = try TaskOwnership.$current.withValue(lease) {
+            try AgentMagnifierImageSource(url: url, mapping: mapping, protectedTargets: [])
+        }
+        var reader: AgentMagnifierImageReader? = try XCTUnwrap(source?.makeReader())
+        source = nil
+        lease.revoke(); lease.retire()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertNotNil(reader?.crop(target: nil, pointer: CGPoint(x: -2432, y: -420)))
+        withExtendedLifetime(reader) {}; reader = nil
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        XCTAssertEqual(lease.captureArtifactUsage, .init(fileCount: 0, totalBytes: 0))
+    }
     func testAcceptedRetinaFrameCanBeCroppedAfterItsPathIsUnlinked() throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("magnifier-\(UUID()).png")
         defer { try? FileManager.default.removeItem(at: url) }

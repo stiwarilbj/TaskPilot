@@ -209,7 +209,10 @@ actor CapturePNGEncoder {
         do { try frame.check(); try budget?.check(phase: "capture_encoding") }
         catch { waitTicket.discard(error is CancellationError ? .cancelled : .rejected); throw error }
         let outputDirectory: URL
+        var encodingHold: CaptureArtifactHold?
+        defer { withExtendedLifetime(encodingHold) {} }
         do {
+            encodingHold = try frame.reservation.owner?.beginCaptureEncoding()
             outputDirectory = try frame.reservation.owner?.scratchDirectory()
                 .appendingPathComponent("capture", isDirectory: true) ?? directory
         } catch {
