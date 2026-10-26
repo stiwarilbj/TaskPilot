@@ -64,6 +64,17 @@ final class CapturePipelineTests: XCTestCase {
             try ScreenCaptureService.writePNG(image, to: url)
         }
     }
+    private final class DiskSpace: @unchecked Sendable {
+        private let lock = NSLock()
+        private var available: UInt64 = .max
+        private var checks: [UInt64] = []
+        var requirements: [UInt64] { lock.withLock { checks } }
+        func setAvailable(_ bytes: UInt64) { lock.withLock { available = bytes } }
+        func check(owner: TaskLease?, directory: URL, required: UInt64) throws {
+            let bytes = lock.withLock { checks.append(required); return available }
+            if bytes < required { throw CaptureDiskHeadroom.Failure.insufficientSpace }
+        }
+    }
     private actor Counter { var value = 0; func increment() { value += 1 } }
     private actor Images {
         var frames: [CGImage]
@@ -80,6 +91,62 @@ final class CapturePipelineTests: XCTestCase {
         private weak var value: CapturedFrame?
         func set(_ frame: CapturedFrame) { lock.withLock { value = frame } }
         var released: Bool { lock.withLock { value == nil } }
+    }
+
+    func testLowDiskAdmissionReleasesTicketsAndOwnerHoldWithoutWriting() async throws {
+        let root = try directory(), lease = TaskLease(scratchRoot: root), disk = DiskSpace()
+        disk.setAvailable(0)
+        let encoder = CapturePNGEncoder(spaceCheck: { try disk.check(owner: $0, directory: $1, required: $2) },
+            writer: { _, _ in XCTFail("Low-space capture reached compression") })
+        let pixels = try image(1), service = ScreenCaptureService(acquirer: { _, _, _ in pixels })
+        let frame = try await TaskOwnership.$current.withValue(lease) { try await service.acquire(display: display) }
+        let telemetry = BackendTelemetry(), ticket = telemetry.beginQueueWait(.pngCompression)
+        do { _ = try await encoder.encode(frame, telemetry: telemetry, waitTicket: ticket); XCTFail("Low-space capture accepted") }
+        catch { guard case CaptureDiskHeadroom.Failure.insufficientSpace = error else { return XCTFail("\(error)") } }
+        let active = await encoder.activeCount, pending = await encoder.pendingCount
+        XCTAssertEqual(active, 0); XCTAssertEqual(pending, 0)
+        XCTAssertEqual(disk.requirements, [try CaptureDiskHeadroom.requiredBytes(pixelBytes: 64)])
+        XCTAssertEqual(lease.captureArtifactUsage, .init(fileCount: 0, totalBytes: 0))
+        let scratch = try lease.scratchDirectory()
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: scratch.appendingPathComponent("capture").path), [])
+        XCTAssertEqual(telemetry.queueWaitHistograms().first { $0.queue == .pngCompression }?.countsByDisposition[.rejected]?.reduce(0, +), 1)
+        XCTAssertTrue(telemetry.memoryHighWaterMarks().allSatisfy { $0.currentCount == 0 && $0.currentBytes == 0 })
+        lease.revoke(); lease.retire()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: scratch.path)) // No leaked encoding hold.
+    }
+
+    func testQueuedCaptureRechecksDiskBeforeWritingAndCanRetryAfterSpaceReturns() async throws {
+        let started = expectation(description: "First writer running"), writer = BlockedWriter(started), disk = DiskSpace()
+        defer { writer.release.signal() }
+        let lease = TaskLease(scratchRoot: try directory())
+        let encoder = CapturePNGEncoder(spaceCheck: { try disk.check(owner: $0, directory: $1, required: $2) },
+            writer: { try writer.write($0, to: $1) })
+        let pixels = try image(1), service = ScreenCaptureService(acquirer: { _, _, _ in pixels })
+        let first = try await TaskOwnership.$current.withValue(lease) { try await service.acquire(display: display) }
+        let second = try await TaskOwnership.$current.withValue(lease) { try await service.acquire(display: display) }
+        let running = Task { try await encoder.encode(first) }
+        await fulfillment(of: [started], timeout: 2)
+        let telemetry = BackendTelemetry(), ticket = telemetry.beginQueueWait(.pngCompression)
+        let queued = Task { try await encoder.encode(second, telemetry: telemetry, waitTicket: ticket) }
+        await eventually { await encoder.pendingCount == 1 }
+        XCTAssertEqual(disk.requirements.count, 3)
+        disk.setAvailable(0); writer.release.signal()
+        let accepted = try await running.value
+        do { _ = try await queued.value; XCTFail("Disk exhaustion during queue wait ignored") }
+        catch { guard case CaptureDiskHeadroom.Failure.insufficientSpace = error else { return XCTFail("\(error)") } }
+        XCTAssertEqual(disk.requirements.count, 4); XCTAssertEqual(writer.count, 1)
+        let active = await encoder.activeCount, pending = await encoder.pendingCount
+        XCTAssertEqual(active, 0); XCTAssertEqual(pending, 0)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: accepted.deletingLastPathComponent().path), [accepted.lastPathComponent])
+        XCTAssertEqual(lease.captureArtifactUsage.fileCount, 1)
+        XCTAssertEqual(telemetry.queueWaitHistograms().first { $0.queue == .pngCompression }?.countsByDisposition[.rejected]?.reduce(0, +), 1)
+        XCTAssertTrue(telemetry.memoryHighWaterMarks().allSatisfy { $0.currentCount == 0 && $0.currentBytes == 0 })
+        disk.setAvailable(.max)
+        _ = try await encoder.encode(second)
+        XCTAssertEqual(disk.requirements.count, 6); XCTAssertEqual(writer.count, 2)
+        let scratch = try lease.scratchDirectory()
+        lease.revoke(); lease.retire()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: scratch.path))
     }
 
     func testExpiredAcquisitionDoesNotReservePixelsOrReplacePreview() async throws {

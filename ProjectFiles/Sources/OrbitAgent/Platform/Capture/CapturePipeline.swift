@@ -171,6 +171,7 @@ final class CapturedFrame: @unchecked Sendable {
 /// its frame immediately. No job can look up or substitute a newer capture.
 actor CapturePNGEncoder {
     typealias Writer = @Sendable (CGImage, URL) throws -> Void
+    typealias SpaceCheck = @Sendable (TaskLease?, URL, UInt64) throws -> Void
     private struct Job {
         let id: UUID
         let frame: CapturedFrame
@@ -182,6 +183,7 @@ actor CapturePNGEncoder {
         let waitTicket: BackendTelemetry.QueueTicket
         let queuedMemory: BackendTelemetry.MemoryTicket
         let budget: LocalOperationBudget?
+        let requiredDiskBytes: UInt64
         let continuation: CheckedContinuation<URL, Error>
         func checkAdmission() throws {
             try cancellation.check(); try frame.reservation.checkAuthority()
@@ -191,14 +193,19 @@ actor CapturePNGEncoder {
     }
     private let writer: Writer
     private let directory: URL
+    private let spaceCheck: SpaceCheck
     private var waiting: [Job] = []
     private var active: Job?
     private var activeMemory: BackendTelemetry.MemoryTicket?
     private var frameIDs: Set<UUID> = []
     private var worker: Task<Void, Never>?
     init(directory: URL = FileManager.default.temporaryDirectory.appendingPathComponent("OrbitAgent", isDirectory: true),
+         spaceCheck: @escaping SpaceCheck = { owner, directory, required in
+             if let owner { try owner.requireCaptureDiskHeadroom(required) }
+             else { try CaptureDiskHeadroom.check(directory: directory, requiredBytes: required) }
+         },
          writer: @escaping Writer = { try ScreenCaptureService.writePNG($0, to: $1) }) {
-        self.directory = directory; self.writer = writer
+        self.directory = directory; self.writer = writer; self.spaceCheck = spaceCheck
     }
     var pendingCount: Int { waiting.count }
     var activeCount: Int { active == nil ? 0 : 1 }
@@ -209,12 +216,17 @@ actor CapturePNGEncoder {
         do { try frame.check(); try budget?.check(phase: "capture_encoding") }
         catch { waitTicket.discard(error is CancellationError ? .cancelled : .rejected); throw error }
         let outputDirectory: URL
+        let requiredDiskBytes: UInt64
         var encodingHold: CaptureArtifactHold?
         defer { withExtendedLifetime(encodingHold) {} }
         do {
             encodingHold = try frame.reservation.owner?.beginCaptureEncoding()
             outputDirectory = try frame.reservation.owner?.scratchDirectory()
                 .appendingPathComponent("capture", isDirectory: true) ?? directory
+            let (pixelBytes, overflow) = frame.image.bytesPerRow.multipliedReportingOverflow(by: frame.image.height)
+            guard !overflow else { throw CaptureDiskHeadroom.Failure.unavailable }
+            requiredDiskBytes = try CaptureDiskHeadroom.requiredBytes(pixelBytes: UInt64(max(frame.imageStorageBytes, pixelBytes)))
+            try spaceCheck(frame.reservation.owner, outputDirectory, requiredDiskBytes)
         } catch {
             waitTicket.discard(error is CancellationError ? .cancelled : .rejected)
             throw error
@@ -236,7 +248,7 @@ actor CapturePNGEncoder {
                     url: outputDirectory.appendingPathComponent("screen-\(UUID().uuidString).png"),
                     cancellation: cancellation, observer: observer, telemetry: telemetry, waitTicket: waitTicket,
                     queuedMemory: telemetry.beginMemory(.queuedCaptureFrames, bytes: frame.imageStorageBytes),
-                    budget: budget, continuation: continuation)
+                    budget: budget, requiredDiskBytes: requiredDiskBytes, continuation: continuation)
                 frameIDs.insert(frame.id); waiting.append(job); pump()
             }
         } onCancel: { cancellation.cancel(); Task { await self.cancel(id) } }
@@ -267,9 +279,16 @@ actor CapturePNGEncoder {
         }
         activeMemory = job.telemetry.beginMemory(.activeCaptureEncodes, bytes: job.frame.imageStorageBytes)
         active = job
-        let writer = writer, directory = job.directory
+        let writer = writer, directory = job.directory, spaceCheck = spaceCheck
         worker = Task.detached(priority: .userInitiated) {
-            do { try job.cancellation.check(); try job.frame.check(); try job.budget?.check(phase: "capture_encoding") }
+            do {
+                try job.cancellation.check(); try job.frame.check(); try job.budget?.check(phase: "capture_encoding")
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                // Admission can precede this worker by an arbitrarily slow
+                // encode. Recheck the actual destination before ImageIO starts.
+                try spaceCheck(job.frame.reservation.owner, directory, job.requiredDiskBytes)
+                try job.cancellation.check(); try job.frame.check(); try job.budget?.check(phase: "capture_encoding")
+            }
             catch {
                 job.waitTicket.discard(error is CancellationError ? .cancelled : .rejected)
                 await self.finished(job, result: .failure(error)); return
@@ -280,7 +299,6 @@ actor CapturePNGEncoder {
                     try BackendTelemetry.$current.withValue(job.telemetry) {
                         try autoreleasepool {
                             try job.cancellation.check(); try job.frame.check(); try LocalOperationBudget.check("capture_encoding")
-                            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                             try writer(job.frame.image, job.url)
                             try job.cancellation.check(); try job.frame.check(); try LocalOperationBudget.check("capture_encoding")
                             // The file becomes evidence only for its original task,

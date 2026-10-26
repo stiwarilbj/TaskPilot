@@ -611,6 +611,11 @@ final class TaskLease: @unchecked Sendable {
         pruneCaptureArtifacts()
         return .init(fileCount: artifacts.count, totalBytes: artifactBytes)
     }
+    func requireCaptureDiskHeadroom(_ requiredBytes: UInt64) throws {
+        lock.lock(); defer { lock.unlock() }
+        try check()
+        try boundCaptureDirectory().requireDiskHeadroom(requiredBytes)
+    }
     func beginCaptureEncoding() throws -> CaptureArtifactHold {
         lock.lock(); defer { lock.unlock() }
         try check()

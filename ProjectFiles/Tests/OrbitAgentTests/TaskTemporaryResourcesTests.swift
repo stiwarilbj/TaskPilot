@@ -34,6 +34,34 @@ final class TaskTemporaryResourcesTests: XCTestCase {
         return directory
     }
 
+    func testCaptureDiskEstimateIncludesReserveAndRejectsOverflow() throws {
+        XCTAssertEqual(try CaptureDiskHeadroom.requiredBytes(pixelBytes: 0), 17 * 1024 * 1024)
+        XCTAssertEqual(try CaptureDiskHeadroom.requiredBytes(pixelBytes: 4096), 17 * 1024 * 1024 + 8192)
+        XCTAssertThrowsError(try CaptureDiskHeadroom.requiredBytes(pixelBytes: .max))
+        XCTAssertThrowsError(try CaptureDiskHeadroom.requiredBytes(pixelBytes: .max / 2))
+        try CaptureDiskHeadroom.check(descriptor: -1, requiredBytes: 10, readAvailable: { _ in 10 })
+        XCTAssertThrowsError(try CaptureDiskHeadroom.check(descriptor: -1, requiredBytes: 10, readAvailable: { _ in 9 })) { error in
+            guard case CaptureDiskHeadroom.Failure.insufficientSpace = error else { return XCTFail("\(error)") }
+        }
+        XCTAssertThrowsError(try CaptureDiskHeadroom.check(descriptor: -1, requiredBytes: 0)) { error in
+            guard case CaptureDiskHeadroom.Failure.unavailable = error else { return XCTFail("\(error)") }
+        }
+    }
+
+    func testDiskCheckUsesExistingVolumeWithoutCreatingMissingDirectories() throws {
+        let root = try fixture(), missing = root.appendingPathComponent("missing/capture", isDirectory: true)
+        try CaptureDiskHeadroom.check(directory: missing, requiredBytes: 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missing.deletingLastPathComponent().path))
+        let lease = try TaskTemporaryResourceLedger.makeLease(root: root)
+        let capture = try lease.captureDirectory()
+        try capture.requireDiskHeadroom(0)
+        let parked = lease.directoryURL.appendingPathComponent("parked")
+        try FileManager.default.moveItem(at: capture.directoryURL, to: parked)
+        try FileManager.default.createDirectory(at: capture.directoryURL, withIntermediateDirectories: false)
+        XCTAssertThrowsError(try capture.requireDiskHeadroom(0))
+        lease.removeDirectory()
+    }
+
     func testLiveLeaseIsKeptAndGracefulRemovalNeverTouchesSiblingOutput() throws {
         let root = try fixture()
         let output = root.deletingLastPathComponent().appendingPathComponent("user-output-\(UUID().uuidString)")

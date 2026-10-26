@@ -370,6 +370,10 @@ final class TaskCaptureDirectory: @unchecked Sendable {
         return lstat(directoryURL.path, &current) == 0 && (current.st_mode & S_IFMT) == S_IFDIR &&
             TaskTemporaryResourceLedger.DirectoryIdentity(current) == identity
     }
+    func requireDiskHeadroom(_ requiredBytes: UInt64) throws {
+        guard pathIsCurrent() else { throw CaptureDiskHeadroom.Failure.unavailable }
+        try CaptureDiskHeadroom.check(descriptor: descriptor, requiredBytes: requiredBytes)
+    }
     func status(named name: String) throws -> stat? {
         guard name != ".", name != "..", !name.contains("/"), !name.utf8.contains(0) else {
             throw TaskTemporaryResourceError.unavailable
@@ -490,6 +494,57 @@ final class TaskTemporaryResourceLease: @unchecked Sendable {
         let directory = directoryDescriptor; directoryDescriptor = -1; lock.unlock()
         if directory >= 0 { close(directory) }
         if leaseDescriptor >= 0 { flock(leaseDescriptor, LOCK_UN); close(leaseDescriptor) }
+    }
+}
+
+/// Advisory only: another writer can consume space after either check. ImageIO
+/// failures still drain through the encoder's normal partial-file cleanup.
+enum CaptureDiskHeadroom {
+    static let reserveBytes: UInt64 = 16 * 1024 * 1024
+    static let encodingOverheadBytes: UInt64 = 1024 * 1024
+    enum Failure: LocalizedError {
+        case insufficientSpace, unavailable
+        var errorDescription: String? {
+            switch self {
+            case .insufficientSpace: return "There is not enough available disk space for the temporary capture. Free some disk space and try again."
+            case .unavailable: return "TaskPilot could not check available disk space for the temporary capture."
+            }
+        }
+    }
+    static func requiredBytes(pixelBytes: UInt64) throws -> UInt64 {
+        let (encoded, multipliedOverflow) = pixelBytes.multipliedReportingOverflow(by: 2)
+        let (required, addedOverflow) = encoded.addingReportingOverflow(reserveBytes + encodingOverheadBytes)
+        guard !multipliedOverflow, !addedOverflow else { throw Failure.unavailable }
+        return required
+    }
+    static func availableBytes(descriptor: Int32) throws -> UInt64 {
+        var info = statfs()
+        guard fstatfs(descriptor, &info) == 0, info.f_bsize > 0 else { throw Failure.unavailable }
+        let (bytes, overflow) = UInt64(info.f_bavail).multipliedReportingOverflow(by: UInt64(info.f_bsize))
+        guard !overflow else { throw Failure.unavailable }
+        return bytes
+    }
+    static func check(descriptor: Int32, requiredBytes: UInt64,
+                      readAvailable: (Int32) throws -> UInt64 = availableBytes) throws {
+        guard try readAvailable(descriptor) >= requiredBytes else { throw Failure.insufficientSpace }
+    }
+    /// Non-task captures may not have created their output directory yet. Read
+    /// the nearest existing ancestor without creating any payload or directory.
+    static func check(directory: URL, requiredBytes: UInt64) throws {
+        guard directory.isFileURL else { throw Failure.unavailable }
+        var current = directory.standardizedFileURL
+        while true {
+            let descriptor = open(current.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            if descriptor >= 0 {
+                defer { close(descriptor) }
+                try check(descriptor: descriptor, requiredBytes: requiredBytes)
+                return
+            }
+            guard errno == ENOENT else { throw Failure.unavailable }
+            let parent = current.deletingLastPathComponent()
+            guard parent != current else { throw Failure.unavailable }
+            current = parent
+        }
     }
 }
 
