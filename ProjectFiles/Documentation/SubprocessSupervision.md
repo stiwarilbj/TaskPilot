@@ -41,6 +41,15 @@ resumes paused processes, terminates owned work, escalates to KILL after at most
 one second, and awaits tree drainage. Once a terminating parent exits, surviving
 children are killed promptly instead of getting a fresh grace period to mutate
 state. The command's parent exit status is preserved separately from timeout.
+Output readers share a separate serial queue. Each round gives both streams a
+turn, rotates which stream goes first, and yields after at most 64 KiB or 16 read
+attempts per stream (including interrupted reads). Read sources stay armed for
+remaining bytes; stderr is inspected even when only stdout's source fires.
+Exit and teardown notifications remain on the independent supervisor queue.
+Final drainage repeats fair rounds through EOF before retiring readers. An
+unexpected continuously inherited writer remains bounded to 16 final rounds
+and is reported incomplete, never exact-output proof. Explicitly persistent
+services keep their existing continuous discard/drain behavior.
 Both output streams continue draining, and their final bytes are collected
 before output-drain acknowledgement. Failed or uncertain effects remain subject
 to the existing receipt reconciliation rules; no action is replayed here.

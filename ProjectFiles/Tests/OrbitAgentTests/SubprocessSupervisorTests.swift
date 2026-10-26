@@ -109,6 +109,47 @@ final class SubprocessSupervisorTests: XCTestCase {
         process.markOutputDrained()
     }
 
+    func testContinuousStdoutDoesNotStarveStderrOrSupervisedTeardown() async throws {
+        let capture = try BufferedProcessOutput(maximumBytes: 1_024)
+        defer { capture.close() }
+        let process = process("")
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = ["-c", """
+        import os, signal, threading, time
+        def stop(*args):
+            os.write(2, b'final diagnostic')
+            os._exit(0)
+        signal.signal(signal.SIGTERM, stop)
+        def noisy():
+            while True: os.write(1, b'x' * 16384)
+        threading.Thread(target=noisy, daemon=True).start()
+        os.write(2, b'early diagnostic;')
+        while True: time.sleep(0.01)
+        """]
+        process.standardOutput = capture.stdout; process.standardError = capture.stderr
+        let exit = ProcessExitNotification(process)
+        try process.run()
+        capture.closeWriters()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while capture.statistics.stderrDrainedBytes < 17, .now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertGreaterThanOrEqual(capture.statistics.stderrDrainedBytes, 17)
+        XCTAssertGreaterThan(capture.statistics.stdoutDrainedBytes, 0)
+        XCTAssertTrue(process.isRunning, "Diagnostics should drain before stdout stops")
+        process.beginTeardown()
+        XCTAssertEqual(exit.waitForExit(until: .now() + 3), 0)
+        guard case .finished = process.waitForTree(until: .now() + 3) else { return XCTFail("Noisy process did not drain") }
+        XCTAssertFalse(process.snapshot.outputDrained)
+        let result = try capture.finish()
+        process.markOutputDrained()
+        XCTAssertEqual(result.stderr.text, "early diagnostic;final diagnostic")
+        XCTAssertFalse(result.stderr.truncated)
+        XCTAssertEqual(result.stdout.text, String(repeating: "x", count: 1_024))
+        XCTAssertTrue(result.stdout.truncated)
+        XCTAssertTrue(process.snapshot.outputDrained)
+    }
+
     func testFailedGroupSetupCannotRunRequestedProgram() throws {
         let marker = try fixture().appendingPathComponent("must-not-exist")
         let process = SubprocessSupervisor(launchCheck: { throw SubprocessSupervisor.Failure.launch(EPERM) })

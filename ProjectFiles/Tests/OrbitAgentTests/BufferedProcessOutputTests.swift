@@ -45,6 +45,33 @@ final class BufferedProcessOutputTests: XCTestCase {
         return try capture.finish()
     }
 
+    func testDrainBudgetBoundsBytesAndInterruptedOrShortReads() {
+        var full = BufferedProcessOutput.DrainBudget()
+        while full.nextReadSize > 0 {
+            let requested = full.nextReadSize
+            XCTAssertLessThanOrEqual(requested, 16_384)
+            full.record(requested)
+        }
+        XCTAssertEqual(full.bytes, 65_536)
+        XCTAssertEqual(full.reads, 4)
+        for result in [-1, 1] { // EINTR and one-byte successful reads.
+            var short = BufferedProcessOutput.DrainBudget()
+            while short.nextReadSize > 0 { short.record(result) }
+            XCTAssertEqual(short.reads, 16)
+            XCTAssertEqual(short.bytes, result > 0 ? 16 : 0)
+        }
+    }
+
+    func testLargeStreamsPreserveTheirFinalBytesAcrossDrainTurns() throws {
+        let capture = try BufferedProcessOutput(spillRoot: fixture())
+        defer { capture.close() }
+        let output = try run(capture,
+            "(printf '%524288s' ''; printf stdout-tail) & (printf '%524288s' '' >&2; printf stderr-tail >&2) & wait")
+        XCTAssertEqual(output.stdout.text, String(repeating: " ", count: 524_288) + "stdout-tail")
+        XCTAssertEqual(output.stderr.text, String(repeating: " ", count: 524_288) + "stderr-tail")
+        XCTAssertFalse(output.stdout.truncated); XCTAssertFalse(output.stderr.truncated)
+    }
+
     func testEmptyAndShortStreamsCreateNoTemporaryOutputFiles() throws {
         let root = try fixture()
         for body in ["exit 0", "printf short; printf error >&2"] {

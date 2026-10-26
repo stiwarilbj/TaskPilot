@@ -35,6 +35,8 @@ final class SubprocessSupervisor: @unchecked Sendable {
     }
     private(set) var processIdentifier: pid_t = 0
     private let condition = NSCondition()
+    // Output readers use their own bounded drain turns. Keep kernel exit and
+    // teardown scheduling independent of stdout/stderr volume on that queue.
     private let queue = DispatchQueue(label: "com.orbitagent.process-tree", qos: .utility)
     private var rootExit: DispatchSourceProcess?
     private var monitor: DispatchSourceTimer?

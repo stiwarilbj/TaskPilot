@@ -6,6 +6,17 @@ import Foundation
 /// block the child while the owning worker handles exit or cancellation.
 final class BufferedProcessOutput: @unchecked Sendable {
     static let memoryLimit = 32_768
+    // Bound bytes AND syscalls: short reads or repeated EINTR must also yield.
+    struct DrainBudget {
+        static let byteLimit = 65_536
+        static let readLimit = 16
+        private(set) var bytes = 0
+        private(set) var reads = 0
+        var nextReadSize: Int { reads < Self.readLimit ? min(16_384, Self.byteLimit - bytes) : 0 }
+        mutating func record(_ count: Int) { reads += 1; bytes += max(0, count) }
+    }
+    private enum DrainResult { case yielded, idle, closed }
+
     struct StreamResult {
         let data: Data
         let truncated: Bool
@@ -14,6 +25,8 @@ final class BufferedProcessOutput: @unchecked Sendable {
     struct Result { let stdout: StreamResult; let stderr: StreamResult }
     struct Statistics {
         let drainedBytes: UInt64
+        let stdoutDrainedBytes: UInt64
+        let stderrDrainedBytes: UInt64
         let retainedBytes: Int
         let memoryBytes: Int
         let spillFiles: Int
@@ -57,6 +70,7 @@ final class BufferedProcessOutput: @unchecked Sendable {
     private var stopped = false
     private var closed = false
     private var discardFurtherOutput = false
+    private var nextStream = 0
 
     init(maximumBytes: Int? = nil, combinedLimit: Int? = nil, merged: Bool = false,
          memoryThreshold: Int = BufferedProcessOutput.memoryLimit,
@@ -78,8 +92,11 @@ final class BufferedProcessOutput: @unchecked Sendable {
                 let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: queue)
                 stream.source = source
                 source.setEventHandler { [weak self, weak stream] in
-                    guard let self, let stream, !self.stopped else { return }
-                    self.drain(stream)
+                    guard let self, let stream, !self.stopped, !stream.eof else { return }
+                    // Service both streams even if only stdout's source fires.
+                    // Read sources remain armed and re-enqueue unread data after
+                    // this bounded round returns to the serial queue.
+                    self.drainRound()
                 }
                 cancellations.enter()
                 source.setCancelHandler { [cancellations] in
@@ -98,7 +115,8 @@ final class BufferedProcessOutput: @unchecked Sendable {
     var stderr: FileHandle { streams.last!.pipe.fileHandleForWriting }
     var statistics: Statistics {
         queue.sync {
-            Statistics(drainedBytes: drainedBytes, retainedBytes: streams.reduce(0) { $0 + $1.retained },
+            Statistics(drainedBytes: drainedBytes, stdoutDrainedBytes: streams[0].drained,
+                stderrDrainedBytes: streams.count == 1 ? 0 : streams[1].drained, retainedBytes: streams.reduce(0) { $0 + $1.retained },
                 memoryBytes: streams.reduce(0) { $0 + $1.memory.count },
                 spillFiles: streams.filter { $0.spill != nil }.count, limitExceeded: exceeded)
         }
@@ -126,19 +144,30 @@ final class BufferedProcessOutput: @unchecked Sendable {
         onInterruption()
     }
 
-    private func drain(_ stream: Stream) {
-        guard !stream.eof else { return }
-        // Bounded batches keep a continuously noisy stdout from starving
-        // stderr, cancellation or the final queue barrier.
-        for _ in 0..<16 {
+    @discardableResult
+    private func drainRound() -> Bool {
+        var yielded = false
+        let first = nextStream
+        nextStream = (first + 1) % streams.count
+        for offset in streams.indices {
+            if case .yielded = drain(streams[(first + offset) % streams.count]) { yielded = true }
+        }
+        return yielded
+    }
+
+    private func drain(_ stream: Stream) -> DrainResult {
+        guard !stream.eof else { return .closed }
+        var budget = DrainBudget()
+        while budget.nextReadSize > 0 {
             let count = scratch.withUnsafeMutableBytes {
-                Darwin.read(stream.pipe.fileHandleForReading.fileDescriptor, $0.baseAddress, $0.count)
+                Darwin.read(stream.pipe.fileHandleForReading.fileDescriptor, $0.baseAddress, budget.nextReadSize)
             }
-            if count == 0 { stream.eof = true; stream.source?.cancel(); return }
+            budget.record(count)
+            if count == 0 { stream.eof = true; stream.source?.cancel(); return .closed }
             if count < 0 {
                 if errno == EINTR { continue }
-                if errno == EAGAIN || errno == EWOULDBLOCK { return }
-                failure = .read; stream.eof = true; stream.source?.cancel(); interrupt(); return
+                if errno == EAGAIN || errno == EWOULDBLOCK { return .idle }
+                failure = .read; stream.eof = true; stream.source?.cancel(); interrupt(); return .closed
             }
             let (total, overflow) = stream.drained.addingReportingOverflow(UInt64(count))
             stream.drained = overflow ? UInt64.max : total
@@ -160,6 +189,7 @@ final class BufferedProcessOutput: @unchecked Sendable {
                 stream.retained += keep
             } catch { failure = .storage; interrupt() }
         }
+        return .yielded
     }
 
     private func spillFile() throws -> FileHandle {
@@ -181,9 +211,17 @@ final class BufferedProcessOutput: @unchecked Sendable {
     /// an unclosed stream is marked incomplete, never exact-output proof.
     func finish(keepDraining: Bool = false) throws -> Result {
         closeWriters()
+        // Each barrier is one fair round, allowing queued reads and cleanup
+        // between rounds. Normally the owned tree has closed both writers;
+        // continue through EOF rather than truncating at a single turn. Keep
+        // the abnormal inherited-writer path bounded (at most 1 MiB per stream)
+        // and visibly incomplete; persistent services keep their readers armed.
+        for _ in 0..<16 {
+            let yielded = queue.sync { !stopped && drainRound() }
+            if !yielded { break }
+        }
         queue.sync {
             guard !stopped else { return }
-            for stream in streams { drain(stream) }
             if keepDraining { discardFurtherOutput = true }
             else {
                 stopped = true
