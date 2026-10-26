@@ -10,6 +10,8 @@ enum ScreenCaptureError: LocalizedError {
     case pipelineBusy
     case displayUnavailable
     case couldNotWriteImage
+    case invalidImageDimensions
+    case imageTooLarge
     case permissionDenied(String)
 
     var errorDescription: String? {
@@ -17,6 +19,8 @@ enum ScreenCaptureError: LocalizedError {
         case .pipelineBusy: return "The local capture pipeline has reached its bounded capacity"
         case .displayUnavailable: return "The agent display is not available to ScreenCaptureKit"
         case .couldNotWriteImage: return "The agent-screen image could not be written"
+        case .invalidImageDimensions: return "The captured image has invalid dimensions or pixel storage"
+        case .imageTooLarge: return "The captured image exceeds the local pixel limit"
         case .permissionDenied(let detail):
             return detail.isEmpty
                 ? "Application, window, and display capture are off for this \(TaskPilotIdentity.displayName) build"
@@ -152,10 +156,10 @@ actor ScreenCaptureService {
             if let acquirer { image = try await acquirer(display, forceRefresh, false) }
             else { image = try await acquireTaskImage(display: display, forceRefresh: forceRefresh) }
             try reservation.check()
+            try CaptureFrameLimits.validate(width: image.width, height: image.height)
             let coordinates = try ScreenCoordinateMapping(displayID: display.id, displayBounds: display.frame,
                 imageSize: CGSize(width: image.width, height: image.height))
-            let frame = CapturedFrame(image: image, imageStorageBytes: Self.imageStorageBytes(image),
-                                      coordinates: coordinates, reservation: reservation)
+            let frame = try CapturedFrame(image: image, coordinates: coordinates, reservation: reservation)
             await acquisitionQueue.acquired(reservation)
             try frame.check(); try LocalOperationBudget.check("capture_acquisition")
             return frame
@@ -222,6 +226,7 @@ actor ScreenCaptureService {
             maximum: CGSize(width: Self.maximumVisionWidth, height: Self.maximumVisionHeight))
         configuration.width = Int(fitted.width)
         configuration.height = Int(fitted.height)
+        try CaptureFrameLimits.validate(width: configuration.width, height: configuration.height)
         configuration.showsCursor = false
         configuration.capturesAudio = false
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
@@ -238,13 +243,16 @@ actor ScreenCaptureService {
         }
         try TaskOwnership.check()
         guard CGDisplayBounds(display.id) == display.frame else { throw ScreenCoordinateError.captureChanged }
-        captureSpan.record(items: image.width * image.height)
+        let pixels = try CaptureFrameLimits.validate(width: image.width, height: image.height)
+        captureSpan.record(items: pixels)
         captureSpan.finish(.succeeded)
         return image
     }
 
     static func writePNG(_ image: CGImage, to url: URL) throws {
-        try BackendTelemetry.current.measure(.pngEncoding, inputBytes: image.bytesPerRow * image.height) { span in
+        let pixels = try CaptureFrameLimits.validate(width: image.width, height: image.height)
+        let storageBytes = try CaptureFrameLimits.storageBytes(for: image)
+        try BackendTelemetry.current.measure(.pngEncoding, inputBytes: storageBytes) { span in
             guard let destination = CGImageDestinationCreateWithURL(
                 url as CFURL,
                 UTType.png.identifier as CFString,
@@ -258,15 +266,8 @@ actor ScreenCaptureService {
                 throw ScreenCaptureError.couldNotWriteImage
             }
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
-            span.record(outputBytes: size, items: image.width * image.height)
+            span.record(outputBytes: size, items: pixels)
         }
-    }
-
-    /// Uses the acquired bitmap's stride rather than width × height so the
-    /// queue gauge includes row padding and matches the buffer held by encoders.
-    private static func imageStorageBytes(_ image: CGImage) -> Int {
-        let (bytes, overflow) = image.bytesPerRow.multipliedReportingOverflow(by: image.height)
-        return overflow ? Int.max : max(0, bytes)
     }
 
     /// Captures a local-only viewer frame. Unlike the OpenClaw frame, this keeps
@@ -282,6 +283,7 @@ actor ScreenCaptureService {
             let image: CGImage
             if let acquirer { image = try await acquirer(display, false, true) }
             else { image = try await acquirePreviewImage(display: display) }
+            try CaptureFrameLimits.validate(width: image.width, height: image.height)
             await acquisitionQueue.acquired(reservation)
             try reservation.check()
             return image
@@ -318,21 +320,24 @@ actor ScreenCaptureService {
         let configuration = SCStreamConfiguration()
         configuration.width = Int(fitted.width)
         configuration.height = Int(fitted.height)
+        try CaptureFrameLimits.validate(width: configuration.width, height: configuration.height)
         configuration.showsCursor = false
         configuration.capturesAudio = false
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        let image: CGImage
         do {
-            let image = try await SCScreenshotManager.captureImage(
+            image = try await SCScreenshotManager.captureImage(
                 contentFilter: filter,
                 configuration: configuration
             )
-            span.record(items: image.width * image.height)
-            span.finish(.succeeded)
-            return image
         } catch {
             contentCache.evict()
             throw permissionError(for: error)
         }
+        let pixels = try CaptureFrameLimits.validate(width: image.width, height: image.height)
+        span.record(items: pixels)
+        span.finish(.succeeded)
+        return image
     }
 
     private func shareableContent(forceRefresh: Bool = false) async throws -> SCShareableContent {

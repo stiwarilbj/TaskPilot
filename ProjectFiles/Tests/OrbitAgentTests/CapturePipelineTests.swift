@@ -93,6 +93,70 @@ final class CapturePipelineTests: XCTestCase {
         var released: Bool { lock.withLock { value == nil } }
     }
 
+    func testFramePixelLimitsUseCheckedArithmeticAndInclusiveBounds() throws {
+        for (width, height) in [(0, 1), (1, 0), (-1, 1), (1, Int.min)] {
+            XCTAssertThrowsError(try CaptureFrameLimits.validate(width: width, height: height)) { error in
+                guard case ScreenCaptureError.invalidImageDimensions = error else { return XCTFail("\(error)") }
+            }
+        }
+        for (width, height) in [(Int.max, 2), (2, Int.max), (Int.max, Int.max),
+                                (8193, 1), (1, 8193), (4096, 4097), (8192, 8192)] {
+            XCTAssertThrowsError(try CaptureFrameLimits.validate(width: width, height: height)) { error in
+                guard case ScreenCaptureError.imageTooLarge = error else { return XCTFail("\(error)") }
+            }
+        }
+        XCTAssertEqual(try CaptureFrameLimits.validate(width: 1, height: 1), 1)
+        XCTAssertEqual(try CaptureFrameLimits.validate(width: 8192, height: 1), 8192)
+        XCTAssertEqual(try CaptureFrameLimits.validate(width: 1, height: 8192), 8192)
+        XCTAssertEqual(try CaptureFrameLimits.validate(width: 4096, height: 4096), CaptureFrameLimits.maximumPixels)
+        XCTAssertEqual(try CaptureFrameLimits.validate(width: 8192, height: 2048), CaptureFrameLimits.maximumPixels)
+        XCTAssertNoThrow(try CaptureFrameLimits.validate(width: Int(ScreenCaptureService.maximumVisionWidth),
+                                                       height: Int(ScreenCaptureService.maximumVisionHeight)))
+    }
+
+    /// An over-wide one-row image exercises actual CGImage admission with just
+    /// 32 KiB of backing pixels, without allocating an oversized bitmap.
+    private func overWideImage() throws -> CGImage {
+        let context = try XCTUnwrap(CGContext(data: nil, width: CaptureFrameLimits.maximumDimension + 1, height: 1,
+            bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        return try XCTUnwrap(context.makeImage())
+    }
+
+    func testOversizedTaskAndPreviewFramesReleaseAcquisitionSlots() async throws {
+        let large = try overWideImage(), small = try image(1), images = Images([large, small, large, small])
+        let queue = CaptureAcquisitionQueue(), root = try directory(), lease = TaskLease(scratchRoot: root)
+        let service = ScreenCaptureService(acquisitionQueue: queue, acquirer: { _, _, preview in try await images.acquire(preview: preview) })
+        do {
+            _ = try await TaskOwnership.$current.withValue(lease) { try await service.acquire(display: display) }
+            XCTFail("Oversized task frame retained")
+        } catch { guard case ScreenCaptureError.imageTooLarge = error else { return XCTFail("\(error)") } }
+        await eventually { let stats = await queue.statistics; return stats.evidenceFrames == 0 && !stats.acquiring }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [])
+        let accepted = try await service.acquire(display: display)
+        XCTAssertEqual(accepted.imageStorageBytes, accepted.image.bytesPerRow * accepted.image.height)
+        do { _ = try await service.capturePreview(display: display); XCTFail("Oversized preview retained") }
+        catch { guard case ScreenCaptureError.imageTooLarge = error else { return XCTFail("\(error)") } }
+        await eventually { let stats = await queue.statistics; return stats.previewFrames == 0 && !stats.acquiring }
+        let preview = try await service.capturePreview(display: display)
+        XCTAssertEqual(preview.width, small.width)
+        lease.revoke(); lease.retire()
+    }
+
+    func testFrameConstructionAndDirectPNGWritingRejectBeforeRetentionOrOutput() async throws {
+        let large = try overWideImage(), queue = CaptureAcquisitionQueue()
+        let reservation = try await queue.acquire(.evidence)
+        let mapping = try ScreenCoordinateMapping(displayID: display.id, displayBounds: display.frame,
+            imageSize: CGSize(width: large.width, height: large.height))
+        XCTAssertThrowsError(try CapturedFrame(image: large, coordinates: mapping, reservation: reservation))
+        await queue.acquired(reservation)
+        let root = try directory(), output = root.appendingPathComponent("screen.png")
+        XCTAssertThrowsError(try ScreenCaptureService.writePNG(large, to: output)) { error in
+            guard case ScreenCaptureError.imageTooLarge = error else { return XCTFail("\(error)") }
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [])
+    }
+
     func testLowDiskAdmissionReleasesTicketsAndOwnerHoldWithoutWriting() async throws {
         let root = try directory(), lease = TaskLease(scratchRoot: root), disk = DiskSpace()
         disk.setAvailable(0)

@@ -1,6 +1,29 @@
 import CoreGraphics
 import Foundation
 
+/// Raw-image admission limits, independent of compressed PNG/disk estimates.
+/// Normal task and preview configurations are well below these backstops.
+enum CaptureFrameLimits {
+    static let maximumDimension = 8_192
+    static let maximumPixels = 16 * 1024 * 1024
+
+    @discardableResult
+    static func validate(width: Int, height: Int) throws -> Int {
+        guard width > 0, height > 0 else { throw ScreenCaptureError.invalidImageDimensions }
+        let (pixels, overflow) = width.multipliedReportingOverflow(by: height)
+        guard !overflow, width <= maximumDimension, height <= maximumDimension,
+              pixels <= maximumPixels else { throw ScreenCaptureError.imageTooLarge }
+        return pixels
+    }
+
+    static func storageBytes(for image: CGImage) throws -> Int {
+        try validate(width: image.width, height: image.height)
+        let (bytes, overflow) = image.bytesPerRow.multipliedReportingOverflow(by: image.height)
+        guard image.bytesPerRow > 0, !overflow, bytes > 0 else { throw ScreenCaptureError.invalidImageDimensions }
+        return bytes
+    }
+}
+
 /// Cancellation can arrive before actor registration or while native work is
 /// already running. It revokes publication, not the capacity of in-flight work.
 final class CaptureCancellation: @unchecked Sendable {
@@ -155,9 +178,11 @@ final class CapturedFrame: @unchecked Sendable {
     let imageStorageBytes: Int
     let coordinates: ScreenCoordinateMapping
     let reservation: CaptureAcquisitionQueue.Reservation
-    init(image: CGImage, imageStorageBytes: Int, coordinates: ScreenCoordinateMapping,
-         reservation: CaptureAcquisitionQueue.Reservation) {
-        self.image = image; self.imageStorageBytes = max(0, imageStorageBytes)
+    init(image: CGImage, coordinates: ScreenCoordinateMapping,
+         reservation: CaptureAcquisitionQueue.Reservation) throws {
+        // Validate before retaining the pixels or recording their memory size.
+        self.imageStorageBytes = try CaptureFrameLimits.storageBytes(for: image)
+        self.image = image
         self.coordinates = coordinates; self.reservation = reservation
     }
     func check() throws {
@@ -213,7 +238,10 @@ actor CapturePNGEncoder {
                 waitTicket suppliedTicket: BackendTelemetry.QueueTicket? = nil) async throws -> URL {
         let waitTicket = suppliedTicket ?? BackendTelemetry.current.beginQueueWait(.pngCompression)
         let budget = LocalOperationBudget.current
-        do { try frame.check(); try budget?.check(phase: "capture_encoding") }
+        do {
+            try frame.check(); try budget?.check(phase: "capture_encoding")
+            try CaptureFrameLimits.validate(width: frame.image.width, height: frame.image.height)
+        }
         catch { waitTicket.discard(error is CancellationError ? .cancelled : .rejected); throw error }
         let outputDirectory: URL
         let requiredDiskBytes: UInt64
