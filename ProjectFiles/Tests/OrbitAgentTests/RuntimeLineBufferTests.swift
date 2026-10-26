@@ -3,6 +3,50 @@ import XCTest
 @testable import OrbitAgent
 
 final class RuntimeLineBufferTests: XCTestCase {
+    func testSmallScratchCapacityIsReusedWithoutAliasingReturnedFrames() {
+        var buffer = RuntimeLineBuffer()
+        let frame = Data((String(repeating: "x", count: 255) + "\n").utf8)
+        let first = buffer.append(frame)
+        let capacity = buffer.scratchCapacity
+        XCTAssertGreaterThanOrEqual(capacity, frame.count)
+        XCTAssertLessThanOrEqual(capacity, RuntimeLineBuffer.compactionThreshold)
+        for _ in 0..<1_000 {
+            XCTAssertEqual(buffer.append(frame), first)
+            XCTAssertEqual(buffer.scratchCapacity, capacity)
+            XCTAssertEqual(buffer.pendingByteCount, 0)
+            XCTAssertEqual(buffer.retainedByteCount, 0)
+        }
+        XCTAssertEqual(buffer.append(Data("different 🧭\n".utf8)), [Data("different 🧭".utf8)])
+        XCTAssertEqual(first, [Data(repeating: 0x78, count: 255)])
+        XCTAssertTrue(buffer.append(Data(), flush: true).isEmpty)
+        XCTAssertEqual(buffer.scratchCapacity, 0)
+        XCTAssertEqual(buffer.append(frame), first)
+    }
+
+    func testLargeFrameScratchIsReleasedOnlyWhenItsPendingBytesDrain() {
+        var buffer = RuntimeLineBuffer()
+        let frame = Data(repeating: 0x61, count: RuntimeLineBuffer.compactionThreshold * 2)
+        XCTAssertTrue(buffer.append(frame).isEmpty)
+        XCTAssertGreaterThan(buffer.scratchCapacity, RuntimeLineBuffer.compactionThreshold)
+        XCTAssertEqual(buffer.pendingByteCount, frame.count)
+        XCTAssertEqual(buffer.append(Data([0x0A])), [frame])
+        XCTAssertEqual(buffer.scratchCapacity, 0)
+        XCTAssertEqual(buffer.append(Data("small\n".utf8)), [Data("small".utf8)])
+        XCTAssertLessThanOrEqual(buffer.scratchCapacity, RuntimeLineBuffer.compactionThreshold)
+    }
+
+    func testOversizedDiscardAndMalformedFramesDoNotRetainPeakScratch() {
+        var buffer = RuntimeLineBuffer(frameLimit: 16)
+        XCTAssertTrue(buffer.append(Data(repeating: 0x61, count: 17)).isEmpty)
+        XCTAssertEqual(buffer.failureCode, "transport_frame_limit")
+        XCTAssertEqual(buffer.scratchCapacity, 0)
+        let invalid = Data([0xFF, 0xFE, 0x0D])
+        var tail = Data([0x0A]); tail.append(invalid); tail.append(0x0A)
+        XCTAssertEqual(buffer.append(tail, flush: true), [invalid])
+        XCTAssertEqual(buffer.scratchCapacity, 0)
+        XCTAssertEqual(buffer.failureCode, "transport_frame_limit")
+    }
+
     private func legacyLines(_ data: Data, chunks: [Int], flush: Bool = true) -> [Data] {
         var buffer = Data(), result: [Data] = [], offset = 0
         for count in chunks {

@@ -97,3 +97,29 @@ Offline regression: `swift test --package-path ProjectFiles --filter
 'CapturePipelineTests|RuntimeTransportTests|LocalOperationBudgetTests'` includes
 fake-clock admission, queued expiry, partial-frame delivery, successor isolation,
 and the distinction between rejected and dispatched/unconfirmed receipts.
+
+## Reusable native framing scratch
+
+`RuntimeLineBuffer` stages incoming bytes in invocation-local `[UInt8]` storage.
+It lazily reserves a small buffer (up to 4 KiB initially), reuses capacity across
+ordinary frames, and retains at most 64 KiB of scratch after complete drainage.
+A drained larger allocation, oversized discarded frame, or terminal flush
+releases its storage. Pending bytes still obey the existing frame limit and
+prefix-compaction boundary; large incomplete frames are never discarded merely
+to shrink scratch. Incoming bounded chunks append directly from the input's
+byte view, without constructing a temporary Data slice.
+
+Returned `Data` frames remain independent copies. Retaining or parsing one
+cannot pin or modify scratch, and copying the framing value retains Swift's
+copy-on-write isolation. UTF-8 is still validated by existing consumers after
+byte framing; malformed bytes, CRs, skipped empty lines, oversized-frame
+resynchronization, batch limits and unterminated exit tails are unchanged.
+There is no shared buffer, background maintenance or new model request.
+
+Offline `RuntimeLineBufferTests` checks stable capacity across 1,000 short
+frames, frame independence, oversized-frame release and flush/reuse alongside
+existing randomized fragmentation, copy isolation and every-byte UTF-8 splits.
+A local optimized standalone benchmark of 100,000 consecutive 256-byte frames
+measured approximately 33.0 ms before and 19.5 ms after this change. These are
+illustrative local timings, not a regression threshold or allocation count;
+capacity/lifecycle assertions provide deterministic regression coverage.

@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 
 /// Invocation-local framing for the runtime's newline-delimited byte stream.
-/// Offsets are relative to the storage's bytes, including after Data compaction.
+/// Offsets are relative to the storage's bytes, including after byte-storage compaction.
 struct RuntimeLineBuffer {
     static let compactionThreshold = 64 * 1024
     static let maximumFrameBytes = 8 * 1024 * 1024
@@ -12,12 +12,15 @@ struct RuntimeLineBuffer {
     private(set) var failureCode: String?
     private var discarding = false
 
-    private var storage = Data()
+    // Retain explicit, inspectable capacity across complete small frames.
+    // Returned frames still copy bytes and cannot alias this scratch.
+    private var storage: [UInt8] = []
     private var readCursor = 0
     private var scanCursor = 0
 
     var pendingByteCount: Int { storage.count - readCursor }
     var retainedByteCount: Int { storage.count }
+    var scratchCapacity: Int { storage.capacity }
 
     init(frameLimit: Int = Self.maximumFrameBytes, batchLimit: Int = Self.maximumBatchBytes) {
         precondition(frameLimit > 0 && batchLimit > 0)
@@ -41,7 +44,10 @@ struct RuntimeLineBuffer {
             // extra byte detects a frame exceeding its limit immediately.
             let count = min(64 * 1024, data.count - offset, frameLimit - pendingByteCount + 1)
             if count == 0 { continue }
-            storage.append(data[data.index(data.startIndex, offsetBy: offset)..<data.index(data.startIndex, offsetBy: offset + count)])
+            if storage.capacity == 0 { storage.reserveCapacity(min(4096, frameLimit)) }
+            data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+                storage.append(contentsOf: bytes[offset..<offset + count])
+            }
             offset += count
             for line in extract(flush: false) {
                 if batchBytes + line.count <= batchLimit && lines.count < 65536 {
@@ -50,7 +56,7 @@ struct RuntimeLineBuffer {
             }
             if pendingByteCount > frameLimit {
                 failureCode = failureCode ?? "transport_frame_limit"
-                storage = Data(); readCursor = 0; scanCursor = 0; discarding = true
+                storage = []; readCursor = 0; scanCursor = 0; discarding = true
             }
         }
         if flush {
@@ -90,11 +96,13 @@ struct RuntimeLineBuffer {
         scanCursor = storage.count
 
         if readCursor == storage.count {
-            storage.removeAll(keepingCapacity: !flush && storage.count <= Self.compactionThreshold)
+            // A large frame must not pin its peak allocation across small
+            // future bursts. Flush is the invocation's existing release boundary.
+            storage.removeAll(keepingCapacity: !flush && storage.capacity <= Self.compactionThreshold)
             readCursor = 0
             scanCursor = 0
         } else if readCursor >= Self.compactionThreshold, readCursor >= pendingByteCount {
-            storage.removeSubrange(storage.startIndex..<storage.index(storage.startIndex, offsetBy: readCursor))
+            storage.removeFirst(readCursor)
             scanCursor -= readCursor
             readCursor = 0
         }
