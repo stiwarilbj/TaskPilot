@@ -464,17 +464,20 @@ final class TaskOwnershipTests: XCTestCase {
         """)
         let complete = expectation(description: "Burst and final tail drained")
         var messages: [String] = [], terminalCount = 0, bridgeCalls = 0
-        let runtime = AgentRuntimeProcess(bridge: bridge()) { request in
-            bridgeCalls += 1
-            if request["method"] as? String == "completion_gate" {
-                let owner = TaskOwnership.current!
-                let revision = (request["instruction_revision"] as? NSNumber)?.uint64Value ?? 0
-                return ["kind": "bridge_response", "task_generation_id": owner.id,
-                        "request_id": request["request_id"]!, "ok": true,
-                        "result": ["accepted": owner.claimCompletion(instructionRevision: revision)]]
+        let telemetry = BackendTelemetry()
+        let runtime = BackendTelemetry.$current.withValue(telemetry) {
+            AgentRuntimeProcess(bridge: bridge()) { request in
+                bridgeCalls += 1
+                if request["method"] as? String == "completion_gate" {
+                    let owner = TaskOwnership.current!
+                    let revision = (request["instruction_revision"] as? NSNumber)?.uint64Value ?? 0
+                    return ["kind": "bridge_response", "task_generation_id": owner.id,
+                            "request_id": request["request_id"]!, "ok": true,
+                            "result": ["accepted": owner.claimCompletion(instructionRevision: revision)]]
+                }
+                return ["kind": "bridge_response", "task_generation_id": TaskOwnership.current!.id,
+                        "request_id": request["request_id"]!, "ok": true, "result": [:]]
             }
-            return ["kind": "bridge_response", "task_generation_id": TaskOwnership.current!.id,
-                    "request_id": request["request_id"]!, "ok": true, "result": [:]]
         }
         runtime.onEvent = { event in
             if case .status(let message) = event { messages.append(message) }
@@ -488,6 +491,10 @@ final class TaskOwnershipTests: XCTestCase {
         await fulfillment(of: [complete], timeout: 5)
         XCTAssertEqual(messages, (0..<1200).map { "\($0): ☃ 🧭" })
         XCTAssertEqual(terminalCount, 1)
+        #if DEBUG
+        XCTAssertEqual(telemetry.snapshotSizeAudit().underestimationCount, 19)
+        XCTAssertGreaterThan(telemetry.snapshotSizeAudit().maximumShortfallBytes, 0)
+        #endif
         XCTAssertEqual(bridgeCalls, 1, "Only the atomic completion gate should cross the bridge")
     }
 

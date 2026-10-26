@@ -2,6 +2,40 @@ import XCTest
 @testable import OrbitAgent
 
 final class RuntimeSnapshotFilterTests: XCTestCase {
+    #if DEBUG
+    func testSizeAuditSamplesExactlyOneIn64AdmittedEventsAndResetsPerInvocation() {
+        let telemetry = BackendTelemetry()
+        var filter = RuntimeSnapshotFilter()
+        for index in 1...129 {
+            XCTAssertTrue(filter.shouldSchedule(.status("status \(index)")))
+            filter.auditSerializedSize(estimatedBytes: 10, serializedBytes: 10 + index, telemetry: telemetry)
+        }
+        XCTAssertEqual(telemetry.snapshotSizeAudit().underestimationCount, 3)
+        XCTAssertEqual(telemetry.snapshotSizeAudit().maximumShortfallBytes, 129)
+        var anotherInvocation = RuntimeSnapshotFilter()
+        anotherInvocation.auditSerializedSize(estimatedBytes: 0, serializedBytes: 1, telemetry: telemetry)
+        XCTAssertEqual(telemetry.snapshotSizeAudit().underestimationCount, 4)
+    }
+
+    func testUnmeasurableAndCoalescedEventsDoNotAdvanceSizeSampling() {
+        let telemetry = BackendTelemetry()
+        var filter = RuntimeSnapshotFilter()
+        for _ in 0..<100 {
+            filter.auditSerializedSize(estimatedBytes: 0, serializedBytes: nil, telemetry: telemetry)
+            filter.auditSerializedSize(estimatedBytes: -1, serializedBytes: 20, telemetry: telemetry)
+        }
+        XCTAssertTrue(filter.shouldSchedule(.status("unchanged")))
+        filter.auditSerializedSize(estimatedBytes: 0, serializedBytes: 20, telemetry: telemetry)
+        for _ in 0..<100 {
+            if filter.shouldSchedule(.status("unchanged")) {
+                filter.auditSerializedSize(estimatedBytes: 0, serializedBytes: 100, telemetry: telemetry)
+            }
+        }
+        XCTAssertEqual(telemetry.snapshotSizeAudit().underestimationCount, 1)
+        XCTAssertEqual(telemetry.snapshotSizeAudit().maximumShortfallBytes, 20)
+    }
+    #endif
+
     private func metrics(_ overrides: [String: Any] = [:]) throws -> AgentRequestMetrics {
         var fields: [String: Any] = ["planning": 1, "verification": 0, "retries": 0,
             "model_switches": 0, "cache_hits": 0, "reconnects": 0]

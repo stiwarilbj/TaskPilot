@@ -305,6 +305,23 @@ final class BackendTelemetry: @unchecked Sendable {
         }
         deinit { finish(.abandoned) }
     }
+    #if DEBUG
+    /// Two numeric aggregates only; no event, encoded data, IDs or size history.
+    struct SnapshotSizeAudit: Equatable {
+        var underestimationCount = 0
+        var maximumShortfallBytes = 0
+    }
+    private var snapshotAudit = SnapshotSizeAudit()
+    func recordSnapshotSizeEstimate(estimatedBytes: Int, serializedBytes: Int) {
+        guard estimatedBytes >= 0, serializedBytes > estimatedBytes else { return }
+        lock.withLock {
+            snapshotAudit.underestimationCount = Self.saturatingAdjustment(snapshotAudit.underestimationCount, by: 1)
+            snapshotAudit.maximumShortfallBytes = max(snapshotAudit.maximumShortfallBytes, serializedBytes - estimatedBytes)
+        }
+    }
+    func snapshotSizeAudit() -> SnapshotSizeAudit { lock.withLock { snapshotAudit } }
+    #endif
+
     private let signposter = OSSignposter(subsystem: "com.orbitagent.controller", category: "BackendPhases")
     private let lock = NSLock()
     private let capacity: Int

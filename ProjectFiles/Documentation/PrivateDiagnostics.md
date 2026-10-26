@@ -48,3 +48,34 @@ record. The file remains private and bounded to 1 MB.
 
 Relevant offline checks: `swift test --package-path ProjectFiles --filter BackendTelemetryTests`
 and `python3 -m unittest discover -s ProjectFiles/Tests/Python -p 'test_openclaw_runtime.py'`.
+
+## Development snapshot-size audit
+
+`DEBUG` builds sample the first and then every 64th admitted event with an
+exact serialized runtime source. `processLine` passes only the existing JSON
+frame byte count (excluding LF) to `emit`; no payload is copied, re-encoded or
+retained for the audit. Sampling occurs after snapshot coalescing and the
+unchanged queue admission check. Native-only and deferred terminal events
+without a one-to-one serialized source are not sampled. Each invocation owns
+its sampling cursor; the existing telemetry recorder aggregates across it.
+
+`BackendTelemetry.snapshotSizeAudit()` exposes exactly two in-memory numeric
+aggregates: `underestimationCount` and `maximumShortfallBytes`. Equal or larger
+estimates add no underestimation; negative/unknown measurements are ignored.
+Updates use the recorder's lock and saturating count arithmetic. There are no
+per-event records, category strings, sizes, request IDs, payloads, timestamps,
+logs, files, exports or history additions. Release builds compile out both the
+sampler and aggregate API/storage.
+
+The actual size is the incoming JSON wire representation, including its
+envelope, escaping and whitespace; this is not a heap-size or projected-object
+measurement. It provides development evidence for later bound tuning. This
+pass changes no estimates, byte limits, coalescing, delivery ordering or
+admission/recovery policy. It adds no generations, captures or timers.
+
+Offline checks: `RuntimeSnapshotFilterTests`, `BackendTelemetryTests` and
+`TaskOwnershipTests.testStreamedBurstAndExitTailDeliverEachEventOnceInOrder`.
+The 1,200-status UTF-8 burst produces 19 sampled underestimates while preserving
+every status and the terminal event exactly once. Fake numeric measurements
+cover sampling, coalescing, invocation reset, invalid measurements, large
+shortfalls and concurrent aggregate updates.

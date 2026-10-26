@@ -11,6 +11,19 @@ struct RuntimeSnapshotFilter {
     private var taskInputRoles: AgentTaskInputRolesSnapshot?
     private var continuationCheckpoint: (generationID: String, revision: UInt64, fingerprint: String)?
 
+    #if DEBUG
+    private var sizeAuditCountdown = 0
+    /// Called only after normal filtering/admission. Samples 1, 65, 129, ...
+    /// among events with an exact serialized source; never retains the source.
+    mutating func auditSerializedSize(estimatedBytes: Int, serializedBytes: Int?, telemetry: BackendTelemetry) {
+        guard let serializedBytes, serializedBytes >= 0, estimatedBytes >= 0 else { return }
+        if sizeAuditCountdown == 0 {
+            telemetry.recordSnapshotSizeEstimate(estimatedBytes: estimatedBytes, serializedBytes: serializedBytes)
+            sizeAuditCountdown = 63
+        } else { sizeAuditCountdown -= 1 }
+    }
+    #endif
+
     /// Accounts for a runtime event that has passed snapshot filtering and is
     /// about to be retained by the main-queue delivery closure. The ticket
     /// contains numeric size metadata only and releases on every exit path.

@@ -4,6 +4,27 @@ import XCTest
 @testable import OrbitAgent
 
 final class BackendTelemetryTests: XCTestCase {
+    #if DEBUG
+    func testSnapshotSizeAuditRetainsOnlyThreadSafeUnderestimationAggregates() {
+        let telemetry = BackendTelemetry()
+        telemetry.recordSnapshotSizeEstimate(estimatedBytes: 10, serializedBytes: 10)
+        telemetry.recordSnapshotSizeEstimate(estimatedBytes: 20, serializedBytes: 10)
+        telemetry.recordSnapshotSizeEstimate(estimatedBytes: -1, serializedBytes: 10)
+        telemetry.recordSnapshotSizeEstimate(estimatedBytes: 0, serializedBytes: -1)
+        XCTAssertEqual(telemetry.snapshotSizeAudit(), .init())
+        DispatchQueue.concurrentPerform(iterations: 1_000) { index in
+            telemetry.recordSnapshotSizeEstimate(estimatedBytes: 1, serializedBytes: index + 2)
+        }
+        XCTAssertEqual(telemetry.snapshotSizeAudit().underestimationCount, 1_000)
+        XCTAssertEqual(telemetry.snapshotSizeAudit().maximumShortfallBytes, 1_000)
+        telemetry.recordSnapshotSizeEstimate(estimatedBytes: 0, serializedBytes: Int.max)
+        XCTAssertEqual(telemetry.snapshotSizeAudit().maximumShortfallBytes, Int.max)
+        XCTAssertEqual(Set(Mirror(reflecting: telemetry.snapshotSizeAudit()).children.compactMap(\.label)),
+                       ["underestimationCount", "maximumShortfallBytes"])
+        XCTAssertTrue(telemetry.samples().isEmpty) // No per-event records or signposts.
+    }
+    #endif
+
     private final class FakeClock: @unchecked Sendable {
         private let lock = NSLock()
         private var time = 0.0

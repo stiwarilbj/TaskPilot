@@ -680,10 +680,10 @@ final class AgentRuntimeProcess {
                CFGetTypeID(version) != CFBooleanGetTypeID(), version.intValue == 1,
                version.doubleValue == 1 { run.supportsMemoryPressure = true }
         case "model_health":
-            emit(.modelHealth(message["model"] as? String ?? "", message["state"] as? String ?? "repair", message["detail"] as? String ?? ""), for: run)
+            emit(.modelHealth(message["model"] as? String ?? "", message["state"] as? String ?? "repair", message["detail"] as? String ?? ""), for: run, serializedByteCount: data.count)
         case "request_metrics":
             if let metrics = try? BackendTelemetry.DiagnosticSchema.decodeRequestMetrics(data, using: run.metricsDecoder) {
-                emit(.diagnostics(metrics), for: run)
+                emit(.diagnostics(metrics), for: run, serializedByteCount: data.count)
             }
         case "bridge_request":
             guard let method = message["method"] as? String,
@@ -760,7 +760,7 @@ final class AgentRuntimeProcess {
             }
             run.operations[operationID] = operation
         case "status":
-            if let text = message["message"] as? String { emit(.status(text), for: run) }
+            if let text = message["message"] as? String { emit(.status(text), for: run, serializedByteCount: data.count) }
         case "output":
             let output = AgentTaskOutput(
                 shouldShow: message["show_output"] as? Bool ?? false,
@@ -769,7 +769,7 @@ final class AgentRuntimeProcess {
                 decidedByAgent: message["decided_by_agent"] as? Bool ?? false,
                 kind: AgentTaskOutputKind(rawValue: message["output_kind"] as? String ?? "result") ?? .result
             )
-            emit(.output(output), for: run)
+            emit(.output(output), for: run, serializedByteCount: data.count)
         case "user_input_required":
             guard let requestID = message["request_id"] as? String,
                   let revision = exactRevision(message["instruction_revision"]) else { return }
@@ -788,7 +788,7 @@ final class AgentRuntimeProcess {
                     rawValue: message["input_kind"] as? String ?? "password"
                 ) ?? .password
             )
-            emit(.userInputRequired(request), for: run)
+            emit(.userInputRequired(request), for: run, serializedByteCount: data.count)
         case "target_choice_required":
             let requiredKeys: Set<String> = ["kind", "task_generation_id", "instruction_revision",
                 "working_document_revision", "version", "request_id", "binding_revision",
@@ -941,31 +941,31 @@ final class AgentRuntimeProcess {
             guard let progress = AgentTaskProgressSnapshot.parse(message, generationID: run.lease.id),
                   progress.revision > run.progressRevision else { return }
             run.progressRevision = progress.revision
-            emit(.taskProgress(progress), for: run)
+            emit(.taskProgress(progress), for: run, serializedByteCount: data.count)
         case "task_input_roles":
             guard let roles = AgentTaskInputRolesSnapshot.parse(message, generationID: run.lease.id,
                   instructionRevision: run.lease.currentInstructionRevision,
                   exactReferences: run.exactInputReferences),
                   roles.revision > run.inputRolesRevision else { return }
             run.inputRolesRevision = roles.revision
-            emit(.taskInputRoles(roles), for: run)
+            emit(.taskInputRoles(roles), for: run, serializedByteCount: data.count)
         case "task_continuation_checkpoint":
             guard let checkpoint = AgentTaskContinuationCheckpoint.parse(message, generationID: run.lease.id),
                   checkpoint.instructionRevision == run.lease.currentInstructionRevision,
                   checkpoint.revision > run.continuationRevision else { return }
             run.continuationRevision = checkpoint.revision
-            emit(.taskContinuationCheckpoint(checkpoint), for: run)
+            emit(.taskContinuationCheckpoint(checkpoint), for: run, serializedByteCount: data.count)
         case "task_wait":
             guard let wait = AgentTaskWaitSnapshot.parse(message, generationID: run.lease.id),
                   wait.revision > run.waitRevision else { return }
             run.waitRevision = wait.revision
-            emit(.taskWait(wait), for: run)
+            emit(.taskWait(wait), for: run, serializedByteCount: data.count)
         case "task_destination":
             guard let destination = AgentTaskDestinationSnapshot.parse(message, generationID: run.lease.id),
                   destination.instructionRevision == run.lease.currentInstructionRevision,
                   destination.revision > run.destinationRevision else { return }
             run.destinationRevision = destination.revision
-            emit(.taskDestination(destination), for: run)
+            emit(.taskDestination(destination), for: run, serializedByteCount: data.count)
         case "instruction_correction_applied":
             guard message["task_generation_id"] as? String == run.lease.id,
                   let id = message["correction_id"] as? String,
@@ -1081,7 +1081,7 @@ final class AgentRuntimeProcess {
                     decidedByAgent: message["decided_by_agent"] as? Bool ?? false,
                     kind: AgentTaskOutputKind(rawValue: message["output_kind"] as? String ?? "result") ?? .result
                 )
-                emit(.output(output), for: run)
+                emit(.output(output), for: run, serializedByteCount: data.count)
             }
             run.receivedTerminalEvent = true
             run.pendingTerminalEvent = .completed(message["message"] as? String ?? "Task complete")
@@ -1204,7 +1204,7 @@ final class AgentRuntimeProcess {
         ioQueue.asyncAfter(deadline: .now() + 0.025) { [weak self] in self?.pollDrain(run) }
     }
 
-    private func emit(_ event: RuntimeEvent, for run: Invocation, terminal: Bool = false, retireAfterDelivery: Bool = false) {
+    private func emit(_ event: RuntimeEvent, for run: Invocation, serializedByteCount: Int? = nil, terminal: Bool = false, retireAfterDelivery: Bool = false) {
         // Suppress redundant snapshots before they allocate main-queue work.
         // Invocation ownership and terminal delivery guards remain unchanged.
         guard terminal || run.snapshots.shouldSchedule(event) else { return }
@@ -1230,6 +1230,11 @@ final class AgentRuntimeProcess {
             if case .taskWait = event { return }
             failTransport("transport_event_limit", for: run); return
         }
+        #if DEBUG
+        // Exact incoming JSON bytes (excluding LF), not a heap-size measurement.
+        // Sampling cannot change the estimate or the admission decision above.
+        run.snapshots.auditSerializedSize(estimatedBytes: bytes, serializedBytes: serializedByteCount, telemetry: telemetry)
+        #endif
         run.queuedEventCount += 1; run.queuedEventBytes += bytes
         let deliveryWait = telemetry.beginQueueWait(.eventDelivery)
         let snapshotMemory = run.snapshots.beginInFlightSnapshot(byteCount: bytes, telemetry: telemetry)
