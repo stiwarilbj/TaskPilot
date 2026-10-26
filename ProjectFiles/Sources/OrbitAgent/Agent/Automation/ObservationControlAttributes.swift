@@ -99,7 +99,7 @@ struct ObservationControlAttributes {
                 individual = true
                 context.requireIndividualReads(for: pid)
             } else if error != .success {
-                context.record(error, attribute: batchAttribute, began: began)
+                context.record(error, attribute: batchAttribute, began: began, element: element)
                 return .init(attributes: [:]) // No nine-read fanout on transport/permission/stale-element failures.
             } else if let values {
                 for (name, value) in zip(names, values) {
@@ -118,7 +118,8 @@ struct ObservationControlAttributes {
                         if result == .success {
                             attribute = .decode(recovered)
                             if case let .error(error) = attribute {
-                                context.record(error, attribute: name, required: name == kAXRoleAttribute, began: began)
+                                context.record(error, attribute: name, required: name == kAXRoleAttribute,
+                                               began: began, element: element)
                             }
                         }
                         else { attribute = .error(result) }
@@ -144,7 +145,7 @@ struct ObservationControlAttributes {
                 try TaskOwnership.check()
                 let attribute: Attribute = error == .success ? .decode(value) : .error(error)
                 if error == .success, case let .error(error) = attribute {
-                    context.record(error, attribute: name, required: name == kAXRoleAttribute, began: began)
+                    context.record(error, attribute: name, required: name == kAXRoleAttribute, began: began, element: element)
                 }
                 if case .missing = attribute, name == kAXRoleAttribute {
                     context.report("accessibility_incomplete", name, nil)

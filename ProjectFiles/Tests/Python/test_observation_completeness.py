@@ -36,7 +36,8 @@ class ObservationCompletenessTests(unittest.TestCase):
     def test_all_collection_gaps_are_preserved_for_planning(self):
         reasons = {reason: 1 for reason in ('element_limit', 'child_limit', 'depth_limit', 'collection_timeout',
                    'accessibility_timeout', 'accessibility_incomplete', 'accessibility_read_error',
-                   'accessibility_unavailable', 'accessibility_permission_unavailable')}
+                   'accessibility_unavailable', 'accessibility_permission_unavailable',
+                   'accessibility_stalled_subtree_deferred')}
         value = observation(reasons=reasons)
         before = copy.deepcopy(value)
         compact = runtime.prompt_observation(value, 'Save this report')

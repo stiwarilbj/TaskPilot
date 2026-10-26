@@ -6,6 +6,7 @@ final class ObservationCollection<Node> {
     static var version: Int { 1 }
     struct Scope {
         let pid: Int
+        var processIdentity: AutomationApplicationIdentity? = nil
         var windowID: String?
         var parentID: String?
         var priority = 0
@@ -75,22 +76,28 @@ final class ObservationCollection<Node> {
     func collect(roots: [Entry], revision: String, expand: Bool = true, check: () throws -> Void,
                  equal: (Node, Node) -> Bool, identityHash: ((Node) -> UInt)? = nil,
                  inspect: (Entry, String) throws -> Inspection,
-                 children: (Entry, Int, Int) throws -> Page) throws {
+                 children: (Entry, Int, Int) throws -> Page,
+                 shouldDefer: (Entry) -> Bool = { _ in false }) throws {
         let before = collected
         try BackendTelemetry.current.measure(.axCollection) { span in
             defer { span.record(items: collected - before) }
             try collectNodes(roots: roots, revision: revision, expand: expand, check: check,
-                             equal: equal, identityHash: identityHash, inspect: inspect, children: children)
+                             equal: equal, identityHash: identityHash, inspect: inspect, children: children,
+                             shouldDefer: shouldDefer)
         }
     }
 
     private func collectNodes(roots: [Entry], revision: String, expand: Bool, check: () throws -> Void,
                               equal: (Node, Node) -> Bool, identityHash: ((Node) -> UInt)?, inspect: (Entry, String) throws -> Inspection,
-                              children: (Entry, Int, Int) throws -> Page) throws {
+                              children: (Entry, Int, Int) throws -> Page, shouldDefer: (Entry) -> Bool) throws {
         func deferNode(_ entry: Entry, _ reason: String) { pending.append(Pending(entry: entry, reason: reason)) }
         func walk(_ entry: Entry) throws {
             try check()
             scope = entry.scope
+            if shouldDefer(entry) {
+                issue("accessibility_stalled_subtree_deferred", attribute: "AXChildren")
+                return
+            }
             guard hasTime else { deferNode(entry, "collection_timeout"); return }
             guard collected < (expanded ? limits.expandedElements : limits.initialElements) else {
                 deferNode(entry, "element_limit"); return

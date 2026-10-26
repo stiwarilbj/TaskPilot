@@ -57,6 +57,44 @@ final class NativeAccessibilityGraphTests: XCTestCase {
         for index in 0..<100 { store(graph, index, [index + 1, index + 2]); XCTAssertLessThanOrEqual(graph.nodeCount, 8) }
         XCTAssertGreaterThan(graph.rebuilds, 1)
     }
+    func testRepeatedSlowTimeoutsDeferExactSubtreeUntilChangeOrCooldown() {
+        var time: Double = 1
+        let process = identity()
+        let graph = NativeAccessibilityGraph<Int>(stallCapacity: 8, stallThreshold: 2, stallWindow: 5,
+            stallCooldown: 2, processIdentity: process, now: { time }, hash: { UInt($0) }, equal: ==)
+        graph.setMonitoring(true)
+        graph.recordTimeout(1, processIdentity: identity(2)) // Reused PID, different process instance.
+        XCTAssertFalse(graph.shouldDefer(1, processIdentity: process))
+        graph.recordTimeout(1, processIdentity: process)
+        XCTAssertFalse(graph.shouldDefer(1, processIdentity: process))
+        graph.recordTimeout(1, processIdentity: process)
+        XCTAssertTrue(graph.shouldDefer(1, processIdentity: process))
+
+        graph.store(0, offset: 0, page: .init(children: [1, 2], total: 2), ticket: graph.beginRead())
+        graph.store(1, offset: 0, page: .init(children: [3], total: 1), ticket: graph.beginRead())
+        for node in [3, 2] { graph.recordTimeout(node, processIdentity: process); graph.recordTimeout(node, processIdentity: process) }
+        graph.changed(1) // A relevant subtree notification releases 1 and its descendants only.
+        XCTAssertFalse(graph.shouldDefer(1, processIdentity: process))
+        XCTAssertFalse(graph.shouldDefer(3, processIdentity: process))
+        XCTAssertTrue(graph.shouldDefer(2, processIdentity: process))
+
+        time += 2
+        XCTAssertFalse(graph.shouldDefer(2, processIdentity: process))
+        graph.recordTimeout(2, processIdentity: process)
+        XCTAssertFalse(graph.shouldDefer(2, processIdentity: process)) // Cooldown expiry reset its streak.
+    }
+
+    func testUncertainChangesAndProcessClosureClearStallState() {
+        let process = identity()
+        let graph = NativeAccessibilityGraph<Int>(processIdentity: process, hash: { UInt($0) }, equal: ==)
+        graph.recordTimeout(7, processIdentity: process); graph.recordTimeout(7, processIdentity: process)
+        XCTAssertTrue(graph.shouldDefer(7, processIdentity: process))
+        graph.changed(nil, uncertain: true)
+        XCTAssertFalse(graph.shouldDefer(7, processIdentity: process))
+        graph.recordTimeout(7, processIdentity: process); graph.recordTimeout(7, processIdentity: process)
+        graph.close()
+        XCTAssertFalse(graph.shouldDefer(7, processIdentity: process))
+    }
     func testCollisionSafeGraphIdentity() {
         let graph = NativeAccessibilityGraph<Int>(hash: { _ in 0 }, equal: ==)
         graph.setMonitoring(true); store(graph, 1, [3]); store(graph, 2, [4])
@@ -126,11 +164,15 @@ final class NativeAccessibilityGraphTests: XCTestCase {
         let old = try XCTUnwrap(session.graph(for: identity()))
         let parent = AXUIElementCreateApplication(424242) // handle only; no live AX queries
         old.store(parent, offset: 0, page: .init(children: [], total: 0), ticket: old.beginRead())
+        old.recordTimeout(parent, processIdentity: identity())
+        old.recordTimeout(parent, processIdentity: identity())
+        XCTAssertTrue(old.shouldDefer(parent, processIdentity: identity()))
         session.prepare(identity(2), windows: [])
         await fulfillment(of: [secondReady], timeout: 2)
         XCTAssertNil(session.graph(for: identity()))
         let new = try XCTUnwrap(session.graph(for: identity(2)))
         XCTAssertFalse(old === new)
+        XCTAssertFalse(new.shouldDefer(parent, processIdentity: identity(2)))
         new.store(parent, offset: 0, page: .init(children: [], total: 0), ticket: new.beginRead())
         callbacks[0]()
         XCTAssertNotNil(new.page(parent, offset: 0, count: 160, total: 0, fresh: false))

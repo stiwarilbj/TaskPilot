@@ -293,11 +293,13 @@ final class NativeGraphSession: @unchecked Sendable {
     private final class Application {
         let identity: AutomationApplicationIdentity
         let windows: [AXUIElement]
-        let graph = NativeAccessibilityGraph<AXUIElement>(hash: { UInt(CFHash($0)) }, equal: { CFEqual($0, $1) })
+        let graph: NativeAccessibilityGraph<AXUIElement>
         var observer: AXObserver? // main run loop only
         var injectedClose: (() -> Void)? // offline notification provider
         init(_ identity: AutomationApplicationIdentity, windows: [AXUIElement]) {
             self.identity = identity; self.windows = windows
+            graph = NativeAccessibilityGraph<AXUIElement>(processIdentity: identity,
+                hash: { UInt(CFHash($0)) }, equal: { CFEqual($0, $1) })
         }
     }
     private let lock = NSLock()
@@ -358,6 +360,12 @@ final class NativeGraphSession: @unchecked Sendable {
             guard let app = applications[identity.pid], app.identity == identity else { return nil }
             return app.graph
         }
+    }
+    func shouldDefer(_ node: AXUIElement, processIdentity identity: AutomationApplicationIdentity) -> Bool {
+        graph(for: identity)?.shouldDefer(node, processIdentity: identity) ?? false
+    }
+    func recordTimeout(_ node: AXUIElement, processIdentity identity: AutomationApplicationIdentity) {
+        graph(for: identity)?.recordTimeout(node, processIdentity: identity)
     }
     @MainActor private func install(_ app: Application) {
         guard isCurrent else { return }

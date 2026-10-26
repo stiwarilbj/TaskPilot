@@ -1122,7 +1122,18 @@ final class AccessibilityController {
         let collection = ObservationCollection<ObservationNode>(budget: LocalOperationBudget.allowance(min(1.5, max(0, budget))))
         let reads = ObservationAccessibilityReads.Context(deadline: collection.deadline, now: collection.now,
             report: { collection.issue($0, attribute: $1, code: $2) }, retried: { collection.retriedRead() },
-            shouldRetry: { collection.scope.priority > 0 })
+            shouldRetry: { collection.scope.priority > 0 },
+            shouldDefer: { element in
+                guard let identity = collection.scope.processIdentity else { return false }
+                return graph?.shouldDefer(element, processIdentity: identity) ?? false
+            },
+            stalled: { element in
+                guard let identity = collection.scope.processIdentity else { return }
+                graph?.recordTimeout(element, processIdentity: identity)
+            },
+            deferred: { _, attribute in
+                collection.issue("accessibility_stalled_subtree_deferred", attribute: attribute)
+            })
         defer {
             if reads.failures > 0 || collection.reasonCounts.keys.contains(where: { $0.hasPrefix("accessibility_") }) { graph?.gap() }
         }
@@ -1158,6 +1169,9 @@ final class AccessibilityController {
                 }, children: { entry, offset, count in
                     self.observationChildren(entry: entry, offset: offset, count: count, collection: collection,
                         graph: graph?.graph(for: entry.node.application), forceFresh: forceFreshTopology)
+                }, shouldDefer: { entry in
+                    guard let identity = entry.scope.processIdentity else { return false }
+                    return graph?.shouldDefer(entry.node.element, processIdentity: identity) ?? false
                 })
             roots.removeAll(keepingCapacity: true)
         }
@@ -1166,7 +1180,8 @@ final class AccessibilityController {
             let pid = app.processIdentifier
             let appPriority = (appIndex == 0 ? 120 : 0) + (app.isActive ? 80 : 0)
                 + AutomationObservationPolicy.keywordScore(app.localizedName ?? "", keywords: keywords)
-            collection.scope = .init(pid: Int(pid), priority: appPriority)
+            let appIdentity = applicationIdentity(app)
+            collection.scope = .init(pid: Int(pid), processIdentity: appIdentity, priority: appPriority)
             let appElement = AXUIElementCreateApplication(pid)
             let windowValue = attribute(appElement, kAXWindowsAttribute)
             let windows = windowValue as? [AXUIElement] ?? []
@@ -1200,7 +1215,6 @@ final class AccessibilityController {
                 collection.issue("accessibility_incomplete", attribute: kAXWindowsAttribute)
             }
             observedGraphics[pid] = graphics
-            let appIdentity = applicationIdentity(app)
             observedApps[pid] = appIdentity
             graph?.prepare(appIdentity, windows: visibleWindows)
 
@@ -1262,7 +1276,7 @@ final class AccessibilityController {
             for root in transientRoots {
                 roots.append(.init(node: ObservationNode(element: root, pid: pid, appName: app.localizedName ?? "Unknown app",
                     application: appIdentity, focusedElement: focusedElement, ownerWindow: nil, windowRecords: windowRecords),
-                    scope: .init(pid: Int(pid), priority: appPriority + 400)))
+                    scope: .init(pid: Int(pid), processIdentity: appIdentity, priority: appPriority + 400)))
             }
 
             for index in AutomationObservationPolicy.windowOrder(count: visibleWindows.count, focusedIndex: focusedIndex, topmostIndex: topmostIndex) {
@@ -1271,7 +1285,7 @@ final class AccessibilityController {
                 let title = stringAttribute(window, kAXTitleAttribute) ?? ""
                 roots.append(.init(node: ObservationNode(element: window, pid: pid, appName: app.localizedName ?? "Unknown app",
                     application: appIdentity, focusedElement: focusedElement, ownerWindow: window, windowRecords: windowRecords),
-                    scope: .init(pid: Int(pid), windowID: record?.id,
+                    scope: .init(pid: Int(pid), processIdentity: appIdentity, windowID: record?.id,
                         priority: appPriority + (index == focusedIndex || index == topmostIndex ? 300 : 0)
                             + AutomationObservationPolicy.keywordScore(title, keywords: keywords))))
             }

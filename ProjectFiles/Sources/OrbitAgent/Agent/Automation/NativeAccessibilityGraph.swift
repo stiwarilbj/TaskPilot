@@ -25,13 +25,28 @@ final class NativeAccessibilityGraph<Node> {
         var pages: [Int: Page] = [:]
         var edges: Set<Int> = []
     }
+    private struct StallRecord {
+        let node: Node
+        var failures: Int
+        var lastFailure: TimeInterval
+        var deferredUntil: TimeInterval?
+        var sequence: UInt64
+    }
     private let lock = NSLock()
     private let hash: (Node) -> UInt
     private let equal: (Node, Node) -> Bool
     private let capacity: Int
     private let maxAge: TimeInterval
+    private let stallCapacity: Int
+    private let stallThreshold: Int
+    private let stallWindow: TimeInterval
+    private let stallCooldown: TimeInterval
+    private let processIdentity: AutomationApplicationIdentity?
     private let now: () -> TimeInterval
     private var buckets: [UInt: [Int]] = [:]
+    private var stalls: [UInt: [StallRecord]] = [:]
+    private var stallCount = 0
+    private var nextStallSequence: UInt64 = 0
     private var records: [Int: Record] = [:]
     private var nextID = 0
     private var edgeCount = 0
@@ -45,9 +60,15 @@ final class NativeAccessibilityGraph<Node> {
     var rebuilds: Int { lock.withLock { rebuildCount } }
 
     init(capacity: Int = 4096, maxAge: TimeInterval = 2,
+         stallCapacity: Int = 1024, stallThreshold: Int = 2,
+         stallWindow: TimeInterval = 5, stallCooldown: TimeInterval = 2,
+         processIdentity: AutomationApplicationIdentity? = nil,
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
          hash: @escaping (Node) -> UInt, equal: @escaping (Node, Node) -> Bool) {
         self.capacity = max(1, capacity); self.maxAge = max(0, maxAge)
+        self.stallCapacity = max(1, stallCapacity); self.stallThreshold = max(2, stallThreshold)
+        self.stallWindow = max(0, stallWindow); self.stallCooldown = max(0, stallCooldown)
+        self.processIdentity = processIdentity
         self.now = now; self.hash = hash; self.equal = equal; refreshed = now()
     }
     private func find(_ node: Node) -> Int? {
@@ -57,6 +78,78 @@ final class NativeAccessibilityGraph<Node> {
         records.removeAll(); buckets.removeAll(); nextID = 0; edgeCount = 0
         revision &+= 1; refreshed = now(); rebuildCount += 1
     }
+    private func processMatches(_ identity: AutomationApplicationIdentity?) -> Bool {
+        guard let processIdentity else { return identity == nil }
+        return identity == processIdentity
+    }
+    private func stallIndex(_ node: Node) -> (hash: UInt, index: Int)? {
+        let key = hash(node)
+        guard let index = stalls[key]?.firstIndex(where: { equal($0.node, node) }) else { return nil }
+        return (key, index)
+    }
+    private func removeStall(_ node: Node) {
+        guard let location = stallIndex(node), var bucket = stalls[location.hash] else { return }
+        bucket.remove(at: location.index); stallCount -= 1
+        if bucket.isEmpty { stalls.removeValue(forKey: location.hash) }
+        else { stalls[location.hash] = bucket }
+    }
+    private func removeOldestStallIfNeeded() {
+        guard stallCount >= stallCapacity else { return }
+        var oldest: (hash: UInt, index: Int, sequence: UInt64)?
+        for (key, bucket) in stalls {
+            for (index, record) in bucket.enumerated() where oldest == nil || record.sequence < oldest!.sequence {
+                oldest = (key, index, record.sequence)
+            }
+        }
+        guard let oldest, var bucket = stalls[oldest.hash] else { return }
+        bucket.remove(at: oldest.index); stallCount -= 1
+        if bucket.isEmpty { stalls.removeValue(forKey: oldest.hash) }
+        else { stalls[oldest.hash] = bucket }
+    }
+    private func clearStalls() { stalls.removeAll(); stallCount = 0 }
+
+    /// Record only slow native failures. A single error never blocks discovery;
+    /// repeated failures on this exact node earn a brief cooldown.
+    func recordTimeout(_ node: Node, processIdentity identity: AutomationApplicationIdentity? = nil) {
+        lock.withLock {
+            guard !closed, processMatches(identity) else { return }
+            let current = now()
+            let key = hash(node)
+            if var bucket = stalls[key], let index = bucket.firstIndex(where: { equal($0.node, node) }) {
+                var record = bucket[index]
+                if current - record.lastFailure > stallWindow {
+                    record.failures = 1
+                    record.deferredUntil = nil
+                } else {
+                    record.failures += 1
+                }
+                record.lastFailure = current
+                record.sequence = nextStallSequence
+                nextStallSequence &+= 1
+                if record.failures >= stallThreshold { record.deferredUntil = current + stallCooldown }
+                bucket[index] = record
+                stalls[key] = bucket
+            } else {
+                removeOldestStallIfNeeded()
+                stalls[key, default: []].append(StallRecord(node: node, failures: 1,
+                    lastFailure: current, deferredUntil: nil, sequence: nextStallSequence))
+                nextStallSequence &+= 1
+                stallCount += 1
+            }
+        }
+    }
+
+    /// Cooldown expiry is the retry path when no useful subtree notification
+    /// arrives. Expired counters are discarded so a recovered app gets a fresh
+    /// chance before it can be deferred again.
+    func shouldDefer(_ node: Node, processIdentity identity: AutomationApplicationIdentity? = nil) -> Bool {
+        lock.withLock {
+            guard !closed, processMatches(identity), let location = stallIndex(node),
+                  let record = stalls[location.hash]?[location.index], let until = record.deferredUntil else { return false }
+            guard now() < until else { removeStall(node); return false }
+            return true
+        }
+    }
     func setMonitoring(_ available: Bool) {
         lock.withLock {
             guard !closed else { return }
@@ -65,7 +158,7 @@ final class NativeAccessibilityGraph<Node> {
         }
     }
     func gap() { lock.withLock { guard !closed else { return }; clear() } }
-    func close() { lock.withLock { clear(); closed = true; monitored = false } }
+    func close() { lock.withLock { clear(); clearStalls(); closed = true; monitored = false } }
     var nodeCount: Int { lock.withLock { records.count } }
     func beginRead() -> Ticket {
         lock.withLock {
@@ -117,10 +210,11 @@ final class NativeAccessibilityGraph<Node> {
     }
     private func invalidate(_ node: Node) {
         revision &+= 1
-        guard let root = find(node) else { clear(); return }
+        guard let root = find(node) else { clear(); clearStalls(); return }
         var pending = [root], seen: Set<Int> = []
         while let id = pending.popLast() {
             guard seen.insert(id).inserted else { continue }
+            if let node = records[id]?.node { removeStall(node) }
             pending.append(contentsOf: records[id]?.edges ?? [])
             edgeCount -= records[id]?.pages.values.reduce(0) { $0 + $1.children.count } ?? 0
             records[id]?.pages.removeAll(); records[id]?.edges.removeAll()
@@ -129,7 +223,7 @@ final class NativeAccessibilityGraph<Node> {
     func changed(_ node: Node?, uncertain: Bool = false) {
         lock.withLock {
             guard !closed else { return }
-            if uncertain || node == nil { clear() }
+            if uncertain || node == nil { clear(); clearStalls() }
             else { invalidate(node!) }
         }
     }

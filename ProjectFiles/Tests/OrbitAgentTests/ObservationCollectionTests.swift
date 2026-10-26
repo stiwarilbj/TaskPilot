@@ -130,6 +130,40 @@ final class ObservationCollectionTests: XCTestCase {
         XCTAssertEqual(result.expansionAttempts, 0)
     }
 
+    func testDeferredStalledSubtreeIsVisibleAsPartialAndRetriesAfterCooldown() throws {
+        var time: Double = 1
+        let process = AutomationApplicationIdentity(pid: 42, bundleID: "fixture", bundlePath: "/fixture",
+            name: "Fixture", launchDate: Date(timeIntervalSince1970: 1))
+        let graph = NativeAccessibilityGraph<Int>(stallThreshold: 2, stallWindow: 5, stallCooldown: 2,
+            processIdentity: process, now: { time }, hash: { UInt($0) }, equal: ==)
+        graph.recordTimeout(9, processIdentity: process); graph.recordTimeout(9, processIdentity: process)
+        var inspected = 0, childReads = 0
+        func collect(_ revision: String) throws -> ObservationCollection<Int> {
+            let result = ObservationCollection<Int>(budget: 1, now: { time })
+            try result.collect(roots: [.init(node: 9, scope: .init(pid: 42, processIdentity: process))],
+                revision: revision, check: {}, equal: ==,
+                inspect: { _, _ in inspected += 1; return .init() },
+                children: { _, _, _ in childReads += 1; return .init(nodes: [], total: 0) },
+                shouldDefer: { entry in
+                    guard let identity = entry.scope.processIdentity else { return false }
+                    return graph.shouldDefer(entry.node, processIdentity: identity)
+                })
+            return result
+        }
+
+        let deferred = try collect("deferred")
+        XCTAssertEqual(inspected, 0); XCTAssertEqual(childReads, 0)
+        XCTAssertEqual(deferred.metadata["state"] as? String, "partial")
+        XCTAssertEqual(deferred.reasonCounts["accessibility_stalled_subtree_deferred"], 1)
+        let limitation = try XCTUnwrap((deferred.metadata["limitations"] as? [[String: Any]])?.first)
+        XCTAssertEqual(limitation["pid"] as? Int, 42)
+
+        time += 2
+        let retried = try collect("retry")
+        XCTAssertEqual(inspected, 1); XCTAssertEqual(childReads, 1)
+        XCTAssertEqual(retried.metadata["state"] as? String, "complete")
+    }
+
     func testCancellationNeverReturnsAnAcceptedCollection() throws {
         let world = World(); world.tree = [0: [1]]
         world.afterInspection = { world.cancelled = true }
