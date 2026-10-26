@@ -252,7 +252,10 @@ final class AgentRuntimeProcess {
         // Fixture executables may omit the descriptor; shipped task launches
         // always resolve the same private instance used by readiness and setup.
         if let descriptor = try? ManagedOpenClawDescriptor.load(), descriptor.executable == openClawURL.path {
-            environment.merge(descriptor.environment) { _, managed in managed }
+            environment = descriptor.environment
+            environment["PYTHONUNBUFFERED"] = "1"
+            environment["ORBIT_CONTROLLER_PID"] = String(getpid())
+            environment["ORBIT_OPENCLAW_PATH"] = openClawURL.path
             lease.managedRuntimeRoot = ManagedOpenClawDescriptor.root
         }
         process.environment = environment

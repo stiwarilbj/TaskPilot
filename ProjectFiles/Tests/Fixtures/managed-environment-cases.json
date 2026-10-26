@@ -1,0 +1,91 @@
+[
+  {
+    "name": "empty",
+    "inherited": {},
+    "expected": {
+      "LANG": "en_US.UTF-8",
+      "LC_ALL": "en_US.UTF-8",
+      "PATH": "/private/node/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+      "OPENCLAW_HIDE_BANNER": "1",
+      "OPENCLAW_SUPPRESS_NOTES": "1",
+      "OPENCLAW_NO_RESPAWN": "1"
+    },
+    "code": 10
+  },
+  {
+    "name": "already_normalized",
+    "inherited": {
+      "LANG": "en_US.UTF-8",
+      "LC_ALL": "en_US.UTF-8",
+      "PATH": "/private/node/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+      "OPENCLAW_HIDE_BANNER": "1",
+      "OPENCLAW_SUPPRESS_NOTES": "1",
+      "OPENCLAW_NO_RESPAWN": "1"
+    },
+    "expected": {
+      "LANG": "en_US.UTF-8",
+      "LC_ALL": "en_US.UTF-8",
+      "PATH": "/private/node/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+      "OPENCLAW_HIDE_BANNER": "1",
+      "OPENCLAW_SUPPRESS_NOTES": "1",
+      "OPENCLAW_NO_RESPAWN": "1"
+    },
+    "code": 0
+  },
+  {
+    "name": "injected_and_conflicting",
+    "inherited": {
+      "HOME": "/private/home",
+      "NODE_OPTIONS": "--import secret",
+      "NODE_PATH": "/secret",
+      "npm_config_prefix": "/shell",
+      "OPENCLAW_STATE_DIR": "/shared",
+      "GEMINI_API_KEY": "secret",
+      "LC_TIME": "custom",
+      "LANGUAGE": "custom",
+      "LANG": "custom",
+      "PATH": "/shell",
+      "HTTPS_PROXY": "http://user:secret@proxy",
+      "https_proxy": "http://other"
+    },
+    "expected": {
+      "LANG": "en_US.UTF-8",
+      "LC_ALL": "en_US.UTF-8",
+      "PATH": "/private/node/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+      "OPENCLAW_HIDE_BANNER": "1",
+      "OPENCLAW_SUPPRESS_NOTES": "1",
+      "OPENCLAW_NO_RESPAWN": "1",
+      "HOME": "/private/home",
+      "HTTPS_PROXY": "http://user:secret@proxy",
+      "https_proxy": "http://user:secret@proxy"
+    },
+    "code": 15
+  },
+  {
+    "name": "lowercase_and_empty_proxies",
+    "inherited": {
+      "LANG": "en_US.UTF-8",
+      "LC_ALL": "en_US.UTF-8",
+      "PATH": "/private/node/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+      "OPENCLAW_HIDE_BANNER": "1",
+      "OPENCLAW_SUPPRESS_NOTES": "1",
+      "OPENCLAW_NO_RESPAWN": "1",
+      "http_proxy": "http://proxy",
+      "NO_PROXY": "",
+      "no_proxy": "keep-me"
+    },
+    "expected": {
+      "LANG": "en_US.UTF-8",
+      "LC_ALL": "en_US.UTF-8",
+      "PATH": "/private/node/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+      "OPENCLAW_HIDE_BANNER": "1",
+      "OPENCLAW_SUPPRESS_NOTES": "1",
+      "OPENCLAW_NO_RESPAWN": "1",
+      "HTTP_PROXY": "http://proxy",
+      "http_proxy": "http://proxy",
+      "NO_PROXY": "",
+      "no_proxy": ""
+    },
+    "code": 4
+  }
+]

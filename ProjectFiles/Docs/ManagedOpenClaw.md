@@ -154,3 +154,40 @@ audits, close with the host, follow no external paths, and perform no recursive
 scans. Vnode delivery is not recursive or guaranteed: missing/unsupported watches
 retain five-minute configuration checks, per-validation file metadata checks,
 and hourly full integrity audits. No generation requests are added.
+
+## Managed Node environment policy (version 1)
+
+Swift launch construction and Python configuration/activation use the same
+fixture-tested policy. Ambient `NODE_*`, `NPM_*`, `npm_*`, provider keys and
+OpenClaw profile settings are removed before private settings are installed.
+`LANG` and `LC_ALL` are `en_US.UTF-8`; other `LC_*` overrides and `LANGUAGE` are
+removed. PATH contains the descriptor's pinned Node directory followed by
+`/usr/bin:/bin:/usr/sbin:/sbin`; provisioning adds its staged Node explicitly.
+No user shell is launched or sourced. The private wrapper also exports the
+pinned PATH and UTF-8 locale. Existing configuration audits can repair an older
+wrapper through the normal owned, drained repair path.
+
+Explicit HTTP, HTTPS, ALL and NO proxy settings are preserved. Uppercase wins
+when uppercase/lowercase aliases conflict (including an explicit empty value),
+and both aliases receive that value. Proxy URLs, credentials, trust settings
+and unrelated environment values are never written to environment diagnostics.
+Other inherited settings, including existing certificate configuration, retain
+their existing behavior; this is a small runtime policy, not a process sandbox.
+
+The fixed diagnostic bitmask compares inherited versus effective categories:
+1 = removed Node/npm overrides, 2 = normalized locale, 4 = normalized proxy
+aliases, 8 = normalized executable search path. Swift emits only this numeric
+code and policy version to the private ManagedEnvironment log category. Python
+activation keeps only `{version, mismatch_code}` in a private mode-600
+`environment-diagnostics.json`; unchanged records are not rewritten. Its audit
+also includes the fixed environment record. These are launch comparisons,
+not failures or Gateway/provider readiness claims. No variable names, values,
+secret-derived hashes or task content are recorded. Diagnostic-write failure
+cannot prevent activation. Existing health/recovery budgets and generation
+counts are unchanged.
+
+Offline reproduction: run `ManagedOpenClawTests` and
+`python3 -m unittest discover -s ProjectFiles/Tests/Python -p test_managed_openclaw.py`.
+The shared `managed-environment-cases.json` covers conflicts and idempotence;
+synthetic child/wrapper tests inspect effective settings without launching
+OpenClaw, a browser, or a desktop task.

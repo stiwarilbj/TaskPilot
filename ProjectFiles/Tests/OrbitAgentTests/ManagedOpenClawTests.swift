@@ -4,6 +4,29 @@ import XCTest
 @testable import OrbitAgent
 
 final class ManagedOpenClawTests: XCTestCase {
+    func testManagedEnvironmentMatchesSharedPolicyAndIsIdempotent() throws {
+        struct Fixture: Decodable { let name: String; let inherited: [String: String]; let expected: [String: String]; let code: Int }
+        let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/managed-environment-cases.json")
+        for fixture in try JSONDecoder().decode([Fixture].self, from: Data(contentsOf: url)) {
+            let result = OpenClawService.managedEnvironment(inherited: fixture.inherited, nodePath: "/private/node/bin/node")
+            XCTAssertEqual(result.values, fixture.expected, fixture.name)
+            XCTAssertEqual(result.mismatchCode, fixture.code, fixture.name)
+            let repeated = OpenClawService.managedEnvironment(inherited: result.values, nodePath: "/private/node/bin/node")
+            XCTAssertEqual(repeated.values, result.values); XCTAssertEqual(repeated.mismatchCode, 0)
+        }
+    }
+
+    func testManagedEnvironmentReachesChildWithoutShellLookupOrNodeInjection() {
+        let effective = OpenClawService.managedEnvironment(inherited: ["NODE_OPTIONS": "--import rejected", "PATH": "/untrusted", "LC_ALL": "custom"], nodePath: "/private/node/bin/node")
+        let result = OpenClawService.run(executable: URL(fileURLWithPath: "/usr/bin/env"), arguments: [], timeout: 2, environment: effective.values)
+        XCTAssertEqual(result.status, 0)
+        let lines = Set(result.output.split(separator: "\n").map(String.init))
+        XCTAssertTrue(lines.contains("PATH=/private/node/bin:/usr/bin:/bin:/usr/sbin:/sbin"))
+        XCTAssertTrue(lines.contains("LC_ALL=en_US.UTF-8"))
+        XCTAssertFalse(lines.contains(where: { $0.hasPrefix("NODE_") }))
+    }
+
     private func hintFixture() throws -> URL {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)

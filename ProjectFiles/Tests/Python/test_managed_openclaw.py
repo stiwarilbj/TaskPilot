@@ -20,6 +20,42 @@ class ManagedRuntimeTests(unittest.TestCase):
         return dict(version=1,instance_id='128bdc78-d592-43a3-b4e1-b6fe3a0e57cd',port=24200,
             endpoint='ws://127.0.0.1:24200',installation_fingerprint='fixture',configuration_fingerprint='config',
             **{k:str(executable) for k in ('executable','node','entry','state','config','workspace','token_file')})
+    def test_managed_environment_matches_shared_policy_and_contains_no_value_diagnostics(self):
+        fixtures=Path(__file__).resolve().parents[1]/'Fixtures/managed-environment-cases.json'
+        for case in json.loads(fixtures.read_text()):
+            with self.subTest(case=case['name']):
+                env,diagnostic=managed.managed_environment(case['inherited'],'/private/node/bin/node')
+                self.assertEqual(env,case['expected'])
+                self.assertEqual(diagnostic,{'version':1,'mismatch_code':case['code']})
+                repeated,clean=managed.managed_environment(env,'/private/node/bin/node')
+                self.assertEqual(repeated,env);self.assertEqual(clean['mismatch_code'],0)
+                self.assertNotIn('secret',json.dumps(diagnostic))
+
+    def test_wrapper_uses_pinned_node_path_and_utf8_locale(self):
+        node=self.root/'node/bin/node';node.parent.mkdir(parents=True)
+        # Synthetic executable reports only assertions; no real OpenClaw or provider.
+        node.write_text('#!/bin/sh\ntest "$LC_ALL" = en_US.UTF-8 && test "$LANG" = en_US.UTF-8 && test -z "$NODE_OPTIONS" && test "${PATH%%:*}" = "${0%/*}"\n')
+        node.chmod(0o700)
+        wrapper=self.root/'wrapper';wrapper.write_text(managed.wrapper_script(self.root,self.root/'config',node,self.root/'entry'))
+        wrapper.chmod(0o700)
+        result=managed.bounded_run([str(wrapper)],env={'PATH':'/bad','NODE_OPTIONS':'--import secret','LANG':'custom'},result=True)
+        self.assertEqual(result[0],0)
+
+    def test_activation_replaces_ambient_environment_and_keeps_only_category_diagnostics(self):
+        value=self.descriptor();managed.atomic_json(self.path,value)
+        with patch.dict(os.environ,{'NODE_OPTIONS':'--import secret','LC_ALL':'custom','PATH':'/shell',
+                                    'HTTPS_PROXY':'http://user:secret@proxy'},clear=True):
+            managed.activate_environment(self.path)
+            self.assertNotIn('NODE_OPTIONS',os.environ)
+            self.assertEqual(os.environ['LC_ALL'],'en_US.UTF-8')
+            self.assertEqual(os.environ['HTTPS_PROXY'],'http://user:secret@proxy')
+            record=self.path.parent/'environment-diagnostics.json'
+            self.assertEqual(json.loads(record.read_text()),{'version':1,'mismatch_code':15})
+            self.assertEqual(record.stat().st_mode & 0o777,0o600)
+        with patch.dict(os.environ,{'NODE_OPTIONS':'secret'},clear=True),patch.object(managed,'atomic_json',side_effect=OSError):
+            self.assertEqual(managed.activate_environment(self.path),value)
+            self.assertNotIn('NODE_OPTIONS',os.environ)
+
     def test_descriptor_rejects_shared_paths_remote_endpoints_bad_types_and_versions(self):
         value=self.descriptor()
         for changes in ({'node':'/usr/bin/node'},{'state':str(Path.home()/'.openclaw')},

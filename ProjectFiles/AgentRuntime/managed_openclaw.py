@@ -506,10 +506,29 @@ def install(resources, root):
     finally:
         if stage.exists(): shutil.rmtree(stage)
 
+def managed_environment(inherited, node=None):
+    """Policy v1 shared with Swift. The diagnostic bitmask never hashes values."""
+    prefixes = ('OPENCLAW_', 'NODE_', 'NPM_', 'npm_', 'GOOGLE_', 'GEMINI_')
+    env = {k:v for k,v in inherited.items() if not k.startswith(prefixes + ('LC_',))}
+    env.pop('LANGUAGE', None)
+    env.update(LANG='en_US.UTF-8', LC_ALL='en_US.UTF-8',
+               PATH=(str(Path(node).parent) + ':' if node else '') + '/usr/bin:/bin:/usr/sbin:/sbin',
+               OPENCLAW_HIDE_BANNER='1', OPENCLAW_SUPPRESS_NOTES='1', OPENCLAW_NO_RESPAWN='1')
+    proxies = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')
+    for name in proxies:
+        value = inherited.get(name, inherited.get(name.lower()))
+        if value is not None: env[name] = env[name.lower()] = value
+    code = 1 if any(k.startswith(('NODE_', 'NPM_', 'npm_')) for k in inherited) else 0
+    if any(inherited.get(k) != env.get(k) for k in inherited.keys() | env.keys()
+           if k in ('LANG', 'LANGUAGE') or k.startswith('LC_')): code |= 2
+    if any(inherited.get(k) != env.get(k) for name in proxies for k in (name, name.lower())): code |= 4
+    if inherited.get('PATH') != env.get('PATH'): code |= 8
+    return env, {'version': 1, 'mismatch_code': code}
+
+
 def isolated_environment():
-    env = {k:v for k,v in os.environ.items() if not k.startswith(('OPENCLAW_', 'NODE_', 'NPM_', 'npm_', 'GOOGLE_', 'GEMINI_'))}
-    env.update(OPENCLAW_HIDE_BANNER='1', OPENCLAW_SUPPRESS_NOTES='1', OPENCLAW_NO_RESPAWN='1')
-    return env
+    return managed_environment(dict(os.environ))[0]
+
 
 def private_port():
     # Reserve sufficient spacing for OpenClaw's derived browser ports.
@@ -619,8 +638,18 @@ def load_descriptor(path: Path = ROOT / 'runtime.json'):
 
 def activate_environment(path):
     d = load_descriptor(path)
-    for key in list(os.environ):
-        if key.startswith(('OPENCLAW_', 'NODE_', 'GOOGLE_', 'GEMINI_')): os.environ.pop(key)
+    env, diagnostic = managed_environment(dict(os.environ), d['node'])
+    # Best-effort, bounded, content-free record. Diagnostic I/O never blocks readiness.
+    record = path.parent / 'environment-diagnostics.json'
+    try:
+        if not record.exists() or record.stat().st_size > 256 or json.loads(record.read_text()) != diagnostic:
+            atomic_json(record, diagnostic)
+    except ValueError:
+        try: atomic_json(record, diagnostic)
+        except OSError: pass
+    except OSError:
+        pass
+    os.environ.clear(); os.environ.update(env)
     os.environ.update(OPENCLAW_STATE_DIR=d['state'], OPENCLAW_CONFIG_PATH=d['config'],
         OPENCLAW_PROFILE='taskpilot', ORBIT_OPENCLAW_PATH=d['executable'],
         TASKPILOT_MANAGED_DESCRIPTOR=str(path),
@@ -841,6 +870,7 @@ def audit(path, *, force_integrity=False):
     fingerprint = hashlib.sha256(':'.join(parts).encode()).hexdigest()
     result = {'version':VERSION, 'ok':not faults, 'causes':sorted(set(faults)), 'fingerprint':fingerprint,
               'full_integrity_ok': integrity_stats.get('audit_mode') == 'full' and installation_ok,
+              'environment': managed_environment(dict(os.environ), d['node'])[1],
               'integrity_audit': {key:integrity_stats.get(key) for key in
                   ('audit_mode','cache_hits','files_hashed','bytes_hashed','integrity_passed')},
               'elapsed_ms':round((time.monotonic()-started)*1000)}
@@ -916,7 +946,9 @@ def wrapper_script(state, config, node, entry):
     script = '#!/bin/sh\nunset OPENCLAW_HOME OPENCLAW_PROFILE OPENCLAW_GATEWAY_TOKEN OPENCLAW_GATEWAY_URL NODE_OPTIONS NODE_PATH\n'
     for name, value in {'OPENCLAW_STATE_DIR':str(state),'OPENCLAW_CONFIG_PATH':str(config),
                         'OPENCLAW_PROFILE':'taskpilot','OPENCLAW_NO_RESPAWN':'1',
-                        'OPENCLAW_HIDE_BANNER':'1','OPENCLAW_SUPPRESS_NOTES':'1'}.items():
+                        'OPENCLAW_HIDE_BANNER':'1','OPENCLAW_SUPPRESS_NOTES':'1',
+                        'LANG':'en_US.UTF-8','LC_ALL':'en_US.UTF-8',
+                        'PATH':str(Path(node).parent) + ':/usr/bin:/bin:/usr/sbin:/sbin'}.items():
         script += 'export ' + name + '=' + shlex.quote(value) + '\n'
     script += 'exec ' + shlex.quote(str(node)) + ' ' + shlex.quote(str(entry)) + ' "$@"\n'
     return script

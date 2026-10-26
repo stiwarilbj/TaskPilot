@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import CryptoKit
 import Network
+import OSLog
 
 struct OpenClawProbe: Equatable, Sendable {
     let executableURL: URL?
@@ -115,6 +116,7 @@ final class OpenClawService {
                 let process = SubprocessSupervisor()
                 process.executableURL = Bundle.main.executableURL
                 process.arguments = ["--managed-openclaw-host", ManagedOpenClawDescriptor.url.path, runtime.path]
+                process.environment = descriptor.environment
                 try process.run(); process.markOutputDrained(); host = process
             }
             // Startup may be in progress. Return promptly; ordinary refreshes
@@ -202,6 +204,34 @@ final class OpenClawService {
         }
     }
 
+    /// Version 1: fixed Node/locale/PATH policy; explicit proxies retain their
+    /// configuration with uppercase precedence. Diagnostics contain category bits only.
+    static func managedEnvironment(inherited: [String: String] = ProcessInfo.processInfo.environment,
+                                   nodePath: String? = nil) -> (values: [String: String], mismatchCode: Int) {
+        let stripped = ["OPENCLAW_", "NODE_", "NPM_", "npm_", "GOOGLE_", "GEMINI_"]
+        var env = inherited.filter { item in !stripped.contains { item.key.hasPrefix($0) } && !item.key.hasPrefix("LC_") }
+        env["LANG"] = "en_US.UTF-8"; env["LC_ALL"] = "en_US.UTF-8"; env.removeValue(forKey: "LANGUAGE")
+        env["PATH"] = (nodePath.map { URL(fileURLWithPath: $0).deletingLastPathComponent().path + ":" } ?? "") + "/usr/bin:/bin:/usr/sbin:/sbin"
+        for name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"] {
+            if let value = inherited[name] ?? inherited[name.lowercased()] {
+                env[name] = value; env[name.lowercased()] = value
+            }
+        }
+        env["OPENCLAW_HIDE_BANNER"] = "1"; env["OPENCLAW_SUPPRESS_NOTES"] = "1"; env["OPENCLAW_NO_RESPAWN"] = "1"
+        var code = 0
+        if inherited.keys.contains(where: { $0.hasPrefix("NODE_") || $0.hasPrefix("NPM_") || $0.hasPrefix("npm_") }) { code |= 1 }
+        if Set(inherited.keys).union(env.keys).contains(where: {
+            ($0 == "LANG" || $0 == "LANGUAGE" || $0.hasPrefix("LC_")) && inherited[$0] != env[$0]
+        }) { code |= 2 }
+        if ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"].contains(where: {
+            inherited[$0] != env[$0] || inherited[$0.lowercased()] != env[$0.lowercased()]
+        }) { code |= 4 }
+        if inherited["PATH"] != env["PATH"] { code |= 8 }
+        Logger(subsystem: "com.orbitagent.controller", category: "ManagedEnvironment")
+            .debug("Managed environment policy 1 mismatch code \(code, privacy: .public)")
+        return (env, code)
+    }
+
     static func candidateExecutableURLs(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
@@ -258,7 +288,7 @@ final class OpenClawService {
             if cancellation?.isCancelled == true { return CommandResult(status: -2, output: "OpenClaw check cancelled") }
             process.executableURL = executable
             process.arguments = arguments
-            process.environment = environment
+            process.environment = environment ?? managedEnvironment().values
             let pipe = try input.map { _ in try SubprocessSupervisor.makePrivatePipe() }
             if let pipe { process.standardInput = pipe }
             let exit = ProcessExitNotification(process)
@@ -303,6 +333,7 @@ final class OpenClawService {
         let process = SubprocessSupervisor()
         process.executableURL = executable
         process.arguments = arguments
+        process.environment = managedEnvironment().values
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         let exit = ProcessExitNotification(process)

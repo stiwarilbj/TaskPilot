@@ -42,10 +42,7 @@ struct ManagedOpenClawDescriptor: Codable, Equatable, Sendable {
         return value
     }
     var environment: [String: String] {
-        var env = ProcessInfo.processInfo.environment.filter {
-            !$0.key.hasPrefix("OPENCLAW_") && !$0.key.hasPrefix("NODE_") &&
-            !$0.key.hasPrefix("GOOGLE_") && !$0.key.hasPrefix("GEMINI_")
-        }
+        var env = OpenClawService.managedEnvironment(nodePath: node).values
         env["OPENCLAW_STATE_DIR"] = state; env["OPENCLAW_CONFIG_PATH"] = config
         env["OPENCLAW_PROFILE"] = "taskpilot"; env["OPENCLAW_NO_RESPAWN"] = "1"
         env["TASKPILOT_MANAGED_DESCRIPTOR"] = (sourceURL ?? Self.url).path
