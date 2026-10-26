@@ -14,6 +14,7 @@ final class RuntimePipeWriter {
     private let failure: (String) -> Void
     private let telemetry: BackendTelemetry
     private var frames: [Frame] = []
+    private var frameHead = 0
     private var bytes = 0
     private var source: DispatchSourceWrite?
     private var deadline: DispatchSourceTimer?
@@ -22,6 +23,7 @@ final class RuntimePipeWriter {
     private let reserve: Int
     private let timeout: TimeInterval
     var pendingBytes: Int { bytes }
+    private var pendingFrameCount: Int { frames.count - frameHead }
 
     init(handle: FileHandle, queue: DispatchQueue, byteLimit: Int = 32 * 1024 * 1024,
          reserve: Int = 8 * 1024 * 1024, timeout: TimeInterval = 5, telemetry: BackendTelemetry = .current,
@@ -44,7 +46,7 @@ final class RuntimePipeWriter {
             waitTicket.discard(.rejected)
             completion(false); fail("transport_frame_limit"); return
         }
-        guard bytes + data.count <= byteLimit - (priority ? 0 : reserve), frames.count < (priority ? 1056 : 1024) else {
+        guard bytes + data.count <= byteLimit - (priority ? 0 : reserve), pendingFrameCount < (priority ? 1056 : 1024) else {
             waitTicket.discard(.rejected)
             completion(false); fail("transport_buffer_limit"); return
         }
@@ -67,35 +69,51 @@ final class RuntimePipeWriter {
 
     private func pump() {
         var allowance = 64 * 1024
-        while !frames.isEmpty && allowance > 0 && !closed {
-            frames[0].waitTicket.start()
-            let written = frames[0].data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
-                Darwin.write(descriptor, buffer.baseAddress!.advanced(by: frames[0].offset),
-                             min(allowance, buffer.count - frames[0].offset))
+        while frameHead < frames.count && allowance > 0 && !closed {
+            frames[frameHead].waitTicket.start()
+            let written = frames[frameHead].data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
+                Darwin.write(descriptor, buffer.baseAddress!.advanced(by: frames[frameHead].offset),
+                             min(allowance, buffer.count - frames[frameHead].offset))
             }
             if written < 0 {
                 if errno == EAGAIN || errno == EINTR { return }
                 fail("transport_closed"); return
             }
             guard written > 0 else { return }
-            frames[0].offset += written; allowance -= written
-            if frames[0].offset == frames[0].data.count {
-                let frame = frames.removeFirst()
+            frames[frameHead].offset += written; allowance -= written
+            if frames[frameHead].offset == frames[frameHead].data.count {
+                let frame = frames[frameHead]
+                frameHead += 1
                 bytes -= frame.data.count
+                compactConsumedPrefixIfNeeded()
                 frame.completion(true)
-                if !frames.isEmpty { armDeadline() }
+                if pendingFrameCount > 0 { armDeadline() }
             }
         }
-        if frames.isEmpty {
+        if pendingFrameCount == 0 {
             source?.cancel(); source = nil
             deadline?.cancel(); deadline = nil
+        }
+    }
+
+    /// Keep steady-state writes O(1); compact only after a meaningful prefix
+    /// has been consumed, or reset the head when the queue drains completely.
+    private func compactConsumedPrefixIfNeeded() {
+        guard frameHead > 0 else { return }
+        if frameHead == frames.count {
+            frames.removeAll(keepingCapacity: true)
+            frameHead = 0
+        } else if frameHead >= 64 && frameHead * 2 >= frames.count {
+            frames.removeFirst(frameHead)
+            frameHead = 0
         }
     }
 
     func cancel() {
         guard !closed else { return }
         closed = true; source?.cancel(); source = nil; deadline?.cancel(); deadline = nil
-        let pending = frames; frames.removeAll(); bytes = 0
+        let pending = Array(frames[frameHead...])
+        frames.removeAll(keepingCapacity: true); frameHead = 0; bytes = 0
         for frame in pending {
             frame.waitTicket.discard(.cancelled)
             frame.completion(false)

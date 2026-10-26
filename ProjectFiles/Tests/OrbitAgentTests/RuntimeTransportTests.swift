@@ -70,6 +70,31 @@ final class RuntimeTransportTests: XCTestCase {
         queue.sync { XCTAssertEqual(writer.pendingBytes, 0); writer.cancel() }
     }
 
+    func testWriterCompactsConsumedPrefixWithoutChangingFIFOOrCompletions() throws {
+        let queue = DispatchQueue(label: "fixture.writer.compaction"), pipe = Pipe()
+        let frameCount = 512, delivered = expectation(description: "Every frame completes in order")
+        delivered.expectedFulfillmentCount = frameCount
+        var callbacks: [Int] = []
+        var writer: RuntimePipeWriter!
+        queue.sync {
+            writer = RuntimePipeWriter(handle: pipe.fileHandleForWriting, queue: queue,
+                                       byteLimit: 1_024, reserve: 128) { code in XCTFail(code) }
+            for value in 0..<frameCount {
+                writer.enqueue(Data([UInt8(value % 256)])) { success in
+                    XCTAssertTrue(success)
+                    callbacks.append(value)
+                    delivered.fulfill()
+                }
+            }
+            XCTAssertEqual(writer.pendingBytes, frameCount)
+        }
+        wait(for: [delivered], timeout: 2)
+        XCTAssertEqual(callbacks, Array(0..<frameCount))
+        let bytes = try pipe.fileHandleForReading.read(upToCount: frameCount)
+        XCTAssertEqual(bytes, Data((0..<frameCount).map { UInt8($0 % 256) }))
+        queue.sync { XCTAssertEqual(writer.pendingBytes, 0); writer.cancel() }
+    }
+
     func testWriterQueueWaitEndsAtFirstWriteAndSeparatesPendingCancellation() {
         let queue = DispatchQueue(label: "fixture.writer.queue-wait"), pipe = Pipe()
         let clock = FakeClock(), telemetry = BackendTelemetry(now: { clock.now() })
