@@ -234,10 +234,10 @@ final class AgentRuntimeProcess {
             throw RuntimeProcessError.runtimeMissing
         }
 
-        let process = SubprocessSupervisor()
-        let input = try SubprocessSupervisor.makePrivatePipe()
-        let output = try SubprocessSupervisor.makePrivatePipe()
-        let error = try SubprocessSupervisor.makePrivatePipe()
+        let process = SubprocessSupervisor(descriptorOwner: lease.descriptorOwner)
+        let input = try SubprocessSupervisor.makePrivatePipe(owner: lease.descriptorOwner, subsystem: .runtimeWritePipe)
+        let output = try SubprocessSupervisor.makePrivatePipe(owner: lease.descriptorOwner, subsystem: .runtimeReadPipe)
+        let error = try SubprocessSupervisor.makePrivatePipe(owner: lease.descriptorOwner, subsystem: .runtimeReadPipe)
         try bridge.bind(lease)
         process.executableURL = runtimeURL
         process.arguments = [
@@ -269,7 +269,7 @@ final class AgentRuntimeProcess {
         startupTransferred = true
         syncIO {
             invocation = run
-            run.writer = RuntimePipeWriter(handle: input.fileHandleForWriting, queue: ioQueue, telemetry: telemetry) { [weak self, weak run] code in
+            run.writer = RuntimePipeWriter(handle: input.fileHandleForWriting, queue: ioQueue, descriptorOwner: lease.descriptorOwner, telemetry: telemetry) { [weak self, weak run] code in
                 guard let self, let run else { return }
                 self.failTransport(code, for: run)
             }
@@ -281,7 +281,7 @@ final class AgentRuntimeProcess {
             guard let self else { return }
             self.enqueueIO {
                 terminated.terminationHandler = nil
-                guard self.invocation === run, run.process === terminated else { return }
+                guard self.invocation === run, run.process === terminated, !run.exited else { return }
                 // Parent exit is not tree exit. Keep readers installed while
                 // remaining runtime children are terminated and drained.
                 if !run.requestedStop && run.pendingTerminalEvent == nil {
@@ -292,12 +292,16 @@ final class AgentRuntimeProcess {
                 run.process.beginTeardown()
                 run.process.whenTreeExits {
                     self.enqueueIO {
-                        guard self.invocation === run else { return }
+                        guard self.invocation === run, !run.exited else { return }
                         output.fileHandleForReading.readabilityHandler = nil
                         error.fileHandleForReading.readabilityHandler = nil
                         self.drainAvailable(output.fileHandleForReading) { self.appendOutput($0, for: run) }
                         self.appendOutput(Data(), for: run, flush: true)
                         self.drainAvailable(error.fileHandleForReading) { self.appendError($0, for: run) }
+                        // Tree exit and final reads precede controller-side closure.
+                        try? output.fileHandleForReading.close()
+                        try? error.fileHandleForReading.close()
+                        try? input.fileHandleForWriting.close()
                         run.process.markOutputDrained()
                         run.exited = true
                         if !run.requestedStop && run.pendingTerminalEvent == nil {
@@ -362,6 +366,9 @@ final class AgentRuntimeProcess {
             error.fileHandleForReading.readabilityHandler = nil
             process.terminationHandler = nil
             if process.isRunning { process.terminate() }
+            for pipe in [input, output, error] {
+                try? pipe.fileHandleForReading.close(); try? pipe.fileHandleForWriting.close()
+            }
             lease.revoke()
             run.startupSpan?.finish(.failed)
             run.startupSpan = nil
@@ -579,7 +586,7 @@ final class AgentRuntimeProcess {
             // bridge response and deadlock the controller pipe.
             handle.readabilityHandler = nil
             self?.enqueueIO { [weak self] in
-                guard let self, self.invocation === run else { return }
+                guard let self, self.invocation === run, !run.exited else { return }
                 let eof = self.drainAvailable(handle) { self.appendOutput($0, for: run) }
                 if !eof && !run.exited { self.installOutputHandler(handle, for: run) }
             }
@@ -590,7 +597,7 @@ final class AgentRuntimeProcess {
         handle.readabilityHandler = { [weak self] handle in
             handle.readabilityHandler = nil
             self?.enqueueIO { [weak self] in
-                guard let self, self.invocation === run else { return }
+                guard let self, self.invocation === run, !run.exited else { return }
                 let eof = self.drainAvailable(handle) { self.appendError($0, for: run) }
                 if !eof && !run.exited { self.installErrorHandler(handle, for: run) }
             }

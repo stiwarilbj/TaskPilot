@@ -65,10 +65,12 @@ final class SubprocessSupervisor: @unchecked Sendable {
     // Injection rejects before spawn, also exercising group-setup failures.
     private let launchCheck: () throws -> Void
     private let inspectionCheck: () -> Bool
+    let descriptorOwner: BackendDescriptors.Owner?
     private let resourceSnapshot: () -> DescriptorHeadroom?
 
-    init(launchCheck: @escaping () throws -> Void = {}, inspectionCheck: @escaping () -> Bool = { true },
+    init(descriptorOwner: BackendDescriptors.Owner? = TaskOwnership.current?.descriptorOwner, launchCheck: @escaping () throws -> Void = {}, inspectionCheck: @escaping () -> Bool = { true },
          resourceSnapshot: @escaping () -> DescriptorHeadroom? = { DescriptorHeadroom.read() }) {
+        self.descriptorOwner = descriptorOwner
         self.launchCheck = launchCheck; self.inspectionCheck = inspectionCheck; self.resourceSnapshot = resourceSnapshot
     }
     var snapshot: Snapshot { condition.withLock { state } }
@@ -77,9 +79,15 @@ final class SubprocessSupervisor: @unchecked Sendable {
 
     /// Foundation's Pipe does not set FD_CLOEXEC. Protect both controller
     /// copies before registering readers or publishing the pipe to a writer.
-    static func makePrivatePipe() throws -> Pipe {
+    static func makePrivatePipe(owner: BackendDescriptors.Owner? = TaskOwnership.current?.descriptorOwner,
+                                subsystem: BackendDescriptors.Subsystem = .subprocess) throws -> Pipe {
         let pipe = Pipe()
-        do { try protectPipeDescriptors(pipe); return pipe }
+        do {
+            try protectPipeDescriptors(pipe)
+            BackendDescriptors.shared.track(pipe.fileHandleForReading, subsystem: subsystem, owner: owner)
+            BackendDescriptors.shared.track(pipe.fileHandleForWriting, subsystem: subsystem, owner: owner)
+            return pipe
+        }
         catch {
             try? pipe.fileHandleForReading.close()
             try? pipe.fileHandleForWriting.close()
@@ -112,7 +120,8 @@ final class SubprocessSupervisor: @unchecked Sendable {
             defer { argv.forEach { free($0) }; env.forEach { free($0) } }
             let null = Darwin.open("/dev/null", O_RDWR | O_CLOEXEC)
             guard null >= 0 else { throw Failure.launch(errno) }
-            defer { Darwin.close(null) }
+            let nullTicket = BackendDescriptors.shared.opened(.subprocess, owner: descriptorOwner)
+            defer { Darwin.close(null); nullTicket.finish() }
             func descriptor(_ object: Any, reading: Bool) -> Int32 {
                 if let pipe = object as? Pipe { return (reading ? pipe.fileHandleForReading : pipe.fileHandleForWriting).fileDescriptor }
                 let descriptor = (object as? FileHandle ?? .nullDevice).fileDescriptor

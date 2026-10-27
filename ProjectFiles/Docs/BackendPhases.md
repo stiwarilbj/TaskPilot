@@ -141,3 +141,36 @@ are excluded from the baseline. An offline Instruments trace verified 810 paired
 intervals across the eleven exercised phases, with numeric-only end metadata.
 Capture/preview intervals require separately
 authorized live validation; the offline fixtures do not exercise them.
+
+## Open descriptor accounting
+
+`BackendDescriptors` keeps in-memory counts for fixed subsystems: subprocess
+launch, runtime read/write pipes, command output, capture-directory leases, and
+magnifier image readers. Each task gets a fresh opaque accounting owner with a
+zero baseline. Its active/draining/retired lifecycle follows the existing task
+lease. Unowned app helpers are counted separately from task snapshots. No task
+IDs, paths, descriptor numbers, content, or new history fields are recorded.
+
+Raw descriptor tickets finish alongside `close`; they never close resources or
+infer success. File handles are observed weakly and reconciled at admission,
+snapshot, lifecycle change, and drain. The Objective-C boundary safely handles
+Foundation's closed-handle exception. Borrowing a pipe for the runtime writer
+recategorizes its entry without counting it twice or adopting another task's
+handle. Closing a writer queue does not imply its caller-owned pipe closed.
+Runtime streams close only after final output drainage, or on launch failure.
+
+Retirement checks whether tracked task descriptors returned to zero and counts
+runs with outstanding work. A separate retained-resource count identifies
+intentional capture/reader holds and authorized persistent-service output;
+these stay visible until their real release. Outstanding counts are diagnostic,
+not proof of a leak, and never delay cleanup, change completion, terminate a
+service, or replay work. Snapshot counts update as retained resources close.
+There are no timers, persisted records, or model requests. The existing
+process-wide prelaunch headroom check remains independent: this inventory covers
+instrumented TaskPilot handles, not framework-internal ImageIO/ScreenCaptureKit
+handles, system descriptors, or descriptors in child processes.
+
+Offline reproduction: `swift test --filter
+'BackendDescriptorsTests|TaskOwnershipTests|AgentActionMagnifierTests|SubprocessSupervisorTests|BufferedProcessOutputTests|TaskTemporaryResourcesTests'`.
+Fixtures exercise actual pipes, synthetic image files and local subprocesses;
+they do not control applications or capture the desktop.

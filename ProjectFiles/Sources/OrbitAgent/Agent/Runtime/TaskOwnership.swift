@@ -5,6 +5,7 @@ import Foundation
 /// One immutable capability for a task. Revocation is serialized with native
 /// commits; cancellation is only a wake-up mechanism, never authorization.
 final class TaskLease: @unchecked Sendable {
+    let descriptorOwner = BackendDescriptors.Owner()
     enum State { case running, paused, draining, retired }
     let id: String
     let actionReceipts: ActionReceiptStore
@@ -543,6 +544,7 @@ final class TaskLease: @unchecked Sendable {
         for waiter in waiters { waiter() }
     }
     func revoke() {
+        BackendDescriptors.shared.transition(descriptorOwner, to: .draining)
         lock.lock()
         if value != .retired { value = .draining }
         let observers = Array(revocationObservers.values); revocationObservers.removeAll()
@@ -557,7 +559,7 @@ final class TaskLease: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard value == .running || value == .paused else { throw CancellationError() }
         if let scratchLease { return scratchLease.directoryURL }
-        let lease = try TaskTemporaryResourceLedger.makeLease(root: scratchRoot)
+        let lease = try TaskTemporaryResourceLedger.makeLease(root: scratchRoot, descriptorOwner: descriptorOwner)
         scratchLease = lease
         return lease.directoryURL
     }
@@ -696,6 +698,8 @@ final class TaskLease: @unchecked Sendable {
         _ = drainPersistentProcesses()
         lock.lock(); persistentProcesses.removeAll(); lock.unlock()
         actionReceipts.discard()
+        BackendDescriptors.shared.transition(descriptorOwner, to: .retired)
+        BackendDescriptors.shared.checkDrain(descriptorOwner)
     }
     func accepts(_ id: String?) -> Bool {
         lock.lock(); defer { lock.unlock() }

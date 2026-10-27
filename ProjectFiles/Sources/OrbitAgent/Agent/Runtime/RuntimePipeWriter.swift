@@ -31,9 +31,11 @@ final class RuntimePipeWriter {
     private var pendingFrameCount: Int { frames.count - frameHead }
 
     init(handle: FileHandle, queue: DispatchQueue, byteLimit: Int = 32 * 1024 * 1024,
-         reserve: Int = 8 * 1024 * 1024, timeout: TimeInterval = 5, telemetry: BackendTelemetry = .current,
+         reserve: Int = 8 * 1024 * 1024, timeout: TimeInterval = 5,
+         descriptorOwner: BackendDescriptors.Owner? = TaskOwnership.current?.descriptorOwner, telemetry: BackendTelemetry = .current,
          writeOperation: @escaping WriteOperation = { descriptor, bytes, count in Darwin.write(descriptor, bytes, count) },
          failure: @escaping (String) -> Void) {
+        BackendDescriptors.shared.track(handle, subsystem: .runtimeWritePipe, owner: descriptorOwner)
         descriptor = handle.fileDescriptor; self.queue = queue; self.failure = failure; self.telemetry = telemetry
         self.writeOperation = writeOperation
         self.byteLimit = byteLimit; self.reserve = reserve; self.timeout = timeout

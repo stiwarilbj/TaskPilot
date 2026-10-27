@@ -50,9 +50,10 @@ final class BufferedProcessOutput: @unchecked Sendable {
         var retained = 0
         var drained: UInt64 = 0
         var eof = false
-        init() throws { pipe = try SubprocessSupervisor.makePrivatePipe() }
+        init() throws { pipe = try SubprocessSupervisor.makePrivatePipe(subsystem: .commandOutput) }
     }
 
+    private let descriptorOwner = TaskOwnership.current?.descriptorOwner
     private let queue = DispatchQueue(label: "com.orbitagent.buffered-process-output", qos: .utility)
     private let cancellations = DispatchGroup()
     private let streams: [Stream]
@@ -203,7 +204,9 @@ final class BufferedProcessOutput: @unchecked Sendable {
         guard FileManager.default.createFile(atPath: path.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
             throw CaptureError.storage
         }
-        return try FileHandle(forUpdating: path)
+        let handle = try FileHandle(forUpdating: path)
+        BackendDescriptors.shared.track(handle, subsystem: .commandOutput, owner: descriptorOwner)
+        return handle
     }
 
     /// Called only after the process has exited. Drain remaining readable
@@ -222,7 +225,17 @@ final class BufferedProcessOutput: @unchecked Sendable {
         }
         queue.sync {
             guard !stopped else { return }
-            if keepDraining { discardFurtherOutput = true }
+            if keepDraining {
+                discardFurtherOutput = true
+                for stream in streams {
+                    BackendDescriptors.shared.track(stream.pipe.fileHandleForReading, subsystem: .commandOutput,
+                                                     owner: descriptorOwner, retention: .retainedResource)
+                    if let spill = stream.spill {
+                        BackendDescriptors.shared.track(spill, subsystem: .commandOutput,
+                                                         owner: descriptorOwner, retention: .retainedResource)
+                    }
+                }
+            }
             else {
                 stopped = true
                 for stream in streams { stream.source?.cancel() }

@@ -403,9 +403,11 @@ final class TaskOwnershipTests: XCTestCase {
             default: break
             }
         }
-        try runtime.start(task: "fixture", display: display, runtimeURL: helper, openClawURL: helper, geminiAPIKey: "")
+        let descriptorLease = TaskLease()
+        try runtime.start(task: "fixture", display: display, runtimeURL: helper, openClawURL: helper, geminiAPIKey: "", lease: descriptorLease)
         await fulfillment(of: [stopped], timeout: 3)
         XCTAssertEqual(terminalCount, 1)
+        XCTAssertTrue(BackendDescriptors.shared.checkDrain(descriptorLease.descriptorOwner).returnedToBaseline)
     }
     func testStoppingOwnedCommandDrainsItsProcessAndCannotWriteAgain() async throws {
         let lease = TaskLease(), executor = TaskToolExecutor()
@@ -487,10 +489,12 @@ final class TaskOwnershipTests: XCTestCase {
             }
             if case .failed(let message) = event { XCTFail(message); complete.fulfill() }
         }
-        try runtime.start(task: "fixture", display: display, runtimeURL: helper, openClawURL: helper, geminiAPIKey: "")
+        let descriptorLease = TaskLease()
+        try runtime.start(task: "fixture", display: display, runtimeURL: helper, openClawURL: helper, geminiAPIKey: "", lease: descriptorLease)
         await fulfillment(of: [complete], timeout: 5)
         XCTAssertEqual(messages, (0..<1200).map { "\($0): ☃ 🧭" })
         XCTAssertEqual(terminalCount, 1)
+        XCTAssertTrue(BackendDescriptors.shared.checkDrain(descriptorLease.descriptorOwner).returnedToBaseline)
         #if DEBUG
         XCTAssertEqual(telemetry.snapshotSizeAudit().underestimationCount, 19)
         XCTAssertGreaterThan(telemetry.snapshotSizeAudit().maximumShortfallBytes, 0)

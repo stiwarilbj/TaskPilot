@@ -38,7 +38,7 @@ enum TaskTemporaryResourceLedger {
             .appendingPathComponent(directoryName, isDirectory: true)
     }
 
-    static func makeLease(root: URL = defaultRoot) throws -> TaskTemporaryResourceLease {
+    static func makeLease(root: URL = defaultRoot, descriptorOwner: BackendDescriptors.Owner? = TaskOwnership.current?.descriptorOwner) throws -> TaskTemporaryResourceLease {
         let rootDescriptor = try openRoot(root, create: true)
         defer { close(rootDescriptor) }
 
@@ -102,7 +102,7 @@ enum TaskTemporaryResourceLedger {
         transferredLease = true
         return TaskTemporaryResourceLease(root: root, directory: directory, leaseDescriptor: leaseDescriptor,
             directoryDescriptor: directoryDescriptor,
-            device: directoryStatus.st_dev, inode: directoryStatus.st_ino)
+            device: directoryStatus.st_dev, inode: directoryStatus.st_ino, descriptorOwner: descriptorOwner)
     }
 
     /// Reclaims only UUID-named private directories whose lease is available
@@ -350,15 +350,17 @@ final class TaskCaptureDirectory: @unchecked Sendable {
     }
     let directoryURL: URL
     private let descriptor: Int32
+    private let descriptorTicket: BackendDescriptors.Ticket
     private let identity: TaskTemporaryResourceLedger.DirectoryIdentity
     private let conflictLock = NSLock()
     private var removalConflict = false
     var hasRemovalConflict: Bool { conflictLock.withLock { removalConflict } }
-    fileprivate init(directoryURL: URL, descriptor: Int32, status: stat) {
+    fileprivate init(directoryURL: URL, descriptor: Int32, status: stat, descriptorOwner: BackendDescriptors.Owner?) {
+        descriptorTicket = BackendDescriptors.shared.opened(.capture, owner: descriptorOwner, retention: .retainedResource)
         self.directoryURL = directoryURL; self.descriptor = descriptor
         identity = .init(status)
     }
-    deinit { close(descriptor) }
+    deinit { close(descriptor); descriptorTicket.finish() }
 
     func filename(for url: URL) -> String? {
         guard url.isFileURL, url.pathExtension == "png",
@@ -424,11 +426,17 @@ final class TaskTemporaryResourceLease: @unchecked Sendable {
     private let lock = NSLock()
     private var descriptor: Int32
     private var directoryDescriptor: Int32
+    private let descriptorOwner: BackendDescriptors.Owner?
+    private let directoryTicket: BackendDescriptors.Ticket
+    private let leaseTicket: BackendDescriptors.Ticket
     private var captureStorage: TaskCaptureDirectory?
     private var removed = false
 
     fileprivate init(root: URL, directory: URL, leaseDescriptor: Int32, directoryDescriptor: Int32,
-                     device: dev_t, inode: ino_t) {
+                     device: dev_t, inode: ino_t, descriptorOwner: BackendDescriptors.Owner?) {
+        self.descriptorOwner = descriptorOwner
+        directoryTicket = BackendDescriptors.shared.opened(.capture, owner: descriptorOwner, retention: .retainedResource)
+        leaseTicket = BackendDescriptors.shared.opened(.capture, owner: descriptorOwner, retention: .retainedResource)
         rootURL = root; directoryURL = directory; descriptor = leaseDescriptor
         self.directoryDescriptor = directoryDescriptor
         self.device = device; self.inode = inode
@@ -455,7 +463,7 @@ final class TaskTemporaryResourceLease: @unchecked Sendable {
         guard fstat(child, &current) == 0, fsync(directoryDescriptor) == 0 else { throw TaskTemporaryResourceError.unavailable }
         try TaskTemporaryResourceLedger.recordCaptureDirectory(current, leaseDescriptor: descriptor)
         let capture = TaskCaptureDirectory(directoryURL: directoryURL.appendingPathComponent("capture", isDirectory: true),
-                                           descriptor: child, status: current)
+                                           descriptor: child, status: current, descriptorOwner: descriptorOwner)
         transferred = true
         guard capture.pathIsCurrent() else { throw TaskTemporaryResourceError.unavailable }
         captureStorage = capture
@@ -484,16 +492,16 @@ final class TaskTemporaryResourceLease: @unchecked Sendable {
         lock.lock(); descriptor = -1
         let directory = directoryDescriptor; directoryDescriptor = -1; captureStorage = nil
         lock.unlock()
-        if directory >= 0 { close(directory) }
+        if directory >= 0 { close(directory); directoryTicket.finish() }
         flock(leaseDescriptor, LOCK_UN)
-        close(leaseDescriptor)
+        close(leaseDescriptor); leaseTicket.finish()
     }
 
     deinit {
         lock.lock(); let leaseDescriptor = descriptor; descriptor = -1
         let directory = directoryDescriptor; directoryDescriptor = -1; lock.unlock()
-        if directory >= 0 { close(directory) }
-        if leaseDescriptor >= 0 { flock(leaseDescriptor, LOCK_UN); close(leaseDescriptor) }
+        if directory >= 0 { close(directory); directoryTicket.finish() }
+        if leaseDescriptor >= 0 { flock(leaseDescriptor, LOCK_UN); close(leaseDescriptor); leaseTicket.finish() }
     }
 }
 

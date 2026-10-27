@@ -44,13 +44,18 @@ final class AgentActionMagnifierTests: XCTestCase {
             try AgentMagnifierImageSource(url: url, mapping: mapping, protectedTargets: [])
         }
         var reader: AgentMagnifierImageReader? = try XCTUnwrap(source?.makeReader())
+        XCTAssertEqual(BackendDescriptors.shared.snapshot(owner: lease.descriptorOwner)
+            .filter { $0.subsystem == .magnifier }.reduce(0) { $0 + $1.open }, 2)
         source = nil
         lease.revoke(); lease.retire()
+        XCTAssertEqual(BackendDescriptors.shared.snapshot(owner: lease.descriptorOwner)
+            .filter { $0.subsystem == .magnifier }.reduce(0) { $0 + $1.retained }, 1)
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
         XCTAssertNotNil(reader?.crop(target: nil, pointer: CGPoint(x: -2432, y: -420)))
         withExtendedLifetime(reader) {}; reader = nil
         XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
         XCTAssertEqual(lease.captureArtifactUsage, .init(fileCount: 0, totalBytes: 0))
+        XCTAssertTrue(BackendDescriptors.shared.checkDrain(lease.descriptorOwner).returnedToBaseline)
     }
     func testAcceptedRetinaFrameCanBeCroppedAfterItsPathIsUnlinked() throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("magnifier-\(UUID()).png")

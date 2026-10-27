@@ -74,6 +74,8 @@ final class AgentMagnifierImageSource: @unchecked Sendable {
     private let protectedTargets: [CGRect]
     private let lock = NSLock()
     private var descriptor: Int32
+    private let descriptorTicket: BackendDescriptors.Ticket
+    private let descriptorOwner: BackendDescriptors.Owner?
     private let artifactHold: CaptureArtifactHold?
 
     init(url: URL, mapping: ScreenCoordinateMapping, protectedTargets: [CGRect]) throws {
@@ -87,6 +89,8 @@ final class AgentMagnifierImageSource: @unchecked Sendable {
             throw POSIXError(.EFBIG)
         }
         self.artifactHold = artifactHold
+        descriptorOwner = TaskOwnership.current?.descriptorOwner
+        descriptorTicket = BackendDescriptors.shared.opened(.magnifier, owner: descriptorOwner, retention: .retainedResource)
         self.descriptor = opened
         self.mapping = mapping
         self.protectedTargets = protectedTargets
@@ -97,12 +101,12 @@ final class AgentMagnifierImageSource: @unchecked Sendable {
         guard descriptor >= 0 else { return nil }
         let copy = Darwin.dup(descriptor)
         guard copy >= 0 else { return nil }
-        return AgentMagnifierImageReader(descriptor: copy, mapping: mapping, protectedTargets: protectedTargets, artifactHold: artifactHold)
+        return AgentMagnifierImageReader(descriptor: copy, mapping: mapping, protectedTargets: protectedTargets, artifactHold: artifactHold, descriptorOwner: descriptorOwner)
     }
 
     deinit {
         lock.lock(); let old = descriptor; descriptor = -1; lock.unlock()
-        if old >= 0 { Darwin.close(old) }
+        if old >= 0 { Darwin.close(old); descriptorTicket.finish() }
     }
 }
 
@@ -112,9 +116,10 @@ final class AgentMagnifierImageReader: @unchecked Sendable {
     private let mapping: ScreenCoordinateMapping
     private let protectedTargets: [CGRect]
 
-    fileprivate init(descriptor: Int32, mapping: ScreenCoordinateMapping, protectedTargets: [CGRect], artifactHold: CaptureArtifactHold?) {
+    fileprivate init(descriptor: Int32, mapping: ScreenCoordinateMapping, protectedTargets: [CGRect], artifactHold: CaptureArtifactHold?, descriptorOwner: BackendDescriptors.Owner?) {
         self.artifactHold = artifactHold
         self.handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        BackendDescriptors.shared.track(handle, subsystem: .magnifier, owner: descriptorOwner, retention: .retainedResource)
         self.mapping = mapping
         self.protectedTargets = protectedTargets
     }
