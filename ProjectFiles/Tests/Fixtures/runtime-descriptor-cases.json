@@ -1,0 +1,1127 @@
+{
+  "version": 1,
+  "descriptor": {
+    "version": 1,
+    "instance_id": "128bdc78-d592-43a3-b4e1-b6fe3a0e57cd",
+    "installation_fingerprint": "pin",
+    "configuration_fingerprint": "config",
+    "executable": "$ROOT/instances/one/openclaw",
+    "node": "$ROOT/installations/pin/node/bin/node",
+    "entry": "$ROOT/installations/pin/package/openclaw.mjs",
+    "state": "$ROOT/instances/one",
+    "config": "$ROOT/instances/one/config.json",
+    "workspace": "$ROOT/instances/one/workspace",
+    "token_file": "$ROOT/instances/one/token",
+    "endpoint": "ws://127.0.0.1:24200",
+    "port": 24200,
+    "openclaw_version": "2026.9.5",
+    "node_version": "24.22.1"
+  },
+  "cases": [
+    {
+      "name": "current descriptor"
+    },
+    {
+      "name": "unknown forward-compatible field",
+      "set": {
+        "future": {
+          "feature": true
+        }
+      }
+    },
+    {
+      "name": "missing version",
+      "remove": [
+        "version"
+      ],
+      "error": {
+        "field": "descriptor.version",
+        "code": "required"
+      }
+    },
+    {
+      "name": "null version",
+      "set": {
+        "version": null
+      },
+      "error": {
+        "field": "descriptor.version",
+        "code": "must_be_integer"
+      }
+    },
+    {
+      "name": "missing instance_id",
+      "remove": [
+        "instance_id"
+      ],
+      "error": {
+        "field": "descriptor.instance_id",
+        "code": "required"
+      }
+    },
+    {
+      "name": "null instance_id",
+      "set": {
+        "instance_id": null
+      },
+      "error": {
+        "field": "descriptor.instance_id",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "missing installation_fingerprint",
+      "remove": [
+        "installation_fingerprint"
+      ],
+      "error": {
+        "field": "descriptor.installation_fingerprint",
+        "code": "required"
+      }
+    },
+    {
+      "name": "null installation_fingerprint",
+      "set": {
+        "installation_fingerprint": null
+      },
+      "error": {
+        "field": "descriptor.installation_fingerprint",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "missing configuration_fingerprint",
+      "remove": [
+        "configuration_fingerprint"
+      ],
+      "error": {
+        "field": "descriptor.configuration_fingerprint",
+        "code": "required"
+      }
+    },
+    {
+      "name": "null configuration_fingerprint",
+      "set": {
+        "configuration_fingerprint": null
+      },
+      "error": {
+        "field": "descriptor.configuration_fingerprint",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "missing executable",
+      "remove": [
+        "executable"
+      ],
+      "error": {
+        "field": "descriptor.executable",
+        "code": "required"
+      }
+    },
+    {
+      "name": "null executable",
+      "set": {
+        "executable": null
+      },
+      "error": {
+        "field": "descriptor.executable",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "missing node",
+      "remove": [
+        "node"
+      ],
+      "error": {
+        "field": "descriptor.node",
+        "code": "required"
+      }
+    },
+    {
+      "name": "null node",
+      "set": {
+        "node": null
+      },
+      "error": {
+        "field": "descriptor.node",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "missing entry",
+      "remove": [
+        "entry"
+      ],
+      "error": {
+        "field": "descriptor.entry",
+        "code": "required"
+      }
+    },
+    {
+      "name": "null entry",
+      "set": {
+        "entry": null
+      },
+      "error": {
+        "field": "descriptor.entry",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "missing state",
+      "remove": [
+        "state"
+      ],
+      "error": {
+        "field": "descriptor.state",
+        "code": "required"
+      }
+    },
+    {
+      "name": "null state",
+      "set": {
+        "state": null
+      },
+      "error": {
+        "field": "descriptor.state",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "missing config",
+      "remove": [
+        "config"
+      ],
+      "error": {
+        "field": "descriptor.config",
+        "code": "required"
+      }
+    },
+    {
+      "name": "null config",
+      "set": {
+        "config": null
+      },
+      "error": {
+        "field": "descriptor.config",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "missing workspace",
+      "remove": [
+        "workspace"
+      ],
+      "error": {
+        "field": "descriptor.workspace",
+        "code": "required"
+      }
+    },
+    {
+      "name": "null workspace",
+      "set": {
+        "workspace": null
+      },
+      "error": {
+        "field": "descriptor.workspace",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "missing token_file",
+      "remove": [
+        "token_file"
+      ],
+      "error": {
+        "field": "descriptor.token_file",
+        "code": "required"
+      }
+    },
+    {
+      "name": "null token_file",
+      "set": {
+        "token_file": null
+      },
+      "error": {
+        "field": "descriptor.token_file",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "missing endpoint",
+      "remove": [
+        "endpoint"
+      ],
+      "error": {
+        "field": "descriptor.endpoint",
+        "code": "required"
+      }
+    },
+    {
+      "name": "null endpoint",
+      "set": {
+        "endpoint": null
+      },
+      "error": {
+        "field": "descriptor.endpoint",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "missing port",
+      "remove": [
+        "port"
+      ],
+      "error": {
+        "field": "descriptor.port",
+        "code": "required"
+      }
+    },
+    {
+      "name": "null port",
+      "set": {
+        "port": null
+      },
+      "error": {
+        "field": "descriptor.port",
+        "code": "must_be_integer"
+      }
+    },
+    {
+      "name": "missing openclaw_version",
+      "remove": [
+        "openclaw_version"
+      ],
+      "error": {
+        "field": "descriptor.openclaw_version",
+        "code": "required"
+      }
+    },
+    {
+      "name": "null openclaw_version",
+      "set": {
+        "openclaw_version": null
+      },
+      "error": {
+        "field": "descriptor.openclaw_version",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "missing node_version",
+      "remove": [
+        "node_version"
+      ],
+      "error": {
+        "field": "descriptor.node_version",
+        "code": "required"
+      }
+    },
+    {
+      "name": "null node_version",
+      "set": {
+        "node_version": null
+      },
+      "error": {
+        "field": "descriptor.node_version",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "port strict true",
+      "raw_fields": {
+        "port": "true"
+      },
+      "error": {
+        "field": "descriptor.port",
+        "code": "must_be_integer"
+      }
+    },
+    {
+      "name": "port strict \"1\"",
+      "raw_fields": {
+        "port": "\"1\""
+      },
+      "error": {
+        "field": "descriptor.port",
+        "code": "must_be_integer"
+      }
+    },
+    {
+      "name": "port strict 1.0",
+      "raw_fields": {
+        "port": "1.0"
+      },
+      "error": {
+        "field": "descriptor.port",
+        "code": "must_be_integer"
+      }
+    },
+    {
+      "name": "port strict 1e0",
+      "raw_fields": {
+        "port": "1e0"
+      },
+      "error": {
+        "field": "descriptor.port",
+        "code": "must_be_integer"
+      }
+    },
+    {
+      "name": "port strict 1.5",
+      "raw_fields": {
+        "port": "1.5"
+      },
+      "error": {
+        "field": "descriptor.port",
+        "code": "must_be_integer"
+      }
+    },
+    {
+      "name": "port strict 9223372036854775808",
+      "raw_fields": {
+        "port": "9223372036854775808"
+      },
+      "error": {
+        "field": "descriptor.port",
+        "code": "must_be_integer"
+      }
+    },
+    {
+      "name": "version strict true",
+      "raw_fields": {
+        "version": "true"
+      },
+      "error": {
+        "field": "descriptor.version",
+        "code": "must_be_integer"
+      }
+    },
+    {
+      "name": "version strict \"1\"",
+      "raw_fields": {
+        "version": "\"1\""
+      },
+      "error": {
+        "field": "descriptor.version",
+        "code": "must_be_integer"
+      }
+    },
+    {
+      "name": "version strict 1.0",
+      "raw_fields": {
+        "version": "1.0"
+      },
+      "error": {
+        "field": "descriptor.version",
+        "code": "must_be_integer"
+      }
+    },
+    {
+      "name": "version strict 1e0",
+      "raw_fields": {
+        "version": "1e0"
+      },
+      "error": {
+        "field": "descriptor.version",
+        "code": "must_be_integer"
+      }
+    },
+    {
+      "name": "version strict 1.5",
+      "raw_fields": {
+        "version": "1.5"
+      },
+      "error": {
+        "field": "descriptor.version",
+        "code": "must_be_integer"
+      }
+    },
+    {
+      "name": "version strict 9223372036854775808",
+      "raw_fields": {
+        "version": "9223372036854775808"
+      },
+      "error": {
+        "field": "descriptor.version",
+        "code": "must_be_integer"
+      }
+    },
+    {
+      "name": "unsupported version",
+      "set": {
+        "version": 2
+      },
+      "error": {
+        "field": "descriptor.version",
+        "code": "unsupported_value"
+      }
+    },
+    {
+      "name": "port 1024",
+      "set": {
+        "port": 1024
+      },
+      "error": {
+        "field": "descriptor.port",
+        "code": "out_of_range"
+      }
+    },
+    {
+      "name": "port 65400",
+      "set": {
+        "port": 65400
+      },
+      "error": {
+        "field": "descriptor.port",
+        "code": "out_of_range"
+      }
+    },
+    {
+      "name": "port -1",
+      "set": {
+        "port": -1
+      },
+      "error": {
+        "field": "descriptor.port",
+        "code": "out_of_range"
+      }
+    },
+    {
+      "name": "valid port 1025",
+      "set": {
+        "port": 1025,
+        "endpoint": "ws://127.0.0.1:1025"
+      }
+    },
+    {
+      "name": "valid port 65399",
+      "set": {
+        "port": 65399,
+        "endpoint": "ws://127.0.0.1:65399"
+      }
+    },
+    {
+      "name": "uuid 128BDC78-D592-43A3-B4E1-B6FE3A0E57CD",
+      "set": {
+        "instance_id": "128BDC78-D592-43A3-B4E1-B6FE3A0E57CD"
+      },
+      "error": {
+        "field": "descriptor.instance_id",
+        "code": "invalid_uuid"
+      }
+    },
+    {
+      "name": "uuid 128bdc78d59243a3b4e1b6fe3a0e57cd",
+      "set": {
+        "instance_id": "128bdc78d59243a3b4e1b6fe3a0e57cd"
+      },
+      "error": {
+        "field": "descriptor.instance_id",
+        "code": "invalid_uuid"
+      }
+    },
+    {
+      "name": "uuid not-a-uuid",
+      "set": {
+        "instance_id": "not-a-uuid"
+      },
+      "error": {
+        "field": "descriptor.instance_id",
+        "code": "invalid_uuid"
+      }
+    },
+    {
+      "name": "endpoint ws://localhost:24200",
+      "set": {
+        "endpoint": "ws://localhost:24200"
+      },
+      "error": {
+        "field": "descriptor.endpoint",
+        "code": "invalid_endpoint"
+      }
+    },
+    {
+      "name": "endpoint ws://127.0.0.1:24201",
+      "set": {
+        "endpoint": "ws://127.0.0.1:24201"
+      },
+      "error": {
+        "field": "descriptor.endpoint",
+        "code": "invalid_endpoint"
+      }
+    },
+    {
+      "name": "endpoint wss://127.0.0.1:24200",
+      "set": {
+        "endpoint": "wss://127.0.0.1:24200"
+      },
+      "error": {
+        "field": "descriptor.endpoint",
+        "code": "invalid_endpoint"
+      }
+    },
+    {
+      "name": "relative executable",
+      "set": {
+        "executable": "relative/file"
+      },
+      "error": {
+        "field": "descriptor.executable",
+        "code": "invalid_path"
+      }
+    },
+    {
+      "name": "traversal executable",
+      "set": {
+        "executable": "$ROOT/../escape"
+      },
+      "error": {
+        "field": "descriptor.executable",
+        "code": "invalid_path"
+      }
+    },
+    {
+      "name": "relative node",
+      "set": {
+        "node": "relative/file"
+      },
+      "error": {
+        "field": "descriptor.node",
+        "code": "invalid_path"
+      }
+    },
+    {
+      "name": "traversal node",
+      "set": {
+        "node": "$ROOT/../escape"
+      },
+      "error": {
+        "field": "descriptor.node",
+        "code": "invalid_path"
+      }
+    },
+    {
+      "name": "relative entry",
+      "set": {
+        "entry": "relative/file"
+      },
+      "error": {
+        "field": "descriptor.entry",
+        "code": "invalid_path"
+      }
+    },
+    {
+      "name": "traversal entry",
+      "set": {
+        "entry": "$ROOT/../escape"
+      },
+      "error": {
+        "field": "descriptor.entry",
+        "code": "invalid_path"
+      }
+    },
+    {
+      "name": "relative state",
+      "set": {
+        "state": "relative/file"
+      },
+      "error": {
+        "field": "descriptor.state",
+        "code": "invalid_path"
+      }
+    },
+    {
+      "name": "traversal state",
+      "set": {
+        "state": "$ROOT/../escape"
+      },
+      "error": {
+        "field": "descriptor.state",
+        "code": "invalid_path"
+      }
+    },
+    {
+      "name": "relative config",
+      "set": {
+        "config": "relative/file"
+      },
+      "error": {
+        "field": "descriptor.config",
+        "code": "invalid_path"
+      }
+    },
+    {
+      "name": "traversal config",
+      "set": {
+        "config": "$ROOT/../escape"
+      },
+      "error": {
+        "field": "descriptor.config",
+        "code": "invalid_path"
+      }
+    },
+    {
+      "name": "relative workspace",
+      "set": {
+        "workspace": "relative/file"
+      },
+      "error": {
+        "field": "descriptor.workspace",
+        "code": "invalid_path"
+      }
+    },
+    {
+      "name": "traversal workspace",
+      "set": {
+        "workspace": "$ROOT/../escape"
+      },
+      "error": {
+        "field": "descriptor.workspace",
+        "code": "invalid_path"
+      }
+    },
+    {
+      "name": "relative token_file",
+      "set": {
+        "token_file": "relative/file"
+      },
+      "error": {
+        "field": "descriptor.token_file",
+        "code": "invalid_path"
+      }
+    },
+    {
+      "name": "traversal token_file",
+      "set": {
+        "token_file": "$ROOT/../escape"
+      },
+      "error": {
+        "field": "descriptor.token_file",
+        "code": "invalid_path"
+      }
+    },
+    {
+      "name": "resolved outside path",
+      "set": {
+        "entry": "$ROOT-other/entry"
+      },
+      "error": {
+        "field": "descriptor.entry",
+        "code": "outside_root"
+      }
+    },
+    {
+      "name": "root is not a file path",
+      "set": {
+        "entry": "$ROOT"
+      },
+      "error": {
+        "field": "descriptor.entry",
+        "code": "outside_root"
+      }
+    },
+    {
+      "name": "installation parent escapes root",
+      "set": {
+        "node": "$ROOT/node"
+      },
+      "error": {
+        "field": "descriptor.paths",
+        "code": "outside_root"
+      }
+    },
+    {
+      "name": "nonempty fingerprint",
+      "set": {
+        "installation_fingerprint": ""
+      },
+      "error": {
+        "field": "descriptor.installation_fingerprint",
+        "code": "invalid_string"
+      }
+    },
+    {
+      "name": "nul path",
+      "set": {
+        "entry": "$ROOT/a\u0000b"
+      },
+      "error": {
+        "field": "descriptor.entry",
+        "code": "invalid_string"
+      }
+    },
+    {
+      "name": "unicode and spaces",
+      "set": {
+        "entry": "$ROOT/資料 🐈/module file.mjs"
+      }
+    },
+    {
+      "name": "missing descendant is structurally allowed",
+      "set": {
+        "entry": "$ROOT/not-created/nested/entry"
+      }
+    },
+    {
+      "name": "internal file alias allowed",
+      "set": {
+        "entry": "$ROOT/alias"
+      },
+      "links": {
+        "alias": "$ROOT/real-entry"
+      }
+    },
+    {
+      "name": "external file alias rejected",
+      "set": {
+        "entry": "$ROOT/alias"
+      },
+      "links": {
+        "alias": "$ROOT-other/entry"
+      },
+      "error": {
+        "field": "descriptor.entry",
+        "code": "outside_root"
+      }
+    },
+    {
+      "name": "private directory alias rejected",
+      "links": {
+        "instances": "$ROOT/other-instances"
+      },
+      "error": {
+        "field": "descriptor.paths",
+        "code": "symlink"
+      }
+    },
+    {
+      "name": "credential directory alias rejected",
+      "links": {
+        "instances/one/agents": "$ROOT/other-agents"
+      },
+      "error": {
+        "field": "descriptor.paths",
+        "code": "symlink"
+      }
+    },
+    {
+      "name": "array",
+      "raw": "[]",
+      "error": {
+        "field": "descriptor",
+        "code": "invalid_json"
+      }
+    },
+    {
+      "name": "null",
+      "raw": "null",
+      "error": {
+        "field": "descriptor",
+        "code": "invalid_json"
+      }
+    },
+    {
+      "name": "malformed",
+      "raw": "{\"version\":",
+      "error": {
+        "field": "descriptor",
+        "code": "invalid_json"
+      }
+    },
+    {
+      "name": "duplicate",
+      "raw": "{\"version\":1,\"version\":1}",
+      "error": {
+        "field": "descriptor",
+        "code": "invalid_json"
+      }
+    },
+    {
+      "name": "escaped duplicate",
+      "raw": "{\"version\":1,\"vers\\u0069on\":1}",
+      "error": {
+        "field": "descriptor",
+        "code": "invalid_json"
+      }
+    },
+    {
+      "name": "nested duplicate",
+      "raw": "{\"future\":{\"x\":1,\"x\":2}}",
+      "error": {
+        "field": "descriptor",
+        "code": "invalid_json"
+      }
+    },
+    {
+      "name": "nonfinite",
+      "raw": "{\"version\":NaN}",
+      "error": {
+        "field": "descriptor",
+        "code": "invalid_json"
+      }
+    },
+    {
+      "name": "overflow number",
+      "raw": "{\"future\":1e400}",
+      "error": {
+        "field": "descriptor",
+        "code": "invalid_json"
+      }
+    },
+    {
+      "name": "invalid unicode",
+      "raw": "{\"future\":\"\\ud800\"}",
+      "error": {
+        "field": "descriptor",
+        "code": "invalid_json"
+      }
+    },
+    {
+      "name": "empty object",
+      "raw": "{}",
+      "error": {
+        "field": "descriptor.version",
+        "code": "required"
+      }
+    },
+    {
+      "name": "file alias loop",
+      "set": {
+        "entry": "$ROOT/a"
+      },
+      "links": {
+        "a": "$ROOT/b",
+        "b": "$ROOT/a"
+      },
+      "error": {
+        "field": "descriptor.entry",
+        "code": "invalid_path"
+      }
+    },
+    {
+      "name": "bounded internal alias chain",
+      "set": {
+        "entry": "$ROOT/a"
+      },
+      "links": {
+        "a": "$ROOT/b",
+        "b": "$ROOT/real-entry"
+      }
+    },
+    {
+      "name": "relative external alias",
+      "set": {
+        "entry": "$ROOT/alias"
+      },
+      "links": {
+        "alias": "../outside/entry"
+      },
+      "error": {
+        "field": "descriptor.entry",
+        "code": "outside_root"
+      }
+    },
+    {
+      "name": "dot path components",
+      "set": {
+        "entry": "$ROOT/./nested/entry"
+      }
+    },
+    {
+      "name": "nested file alias escape",
+      "set": {
+        "entry": "$ROOT/aliases/entry"
+      },
+      "links": {
+        "aliases": "$ROOT-other/package"
+      },
+      "error": {
+        "field": "descriptor.entry",
+        "code": "outside_root"
+      }
+    },
+    {
+      "name": "canonically equivalent duplicate keys",
+      "raw": "{\"é\":1,\"e\\u0301\":2}",
+      "error": {
+        "field": "descriptor",
+        "code": "invalid_json"
+      }
+    },
+    {
+      "name": "node wrong type int",
+      "set": {
+        "node": 42
+      },
+      "error": {
+        "field": "descriptor.node",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "node wrong type bool",
+      "set": {
+        "node": false
+      },
+      "error": {
+        "field": "descriptor.node",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "node wrong type list",
+      "set": {
+        "node": []
+      },
+      "error": {
+        "field": "descriptor.node",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "node wrong type dict",
+      "set": {
+        "node": {}
+      },
+      "error": {
+        "field": "descriptor.node",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "openclaw_version wrong type int",
+      "set": {
+        "openclaw_version": 42
+      },
+      "error": {
+        "field": "descriptor.openclaw_version",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "openclaw_version wrong type bool",
+      "set": {
+        "openclaw_version": false
+      },
+      "error": {
+        "field": "descriptor.openclaw_version",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "openclaw_version wrong type list",
+      "set": {
+        "openclaw_version": []
+      },
+      "error": {
+        "field": "descriptor.openclaw_version",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "openclaw_version wrong type dict",
+      "set": {
+        "openclaw_version": {}
+      },
+      "error": {
+        "field": "descriptor.openclaw_version",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "installation_fingerprint wrong type int",
+      "set": {
+        "installation_fingerprint": 42
+      },
+      "error": {
+        "field": "descriptor.installation_fingerprint",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "installation_fingerprint wrong type bool",
+      "set": {
+        "installation_fingerprint": false
+      },
+      "error": {
+        "field": "descriptor.installation_fingerprint",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "installation_fingerprint wrong type list",
+      "set": {
+        "installation_fingerprint": []
+      },
+      "error": {
+        "field": "descriptor.installation_fingerprint",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "installation_fingerprint wrong type dict",
+      "set": {
+        "installation_fingerprint": {}
+      },
+      "error": {
+        "field": "descriptor.installation_fingerprint",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "endpoint wrong type int",
+      "set": {
+        "endpoint": 42
+      },
+      "error": {
+        "field": "descriptor.endpoint",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "endpoint wrong type bool",
+      "set": {
+        "endpoint": false
+      },
+      "error": {
+        "field": "descriptor.endpoint",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "endpoint wrong type list",
+      "set": {
+        "endpoint": []
+      },
+      "error": {
+        "field": "descriptor.endpoint",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "endpoint wrong type dict",
+      "set": {
+        "endpoint": {}
+      },
+      "error": {
+        "field": "descriptor.endpoint",
+        "code": "must_be_string"
+      }
+    },
+    {
+      "name": "filesystem-root containment semantics",
+      "validation_root": "/"
+    },
+    {
+      "name": "repeated separators",
+      "set": {
+        "state": "//$ROOT//instances//one",
+        "entry": "//$ROOT//nested//entry",
+        "node": "//$ROOT//installations//pin//node//bin//node"
+      }
+    }
+  ]
+}

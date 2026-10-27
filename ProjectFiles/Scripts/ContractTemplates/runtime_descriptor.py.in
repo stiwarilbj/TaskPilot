@@ -1,0 +1,148 @@
+import math
+import errno
+import os
+from pathlib import Path
+import stat
+import unicodedata
+import uuid
+
+
+class DescriptorError(ValueError):
+    """Fixed field paths and reasons only; never includes descriptor values."""
+    def __init__(self, field, code):
+        self.field, self.code = field, code
+        super().__init__(field + ': ' + code)
+
+
+def _fail(field, code):
+    raise DescriptorError(field, code)
+
+
+def _pairs(pairs):
+    result = {}
+    seen = set()
+    for key, value in pairs:
+        # Swift String keys compare canonically equivalent Unicode equally.
+        identity = unicodedata.normalize('NFC', key)
+        if identity in seen: _fail('descriptor', 'invalid_json')
+        seen.add(identity)
+        result[key] = value
+    return result
+
+
+def _finite(value, depth=0):
+    if isinstance(value, float) and not math.isfinite(value): _fail('descriptor', 'invalid_json')
+    if isinstance(value, str): value.encode('utf-8', errors='strict')
+    if isinstance(value, (dict, list)) and depth >= DEFINITION['max_depth']: _fail('descriptor', 'invalid_json')
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key.encode('utf-8', errors='strict')
+            _finite(item, depth + 1)
+    elif isinstance(value, list):
+        for item in value: _finite(item, depth + 1)
+
+
+def parse_descriptor(data, root):
+    if len(data) > DEFINITION['max_bytes']: _fail('descriptor', 'too_large')
+    try:
+        # A single UTF-8 JSON object; do not let json.loads infer UTF-16/32.
+        value = json.loads(data.decode('utf-8'), object_pairs_hook=_pairs,
+                           parse_constant=lambda _: _fail('descriptor', 'invalid_json'))
+        _finite(value)
+        if not isinstance(value, dict): _fail('descriptor', 'invalid_json')
+    except (UnicodeError, ValueError, RecursionError) as error:
+        if isinstance(error, DescriptorError): raise
+        raise DescriptorError('descriptor', 'invalid_json') from error
+    return validate_descriptor(value, root)
+
+
+def directory_paths(root, descriptor=None):
+    """Known private directory topology only. Never scans directories."""
+    root = Path('/' + os.path.abspath(root).lstrip('/'))
+    rules = DEFINITION['path_rules']['private_directories']
+    leaves = [root]
+    for name in rules['optional_root_children']:
+        candidate = root / name
+        if candidate.exists() or candidate.is_symlink(): leaves.append(candidate)
+    if descriptor is not None:
+        for rule in rules['leaves']:
+            leaf = Path(descriptor[rule['field']])
+            for _ in range(rule['parents']): leaf = leaf.parent
+            leaves.append(leaf)
+        for field, names in rules['optional_descendants'].items():
+            for name in names:
+                candidate = Path(descriptor[field]) / name
+                if candidate.exists() or candidate.is_symlink(): leaves.append(candidate)
+    paths = {root}
+    for leaf in leaves:
+        if not leaf.is_absolute() or '..' in leaf.parts: _fail('descriptor.paths', 'outside_root')
+        leaf = Path('/' + os.path.abspath(leaf).lstrip('/'))
+        if not leaf.is_relative_to(root): _fail('descriptor.paths', 'outside_root')
+        while leaf != root:
+            paths.add(leaf)
+            leaf = leaf.parent
+    return sorted(paths, key=lambda path: (len(path.parts), str(path)))
+
+
+def _resolved_path(path, field):
+    # Resolve even dangling links. Foundation's convenience resolver leaves
+    # those unresolved; using the same bounded walk prevents reader drift.
+    pending = str(path).split('/')
+    resolved, cursor, hops = [], 0, 0
+    while cursor < len(pending):
+        component = pending[cursor]; cursor += 1
+        if component in ('', '.'): continue
+        if component == '..':
+            if resolved: resolved.pop()
+            continue
+        candidate = '/' + '/'.join(resolved + [component])
+        try:
+            info = os.lstat(candidate)
+            if stat.S_ISLNK(info.st_mode):
+                hops += 1
+                if hops > DEFINITION['path_rules']['max_symlink_hops']: _fail(field, 'invalid_path')
+                target = os.readlink(candidate)
+                if target.startswith('/'): resolved = []
+                pending = target.split('/') + pending[cursor:]
+                cursor = 0
+                continue
+        except OSError as error:
+            if error.errno not in (errno.ENOENT, errno.ENOTDIR): raise DescriptorError(field, 'invalid_path') from error
+        resolved.append(component)
+    return Path('/' + '/'.join(resolved))
+
+
+def validate_descriptor(value, root):
+    if not isinstance(value, dict): _fail('descriptor', 'must_be_object')
+    for name, spec in DEFINITION['fields'].items():
+        field = 'descriptor.' + name
+        if name not in value: _fail(field, 'required')
+        item = value[name]
+        if spec['type'] == 'integer':
+            if type(item) is not int or not -(2 ** 63) <= item < 2 ** 63: _fail(field, 'must_be_integer')
+            if 'const' in spec and item != spec['const']: _fail(field, 'unsupported_value')
+            if 'min' in spec and not spec['min'] <= item <= spec['max']: _fail(field, 'out_of_range')
+        else:
+            if not isinstance(item, str): _fail(field, 'must_be_string')
+            if not item or '\x00' in item: _fail(field, 'invalid_string')
+            kind = spec.get('format')
+            if kind == 'canonical_uuid':
+                try: valid = str(uuid.UUID(item)) == item
+                except ValueError: valid = False
+                if not valid: _fail(field, 'invalid_uuid')
+            elif kind == 'private_path':
+                if not Path(item).is_absolute() or '..' in Path(item).parts: _fail(field, 'invalid_path')
+    # Relational checks run only after field types have been established.
+    for name, spec in DEFINITION['fields'].items():
+        if spec.get('format') == 'loopback_endpoint':
+            expected = spec['template'].replace('{port}', str(value[spec['port_field']]))
+            if value[name] != expected: _fail('descriptor.' + name, 'invalid_endpoint')
+    for directory in directory_paths(root, value):
+        if directory.is_symlink(): _fail('descriptor.paths', 'symlink')
+    resolved_root = _resolved_path(os.path.abspath(root), 'descriptor.paths')
+    for name, spec in DEFINITION['fields'].items():
+        if spec.get('format') == 'private_path':
+            resolved = _resolved_path(value[name], 'descriptor.' + name)
+            if resolved == resolved_root or not resolved.is_relative_to(resolved_root):
+                _fail('descriptor.' + name, 'outside_root')
+    return value

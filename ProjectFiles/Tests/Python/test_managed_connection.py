@@ -15,7 +15,7 @@ class ManagedConnectionTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name);self.path=self.root/'runtime.json'
         self.wrapper=self.root/'wrapper';self.entry=self.root/'entry.py'
-        self.d=dict(version=1,instance_id='128bdc78-d592-43a3-b4e1-b6fe3a0e57cd',port=24200,
+        self.d=dict(openclaw_version='fixture',node_version='fixture',version=1,instance_id='128bdc78-d592-43a3-b4e1-b6fe3a0e57cd',port=24200,
             endpoint='ws://127.0.0.1:24200',installation_fingerprint='pin',configuration_fingerprint='config',
             executable=str(self.wrapper),node=sys.executable,entry=str(self.entry),state=str(self.root/'state'),
             config=str(self.root/'config'),workspace=str(self.root/'workspace'),token_file=str(self.root/'token'))

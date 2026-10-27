@@ -3,61 +3,22 @@ import Foundation
 import ProcessSupport
 
 /// Private runtime compatibility boundary; never falls back to PATH or a shared profile.
-struct ManagedOpenClawDescriptor: Codable, Equatable, Sendable {
-    let version: Int
-    let instanceID: String
-    let installationFingerprint: String
-    let configurationFingerprint: String
-    let executable: String
-    let node: String
-    let entry: String
-    let state: String
-    let config: String
-    let workspace: String
-    let tokenFile: String
-    let endpoint: String
-    let port: Int
-    let openclawVersion: String
-    let nodeVersion: String
-    private var sourceURL: URL? = nil
-    enum CodingKeys: String, CodingKey {
-        case version, executable, node, entry, state, config, workspace, endpoint, port
-        case instanceID = "instance_id", installationFingerprint = "installation_fingerprint"
-        case configurationFingerprint = "configuration_fingerprint", tokenFile = "token_file"
-        case openclawVersion = "openclaw_version", nodeVersion = "node_version"
-    }
+extension ManagedOpenClawDescriptor {
     static let root = GeminiAPIKeyStore.defaultFileURL().deletingLastPathComponent().appendingPathComponent("ManagedOpenClaw")
     static let url = root.appendingPathComponent("runtime.json")
     static func load(from url: URL = Self.url) throws -> Self {
-        var value = try JSONDecoder().decode(Self.self, from: Data(contentsOf: url))
-        let root = url.deletingLastPathComponent().resolvingSymlinksInPath().path + "/"
-        guard value.version == 1, UUID(uuidString: value.instanceID) != nil,
-              value.port > 1024, value.port < 65400,
-              value.endpoint == "ws://127.0.0.1:\(value.port)",
-              [value.executable, value.node, value.entry, value.state, value.config, value.workspace, value.tokenFile]
-                .allSatisfy({ $0.hasPrefix("/") && URL(fileURLWithPath: $0).resolvingSymlinksInPath().path.hasPrefix(root) }) else {
-            throw ManagedOpenClawError.invalidDescriptor
-        }
+        let data = try Data(contentsOf: url)
+        do { _ = try RuntimeDescriptorContract.parse(data, root: url.deletingLastPathComponent()) }
+        catch let error as RuntimeDescriptorContract.Failure where error.code == "symlink" {
+            throw PrivateDirectoryPermissions.Failure.symlink
+        } catch { throw ManagedOpenClawError.invalidDescriptor }
+        var value = try JSONDecoder().decode(Self.self, from: data)
         value.sourceURL = url
         return value
     }
     func checkPrivateDirectories() throws {
-        let root = (sourceURL ?? Self.url).deletingLastPathComponent().standardizedFileURL
-        var paths: Set<URL> = [root]
-        let installation = URL(fileURLWithPath: node).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        for leaf in [installation, URL(fileURLWithPath: state), URL(fileURLWithPath: workspace), URL(fileURLWithPath: config).deletingLastPathComponent()] {
-            var current = leaf.standardizedFileURL
-            while current.path != root.path {
-                guard current.path.hasPrefix(root.path + "/") else { throw ManagedOpenClawError.invalidDescriptor }
-                paths.insert(current); current.deleteLastPathComponent()
-            }
-        }
-        for name in ["state", "agents", "agents/main", "agents/main/agent"] {
-            let candidate = URL(fileURLWithPath: state).appendingPathComponent(name)
-            var status = stat()
-            if lstat(candidate.path, &status) == 0 { paths.insert(candidate) }
-        }
-        for path in paths.sorted(by: { $0.pathComponents.count < $1.pathComponents.count }) {
+        let root = (sourceURL ?? Self.url).deletingLastPathComponent()
+        for path in try RuntimeDescriptorContract.directoryPaths(root: root, paths: pathValues) {
             try PrivateDirectoryPermissions.check(path)
         }
     }

@@ -27,6 +27,8 @@ import time
 import urllib.request
 import uuid
 
+import runtime_descriptor_generated as descriptor_contract
+
 VERSION = 1
 ROOT = Path.home() / 'Library/Application Support/Orbit Agent/ManagedOpenClaw'
 INTEGRITY_CACHE_VERSION = 1
@@ -69,25 +71,10 @@ def check_private_directory(path, *, repair=False, allow_mode_drift=False):
 
 
 def managed_directory_paths(root, descriptor=None):
-    root = Path(root).absolute()
-    leaves = [root]
-    for name in ('installations', 'instances'):
-        candidate = root / name
-        if candidate.exists() or candidate.is_symlink(): leaves.append(candidate)
-    if descriptor:
-        leaves.extend((Path(descriptor['node']).parents[2], Path(descriptor['state']),
-                       Path(descriptor['workspace']), Path(descriptor['config']).parent))
-        # These stores may not exist until first use. Never discover or scan children.
-        for name in ('state', 'agents', 'agents/main', 'agents/main/agent'):
-            candidate = Path(descriptor['state']) / name
-            if candidate.exists() or candidate.is_symlink(): leaves.append(candidate)
-    paths = {root}
-    for leaf in leaves:
-        leaf = leaf.absolute()
-        if not leaf.is_relative_to(root) or '..' in leaf.parts: raise PrivateDirectoryError('changed')
-        while leaf != root:
-            paths.add(leaf); leaf = leaf.parent
-    return sorted(paths, key=lambda path: (len(path.parts), str(path)))
+    try:
+        return descriptor_contract.directory_paths(root, descriptor)
+    except descriptor_contract.DescriptorError as error:
+        raise PrivateDirectoryError('changed') from error
 
 
 def check_managed_directories(root, descriptor=None, *, repair=False):
@@ -709,7 +696,7 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
             except OSError: saved_key = ''
             atomic_json(key_record, {'fingerprint':key_fingerprint,
                                     'verification_until':time.time() + 300 if saved_key and saved_key != key.strip() else 0})
-        descriptor = {'version':VERSION, 'instance_id':identity, 'installation_fingerprint':fingerprint,
+        descriptor = {'version':descriptor_contract.DESCRIPTOR_VERSION, 'instance_id':identity, 'installation_fingerprint':fingerprint,
             'openclaw_version':manifest['openclaw_version'], 'node_version':manifest['node_version'],
             'node':str(node),'entry':str(entry),'executable':str(wrapper),'state':str(state),
             'config':str(config),'workspace':str(workspace),'token_file':str(token), 'port':port,
@@ -729,19 +716,11 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
 
 def load_descriptor(path: Path = ROOT / 'runtime.json'):
     try:
-        d = json.loads(path.read_text())
-        if d['version'] != VERSION or str(uuid.UUID(d['instance_id'])) != d['instance_id']: raise ValueError()
-        root = path.parent.resolve()
-        names = ('node','entry','executable','state','config','workspace','token_file')
-        if any(not Path(d[name]).is_absolute() for name in names): raise ValueError()
-        # Classify links before resolved-path validation can hide the cause as an
-        # invalid descriptor and accidentally select new-instance provisioning.
-        for directory in managed_directory_paths(path.parent, d):
-            if directory.is_symlink(): raise PrivateDirectoryError('symlink')
-        if any(not Path(d[name]).resolve().is_relative_to(root) for name in names): raise ValueError()
-        if type(d['port']) is not int or not 1024 < d['port'] < 65400 or d['endpoint'] != f"ws://127.0.0.1:{d['port']}": raise ValueError()
-        return d
-    except (OSError, ValueError, KeyError, TypeError) as error:
+        return descriptor_contract.parse_descriptor(path.read_bytes(), path.parent)
+    except descriptor_contract.DescriptorError as error:
+        if error.code == 'symlink': raise PrivateDirectoryError('symlink') from error
+        raise ManagedRuntimeError('TaskPilot private OpenClaw is not installed or its descriptor is invalid.') from error
+    except OSError as error:
         raise ManagedRuntimeError('TaskPilot private OpenClaw is not installed or its descriptor is invalid.') from error
 
 def activate_environment(path):

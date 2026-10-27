@@ -22,7 +22,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         (self.root / 'installations').mkdir(mode=0o700, exist_ok=True)
         installation.mkdir(mode=0o700, exist_ok=True)
         executable = state / 'openclaw'; executable.write_text('fixture')
-        return dict(version=1,instance_id='128bdc78-d592-43a3-b4e1-b6fe3a0e57cd',port=24200,
+        return dict(openclaw_version='fixture',node_version='fixture',version=1,instance_id='128bdc78-d592-43a3-b4e1-b6fe3a0e57cd',port=24200,
             endpoint='ws://127.0.0.1:24200',installation_fingerprint='fixture',configuration_fingerprint='config',
             executable=str(executable), node=str(installation / 'node/bin/node'), entry=str(installation / 'entry'),
             state=str(state), workspace=str(workspace), config=str(state/'config'), token_file=str(state/'token'))

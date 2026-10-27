@@ -30,6 +30,41 @@ configuration/state/workspace, token file, loopback endpoint, and instance and
 installation fingerprints. Ambient OpenClaw/Node/provider settings cannot
 redirect the managed environment.
 
+## Shared descriptor contract
+
+`Contracts/runtime-descriptor.json` defines the existing version-1 wire format:
+all required field names and Swift properties, strict 64-bit JSON integers,
+nonempty strings, canonical lowercase instance UUIDs, port bounds, the exact
+loopback endpoint, and private path/directory rules. Unknown fields remain
+forward-compatible; they do not become configuration or execution authority.
+Paths must be absolute, contain no parent traversal, and resolve strictly below
+the descriptor's parent. Known private directory ancestors may not be symlinks.
+Missing leaf files remain structurally valid: installation integrity, private
+ownership/permissions, authenticated health, and provider readiness are separate
+checks. A malformed descriptor cannot independently pass any of them.
+
+The existing dependency-free generator emits the Swift Codable model and both
+validators from that definition. Private directory topology is shared too;
+ownership/mode checks and serialized repairs stay in their native implementations.
+Duplicate keys, non-UTF-8 JSON, nonfinite values and oversized documents are
+rejected before field validation. Errors use fixed field paths and reasons,
+without descriptor values. Schema and generator fingerprints are embedded in
+both generated artifacts. Descriptor changes also invalidate the existing bundled
+contract fingerprint, so mixed components fail the existing startup compatibility
+check. No wire field or installed-runtime migration is added.
+
+Regenerate with `python3 Scripts/generate-action-contract.py` from `ProjectFiles`.
+Its `--check` mode validates both contracts and rejects stale artifacts without
+rewriting them. The shared `Tests/Fixtures/runtime-descriptor-cases.json` exercises
+both readers, including exact error paths, optional unknown fields, numeric
+coercion, path escapes, missing fields, and directory aliases. Reproduce offline:
+
+```sh
+python3 Scripts/generate-action-contract.py --check
+python3 -m unittest discover -s Tests/Python -p test_runtime_descriptor.py
+swift test --filter 'RuntimeDescriptorTests|ManagedOpenClawTests'
+```
+
 Readiness separates installation integrity, configuration, authenticated health,
 ACP handshake, and provider verification. The native host probes locally every
 30 seconds, on wake/network notification, and on a coalesced runtime fault.

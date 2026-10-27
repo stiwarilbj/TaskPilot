@@ -184,7 +184,7 @@ final class ManagedOpenClawTests: XCTestCase {
         let port = 24200
         let value: [String:Any] = ["version":1,"instance_id":UUID().uuidString.lowercased(),
             "installation_fingerprint":"pin","configuration_fingerprint":"config",
-            "executable":root.path+"/openclaw","node":root.path+"/node","entry":root.path+"/entry",
+            "executable":root.path+"/openclaw","node":root.path+"/installations/fixture/node/bin/node","entry":root.path+"/entry",
             "state":root.path+"/state","config":root.path+"/config","workspace":root.path+"/workspace",
             "token_file":root.path+"/token","port":port,"endpoint":"ws://127.0.0.1:\(port)",
             "openclaw_version":"fixture","node_version":"fixture"]
@@ -352,7 +352,7 @@ final class ManagedOpenClawTests: XCTestCase {
         let port = (30000..<40000).first(where:ManagedGatewayHost.portAvailable)!
         let value: [String:Any] = ["version":1,"instance_id":UUID().uuidString.lowercased(),
             "installation_fingerprint":"fixture","configuration_fingerprint":"fixture",
-            "executable":cli.path,"node":cli.path,"entry":cli.path,"state":root.path+"/state",
+            "executable":cli.path,"node":root.path+"/installations/fixture/node/bin/node","entry":cli.path,"state":root.path+"/state",
             "config":root.path+"/config","workspace":root.path+"/workspace","token_file":root.path+"/token",
             "port":port,"endpoint":"ws://127.0.0.1:\(port)","openclaw_version":"fixture","node_version":"fixture"]
         try JSONSerialization.data(withJSONObject:value).write(to:url)

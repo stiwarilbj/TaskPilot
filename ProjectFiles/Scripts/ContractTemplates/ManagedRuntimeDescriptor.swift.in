@@ -1,0 +1,169 @@
+    struct Failure: Error, Equatable {
+        let field: String
+        let code: String
+    }
+
+    private static func fail(_ field: String, _ code: String) throws -> Never {
+        throw Failure(field: field, code: code)
+    }
+
+    static func parse(_ data: Data, root: URL) throws -> [String: Any] {
+        guard data.count <= maxBytes else { try fail("descriptor", "too_large") }
+        let value: [String: Any]
+        do {
+            guard !data.starts(with: [0xef, 0xbb, 0xbf]) else { try fail("descriptor", "invalid_json") }
+            value = try RuntimeMessageJSON.decode(data)
+        }
+        catch { try fail("descriptor", "invalid_json") }
+        return try validate(value, root: root)
+    }
+
+    private static func lexicalURL(_ url: URL) -> URL {
+        // standardizedFileURL can rewrite existing /private/var ancestors to
+        // /var while leaving missing descendants untouched. Normalize syntax
+        // only here; resolved containment is checked separately below.
+        var parts: [String] = []
+        for part in url.path.split(separator: "/") {
+            if part == "." { continue }
+            if part == ".." {
+                if !parts.isEmpty { parts.removeLast() }
+            } else { parts.append(String(part)) }
+        }
+        return URL(fileURLWithPath: "/" + parts.joined(separator: "/"))
+    }
+
+    /// Discovery topology, not permission or proof of installation health.
+    static func directoryPaths(root: URL, paths: [String: String] = [:]) throws -> [URL] {
+        let root = lexicalURL(root)
+        let prefix = root.path == "/" ? "/" : root.path + "/"
+        let rules = definition["path_rules"] as! [String: Any]
+        let directories = rules["private_directories"] as! [String: Any]
+        var leaves = [root]
+        func exists(_ url: URL) -> Bool {
+            var status = stat()
+            return lstat(url.path, &status) == 0
+        }
+        for name in directories["optional_root_children"] as! [String] {
+            let url = root.appendingPathComponent(name)
+            if exists(url) { leaves.append(url) }
+        }
+        if !paths.isEmpty {
+            for rule in directories["leaves"] as! [[String: Any]] {
+                guard let path = paths[rule["field"] as! String] else { try fail("descriptor.paths", "required") }
+                var leaf = URL(fileURLWithPath: path)
+                for _ in 0..<(rule["parents"] as! Int) { leaf.deleteLastPathComponent() }
+                leaves.append(leaf)
+            }
+            for (field, names) in directories["optional_descendants"] as! [String: [String]] {
+                guard let path = paths[field] else { try fail("descriptor.paths", "required") }
+                for name in names {
+                    let url = URL(fileURLWithPath: path).appendingPathComponent(name)
+                    if exists(url) { leaves.append(url) }
+                }
+            }
+        }
+        var found: Set<URL> = [root]
+        for leaf in leaves {
+            var current = lexicalURL(leaf)
+            guard current.path == root.path || current.path.hasPrefix(prefix) else {
+                try fail("descriptor.paths", "outside_root")
+            }
+            while current.path != root.path {
+                found.insert(current)
+                current.deleteLastPathComponent()
+            }
+        }
+        return found.sorted {
+            let a = $0.pathComponents.count, b = $1.pathComponents.count
+            return a == b ? $0.path < $1.path : a < b
+        }
+    }
+
+    private static func resolvedPath(_ path: String, field: String) throws -> String {
+        var pending = path.split(separator: "/").map(String.init)
+        var resolved: [String] = [], cursor = 0, hops = 0
+        let rules = definition["path_rules"] as! [String: Any]
+        while cursor < pending.count {
+            let component = pending[cursor]
+            cursor += 1
+            if component == "." { continue }
+            if component == ".." {
+                if !resolved.isEmpty { resolved.removeLast() }
+                continue
+            }
+            let candidate = "/" + (resolved + [component]).joined(separator: "/")
+            var status = stat()
+            let result = lstat(candidate, &status)
+            if result == 0, (status.st_mode & S_IFMT) == S_IFLNK {
+                hops += 1
+                guard hops <= rules["max_symlink_hops"] as! Int else { try fail(field, "invalid_path") }
+                let target: String
+                do { target = try FileManager.default.destinationOfSymbolicLink(atPath: candidate) }
+                catch { try fail(field, "invalid_path") }
+                if target.hasPrefix("/") { resolved.removeAll(keepingCapacity: true) }
+                pending = target.split(separator: "/").map(String.init) + pending[cursor...]
+                cursor = 0
+                continue
+            }
+            if result != 0, errno != ENOENT, errno != ENOTDIR { try fail(field, "invalid_path") }
+            resolved.append(component)
+        }
+        return "/" + resolved.joined(separator: "/")
+    }
+
+    static func validate(_ value: [String: Any], root: URL) throws -> [String: Any] {
+        var paths: [String: String] = [:]
+        let fields = definition["fields"] as! [String: [String: Any]]
+        for name in fieldOrder {
+            let spec = fields[name]!, field = "descriptor." + name
+            guard let item = value[name] else { try fail(field, "required") }
+            if spec["type"] as! String == "integer" {
+                guard let number = item as? NSNumber,
+                      CFGetTypeID(number) != CFBooleanGetTypeID(),
+                      !["f", "d"].contains(String(cString: number.objCType)),
+                      number.compare(NSNumber(value: Int64.max)) != .orderedDescending,
+                      number.compare(NSNumber(value: Int64.min)) != .orderedAscending else {
+                    try fail(field, "must_be_integer")
+                }
+                if let expected = spec["const"] as? NSNumber, number != expected { try fail(field, "unsupported_value") }
+                if let minimum = spec["min"] as? NSNumber, let maximum = spec["max"] as? NSNumber,
+                   (number.compare(minimum) == .orderedAscending || number.compare(maximum) == .orderedDescending) {
+                    try fail(field, "out_of_range")
+                }
+            } else {
+                guard let text = item as? String else { try fail(field, "must_be_string") }
+                guard !text.isEmpty, !text.utf8.contains(0) else { try fail(field, "invalid_string") }
+                switch spec["format"] as? String {
+                case "canonical_uuid":
+                    guard let uuid = UUID(uuidString: text), uuid.uuidString.lowercased() == text else { try fail(field, "invalid_uuid") }
+                case "private_path":
+                    guard text.hasPrefix("/"), !text.split(separator: "/").contains("..") else { try fail(field, "invalid_path") }
+                    paths[name] = text
+                default: break
+                }
+            }
+        }
+        for name in fieldOrder {
+            let spec = fields[name]!
+            if spec["format"] as? String == "loopback_endpoint" {
+                let port = (value[spec["port_field"] as! String] as! NSNumber).intValue
+                let expected = (spec["template"] as! String).replacingOccurrences(of: "{port}", with: String(port))
+                guard value[name] as? String == expected else { try fail("descriptor." + name, "invalid_endpoint") }
+            }
+        }
+        // Preserve classified private-directory failures before path resolution
+        // hides a link, including a link that resolves to another private path.
+        for directory in try directoryPaths(root: root, paths: paths) {
+            var status = stat()
+            if lstat(directory.path, &status) == 0, (status.st_mode & S_IFMT) == S_IFLNK {
+                try fail("descriptor.paths", "symlink")
+            }
+        }
+        let resolvedRoot = try resolvedPath(root.path, field: "descriptor.paths")
+        let prefix = resolvedRoot == "/" ? "/" : resolvedRoot + "/"
+        for name in fieldOrder where paths[name] != nil {
+            let resolved = try resolvedPath(paths[name]!, field: "descriptor." + name)
+            guard resolved != resolvedRoot, resolved.hasPrefix(prefix) else { try fail("descriptor." + name, "outside_root") }
+        }
+        return value
+    }

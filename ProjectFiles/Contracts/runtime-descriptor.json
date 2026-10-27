@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "descriptor_version": 1,
+  "max_bytes": 131072,
+  "integer_bits": 64,
+  "max_depth": 512,
+  "unknown_fields": "allow",
+  "fields": {
+    "version": {"swift": "version", "type": "integer", "const": 1},
+    "instance_id": {"swift": "instanceID", "type": "string", "format": "canonical_uuid"},
+    "installation_fingerprint": {"swift": "installationFingerprint", "type": "string"},
+    "configuration_fingerprint": {"swift": "configurationFingerprint", "type": "string"},
+    "executable": {"swift": "executable", "type": "string", "format": "private_path"},
+    "node": {"swift": "node", "type": "string", "format": "private_path"},
+    "entry": {"swift": "entry", "type": "string", "format": "private_path"},
+    "state": {"swift": "state", "type": "string", "format": "private_path"},
+    "config": {"swift": "config", "type": "string", "format": "private_path"},
+    "workspace": {"swift": "workspace", "type": "string", "format": "private_path"},
+    "token_file": {"swift": "tokenFile", "type": "string", "format": "private_path"},
+    "endpoint": {"swift": "endpoint", "type": "string", "format": "loopback_endpoint", "port_field": "port", "template": "ws://127.0.0.1:{port}"},
+    "port": {"swift": "port", "type": "integer", "min": 1025, "max": 65399},
+    "openclaw_version": {"swift": "openclawVersion", "type": "string"},
+    "node_version": {"swift": "nodeVersion", "type": "string"}
+  },
+  "path_rules": {
+    "absolute": true,
+    "reject_parent_components": true,
+    "resolved_root": "descriptor_parent",
+    "strict_descendants": true,
+    "require_exists": false,
+    "max_symlink_hops": 40,
+    "private_directories": {
+      "optional_root_children": ["installations", "instances"],
+      "leaves": [
+        {"field": "node", "parents": 3},
+        {"field": "state", "parents": 0},
+        {"field": "workspace", "parents": 0},
+        {"field": "config", "parents": 1}
+      ],
+      "optional_descendants": {"state": ["state", "agents", "agents/main", "agents/main/agent"]},
+      "include_ancestors": true,
+      "reject_symlinks": true
+    }
+  }
+}
