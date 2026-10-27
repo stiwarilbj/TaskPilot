@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import secrets
 import shlex
 import shutil
@@ -100,6 +101,171 @@ def atomic_json(path: Path, value):
     finally:
         Path(name).unlink(missing_ok=True)
 
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+
+class ProvisioningJournal:
+    """One private transaction marker, held under the installation lock.
+
+    A separate inherited lease prevents recovery while an orphaned installer or
+    configuration child is still running. Markers are hints, never integrity or
+    readiness proof. No executable paths, settings, tokens or keys are recorded.
+    """
+    phases = {'staging', 'sealing', 'sealed', 'promoting', 'promoted',
+              'configuration', 'readback', 'activating', 'activated'}
+    def __init__(self, root):
+        self.root = Path(root)
+        self.path = self.root / 'provisioning.json'
+        self.fd = None
+
+    def __enter__(self):
+        check_private_directory(self.root)
+        fd = os.open(self.root / 'provisioning-lease.lock',
+                     os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+                raise ManagedRuntimeError('Private provisioning lease needs attention.')
+            os.fchmod(fd, 0o600)
+            try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise ManagedRuntimeError('A previous private provisioning helper is still finishing; try again after it exits.') from error
+            self.fd = fd
+            return self
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def __exit__(self, *_):
+        # Do not explicitly unlock: children may still hold this same lease
+        # after controller death. Its final close releases kernel ownership.
+        os.close(self.fd)
+        self.fd = None
+
+    @staticmethod
+    def valid(record):
+        if not isinstance(record, dict) or set(record) != {'version', 'phase', 'fingerprint', 'stage_id', 'stage_identity'}:
+            return False
+        if (type(record['version']) is not int or record['version'] != 1 or
+                not isinstance(record['phase'], str) or record['phase'] not in ProvisioningJournal.phases):
+            return False
+        if not isinstance(record['fingerprint'], str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', record['fingerprint']):
+            return False
+        stage, identity = record['stage_id'], record['stage_identity']
+        if stage is None:
+            return identity is None and record['phase'] not in {'staging', 'sealing', 'sealed', 'promoting'}
+        if not isinstance(stage, str) or not re.fullmatch(r'[0-9a-f]{32}', stage): return False
+        if record['phase'] not in {'staging', 'sealing', 'sealed', 'promoting', 'promoted'}: return False
+        if identity is None: return record['phase'] == 'staging'
+        return (isinstance(identity, dict) and set(identity) == {'device', 'inode'} and
+                all(type(v) is int and v >= 0 for v in identity.values()) and identity['inode'] > 0)
+
+    def read(self):
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as source:
+                info = os.fstat(source.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or
+                        stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1 or info.st_size > 4096):
+                    raise ValueError()
+                def unique(pairs):
+                    result = {}
+                    for key, value in pairs:
+                        if key in result: raise ValueError()
+                        result[key] = value
+                    return result
+                data = source.read(4097)
+                if len(data) > 4096: raise ValueError()
+                record = json.loads(data.decode('utf-8'), object_pairs_hook=unique)
+                if not self.valid(record): raise ValueError()
+                return record
+        except FileNotFoundError: return None
+        except (OSError, ValueError, TypeError, RecursionError) as error:
+            raise ManagedRuntimeError('Private provisioning journal needs attention; the active installation was left unchanged.') from error
+
+    def record(self, phase, fingerprint, stage_id=None, stage_identity=None):
+        value = dict(version=1, phase=phase, fingerprint=fingerprint,
+                     stage_id=stage_id, stage_identity=stage_identity)
+        if self.fd is None or not self.valid(value): raise ManagedRuntimeError('Invalid private provisioning phase.')
+        atomic_json(self.path, value)
+        sync_directory(self.root)
+        return value
+
+    def clear(self):
+        self.path.unlink(missing_ok=True)
+        sync_directory(self.root)
+
+    def run(self, argv, **kwargs):
+        return bounded_run(argv, pass_fds=(self.fd,), **kwargs)
+
+    def stage(self, record):
+        if not self.valid(record) or record['stage_id'] is None:
+            raise ManagedRuntimeError('Invalid private provisioning stage.')
+        return self.root / 'installations' / ('.stage-' + record['stage_id'])
+
+    def open_stage(self, record):
+        stage = self.stage(record)
+        try:
+            fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError: return None
+        except OSError as error:
+            raise ManagedRuntimeError('Private provisioning staging identity changed; no staging data was removed.') from error
+        info = os.fstat(fd)
+        identity = {'device': info.st_dev, 'inode': info.st_ino}
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700 or record['stage_identity'] not in (None, identity):
+            os.close(fd)
+            raise ManagedRuntimeError('Private provisioning staging identity changed; no staging data was removed.')
+        return fd
+
+    def discard_stage(self, record):
+        """Remove only the recorded staging object, using descriptor-relative IO."""
+        check_private_directory(self.root / 'installations')
+        fd = self.open_stage(record)
+        if fd is None: return
+        try:
+            info = os.fstat(fd)
+            # A crash between mkdir and binding its inode can leave only an
+            # empty directory: no payload work starts before the binding write.
+            if record['stage_identity'] is not None:
+                if not shutil.rmtree.avoids_symlink_attacks:
+                    raise ManagedRuntimeError('Safe private staging cleanup is unavailable on this platform.')
+                with os.scandir(fd) as entries:
+                    for entry in entries:
+                        if entry.is_dir(follow_symlinks=False): shutil.rmtree(entry.name, dir_fd=fd)
+                        else: os.unlink(entry.name, dir_fd=fd)
+            parent = os.open(self.root / 'installations', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                name = self.stage(record).name
+                current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                    raise ManagedRuntimeError('Private provisioning staging identity changed; no replacement was removed.')
+                try: os.rmdir(name, dir_fd=parent)
+                except OSError as error:
+                    if record['stage_identity'] is None and error.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                        raise ManagedRuntimeError('Unbound private provisioning stage is not empty; no data was removed.') from error
+                    raise
+                os.fsync(parent)
+            finally: os.close(parent)
+        finally: os.close(fd)
+
+    def recover_stage(self, fingerprint):
+        record = self.read()
+        if record is None or record['stage_id'] is None: return None
+        check_private_directory(self.root / 'installations')
+        fd = self.open_stage(record)
+        if fd is None: return None # Promotion may already have completed.
+        os.close(fd)
+        if (record['fingerprint'] == fingerprint and record['phase'] in {'sealed', 'promoting'} and
+                validate_install(self.stage(record), fingerprint, force_full=True)):
+            return record
+        self.discard_stage(record)
+        self.clear()
+        return None
+
 @contextmanager
 def locked(root: Path):
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -147,14 +313,14 @@ def download(url, destination, expected):
         destination.unlink(missing_ok=True)
         raise ManagedRuntimeError('Official Node checksum did not match. Installation was not activated.')
 
-def bounded_run(argv, *, env=None, timeout=45, cwd=None, input_data=None, result=False):
+def bounded_run(argv, *, env=None, timeout=45, cwd=None, input_data=None, result=False, pass_fds=()):
     # Disk-backed capture prevents unbounded communicate() allocation for npm.
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as input_file:
         if input_data is not None:
             input_file.write(input_data); input_file.seek(0)
         process = subprocess.Popen(argv, stdout=output, stderr=output,
                                    stdin=input_file if input_data is not None else subprocess.DEVNULL,
-                                   env=env, cwd=cwd, start_new_session=True)
+                                   env=env, cwd=cwd, start_new_session=True, pass_fds=pass_fds)
         try:
             code = process.wait(timeout=timeout)
         except BaseException:
@@ -533,13 +699,31 @@ def validate_install(directory, fingerprint, *, force_full=False, now_monotonic_
                 pass
             os.close(cache_fd)
 
-def install(resources, root):
+def install(resources, root, *, journal=None):
+    root = Path(root)
+    if journal is None:
+        with locked(root), ProvisioningJournal(root) as owned:
+            (root / 'installations').mkdir(exist_ok=True, mode=0o700)
+            check_private_directory(root / 'installations')
+            return install(resources, root, journal=owned)
     manifest, fingerprint = specification(resources)
+    pending = journal.read()
+    recovered = journal.recover_stage(fingerprint)
     target = root / 'installations' / fingerprint
-    if validate_install(target, fingerprint): return target, fingerprint, manifest
-    stage = root / 'installations' / ('.stage-' + uuid.uuid4().hex)
-    stage.mkdir(parents=True, mode=0o700)
+    if validate_install(target, fingerprint, force_full=pending is not None):
+        if recovered: journal.discard_stage(recovered)
+        return target, fingerprint, manifest
+    if recovered:
+        _promote_installation(journal, recovered, target)
+        return target, fingerprint, manifest
+    stage_id = uuid.uuid4().hex
+    record = journal.record('staging', fingerprint, stage_id)
+    stage = journal.stage(record)
+    stage.mkdir(mode=0o700)
+    info = stage.lstat()
+    identity = {'device': info.st_dev, 'inode': info.st_ino}
     try:
+        record = journal.record('staging', fingerprint, stage_id, identity)
         archive = manifest['node_archives'].get(platform.machine())
         if archive is None: raise ManagedRuntimeError('This Mac architecture is unsupported by the bundled runtime.')
         payload = stage / 'node.tar.gz'
@@ -560,22 +744,51 @@ def install(resources, root):
         package = stage / 'package'; package.mkdir()
         for name in ('package.json', 'package-lock.json'): shutil.copyfile(resources / name, package / name)
         env = isolated_environment(); env['PATH'] = str(stage / 'node/bin') + ':/usr/bin:/bin'
-        bounded_run([str(stage / 'node/bin/node'), str(stage / 'node/lib/node_modules/npm/bin/npm-cli.js'),
+        journal.run([str(stage / 'node/bin/node'), str(stage / 'node/lib/node_modules/npm/bin/npm-cli.js'),
             'ci', '--ignore-scripts', '--no-audit', '--no-fund', '--registry=https://registry.npmjs.org/',
             '--cache', str(stage / 'npm-cache')], env=env, timeout=900, cwd=package)
         shutil.rmtree(stage / 'npm-cache', ignore_errors=True)
         actual = json.loads((package / 'node_modules/openclaw/package.json').read_text())
         if actual['version'] != manifest['openclaw_version']: raise ManagedRuntimeError('Unexpected OpenClaw version.')
-        version = bounded_run([str(stage / 'node/bin/node'), str(package / 'node_modules/openclaw/openclaw.mjs'), '--version'], env=env)
+        version = journal.run([str(stage / 'node/bin/node'), str(package / 'node_modules/openclaw/openclaw.mjs'), '--version'], env=env)
         if manifest['openclaw_version'] not in version: raise ManagedRuntimeError('OpenClaw did not pass its launch check.')
+        record = journal.record('sealing', fingerprint, stage_id, identity)
         atomic_json(stage / 'integrity.json', {'fingerprint': fingerprint, 'files': seal(stage)})
-        if target.exists():
-            # Preserve corrupt installation for diagnosis, never overwrite active code.
+        sync_directory(stage)
+        record = journal.record('sealed', fingerprint, stage_id, identity)
+    except Exception:
+        # Normal download/build failures discard only their bound stage. A
+        # process crash/BaseException leaves the marker for the next owner.
+        journal.discard_stage(record)
+        journal.clear()
+        raise
+    _promote_installation(journal, record, target)
+    return target, fingerprint, manifest
+
+
+def _promote_installation(journal, record, target):
+    fd = journal.open_stage(record)
+    if fd is None: raise ManagedRuntimeError('Sealed private staging directory disappeared before promotion.')
+    try:
+        journal.record('promoting', record['fingerprint'], record['stage_id'], record['stage_identity'])
+        if target.exists() or target.is_symlink():
+            check_private_directory(target)
+            if validate_install(target, record['fingerprint'], force_full=True):
+                journal.discard_stage(record)
+                journal.record('promoted', record['fingerprint'])
+                return
+            # Never move a verified installation. Retain damaged code for
+            # diagnosis; no recovery cleanup follows this quarantine name.
             target.rename(target.with_name('.corrupt-' + uuid.uuid4().hex))
-        stage.rename(target)
-        return target, fingerprint, manifest
-    finally:
-        if stage.exists(): shutil.rmtree(stage)
+            sync_directory(target.parent)
+        info = os.fstat(fd)
+        current = journal.stage(record).lstat()
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            raise ManagedRuntimeError('Private staging directory changed before promotion.')
+        journal.stage(record).rename(target)
+        sync_directory(target.parent)
+        journal.record('promoted', record['fingerprint'], record['stage_id'], record['stage_identity'])
+    finally: os.close(fd)
 
 def managed_environment(inherited, node=None):
     """Policy v1 shared with Swift. The diagnostic bitmask never hashes values."""
@@ -631,17 +844,27 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
             offline = True
         for name in ('installations', 'instances'):
             (root / name).mkdir(exist_ok=True, mode=0o700)
-        target, fingerprint, manifest = install(resources, root)
+        journal = cleanup.enter_context(ProvisioningJournal(root))
+        interrupted = journal.read()
+        # Recover the activation flag before overwriting its phase. A second
+        # interruption during configuration must not lose this obligation.
+        if (interrupted is not None and interrupted['phase'] in {'activating', 'activated'} and
+                existing and existing['installation_fingerprint'] == interrupted['fingerprint']):
+            atomic_json(root / 'activation-verification.json', {'installation_fingerprint':interrupted['fingerprint']})
+            sync_directory(root)
+        target, fingerprint, manifest = install(resources, root, journal=journal)
         try:
             rejected = json.loads((root / 'rejected-installation.json').read_text())
-            if rejected.get('fingerprint') == fingerprint:
-                # Keep a tested rollback usable; do not reactivate a rejected update every refresh.
-                return load_descriptor(root / 'runtime.json')
-        except (OSError, ValueError): pass
+        except (OSError, ValueError): rejected = None
+        if isinstance(rejected, dict) and rejected.get('fingerprint') == fingerprint:
+            # Keep a tested rollback usable; do not reactivate a rejected update every refresh.
+            journal.clear()
+            return load_descriptor(root / 'runtime.json')
         check_private_directory(target)
         active = root / 'runtime.json'
         try: previous = load_descriptor(active)
         except ManagedRuntimeError: previous = None
+        journal.record('configuration', fingerprint)
         identity = previous['instance_id'] if previous and previous['installation_fingerprint'] == fingerprint else str(uuid.uuid4())
         state = root / 'instances' / identity; state.mkdir(parents=True, exist_ok=True, mode=0o700)
         config = state / 'openclaw.json'; workspace = state / 'workspace'; workspace.mkdir(exist_ok=True, mode=0o700)
@@ -657,7 +880,7 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
             if config.exists(): shutil.copyfile(config, state / 'previous-config.json')
         try: current_config = json.loads(config.read_text())
         except (OSError, ValueError): current_config = {}
-        config_changed = drained or not contains_settings(current_config, desired) or set(current_config.get('agents', {}).get('defaults', {}).get('models', {})) != set(desired['agents']['defaults']['models'])
+        config_changed = drained or interrupted is not None or not contains_settings(current_config, desired) or set(current_config.get('agents', {}).get('defaults', {}).get('models', {})) != set(desired['agents']['defaults']['models'])
         if config_changed:
             if not offline: cleanup.enter_context(configuration_hold(root, already_drained=drained)); offline = True
             require_offline(root)
@@ -675,9 +898,10 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
         # The pinned release stores authoritative configuration in SQLite and
         # exports JSON. Replacing JSON alone is reverted by the next command.
         if config_changed:
-            bounded_run([str(wrapper), 'config', 'patch', '--stdin', '--replace-path', 'agents.defaults.models'],
+            journal.run([str(wrapper), 'config', 'patch', '--stdin', '--replace-path', 'agents.defaults.models'],
                         input_data=json.dumps(desired).encode(), env=isolated_environment())
-            verify_settings(wrapper, desired)
+            journal.record('readback', fingerprint)
+            verify_settings(wrapper, desired, pass_fds=(journal.fd,))
         if key:
             key_fingerprint = hashlib.sha256(key.strip().encode()).hexdigest()
             try: saved_fingerprint = json.loads(key_record.read_text()).get('fingerprint')
@@ -689,7 +913,7 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
                 # or import any shared store. The supported auth command writes
                 # OpenClaw's current credential schema (SQLite in this release).
                 auth.unlink(missing_ok=True)
-                bounded_run([str(wrapper), 'models', 'auth', 'paste-api-key',
+                journal.run([str(wrapper), 'models', 'auth', 'paste-api-key',
                     '--provider', 'google', '--profile-id', 'google:orbit'],
                     input_data=(key.strip() + '\n').encode(), env=isolated_environment())
             try: saved_key = (root.parent / 'gemini-api-key').read_text().strip()
@@ -702,16 +926,23 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
             'config':str(config),'workspace':str(workspace),'token_file':str(token), 'port':port,
             'endpoint':f'ws://127.0.0.1:{port}',
             'configuration_fingerprint':configuration_fingerprint(desired, key_record)}
-        bounded_run([str(wrapper),'config','validate'], timeout=45, env=isolated_environment())
+        journal.record('readback', fingerprint)
+        journal.run([str(wrapper),'config','validate'], timeout=45, env=isolated_environment())
         try: check_managed_directories(root, descriptor)
         except PrivateDirectoryError as error:
             if error.code != 'private_directory_permissions': raise
             if not offline: cleanup.enter_context(configuration_hold(root, already_drained=drained)); offline = True
             require_offline(root)
             check_managed_directories(root, descriptor, repair=True)
+        journal.record('activating', fingerprint)
         atomic_json(active, descriptor)
-        if not previous or previous['installation_fingerprint'] != fingerprint:
+        sync_directory(root)
+        if (not previous or previous['installation_fingerprint'] != fingerprint or
+                interrupted is not None and interrupted['fingerprint'] == fingerprint and
+                interrupted['phase'] in {'activating', 'activated'}):
             atomic_json(root / 'activation-verification.json', {'installation_fingerprint':fingerprint})
+        journal.record('activated', fingerprint)
+        journal.clear()
         return descriptor
 
 def load_descriptor(path: Path = ROOT / 'runtime.json'):
@@ -874,11 +1105,11 @@ def contains_settings(actual, expected):
     return type(actual) is type(expected) and actual == expected
 
 
-def verify_settings(wrapper, expected):
+def verify_settings(wrapper, expected, *, pass_fds=()):
     # Read back authoritative SQLite configuration using the supported CLI.
     # Only managed top-level keys are compared; CLI metadata is not our setting.
     for key, value in expected.items():
-        actual = json.loads(bounded_run([str(wrapper), 'config', 'get', key, '--json'], env=isolated_environment()))
+        actual = json.loads(bounded_run([str(wrapper), 'config', 'get', key, '--json'], env=isolated_environment(), pass_fds=pass_fds))
         if key == 'gateway' and isinstance(actual, dict) and actual.get('auth', {}).get('token') == '__OPENCLAW_REDACTED__':
             value = {**value, 'auth':{**value['auth'], 'token':'__OPENCLAW_REDACTED__'}}
         if not contains_settings(actual, value):

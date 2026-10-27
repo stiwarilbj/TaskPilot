@@ -6,6 +6,52 @@ lock in `Resources/OpenClaw/managed` pin official Node checksums and every npm
 integrity. Provisioning stages, checks, seals, and then activates an installation.
 Updates ship with TaskPilot; runtime provisioning never requests `latest`.
 
+## Interrupted provisioning
+
+Provisioning keeps one bounded, versioned, mode-600 `provisioning.json` beside
+the active descriptor, outside sealed installations. It records fixed phase
+codes for staging, sealing, promotion, configuration/readback, and activation,
+an opaque installation fingerprint, and an optional random stage identifier
+with its device/inode. It contains no keys, settings, configuration contents,
+task data, or executable paths. Phase writes use atomic replacement and sync
+the file and parent directory before the corresponding work proceeds.
+
+The existing installation/configuration locks serialize provisioning. A separate
+kernel lease is explicitly inherited by provisioning CLI children, preventing
+recovery while a surviving child still holds it after controller death. No PID
+alone establishes abandonment. Recovery never scans for or deletes arbitrary
+stage directories: it opens the one recorded private stage without following
+symlinks, checks its identity, and removes contents relative to that descriptor.
+The mkdir-before-identity crash window permits only empty-directory removal.
+Unexpected replacements or malformed, unsafe, or oversized journals require
+attention and preserve the active installation.
+
+An interrupted incomplete stage is discarded and rebuilt. A matching sealed
+stage can resume promotion only after a full seal verification; a phase marker
+cannot prove integrity or readiness. Recovery also handles interruptions on
+either side of the promotion rename. An existing verified target wins over a
+duplicate stage, damaged targets retain the existing quarantine behavior, and
+the last verified active installation is never deleted by journal cleanup.
+No checkpoint requires a migration of older installations without a journal.
+
+Configuration is read back through the supported CLI again after an interrupted
+transaction, even if its exported JSON appears correct. Activation retains the
+provider-verification obligation across an interrupted descriptor/flag update,
+including a second interruption during recovery. A completed transaction clears
+the marker. These checks add no provider generations, connections, or desktop
+actions; ordinary health and provider checks retain their existing authority.
+
+Offline reproduction (from `ProjectFiles`):
+
+```sh
+python3 -m unittest discover -s Tests/Python -p test_managed_provisioning.py
+```
+
+The fixture uses tiny local archives, injected phase/rename failures, and a
+synthetic child process to test the surviving lease. It performs no download,
+OpenClaw launch, provider request, or desktop interaction. Live provisioning
+crash validation remains incomplete.
+
 `managed_openclaw.py` owns installation, isolated configuration, supported
 credential storage, descriptors, and tested rollback. It does not read shared
 OpenClaw workspace/configuration or invoke doctor, Homebrew, Gateway service
