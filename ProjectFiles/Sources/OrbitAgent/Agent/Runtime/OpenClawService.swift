@@ -50,6 +50,7 @@ final class OpenClawService {
     private var provisionedConfiguration: String?
     private var provisionAfter = Date.distantPast
     private var provisioningFailures = 0
+    private var provisioningResourceDetail: String?
     private var provisionedCredential: String?
     private var clientFile: URL?
     private var host: SubprocessSupervisor?
@@ -99,7 +100,7 @@ final class OpenClawService {
             if force || directoryRepair || provisionedCredential != SHA256.hash(data: Data(key.utf8)).description ||
                 current == nil || provisionedConfiguration != current?.configurationFingerprint {
                 guard Date() >= provisionAfter else {
-                    throw ManagedOpenClawError.command("Private OpenClaw installation is waiting for network recovery; TaskPilot will retry automatically.")
+                    throw ManagedOpenClawError.command(provisioningResourceDetail ?? "Private OpenClaw installation is waiting for network recovery; TaskPilot will retry automatically.")
                 }
                 let resources = Bundle.main.resourceURL!.appendingPathComponent("OpenClaw/managed")
                 let result = Self.run(executable: runtime,
@@ -108,9 +109,11 @@ final class OpenClawService {
                 guard result.status == 0 else {
                     provisioningFailures += 1
                     provisionAfter = Date().addingTimeInterval(min(300, 30 * pow(2, Double(min(provisioningFailures - 1, 4)))))
-                    throw ManagedOpenClawError.command(result.output)
+                    provisioningResourceDetail = ManagedGatewayHost.provisioningResourceDetail(result.output)
+                    throw ManagedOpenClawError.command(provisioningResourceDetail ?? result.output)
                 }
                 provisioningFailures = 0; provisionAfter = .distantPast
+                provisioningResourceDetail = nil
                 provisionedConfiguration = try ManagedOpenClawDescriptor.load().configurationFingerprint
                 provisionedCredential = SHA256.hash(data: Data(key.utf8)).description
             }

@@ -8,6 +8,8 @@ enum PrivateDirectoryPermissions {
         case ownership = "private_directory_ownership"
         case symlink = "private_directory_symlink"
         case permissions = "private_directory_permissions"
+        case acl = "private_directory_acl"
+        case flags = "private_directory_flags"
         case changed = "private_directory_changed"
         case unavailable = "private_directory_unavailable"
         var errorDescription: String? {
@@ -28,6 +30,24 @@ enum PrivateDirectoryPermissions {
             var opened = stat()
             guard fstat(fd, &opened) == 0, opened.st_dev == before.st_dev, opened.st_ino == before.st_ino,
                   opened.st_uid == getuid() else { throw Failure.changed }
+            let permittedFlags = UInt32(UF_HIDDEN | UF_NODUMP)
+            if UInt32(opened.st_flags) & ~permittedFlags != 0 { throw Failure.flags }
+            let acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED)
+            if let extendedACL = acl {
+                defer { acl_free(UnsafeMutableRawPointer(extendedACL)) }
+                var entry: acl_entry_t?
+                var result = acl_get_entry(extendedACL, 0, &entry)
+                var entryCount = 0
+                while result == 0 {
+                    entryCount += 1
+                    guard entryCount <= 169 else { throw Failure.acl }
+                    result = acl_get_entry(extendedACL, -1, &entry)
+                }
+                guard errno == EINVAL else { throw Failure.acl }
+                guard entryCount == 0 else { throw Failure.acl }
+            } else if errno != ENOENT {
+                throw Failure.acl
+            }
             if opened.st_mode & 0o7777 != 0o700 {
                 guard repair else { throw Failure.permissions }
                 guard fchmod(fd, 0o700) == 0 else { throw Failure.permissions }

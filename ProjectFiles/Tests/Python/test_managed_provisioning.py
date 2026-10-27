@@ -1,5 +1,5 @@
 """Crash-injected provisioning with tiny local archives; no runtime or network."""
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import hashlib
 import io
 import json
@@ -11,7 +11,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -43,6 +45,8 @@ class ProvisioningTests(unittest.TestCase):
                 archive.addfile(info, io.BytesIO(b'fixture'))
         self.fingerprint = hashlib.sha256(b'fixture-installation').hexdigest()
         self.manifest = dict(openclaw_version='2026.9.5', node_version='24.22.1',
+                             provisioning_space=dict(version=1, node_archive_bytes=1024, node_expanded_bytes=4096,
+                                                     package_archive_bytes=8192, package_expanded_bytes=32768),
                              node_archives={platform.machine(): dict(name='fixture.tar.gz', sha256=managed.digest(self.archive))})
         self.calls = []
 
@@ -53,7 +57,9 @@ class ProvisioningTests(unittest.TestCase):
             package.mkdir(parents=True)
             (package / 'package.json').write_text(json.dumps({'version':self.manifest['openclaw_version']}))
             (package / 'openclaw.mjs').write_text('fixture module')
-        return self.manifest['openclaw_version'] if '--version' in argv else ''
+        if '--version' in argv:
+            return 'v' + self.manifest['node_version'] if len(argv) == 2 else self.manifest['openclaw_version']
+        return ''
 
     @contextmanager
     def build(self):
@@ -61,7 +67,10 @@ class ProvisioningTests(unittest.TestCase):
             self.assertEqual(expected, managed.digest(self.archive))
             destination.write_bytes(self.archive.read_bytes())
         with patch.object(managed, 'specification', return_value=(self.manifest, self.fingerprint)), \
+             patch.object(managed, 'verify_binary_compatibility', return_value=True), \
+             patch.object(managed, 'verify_native_addons', return_value=0), \
              patch.object(managed, 'download', side_effect=download) as downloads, \
+             patch.object(managed.shutil, 'disk_usage', return_value=SimpleNamespace(free=64 * 1024**3)), \
              patch.object(managed, 'bounded_run', side_effect=self.cli) as runs:
             yield downloads, runs
 
@@ -231,7 +240,7 @@ class ProvisioningTests(unittest.TestCase):
             self.assertEqual(Path(first['config']).read_bytes(), config)
             managed.ensure(self.resources, self.root)
             readback.assert_called_once()
-            self.assertTrue(any('patch' in argv for argv, _ in self.calls))
+            self.assertFalse(any('patch' in argv for argv, _ in self.calls))
             self.assertFalse((self.root / 'provisioning.json').exists())
             # A healthy refresh uses no patch/readback generation or reinstalls.
             readback.reset_mock(); self.calls.clear()
@@ -344,6 +353,255 @@ class ProvisioningTests(unittest.TestCase):
         self.assertFalse(list(self.root.glob('.provisioning.json*')))
         self.assertFalse(list((self.root / 'installations').glob('.stage-*')))
         self.assert_preserved(before)
+
+    def test_space_budget_counts_only_remaining_allocations_and_accepts_exact_headroom(self):
+        phases = {'download':46104, 'extraction':45080, 'npm installation':40984, 'promotion':16}
+        with patch.object(managed, 'PROVISIONING_RESERVE_BYTES', 16), patch.object(managed, 'PROVISIONING_TEMPORARY_BYTES', 8):
+            for phase, required in phases.items():
+                with self.subTest(phase=phase):
+                    with patch.object(managed.shutil, 'disk_usage', return_value=SimpleNamespace(free=required)):
+                        managed.require_provisioning_space(self.root, self.manifest, phase)
+                    with patch.object(managed.shutil, 'disk_usage', return_value=SimpleNamespace(free=required - 1)):
+                        with self.assertRaises(managed.ProvisioningResourceError) as caught:
+                            managed.require_provisioning_space(self.root, self.manifest, phase)
+                    self.assertEqual(caught.exception.required_bytes, required)
+                    self.assertEqual(caught.exception.available_bytes, required - 1)
+                    self.assertEqual(caught.exception.code, 'local_resource_disk_space')
+
+    def test_space_shortage_at_each_phase_preserves_working_runtime(self):
+        for index, phase in enumerate(('download', 'extraction', 'npm installation', 'promotion')):
+            with self.subTest(phase=phase):
+                self.root = self.base / f'space-{index}'; self.root.mkdir(mode=0o700)
+                (self.root / 'installations').mkdir(mode=0o700)
+                before = self.preserve_active()
+                with self.build() as (downloads, runs), \
+                     patch.object(managed.shutil, 'disk_usage', side_effect=[SimpleNamespace(free=64 * 1024**3)] * index + [SimpleNamespace(free=0)]) as capacity, \
+                     patch.object(tarfile.TarFile, 'extractall', autospec=True, side_effect=tarfile.TarFile.extractall) as extract:
+                    with self.assertRaises(managed.ProvisioningResourceError) as caught:
+                        managed.install(self.resources, self.root)
+                    self.assertEqual(caught.exception.phase, phase)
+                    self.assertEqual(capacity.call_count, index + 1)
+                    self.assertEqual(downloads.call_count, 0 if index == 0 else 1)
+                    self.assertEqual(extract.call_count, 0 if index < 2 else 1)
+                    self.assertEqual(runs.call_count, {2: 1, 3: 3}.get(index, 0))
+                self.assert_preserved(before)
+                stages = list((self.root / 'installations').glob('.stage-*'))
+                self.assertEqual(len(stages), 1 if phase == 'promotion' else 0)
+                if phase == 'promotion':
+                    self.assertEqual(self.marker()['phase'], 'sealed')
+                    with self.build() as (downloads, runs):
+                        managed.install(self.resources, self.root)
+                        downloads.assert_not_called(); runs.assert_not_called()
+                    self.assert_preserved(before)
+
+    def test_recovered_stage_checks_space_before_moving_any_existing_target(self):
+        with self.build():
+            with self.crash_at('sealed'), self.assertRaises(Interrupted):
+                managed.install(self.resources, self.root)
+        broken = self.root / 'installations' / self.fingerprint
+        broken.mkdir(mode=0o700); (broken / 'keep').write_text('retained until safe promotion')
+        identity = broken.stat().st_ino
+        with self.build() as (downloads, runs), patch.object(managed.shutil, 'disk_usage', return_value=SimpleNamespace(free=0)):
+            with self.assertRaises(managed.ProvisioningResourceError): managed.install(self.resources, self.root)
+            downloads.assert_not_called(); runs.assert_not_called()
+        self.assertEqual(broken.stat().st_ino, identity)
+        self.assertFalse(list(broken.parent.glob('.corrupt-*')))
+        self.assertEqual(self.marker()['phase'], 'sealed')
+
+    def test_healthy_installation_skips_provisioning_space_checks(self):
+        with self.build():
+            first = managed.install(self.resources, self.root)
+            with patch.object(managed.shutil, 'disk_usage', side_effect=AssertionError('healthy runtime must not provision')):
+                self.assertEqual(managed.install(self.resources, self.root), first)
+
+    def test_unreadable_capacity_fails_before_download_instead_of_assuming_room(self):
+        for free in (None, -1, True, float('inf')):
+            with self.subTest(free=free), patch.object(managed.shutil, 'disk_usage', return_value=SimpleNamespace(free=free)):
+                with self.assertRaises(managed.ProvisioningResourceError) as caught:
+                    managed.require_provisioning_space(self.root, self.manifest, 'download')
+                self.assertEqual(caught.exception.code, 'local_resource_disk_space_check')
+        before = self.preserve_active()
+        with self.build() as (downloads, runs), patch.object(managed.shutil, 'disk_usage', side_effect=OSError('unavailable')):
+            with self.assertRaises(managed.ProvisioningResourceError): managed.install(self.resources, self.root)
+            downloads.assert_not_called(); runs.assert_not_called()
+        self.assert_preserved(before)
+
+    def test_invalid_manifest_estimates_are_not_silently_used(self):
+        values = [None, {}, {'version':2}, {**self.manifest['provisioning_space'], 'extra':1}]
+        values += [{**self.manifest['provisioning_space'], 'node_archive_bytes':value}
+                   for value in (True, 0, -1, '1024', 1.5, 65 * 1024**3)]
+        values += [{**self.manifest['provisioning_space'], 'package_expanded_bytes':1}]
+        for value in values:
+            with self.subTest(value=value), patch.object(managed.shutil, 'disk_usage') as capacity:
+                with self.assertRaisesRegex(managed.ManagedRuntimeError, 'space estimates are invalid'):
+                    managed.require_provisioning_space(self.root, {**self.manifest, 'provisioning_space':value}, 'download')
+                capacity.assert_not_called()
+
+    def test_disk_error_keeps_its_code_and_never_becomes_provider_capacity(self):
+        from request_policy import classify_failure
+        for available in (429 * 1024**2, 503 * 1024**2):
+            error = managed.ProvisioningResourceError('download', 1024**3, available)
+            failure = classify_failure(error, 1000)
+            self.assertEqual(failure.code, 'local_resource_disk_space')
+            self.assertEqual(failure.kind, 'configuration')
+            self.assertEqual(failure.retry_at, 0)
+            self.assertIsNone(failure.provider)
+
+    def test_private_directory_acl_and_access_flags_fail_closed_without_repair(self):
+        with patch.object(managed, '_extended_acl_entry_count', return_value=1):
+            with self.assertRaises(managed.PrivateDirectoryError) as caught:
+                managed.check_private_directory(self.root, repair=True)
+            self.assertEqual(caught.exception.code, 'private_directory_acl')
+        with patch.object(managed, '_extended_acl_entry_count', side_effect=OSError('unavailable')):
+            with self.assertRaises(managed.PrivateDirectoryError) as caught:
+                managed.check_private_directory(self.root, repair=True)
+            self.assertEqual(caught.exception.code, 'private_directory_acl')
+        with patch.object(managed, '_unexpected_private_directory_flags', return_value=True):
+            with self.assertRaises(managed.PrivateDirectoryError) as caught:
+                managed.check_private_directory(self.root, repair=True)
+            self.assertEqual(caught.exception.code, 'private_directory_flags')
+        self.assertEqual(managed._unexpected_private_directory_flags(0), False)
+
+    def test_configuration_delta_only_contains_differing_managed_leaves(self):
+        desired = {'gateway': {'mode': 'local', 'port': 12},
+                   'agents': {'defaults': {'workspace': '/new', 'models': {'new-model': {}}}},
+                   'plugins': {'enabled': True}}
+        actual = {'gateway': {'mode': 'local', 'port': 12, 'custom': 'keep'},
+                  'agents': {'defaults': {'workspace': '/old', 'models': {'old-model': {}}, 'extra': 3}},
+                  'plugins': {'enabled': True, 'custom': 4}, 'unrelated': True}
+        self.assertEqual(managed.configuration_delta(actual, desired), {
+            'agents': {'defaults': {'workspace': '/new', 'models': {'new-model': {}}}}})
+        self.assertEqual(managed.configuration_delta(desired, desired), {})
+        self.assertEqual(managed.configuration_patch_arguments('/private/openclaw', {'plugins': {'enabled': True}}),
+                         ['/private/openclaw', 'config', 'patch', '--stdin'])
+        self.assertEqual(managed.configuration_patch_arguments('/private/openclaw', {'agents': {'defaults': {'models': {'new': {}}}}}),
+                         ['/private/openclaw', 'config', 'patch', '--stdin', '--replace-path', 'agents.defaults.models'])
+
+    def test_configuration_path_fence_detects_state_and_config_replacement(self):
+        state = self.root / 'state'; state.mkdir(mode=0o700)
+        config = state / 'openclaw.json'; config.write_text('{}'); config.chmod(0o600)
+        fence = managed.ConfigurationPathFence(state, config)
+        snapshot = fence.snapshot()
+        replacement = state / 'replacement'; replacement.write_text('{}'); replacement.chmod(0o600)
+        os.replace(replacement, config)
+        with self.assertRaises(managed.ConfigurationPathError): fence.verify(snapshot)
+
+    def test_configuration_subprocess_cannot_replace_its_bound_file(self):
+        state = self.root / 'state'; state.mkdir(mode=0o700)
+        config = state / 'openclaw.json'; config.write_text('{}'); config.chmod(0o600)
+        replacement = state / 'replacement.json'; replacement.write_text('{"new":true}'); replacement.chmod(0o600)
+        fence = managed.ConfigurationPathFence(state, config)
+        script = 'import os,sys; os.replace(sys.argv[1], sys.argv[2])'
+        with self.assertRaises(managed.ConfigurationPathError):
+            managed.bounded_run([sys.executable, '-c', script, str(replacement), str(config)], path_fence=fence)
+        self.assertEqual(json.loads(config.read_text()), {'new': True})
+
+    def test_read_only_database_health_is_bounded_and_distinguishes_corruption(self):
+        import sqlite3
+        state = self.root / 'state'; state.mkdir(mode=0o700)
+        good = state / 'openclaw.sqlite'
+        with closing(sqlite3.connect(good)) as database: database.execute('CREATE TABLE state (value TEXT)')
+        self.assertEqual(managed.read_only_database_health(good), 'ok')
+        before = good.stat()
+        self.assertEqual(managed.read_only_database_health(good), 'ok')
+        self.assertEqual(good.stat().st_mtime_ns, before.st_mtime_ns)
+        corrupt = state / 'bad.sqlite'; corrupt.write_bytes(b'not a sqlite database')
+        self.assertEqual(managed.read_only_database_health(corrupt), 'corrupt')
+        self.assertEqual(managed.read_only_database_health(state / 'absent.sqlite'), 'missing')
+
+    def test_read_only_database_locked_or_expired_is_inconclusive(self):
+        import sqlite3
+        state = self.root / 'state'; state.mkdir(mode=0o700)
+        path = state / 'openclaw.sqlite'
+        with closing(sqlite3.connect(path)) as database: database.execute('CREATE TABLE state (value TEXT)')
+        with patch.object(managed.time, 'monotonic', side_effect=[0.0, 2.0, 2.0]):
+            self.assertEqual(managed.read_only_database_health(path, timeout=0.5), 'inconclusive')
+        self.assertIn(managed.read_only_database_health(path), {'ok', 'inconclusive'})
+
+    def test_read_only_database_timeout_interrupts_an_inflight_check(self):
+        import sqlite3
+        state = self.root / 'state'; state.mkdir(mode=0o700)
+        path = state / 'openclaw.sqlite'; path.write_bytes(b'fixture')
+        interrupted = threading.Event()
+        class SlowConnection:
+            def execute(self, statement):
+                if statement.startswith('PRAGMA busy_timeout='): return self
+                if statement == 'PRAGMA quick_check(1)':
+                    if not interrupted.wait(1): raise AssertionError('health check was not interrupted')
+                    raise sqlite3.OperationalError('interrupted')
+                raise AssertionError('unexpected query')
+            def set_progress_handler(self, *_): pass
+            def interrupt(self): interrupted.set()
+            def close(self): pass
+        with patch('managed_openclaw.sqlite3.connect', return_value=SlowConnection()):
+            self.assertEqual(managed.read_only_database_health(path, timeout=0.02), 'inconclusive')
+        self.assertTrue(interrupted.is_set())
+
+    def test_read_only_database_path_replacement_is_inconclusive(self):
+        state = self.root / 'state'; state.mkdir(mode=0o700)
+        path = state / 'openclaw.sqlite'; path.write_bytes(b'original')
+        replacement = state / 'replacement.sqlite'; replacement.write_bytes(b'replacement')
+        class ReplacingConnection:
+            class Cursor:
+                def fetchone(self): return ('ok',)
+            def execute(self, statement):
+                if statement.startswith('PRAGMA busy_timeout='): return self
+                os.replace(replacement, path)
+                return self.Cursor()
+            def set_progress_handler(self, *_): pass
+            def interrupt(self): pass
+            def close(self): pass
+        with patch('managed_openclaw.sqlite3.connect', return_value=ReplacingConnection()):
+            self.assertEqual(managed.read_only_database_health(path), 'inconclusive')
+        self.assertEqual(path.read_bytes(), b'replacement')
+
+    def test_database_corruption_and_inconclusive_audits_are_not_repaired_automatically(self):
+        for cause in ('database_corrupt', 'database_inconclusive', 'private_configuration_path_changed'):
+            with self.subTest(cause=cause), patch.object(managed, 'require_offline'), \
+                 patch.object(managed, 'audit', return_value={'ok':False, 'causes':[cause], 'fingerprint':'fixture'}), \
+                 patch.object(managed, 'ensure') as provision:
+                with self.assertRaises(managed.ManagedRuntimeError):
+                    managed.repair(self.root / 'runtime.json', self.resources)
+                provision.assert_not_called()
+
+    def test_macho_compatibility_checks_architecture_minimum_os_and_binary_identity(self):
+        import struct
+        node = self.base / 'node'
+        command = struct.pack('<IIIIII', 0x32, 24, 1, (13 << 16) | (5 << 8),
+                              (14 << 16), 0)
+        header = bytearray(32)
+        header[:4] = b'\xcf\xfa\xed\xfe'
+        struct.pack_into('<I', header, 4, 0x0100000C)
+        struct.pack_into('<II', header, 16, 1, len(command))
+        node.write_bytes(header + command)
+        manifest = {**self.manifest, 'compatibility': {'version':1, 'architectures':['arm64'], 'minimum_macos':'13.5'}}
+        self.assertEqual(managed.inspect_mach_o(node), [('arm64', (13, 5, 0))])
+        self.assertTrue(managed.verify_binary_compatibility(node, manifest, process_arch='arm64', macos_version='14.0'))
+        with self.assertRaisesRegex(managed.ManagedRuntimeError, 'architecture'):
+            managed.verify_binary_compatibility(node, manifest, process_arch='x86_64', macos_version='14.0')
+        old_manifest = {**manifest, 'compatibility': {'version':1, 'architectures':['arm64'], 'minimum_macos':'12.0'}}
+        with self.assertRaisesRegex(managed.ManagedRuntimeError, 'newer macOS'):
+            managed.verify_binary_compatibility(node, old_manifest, process_arch='arm64', macos_version='12.7')
+
+    def test_native_addon_scanner_is_bounded_and_accepts_host_compatible_addon(self):
+        import struct
+        package = self.base / 'node_modules'; package.mkdir()
+        addon = bytearray(32); addon[:4] = b'\xcf\xfa\xed\xfe'
+        struct.pack_into('<I', addon, 4, 0x0100000C)
+        command = struct.pack('<IIIIII', 0x32, 24, 1, (13 << 16) | (5 << 8), (14 << 16), 0)
+        struct.pack_into('<II', addon, 16, 1, len(command))
+        (package / 'native.node').write_bytes(addon + command)
+        # npm packages may include prebuilds for multiple architectures. The
+        # host's package launch check covers the selected module; unrelated
+        # architecture variants must not make an otherwise valid install fail.
+        alternate = bytearray(32); alternate[:4] = b'\xcf\xfa\xed\xfe'
+        struct.pack_into('<I', alternate, 4, 0x01000007)
+        struct.pack_into('<II', alternate, 16, 1, len(command))
+        (package / 'native-x64-prebuild.node').write_bytes(alternate + command)
+        manifest = {**self.manifest, 'compatibility': {'version':1, 'architectures':['arm64'], 'minimum_macos':'13.5'}}
+        self.assertEqual(managed.verify_native_addons(package, manifest, process_arch='arm64', macos_version='14.0'), 1)
+        with self.assertRaisesRegex(managed.ManagedRuntimeError, 'bounded work limit'):
+            managed.verify_native_addons(package, manifest, maximum_files=0, process_arch='arm64', macos_version='14.0')
 
     def test_live_helper_retains_lease_after_controller_exit(self):
         ready = self.base / 'ready'; release = self.base / 'release'

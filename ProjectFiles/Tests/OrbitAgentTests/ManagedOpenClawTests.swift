@@ -5,6 +5,19 @@ import XCTest
 @testable import OrbitAgent
 
 final class ManagedOpenClawTests: XCTestCase {
+    func testProvisioningResourceErrorsStaySpecificWithoutExposingChildPayloads() {
+        let disk = #"{"kind":"error","error_code":"local_resource_disk_space","message":"untrusted child payload"}"#
+        let unavailable = #"{"kind":"error","error_code":"local_resource_disk_space_check"}"#
+        let detail = ManagedGatewayHost.provisioningResourceDetail(disk)
+        XCTAssertTrue(detail?.contains("Not enough disk space") == true)
+        XCTAssertFalse(detail?.contains("untrusted") == true)
+        XCTAssertTrue(ManagedGatewayHost.provisioningResourceDetail(unavailable)?.contains("could not check") == true)
+        for output in ["not JSON", #"{"kind":"status","error_code":"local_resource_disk_space"}"#,
+                       #"{"kind":"error","error_code":"other_error"}"#] {
+            XCTAssertNil(ManagedGatewayHost.provisioningResourceDetail(output))
+        }
+    }
+
     func testManagedEnvironmentMatchesSharedPolicyAndIsIdempotent() throws {
         struct Fixture: Decodable { let name: String; let inherited: [String: String]; let expected: [String: String]; let code: Int }
         let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
@@ -326,11 +339,58 @@ final class ManagedOpenClawTests: XCTestCase {
     }
 
     func testUnsafeDirectoryFaultRequiresAttentionRatherThanReinstall() {
-        for cause in ["private_directory_symlink", "private_directory_ownership", "private_directory_changed", "private_directory_unavailable"] {
+        for cause in ["private_directory_symlink", "private_directory_ownership", "private_directory_changed", "private_directory_unavailable", "private_directory_acl", "private_directory_flags"] {
             XCTAssertEqual(ManagedGatewayHost.directoryAttentionCause(["causes":[cause]]), cause)
         }
         XCTAssertNil(ManagedGatewayHost.directoryAttentionCause(["causes":["private_directory_permissions"]]))
         XCTAssertNil(ManagedGatewayHost.directoryAttentionCause(["causes":["installation"]]))
+    }
+
+    func testGatewayWakeReceivesHealthAndConfigurationRequestsAndProcessSignals() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory:true)
+        try FileManager.default.createDirectory(at:root, withIntermediateDirectories:true, attributes:[.posixPermissions:0o700])
+        try FileManager.default.createDirectory(at:root.appendingPathComponent("clients"), withIntermediateDirectories:false,
+                                                attributes:[.posixPermissions:0o700])
+        defer { try? FileManager.default.removeItem(at:root) }
+        let wake = ManagedGatewayWake(root:root); defer { wake.close() }
+        var token = wake.token()
+        try Data("{}".utf8).write(to:root.appendingPathComponent("health-request.json"), options:.atomic)
+        XCTAssertTrue(wake.wait(after:token, timeout:2))
+        token = wake.token()
+        try Data("{}".utf8).write(to:root.appendingPathComponent("configuration-request.json"), options:.atomic)
+        XCTAssertTrue(wake.wait(after:token, timeout:2))
+        token = wake.token()
+        let requestHandle = try FileHandle(forWritingTo:root.appendingPathComponent("health-request.json"))
+        try requestHandle.truncate(atOffset:0)
+        try requestHandle.write(contentsOf:Data("{\"fault\":true}".utf8))
+        try requestHandle.close()
+        XCTAssertTrue(wake.wait(after:token, timeout:2), "In-place request updates should wake the supervisor")
+        token = wake.token()
+        try Data("{}".utf8).write(to:root.appendingPathComponent("clients/client.json"), options:.atomic)
+        XCTAssertTrue(wake.wait(after:token, timeout:2), "Client registration should wake the supervisor")
+        token = wake.token()
+        try FileManager.default.removeItem(at:root.appendingPathComponent("clients/client.json"))
+        XCTAssertTrue(wake.wait(after:token, timeout:2), "Client removal should wake the supervisor")
+        token = wake.token(); wake.signal()
+        XCTAssertTrue(wake.wait(after:token, timeout:0.1))
+    }
+
+    func testGatewayWakeReceivesOwnedChildExitNotification() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory:true)
+        try FileManager.default.createDirectory(at:root, withIntermediateDirectories:true, attributes:[.posixPermissions:0o700])
+        try FileManager.default.createDirectory(at:root.appendingPathComponent("clients"), withIntermediateDirectories:false,
+                                                attributes:[.posixPermissions:0o700])
+        defer { try? FileManager.default.removeItem(at:root) }
+        let wake = ManagedGatewayWake(root:root); defer { wake.close() }
+        let token = wake.token()
+        let process = SubprocessSupervisor(resourceSnapshot: { .init(available:100, softLimit:256) })
+        process.executableURL = URL(fileURLWithPath:"/usr/bin/true")
+        process.terminationHandler = { _ in wake.signal() }
+        process.whenTreeExits { wake.signal() }
+        try process.run()
+        XCTAssertTrue(wake.wait(after:token, timeout:3), "An owned process exit should wake the Gateway loop")
+        if case .finished = process.waitForTree(until:.now() + 3) { }
+        else { XCTFail("The owned child tree should finish") }
     }
 
     func testFakeGatewayHasOneOwnerAndDrainsAfterLastClient() throws {

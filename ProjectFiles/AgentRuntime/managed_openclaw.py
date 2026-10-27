@@ -12,6 +12,7 @@ from contextlib import contextmanager, ExitStack, closing
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -21,9 +22,11 @@ import shlex
 import shutil
 import socket
 import stat
+import struct
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.request
 import uuid
@@ -36,13 +39,117 @@ INTEGRITY_CACHE_VERSION = 1
 FULL_INTEGRITY_AUDIT_SECONDS = 60 * 60
 INTEGRITY_READ_CHUNK_BYTES = 1024 * 1024
 INTEGRITY_CACHE_MAX_BYTES = 64 * 1024 * 1024
+PROVISIONING_RESERVE_BYTES = 512 * 1024 * 1024
+PROVISIONING_TEMPORARY_BYTES = 256 * 1024 * 1024
+SQLITE_HEALTH_TIMEOUT_SECONDS = 0.75
+SQLITE_BUSY_TIMEOUT_MILLISECONDS = 100
+SQLITE_PROGRESS_INTERVAL = 500
+SQLITE_HEALTH_FILES = ('openclaw.sqlite', 'agents/main/agent/openclaw-agent.sqlite')
 
 class ManagedRuntimeError(RuntimeError): pass
+
+class ConfigurationPathError(ManagedRuntimeError):
+    code = 'private_configuration_path_changed'
+
+class ProvisioningResourceError(ManagedRuntimeError):
+    def __init__(self, phase, required=None, available=None):
+        self.code = 'local_resource_disk_space' if available is not None else 'local_resource_disk_space_check'
+        self.phase, self.required_bytes, self.available_bytes = phase, required, available
+        if available is None:
+            detail = 'Could not check available disk space before private OpenClaw provisioning. Check the storage volume and retry.'
+        else:
+            mib = 1024 * 1024
+            needed = (required + mib - 1) // mib
+            free = available // mib
+            detail = (f'Not enough disk space before private OpenClaw {phase}: '
+                      f'at least {needed} MiB free is needed; {free} MiB is available. Free disk space and retry.')
+        super().__init__(self.code + ': ' + detail + ' The current working runtime was left intact.')
+
+
+def provisioning_space(manifest):
+    """Pinned estimates, not measured requirements or an integrity assertion."""
+    value = manifest.get('provisioning_space')
+    names = ('node_archive_bytes', 'node_expanded_bytes', 'package_archive_bytes', 'package_expanded_bytes')
+    if (not isinstance(value, dict) or set(value) != {'version', *names} or
+            type(value['version']) is not int or value['version'] != 1 or
+            any(type(value[name]) is not int or not 0 < value[name] <= 64 * 1024**3 for name in names) or
+            value['node_expanded_bytes'] < value['node_archive_bytes'] or
+            value['package_expanded_bytes'] < value['package_archive_bytes']):
+        raise ManagedRuntimeError('Bundled OpenClaw provisioning space estimates are invalid; reinstall TaskPilot.')
+    return value
+
+
+def require_provisioning_space(directory, manifest, phase):
+    estimates = provisioning_space(manifest)
+    # Free space already excludes allocated archives, Node and package files.
+    # Count only the remaining peak allocations, never the active installation.
+    remaining = {
+        'download': ('node_archive_bytes', 'node_expanded_bytes', 'package_archive_bytes', 'package_expanded_bytes'),
+        'extraction': ('node_expanded_bytes', 'package_archive_bytes', 'package_expanded_bytes'),
+        'npm installation': ('package_archive_bytes', 'package_expanded_bytes'),
+        'promotion': (),
+    }
+    required = PROVISIONING_RESERVE_BYTES + sum(estimates[key] for key in remaining[phase])
+    if phase != 'promotion': required += PROVISIONING_TEMPORARY_BYTES
+    try:
+        available = shutil.disk_usage(directory).free
+        if type(available) is not int or available < 0: raise ValueError()
+    except (OSError, ValueError, OverflowError) as error:
+        raise ProvisioningResourceError(phase) from error
+    if available < required: raise ProvisioningResourceError(phase, required, available)
+
 
 class PrivateDirectoryError(ManagedRuntimeError):
     def __init__(self, code):
         self.code = 'private_directory_' + code
         super().__init__(self.code + ': TaskPilot private storage needs attention; verify ownership and permissions.')
+
+
+def _extended_acl_entry_count(fd):
+    """Return the number of extended ACL entries, failing closed if unreadable."""
+    library = ctypes.CDLL(None, use_errno=True)
+    getter = getattr(library, 'acl_get_fd_np', None)
+    entry_getter = getattr(library, 'acl_get_entry', None)
+    free = getattr(library, 'acl_free', None)
+    if getter is None or entry_getter is None or free is None:
+        raise OSError(errno.ENOTSUP, 'extended ACL inspection is unavailable')
+    getter.argtypes = (ctypes.c_int, ctypes.c_int)
+    getter.restype = ctypes.c_void_p
+    entry_getter.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))
+    entry_getter.restype = ctypes.c_int
+    free.argtypes = (ctypes.c_void_p,)
+    free.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    acl = getter(fd, 0x100)  # Darwin ACL_TYPE_EXTENDED
+    if not acl:
+        error = ctypes.get_errno()
+        # Darwin reports ENOENT when the vnode has no extended ACL.
+        if error == errno.ENOENT: return 0
+        raise OSError(error or errno.EIO, 'extended ACL could not be inspected')
+    try:
+        count = 0
+        entry = ctypes.c_void_p()
+        while True:
+            ctypes.set_errno(0)
+            result = entry_getter(acl, 0 if count == 0 else -1, ctypes.byref(entry))
+            if result == 0:
+                count += 1
+                if count > 128:
+                    raise OSError(errno.EOVERFLOW, 'extended ACL entry limit exceeded')
+                continue
+            error = ctypes.get_errno()
+            # macOS uses EINVAL to indicate end-of-list for acl_get_entry.
+            if error == errno.EINVAL:
+                return count
+            raise OSError(error or errno.EIO, 'extended ACL could not be enumerated')
+    finally:
+        free(acl)
+
+
+def _unexpected_private_directory_flags(flags):
+    # Hiding and backup-exclusion flags do not grant access or inhibit cleanup.
+    permitted = getattr(stat, 'UF_HIDDEN', 0) | getattr(stat, 'UF_NODUMP', 0)
+    return bool(flags & ~permitted)
 
 
 def check_private_directory(path, *, repair=False, allow_mode_drift=False):
@@ -58,6 +165,15 @@ def check_private_directory(path, *, repair=False, allow_mode_drift=False):
             opened = os.fstat(fd)
             if (opened.st_dev, opened.st_ino, opened.st_uid) != (before.st_dev, before.st_ino, os.getuid()):
                 raise PrivateDirectoryError('changed')
+            if _unexpected_private_directory_flags(int(getattr(opened, 'st_flags', 0))):
+                raise PrivateDirectoryError('flags')
+            try:
+                extended_acl_entries = _extended_acl_entry_count(fd)
+            except OSError as error:
+                raise PrivateDirectoryError('acl') from error
+            if extended_acl_entries:
+                # No ACL is removed automatically: provenance cannot be proved.
+                raise PrivateDirectoryError('acl')
             if stat.S_IMODE(opened.st_mode) != 0o700:
                 if repair: os.fchmod(fd, 0o700)
                 elif not allow_mode_drift: raise PrivateDirectoryError('permissions')
@@ -106,6 +222,158 @@ def sync_directory(path):
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     try: os.fsync(fd)
     finally: os.close(fd)
+
+
+_MACH_CPU_ARCHITECTURES = {0x0100000C: 'arm64', 0x01000007: 'x86_64'}
+
+
+def _version_tuple(value):
+    if not isinstance(value, str) or not re.fullmatch(r'\d+\.\d+(?:\.\d+)?', value):
+        raise ManagedRuntimeError('Bundled OpenClaw compatibility version is invalid.')
+    return tuple(int(part) for part in (value.split('.') + ['0'])[:3])
+
+
+def runtime_compatibility(manifest):
+    value = manifest.get('compatibility')
+    architectures = value.get('architectures') if isinstance(value, dict) else None
+    archives = manifest.get('node_archives')
+    if (not isinstance(value, dict) or set(value) != {'version', 'architectures', 'minimum_macos'} or
+            type(value.get('version')) is not int or value['version'] != 1 or
+            not isinstance(architectures, list) or not architectures or
+            any(not isinstance(arch, str) for arch in architectures) or
+            len(set(architectures)) != len(architectures) or
+            any(arch not in {'arm64', 'x86_64'} for arch in architectures) or
+            not isinstance(archives, dict) or set(architectures) - set(archives)):
+        raise ManagedRuntimeError('Bundled OpenClaw architecture compatibility is invalid.')
+    minimum = _version_tuple(value['minimum_macos'])
+    return set(value['architectures']), minimum
+
+
+def _read_exact(fd, offset, size, limit=1024 * 1024):
+    if offset < 0 or size < 0 or size > limit:
+        raise ManagedRuntimeError('Managed runtime binary metadata exceeds its bounds.')
+    data = os.pread(fd, size, offset)
+    if len(data) != size: raise ManagedRuntimeError('Managed runtime binary header is truncated.')
+    return data
+
+
+def _thin_mach_o_slice(fd, offset, size):
+    magic = _read_exact(fd, offset, min(size, 4), limit=4)
+    formats = {
+        b'\xcf\xfa\xed\xfe': ('<', 32), b'\xfe\xed\xfa\xcf': ('>', 32),
+        b'\xce\xfa\xed\xfe': ('<', 28), b'\xfe\xed\xfa\xce': ('>', 28),
+    }
+    if magic not in formats: return None
+    endian, header_size = formats[magic]
+    header = _read_exact(fd, offset, header_size, limit=64)
+    cpu = struct.unpack_from(endian + 'i', header, 4)[0] & 0xffffffff
+    if header_size == 32:
+        command_count, command_bytes = struct.unpack_from(endian + 'II', header, 16)
+    else:
+        command_count, command_bytes = struct.unpack_from(endian + 'II', header, 16)
+    if command_count > 4096 or command_bytes > 1024 * 1024 or header_size + command_bytes > size:
+        raise ManagedRuntimeError('Managed runtime binary load commands exceed their bounds.')
+    commands = _read_exact(fd, offset + header_size, command_bytes)
+    cursor = 0; minimum = None
+    for _ in range(command_count):
+        if cursor + 8 > len(commands): raise ManagedRuntimeError('Managed runtime binary load command is truncated.')
+        command, command_size = struct.unpack_from(endian + 'II', commands, cursor)
+        if command_size < 8 or cursor + command_size > len(commands):
+            raise ManagedRuntimeError('Managed runtime binary load command is invalid.')
+        if command == 0x32 and command_size >= 24:  # LC_BUILD_VERSION
+            encoded = struct.unpack_from(endian + 'I', commands, cursor + 12)[0]
+            minimum = ((encoded >> 16) & 0xffff, (encoded >> 8) & 0xff, encoded & 0xff)
+        elif command == 0x24 and command_size >= 16:  # LC_VERSION_MIN_MACOSX
+            encoded = struct.unpack_from(endian + 'I', commands, cursor + 8)[0]
+            minimum = ((encoded >> 16) & 0xffff, (encoded >> 8) & 0xff, encoded & 0xff)
+        cursor += command_size
+    architecture = _MACH_CPU_ARCHITECTURES.get(cpu)
+    if architecture is None: return None
+    return architecture, minimum
+
+
+def inspect_mach_o(path):
+    """Read bounded Mach-O headers through a no-follow descriptor."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0))
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 512 * 1024 * 1024:
+            raise ManagedRuntimeError('Managed runtime binary is not a bounded regular file.')
+        prefix = _read_exact(fd, 0, min(before.st_size, 8), limit=8)
+        fat = {b'\xca\xfe\xba\xbe': ('>', False), b'\xbe\xba\xfe\xca': ('<', False),
+               b'\xca\xfe\xba\xbf': ('>', True), b'\xbf\xba\xfe\xca': ('<', True)}
+        slices = []
+        if prefix[:4] in fat:
+            endian, fat64 = fat[prefix[:4]]
+            if len(prefix) < 8: raise ManagedRuntimeError('Managed runtime universal binary header is truncated.')
+            count = struct.unpack_from(endian + 'I', prefix, 4)[0]
+            entry_size = 32 if fat64 else 20
+            if count < 1 or count > 16: raise ManagedRuntimeError('Managed runtime universal binary has an invalid architecture count.')
+            table = _read_exact(fd, 8, count * entry_size, limit=16 * 32)
+            for index in range(count):
+                entry = index * entry_size
+                cpu = struct.unpack_from(endian + 'I', table, entry)[0]
+                if fat64: slice_offset, slice_size = struct.unpack_from(endian + 'QQ', table, entry + 8)
+                else: slice_offset, slice_size = struct.unpack_from(endian + 'II', table, entry + 8)
+                if slice_offset + slice_size > before.st_size or slice_size <= 0:
+                    raise ManagedRuntimeError('Managed runtime universal binary slice is invalid.')
+                parsed = _thin_mach_o_slice(fd, slice_offset, slice_size)
+                if parsed is not None and parsed[0] == _MACH_CPU_ARCHITECTURES.get(cpu): slices.append(parsed)
+        else:
+            parsed = _thin_mach_o_slice(fd, 0, before.st_size)
+            if parsed is not None: slices.append(parsed)
+        after = os.fstat(fd)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ManagedRuntimeError('Managed runtime binary changed during compatibility inspection.')
+        return slices
+    finally: os.close(fd)
+
+
+def verify_binary_compatibility(path, manifest, *, process_arch=None, macos_version=None, required=True):
+    supported, minimum = runtime_compatibility(manifest)
+    process_arch = process_arch or platform.machine()
+    if process_arch not in supported:
+        raise ManagedRuntimeError('This Mac architecture is not supported by the pinned private OpenClaw runtime.')
+    if macos_version is None: macos_version = platform.mac_ver()[0]
+    if macos_version and _version_tuple(macos_version) < minimum:
+        raise ManagedRuntimeError('This macOS version is older than the bundled private runtime supports.')
+    slices = inspect_mach_o(path)
+    if not slices and not required: return False
+    matching = [minimum_os for architecture, minimum_os in slices if architecture == process_arch]
+    if not matching or any(version is None for version in matching):
+        raise ManagedRuntimeError('Staged OpenClaw binary does not declare a supported macOS architecture and minimum version.')
+    if any(version > (macos_version and _version_tuple(macos_version) or minimum) for version in matching):
+        raise ManagedRuntimeError('Staged OpenClaw binary requires a newer macOS version than this app process.')
+    return True
+
+
+def verify_native_addons(package, manifest, *, process_arch=None, macos_version=None,
+                         maximum_directories=8192, maximum_files=32768, timeout=30):
+    started = time.monotonic(); directories = 0; files = 0; addons = 0
+    root = Path(package)
+    for current, names, filenames in os.walk(root, followlinks=False):
+        directories += 1; files += len(filenames)
+        if (directories > maximum_directories or files > maximum_files or
+                time.monotonic() - started > timeout):
+            raise ManagedRuntimeError('Native module compatibility inspection exceeded its bounded work limit.')
+        names[:] = [name for name in names if not (Path(current) / name).is_symlink()]
+        for filename in filenames:
+            if not filename.endswith('.node'): continue
+            path = Path(current) / filename
+            if path.is_symlink(): continue
+            slices = inspect_mach_o(path)
+            if not slices or not any(architecture == (process_arch or platform.machine())
+                                     for architecture, _ in slices):
+                # Packages may ship alternative platform prebuilds beside the
+                # host-selected module. OpenClaw's own --version launch above
+                # already proves its eagerly loaded native dependencies resolve.
+                continue
+            if verify_binary_compatibility(path, manifest, process_arch=process_arch,
+                                           macos_version=macos_version, required=False):
+                addons += 1
+                if addons > 512: raise ManagedRuntimeError('Native module compatibility inspection exceeded its file limit.')
+    return addons
 
 
 class ProvisioningJournal:
@@ -267,7 +535,7 @@ class ProvisioningJournal:
         return None
 
 @contextmanager
-def locked(root: Path):
+def locked(root: Path, *, blocking=True):
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     check_private_directory(root, allow_mode_drift=True)
     fd = os.open(root / 'installation.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0), 0o600)
@@ -276,7 +544,7 @@ def locked(root: Path):
         if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != os.getuid() or lock_stat.st_nlink != 1:
             raise PrivateDirectoryError('ownership')
         os.fchmod(f.fileno(), 0o600)
-        fcntl.flock(f, fcntl.LOCK_EX)
+        fcntl.flock(f, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
         yield
 
 def digest(path):
@@ -298,6 +566,8 @@ def specification(resources: Path):
         if not name: continue
         if not entry.get('integrity') or not entry.get('resolved', '').startswith('https://registry.npmjs.org/'):
             raise ManagedRuntimeError('Bundled dependency lock contains an unverified source.')
+    provisioning_space(manifest)
+    runtime_compatibility(manifest)
     fingerprint = hashlib.sha256(b''.join((resources / n).read_bytes() for n in
         ('runtime-manifest.json', 'package.json', 'package-lock.json'))).hexdigest()
     return manifest, fingerprint
@@ -313,8 +583,41 @@ def download(url, destination, expected):
         destination.unlink(missing_ok=True)
         raise ManagedRuntimeError('Official Node checksum did not match. Installation was not activated.')
 
-def bounded_run(argv, *, env=None, timeout=45, cwd=None, input_data=None, result=False, pass_fds=()):
+def _identity_at(path, expected):
+    path = Path(path)
+    try: value = path.lstat()
+    except FileNotFoundError: return None
+    if (stat.S_ISLNK(value.st_mode) or value.st_uid != os.getuid() or
+            expected == 'file' and value.st_nlink != 1):
+        raise ConfigurationPathError('Private configuration identity needs attention.')
+    if expected == 'directory' and not stat.S_ISDIR(value.st_mode):
+        raise ConfigurationPathError('Private configuration directory changed.')
+    if expected == 'file' and not stat.S_ISREG(value.st_mode):
+        raise ConfigurationPathError('Private configuration file changed.')
+    return (value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode), value.st_uid,
+            value.st_nlink if expected == 'file' else None)
+
+
+class ConfigurationPathFence:
+    """Detect state/config path replacement around supported CLI operations."""
+    def __init__(self, state, config):
+        self.state, self.config = Path(state), Path(config)
+
+    def snapshot(self):
+        state = _identity_at(self.state, 'directory')
+        config = _identity_at(self.config, 'file')
+        if state is None:
+            raise ConfigurationPathError('Private state directory disappeared.')
+        return state, config
+
+    def verify(self, snapshot):
+        if self.snapshot() != snapshot:
+            raise ConfigurationPathError('A private configuration path was replaced during a CLI operation.')
+
+
+def bounded_run(argv, *, env=None, timeout=45, cwd=None, input_data=None, result=False, pass_fds=(), path_fence=None):
     # Disk-backed capture prevents unbounded communicate() allocation for npm.
+    fence_snapshot = path_fence.snapshot() if path_fence is not None else None
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as input_file:
         if input_data is not None:
             input_file.write(input_data); input_file.seek(0)
@@ -328,6 +631,8 @@ def bounded_run(argv, *, env=None, timeout=45, cwd=None, input_data=None, result
             try: os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError: pass
             process.wait(); raise
+        if path_fence is not None:
+            path_fence.verify(fence_snapshot)
         output.seek(0); text = output.read(65536).decode('utf-8', 'replace')
         if result: return code, text
         if code: raise ManagedRuntimeError('Managed runtime validation failed; the previous installation remains available.')
@@ -714,8 +1019,9 @@ def install(resources, root, *, journal=None):
         if recovered: journal.discard_stage(recovered)
         return target, fingerprint, manifest
     if recovered:
-        _promote_installation(journal, recovered, target)
+        _promote_installation(journal, recovered, target, manifest)
         return target, fingerprint, manifest
+    require_provisioning_space(root / 'installations', manifest, 'download')
     stage_id = uuid.uuid4().hex
     record = journal.record('staging', fingerprint, stage_id)
     stage = journal.stage(record)
@@ -737,13 +1043,20 @@ def install(resources, root, *, journal=None):
                     parent = resolved.parent if member.issym() else stage
                     if not (parent / member.linkname).resolve().is_relative_to(stage.resolve()):
                         raise ManagedRuntimeError('Unsafe Node archive link.')
+            require_provisioning_space(stage, manifest, 'extraction')
             tar.extractall(stage, filter='data')
         payload.unlink()
         extracted = stage / archive['name'].removesuffix('.tar.gz')
         extracted.rename(stage / 'node')
+        staged_node = stage / 'node/bin/node'
+        verify_binary_compatibility(staged_node, manifest)
+        runtime_version = journal.run([str(staged_node), '--version'], env=isolated_environment())
+        if runtime_version.strip() != 'v' + manifest['node_version']:
+            raise ManagedRuntimeError('The staged Node runtime failed its bounded launch compatibility check.')
         package = stage / 'package'; package.mkdir()
         for name in ('package.json', 'package-lock.json'): shutil.copyfile(resources / name, package / name)
         env = isolated_environment(); env['PATH'] = str(stage / 'node/bin') + ':/usr/bin:/bin'
+        require_provisioning_space(stage, manifest, 'npm installation')
         journal.run([str(stage / 'node/bin/node'), str(stage / 'node/lib/node_modules/npm/bin/npm-cli.js'),
             'ci', '--ignore-scripts', '--no-audit', '--no-fund', '--registry=https://registry.npmjs.org/',
             '--cache', str(stage / 'npm-cache')], env=env, timeout=900, cwd=package)
@@ -752,6 +1065,7 @@ def install(resources, root, *, journal=None):
         if actual['version'] != manifest['openclaw_version']: raise ManagedRuntimeError('Unexpected OpenClaw version.')
         version = journal.run([str(stage / 'node/bin/node'), str(package / 'node_modules/openclaw/openclaw.mjs'), '--version'], env=env)
         if manifest['openclaw_version'] not in version: raise ManagedRuntimeError('OpenClaw did not pass its launch check.')
+        verify_native_addons(package / 'node_modules', manifest)
         record = journal.record('sealing', fingerprint, stage_id, identity)
         atomic_json(stage / 'integrity.json', {'fingerprint': fingerprint, 'files': seal(stage)})
         sync_directory(stage)
@@ -762,14 +1076,15 @@ def install(resources, root, *, journal=None):
         journal.discard_stage(record)
         journal.clear()
         raise
-    _promote_installation(journal, record, target)
+    _promote_installation(journal, record, target, manifest)
     return target, fingerprint, manifest
 
 
-def _promote_installation(journal, record, target):
+def _promote_installation(journal, record, target, manifest):
     fd = journal.open_stage(record)
     if fd is None: raise ManagedRuntimeError('Sealed private staging directory disappeared before promotion.')
     try:
+        require_provisioning_space(journal.stage(record), manifest, 'promotion')
         journal.record('promoting', record['fingerprint'], record['stage_id'], record['stage_identity'])
         if target.exists() or target.is_symlink():
             check_private_directory(target)
@@ -864,9 +1179,15 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
         active = root / 'runtime.json'
         try: previous = load_descriptor(active)
         except ManagedRuntimeError: previous = None
+        active_path_fence = ConfigurationPathFence(root, active)
+        active_path_snapshot = active_path_fence.snapshot()
         journal.record('configuration', fingerprint)
         identity = previous['instance_id'] if previous and previous['installation_fingerprint'] == fingerprint else str(uuid.uuid4())
-        state = root / 'instances' / identity; state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        state = root / 'instances' / identity
+        try: state.mkdir(mode=0o700); created = True
+        except FileExistsError: created = False
+        from managed_profiles import register_owner
+        register_owner(root, state, created=created, installation_lock_held=True)
         config = state / 'openclaw.json'; workspace = state / 'workspace'; workspace.mkdir(exist_ok=True, mode=0o700)
         token = state / 'gateway-token'
         if not token.exists():
@@ -885,6 +1206,8 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
             if not offline: cleanup.enter_context(configuration_hold(root, already_drained=drained)); offline = True
             require_offline(root)
             atomic_json(config, merge_settings(current_config, desired))
+        configuration_fence = ConfigurationPathFence(state, config)
+        configuration_snapshot = configuration_fence.snapshot()
         auth = state / 'agents/main/agent/auth-profiles.json'
         key_record = state / 'credential-fingerprint.json'
         if key and len(key.strip()) < 20:
@@ -897,11 +1220,15 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
             temp = wrapper.with_suffix('.new'); temp.write_text(script); temp.chmod(0o700); temp.replace(wrapper)
         # The pinned release stores authoritative configuration in SQLite and
         # exports JSON. Replacing JSON alone is reverted by the next command.
+        patch_value = configuration_delta(current_config, desired)
+        if patch_value:
+            patch_command = configuration_patch_arguments(wrapper, patch_value)
+            journal.run(patch_command,
+                        input_data=json.dumps(patch_value).encode(), env=isolated_environment(),
+                        path_fence=configuration_fence)
         if config_changed:
-            journal.run([str(wrapper), 'config', 'patch', '--stdin', '--replace-path', 'agents.defaults.models'],
-                        input_data=json.dumps(desired).encode(), env=isolated_environment())
             journal.record('readback', fingerprint)
-            verify_settings(wrapper, desired, pass_fds=(journal.fd,))
+            verify_settings(wrapper, desired, pass_fds=(journal.fd,), path_fence=configuration_fence)
         if key:
             key_fingerprint = hashlib.sha256(key.strip().encode()).hexdigest()
             try: saved_fingerprint = json.loads(key_record.read_text()).get('fingerprint')
@@ -915,7 +1242,8 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
                 auth.unlink(missing_ok=True)
                 journal.run([str(wrapper), 'models', 'auth', 'paste-api-key',
                     '--provider', 'google', '--profile-id', 'google:orbit'],
-                    input_data=(key.strip() + '\n').encode(), env=isolated_environment())
+                    input_data=(key.strip() + '\n').encode(), env=isolated_environment(),
+                    path_fence=configuration_fence)
             try: saved_key = (root.parent / 'gemini-api-key').read_text().strip()
             except OSError: saved_key = ''
             atomic_json(key_record, {'fingerprint':key_fingerprint,
@@ -927,7 +1255,9 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
             'endpoint':f'ws://127.0.0.1:{port}',
             'configuration_fingerprint':configuration_fingerprint(desired, key_record)}
         journal.record('readback', fingerprint)
-        journal.run([str(wrapper),'config','validate'], timeout=45, env=isolated_environment())
+        journal.run([str(wrapper),'config','validate'], timeout=45, env=isolated_environment(),
+                    path_fence=configuration_fence)
+        configuration_fence.verify(configuration_snapshot)
         try: check_managed_directories(root, descriptor)
         except PrivateDirectoryError as error:
             if error.code != 'private_directory_permissions': raise
@@ -935,6 +1265,7 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
             require_offline(root)
             check_managed_directories(root, descriptor, repair=True)
         journal.record('activating', fingerprint)
+        active_path_fence.verify(active_path_snapshot)
         atomic_json(active, descriptor)
         sync_directory(root)
         if (not previous or previous['installation_fingerprint'] != fingerprint or
@@ -957,6 +1288,8 @@ def load_descriptor(path: Path = ROOT / 'runtime.json'):
 def activate_environment(path):
     d = load_descriptor(path)
     check_managed_directories(path.parent, d)
+    from managed_profiles import register_owner
+    register_owner(path.parent, d['state'])
     env, diagnostic = managed_environment(dict(os.environ), d['node'])
     # Best-effort, bounded, content-free record. Diagnostic I/O never blocks readiness.
     record = path.parent / 'environment-diagnostics.json'
@@ -998,14 +1331,27 @@ def wait_for_health(path, *, sleep=time.sleep, now=time.monotonic, status=None, 
 def relocate(path):
     with locked(path.parent):
         d = load_descriptor(path)
+        active_identity = _identity_at(path, 'file')
+        fence = ConfigurationPathFence(d['state'], d['config'])
+        before = fence.snapshot()
         port = private_port()
         config = Path(d['config']); value = json.loads(config.read_text())
         value['gateway']['port'] = port
         bounded_run([d['executable'], 'config', 'patch', '--stdin'],
-                    input_data=json.dumps({'gateway':{'port':port}}).encode(), env=isolated_environment())
+                    input_data=json.dumps({'gateway':{'port':port}}).encode(), env=isolated_environment(),
+                    path_fence=fence)
+        fence.verify(before)
         atomic_json(config, value)
+        updated = fence.snapshot()
         d.update(port=port, endpoint=f'ws://127.0.0.1:{port}')
         d['configuration_fingerprint'] = configuration_fingerprint(desired_settings(d['workspace'], Path(d['token_file']), port), Path(d['state']) / 'credential-fingerprint.json')
+        expected = desired_settings(d['workspace'], Path(d['token_file']), port)
+        verify_settings(d['executable'], expected, path_fence=fence)
+        bounded_run([d['executable'], 'config', 'validate'], timeout=45,
+                    env=isolated_environment(), path_fence=fence)
+        fence.verify(updated)
+        if _identity_at(path, 'file') != active_identity:
+            raise ConfigurationPathError('Active descriptor changed during endpoint relocation.')
         atomic_json(path, d)
         return d
 
@@ -1021,6 +1367,9 @@ def command(operation, resources=None, descriptor=None, *, force_integrity=False
         require_offline(path.parent)
         result = relocate(path)
     elif operation == 'rollback': result = rollback(path)
+    elif operation == 'collect-profiles':
+        from managed_profiles import collect
+        result = collect(path.parent)
     else: raise ManagedRuntimeError('Unsupported managed runtime operation.')
     print(json.dumps(result, separators=(',', ':')))
     return 0
@@ -1034,6 +1383,7 @@ def mark_working(path):
 def rollback(path):
     require_offline(path.parent)
     with locked(path.parent):
+        active_identity = _identity_at(path, 'file')
         d = load_descriptor(path.parent / 'working-runtime.json')
         if not validate_install(Path(d['node']).parents[2], d['installation_fingerprint'], force_full=True):
             raise ManagedRuntimeError('The last working OpenClaw installation is unavailable; reconfigure in Settings.')
@@ -1041,9 +1391,20 @@ def rollback(path):
         if d['installation_fingerprint'] == failed['installation_fingerprint']:
             raise ManagedRuntimeError('No different verified compatible installation is available for rollback.')
         configuration = json.loads((path.parent / 'working-config.json').read_text())
+        fence = ConfigurationPathFence(d['state'], d['config'])
+        before = fence.snapshot()
         bounded_run([d['executable'], 'config', 'patch', '--stdin'],
-                    input_data=json.dumps(configuration).encode(), env=isolated_environment())
+                    input_data=json.dumps(configuration).encode(), env=isolated_environment(),
+                    path_fence=fence)
+        fence.verify(before)
         atomic_json(Path(d['config']), configuration)
+        updated = fence.snapshot()
+        verify_settings(d['executable'], configuration, path_fence=fence)
+        bounded_run([d['executable'], 'config', 'validate'], timeout=45,
+                    env=isolated_environment(), path_fence=fence)
+        fence.verify(updated)
+        if _identity_at(path, 'file') != active_identity:
+            raise ConfigurationPathError('Active descriptor changed during runtime rollback.')
         atomic_json(path.parent / 'rejected-installation.json', {'fingerprint':failed['installation_fingerprint']})
         atomic_json(path, d)
         return d
@@ -1105,11 +1466,12 @@ def contains_settings(actual, expected):
     return type(actual) is type(expected) and actual == expected
 
 
-def verify_settings(wrapper, expected, *, pass_fds=()):
+def verify_settings(wrapper, expected, *, pass_fds=(), path_fence=None):
     # Read back authoritative SQLite configuration using the supported CLI.
     # Only managed top-level keys are compared; CLI metadata is not our setting.
     for key, value in expected.items():
-        actual = json.loads(bounded_run([str(wrapper), 'config', 'get', key, '--json'], env=isolated_environment(), pass_fds=pass_fds))
+        actual = json.loads(bounded_run([str(wrapper), 'config', 'get', key, '--json'], env=isolated_environment(),
+                                        pass_fds=pass_fds, path_fence=path_fence))
         if key == 'gateway' and isinstance(actual, dict) and actual.get('auth', {}).get('token') == '__OPENCLAW_REDACTED__':
             value = {**value, 'auth':{**value['auth'], 'token':'__OPENCLAW_REDACTED__'}}
         if not contains_settings(actual, value):
@@ -1129,6 +1491,77 @@ def credential_present(state):
                 if row is not None: return True
         except (OSError, sqlite3.Error): continue
     return False
+
+
+def read_only_database_health(path, *, timeout=SQLITE_HEALTH_TIMEOUT_SECONDS,
+                              now_monotonic=None):
+    """Bounded SQLite integrity check. It never opens a database for writing."""
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 5:
+        return 'inconclusive'
+    database = Path(path)
+    try: info = database.lstat()
+    except FileNotFoundError: return 'missing'
+    if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or
+            info.st_uid != os.getuid() or info.st_nlink != 1):
+        return 'inconclusive'
+    started = time.monotonic() if now_monotonic is None else now_monotonic()
+    deadline = started + timeout
+    connection = None
+    interrupter = None
+    try:
+        uri = database.as_uri() + '?mode=ro'
+        connection = sqlite3.connect(uri, uri=True,
+                                     timeout=SQLITE_BUSY_TIMEOUT_MILLISECONDS / 1000)
+        connection.execute(f'PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MILLISECONDS}')
+        clock = time.monotonic if now_monotonic is None else now_monotonic
+        connection.set_progress_handler(lambda: 1 if clock() >= deadline else 0,
+                                        SQLITE_PROGRESS_INTERVAL)
+        # Progress handlers run between SQLite VM steps. An independent
+        # interrupt also bounds a long-running statement while it is blocked
+        # in a database operation. It is cancelled before the connection is
+        # closed and never changes the database.
+        if now_monotonic is None:
+            interrupter = threading.Timer(max(0.001, timeout), connection.interrupt)
+            interrupter.daemon = True
+            interrupter.start()
+        row = connection.execute('PRAGMA quick_check(1)').fetchone()
+        if clock() >= deadline: return 'inconclusive'
+        try: after = database.lstat()
+        except OSError: return 'inconclusive'
+        before_identity = (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink,
+                           info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        after_identity = (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_nlink,
+                          after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        if before_identity != after_identity or stat.S_ISLNK(after.st_mode): return 'inconclusive'
+        if row == ('ok',): return 'ok'
+        return 'corrupt'
+    except sqlite3.OperationalError as error:
+        message = str(error).lower()
+        if any(token in message for token in ('locked', 'busy', 'interrupted', 'unable to open', 'permission denied')):
+            return 'inconclusive'
+        if any(token in message for token in ('not a database', 'malformed', 'disk image is malformed')):
+            return 'corrupt'
+        return 'inconclusive'
+    except sqlite3.DatabaseError as error:
+        message = str(error).lower()
+        return 'corrupt' if any(token in message for token in ('not a database', 'malformed', 'disk image is malformed')) else 'inconclusive'
+    except OSError:
+        return 'inconclusive'
+    finally:
+        if interrupter is not None:
+            interrupter.cancel()
+            if interrupter.is_alive(): interrupter.join(timeout=0.1)
+        if connection is not None:
+            try: connection.close()
+            except sqlite3.Error: pass
+
+
+def known_database_health(state, *, timeout=SQLITE_HEALTH_TIMEOUT_SECONDS,
+                          now_monotonic=None):
+    root = Path(state)
+    return {name: read_only_database_health(root / name, timeout=timeout,
+                                             now_monotonic=now_monotonic)
+            for name in SQLITE_HEALTH_FILES}
 
 
 def direct_command(descriptor):
@@ -1166,6 +1599,10 @@ def audit(path, *, force_integrity=False):
     installation_ok = validate_install(Path(d['node']).parents[2], d['installation_fingerprint'],
                                         force_full=force_integrity, stats=integrity_stats)
     if not installation_ok: faults.append('installation')
+    database_health = known_database_health(d['state'])
+    database_values = tuple(database_health.values())
+    if 'corrupt' in database_values: faults.append('database_corrupt')
+    if 'inconclusive' in database_values: faults.append('database_inconclusive')
     try:
         if Path(d['executable']).read_text() != wrapper_script(d['state'], d['config'], d['node'], d['entry']) or not os.access(d['executable'], os.X_OK): faults.append('wrapper')
     except (OSError, UnicodeError): faults.append('wrapper')
@@ -1177,9 +1614,14 @@ def audit(path, *, force_integrity=False):
         expected_fingerprint = configuration_fingerprint(required, key_record)
         if expected_fingerprint != d['configuration_fingerprint']: faults.append('configuration_fingerprint')
         if not contains_settings(config, required) or set(config.get('agents', {}).get('defaults', {}).get('models', {})) != set(ALL_MODELS): faults.append('configuration')
-        if not faults: verify_settings(d['executable'], required)
+        if not faults and not any(value in {'inconclusive', 'corrupt'} for value in database_values):
+            verify_settings(d['executable'], required,
+                            path_fence=ConfigurationPathFence(d['state'], d['config']))
+    except ConfigurationPathError: faults.append(ConfigurationPathError.code)
     except (OSError, ValueError, ManagedRuntimeError): faults.append('configuration')
-    if not credential_present(d['state']): faults.append('credential_store')
+    if (not any(value in {'inconclusive', 'corrupt'} for value in database_values) and
+            not credential_present(d['state'])):
+        faults.append('credential_store')
     try:
         saved_key = (path.parent.parent / 'gemini-api-key').read_text().strip()
         record = json.loads((Path(d['state']) / 'credential-fingerprint.json').read_text())
@@ -1191,12 +1633,15 @@ def audit(path, *, force_integrity=False):
         if not key_matches and not checking: faults.append('credential_store')
     except (OSError, ValueError, KeyError): faults.append('credential_store')
     # Hash contents only for equality/budget identity, never persist raw config.
-    parts = [d['installation_fingerprint'], d['configuration_fingerprint'], *sorted(set(faults))]
+    parts = [d['installation_fingerprint'], d['configuration_fingerprint'], *sorted(set(faults)),
+             *[name + ':' + database_health[name] for name in sorted(database_health)]]
     for name in ('config','executable'):
         try: parts.append(digest(d[name]))
         except OSError: parts.append('missing')
     fingerprint = hashlib.sha256(':'.join(parts).encode()).hexdigest()
     result = {'version':VERSION, 'ok':not faults, 'causes':sorted(set(faults)), 'fingerprint':fingerprint,
+              'database_health':database_health,
+              'retry_after_seconds':5 if 'database_inconclusive' in faults else 0,
               'full_integrity_ok': integrity_stats.get('audit_mode') == 'full' and installation_ok,
               'environment': managed_environment(dict(os.environ), d['node'])[1],
               'integrity_audit': {key:integrity_stats.get(key) for key in
@@ -1209,6 +1654,10 @@ def audit(path, *, force_integrity=False):
 def repair(path, resources):
     require_offline(path.parent)
     result = audit(path, force_integrity=True)
+    if 'database_inconclusive' in result['causes']:
+        raise ManagedRuntimeError('Private OpenClaw database health was inconclusive; no repair was attempted. Wait briefly and retry the read-only check.')
+    if 'database_corrupt' in result['causes'] or 'private_configuration_path_changed' in result['causes']:
+        raise ManagedRuntimeError('A private OpenClaw database or configuration path needs inspection; no automatic repair was attempted.')
     unsafe = [cause for cause in result['causes'] if cause.startswith('private_directory_') and cause != 'private_directory_permissions']
     if unsafe: raise ManagedRuntimeError(unsafe[0] + ': Private storage needs attention; no automatic repair was attempted.')
     if result['ok']: return load_descriptor(path)
@@ -1314,3 +1763,27 @@ def merge_settings(actual, desired):
     if 'agents' in desired:
         merged['agents']['defaults']['models'] = desired['agents']['defaults']['models']
     return merged
+
+
+def configuration_delta(actual, desired, path=()):
+    """Return only TaskPilot-managed leaves that differ from the readback file."""
+    if isinstance(desired, dict):
+        result = {}
+        actual_map = actual if isinstance(actual, dict) else {}
+        for key, value in desired.items():
+            # The model catalog is an exact managed set. Replace it as one leaf
+            # so removed/legacy model entries cannot survive a recursive merge.
+            if path == ('agents', 'defaults') and key == 'models':
+                if actual_map.get(key) != value: result[key] = value
+                continue
+            child = configuration_delta(actual_map.get(key), value, path + (key,))
+            if child != {}: result[key] = child
+        return result
+    return {} if type(actual) is type(desired) and actual == desired else desired
+
+
+def configuration_patch_arguments(wrapper, delta):
+    arguments = [str(wrapper), 'config', 'patch', '--stdin']
+    if 'models' in delta.get('agents', {}).get('defaults', {}):
+        arguments.extend(['--replace-path', 'agents.defaults.models'])
+    return arguments

@@ -2,7 +2,19 @@
   "version": 1,
   "openclaw_version": "2026.9.5",
   "node_version": "24.22.1",
+  "compatibility": {
+    "version": 1,
+    "architectures": ["arm64", "x86_64"],
+    "minimum_macos": "13.5"
+  },
   "openclaw_integrity": "sha512-TCO/ImVLh5HkF4tdfo7iriIa7kT6iYkIr/jR5ZOkePGFGhUx5Oe7DE716Y1DzzG2teRAVDdCjgJDu1A24Yta7w==",
+  "provisioning_space": {
+    "version": 1,
+    "node_archive_bytes": 134217728,
+    "node_expanded_bytes": 536870912,
+    "package_archive_bytes": 536870912,
+    "package_expanded_bytes": 2147483648
+  },
   "node_archives": {
     "arm64": {
       "name": "node-v24.22.1-darwin-arm64.tar.gz",

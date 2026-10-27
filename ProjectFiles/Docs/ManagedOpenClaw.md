@@ -308,9 +308,150 @@ Even a known directory remains blocked if it cannot be opened safely (for exampl
 mode `000` on macOS); no pathname-only chmod fallback is used. These are point-in-time
 checks, not a claim to prevent unrelated processes from changing paths afterward.
 
+On macOS, preflight also inspects the directory descriptor for extended ACL
+entries and access-affecting filesystem flags. Any extended ACL, unsupported ACL
+inspection, immutable/append/no-unlink flag, or unrecognized flag is classified as
+`private_directory_acl` or `private_directory_flags`. TaskPilot does not remove
+ACL entries or clear flags because it cannot prove it created the exact item;
+only ordinary mode drift on an identity-checked directory follows the existing
+repair path. Hidden and no-dump flags are allowed because they do not grant access
+or prevent safe operation.
+
 Offline reproduction (from `ProjectFiles`):
 
 ```sh
 python3 -m unittest discover -s Tests/Python -p test_managed_openclaw.py
 swift test --filter 'TaskTemporaryResourcesTests|ManagedOpenClawTests'
+```
+
+## Provisioning disk headroom
+
+The pinned manifest includes versioned conservative space estimates: 128 MiB
+for the Node archive, 512 MiB for expanded Node, 512 MiB for package archives,
+and 2 GiB for expanded packages. Provisioning adds a 256 MiB temporary-work
+allowance and keeps a 512 MiB free-space reserve. Each check uses available
+space on the installation volume and counts only remaining allocations:
+
+| Boundary | Required free space |
+| --- | --- |
+| Before download | 3,968 MiB |
+| Before Node extraction | 3,840 MiB |
+| Before npm installation | 3,328 MiB |
+| Before same-volume promotion | 512 MiB |
+
+Checks run before starting the relevant work. The promotion check also runs
+when resuming a sealed stage, before moving an existing installation aside.
+An already valid installation bypasses these provisioning checks. Estimates
+are not reservations: another application can still consume space afterward,
+and ordinary write failures retain their existing handling. The working runtime
+and descriptor remain intact on a rejected phase. Early failed stages are
+discarded; a verified sealed stage remains resumable after a promotion refusal.
+
+Insufficient capacity reports `local_resource_disk_space`; unavailable capacity
+metadata reports `local_resource_disk_space_check`. Swift preserves fixed,
+actionable storage explanations during provisioning cooldown and failed repair,
+instead of suggesting a credential or network fault. These local conditions
+cannot trigger provider capacity retries or model switching. Manifest estimates
+participate in the existing bundled installation fingerprint; the previous
+verified installation remains available through normal promotion and rollback.
+
+## Unused private instance collection
+
+`managed_profiles.py` records a bounded mode-600 ownership marker only when
+TaskPilot creates an exclusive, canonical UUID directory directly under its
+private `instances` directory. The marker contains the directory's device/inode,
+creation and unreferenced times, and at most 16 process birth identities. Runtime
+activation registers the invoking owner under the installation lock. Repeated
+registration by the same owner does not rewrite the marker. Untracked legacy
+profiles and uncertain or malformed ownership records are never adopted.
+
+The lifecycle host invokes best-effort collection after abandoned-tree drainage
+and after its final owned Gateway/output drainage. It never stops a Gateway
+for housekeeping. An exclusive native action permit, nonblocking configuration
+and installation locks, the inherited provisioning lease, and a Gateway-owner
+check prevent collection alongside owned work. Busy locks defer collection;
+the helper has a five-second process bound. The scan considers at most 128
+directory entries, checks a two-second monotonic work allowance, and removes
+at most 512 child entries per pass. It starts no timer, model request, screenshot,
+or global search.
+
+Active, verified-working, and previous rollback descriptors protect all their
+instance directories. An invalid descriptor aborts collection. Live or uncertain
+process identities, including inaccessible birth metadata, retain their instance;
+a reused PID alone cannot retain an exited owner. Owner-list overflow permanently
+disables collection for that instance rather than forgetting a potentially live
+owner. Nonempty or ambiguous workspaces are retained, preserving user outputs.
+Shared profiles, installation directories, and paths outside this private UUID
+namespace are outside the cleanup routine.
+
+Eligible instances first receive an unreferenced timestamp. Deletion requires
+seven days without a descriptor reference or live owner; observing either resets
+that grace period. Clock regression restarts the interval. Cleanup opens the
+recorded directory without following symlinks, checks identity, and removes
+contents relative to retained directory descriptors with per-entry identity
+checks. Symlink destinations are never traversed. A nonempty workspace remains
+protected even if content arrives during cleanup. Partial bounded passes retain
+the marker for another pass; unexpected replacements are left alone. These are
+cooperative ownership and race-detection checks, not filesystem-wide exclusion
+of unrelated applications. Only aggregate inspected/removed/deferred counts
+are returned, without profile names, paths, credentials, or task contents.
+
+Offline reproduction (from `ProjectFiles`):
+
+```sh
+python3 -m unittest discover -s Tests/Python -p 'test_managed*.py'
+swift test --filter ManagedOpenClawTests
+```
+
+Fixtures inject capacity loss at each provisioning boundary, protected descriptors,
+corrupt records, PID reuse, a real disposable child owner, directory replacements,
+symlinks, concurrent workspace writes, lock contention, and work/grace limits.
+They launch no OpenClaw, browser, or desktop task. Live provisioning and profile
+retirement validation remain incomplete.
+
+## Runtime, configuration and database checks
+
+The pinned runtime manifest records supported process architectures and the
+minimum macOS version for the Node bundle. Before npm begins, provisioning checks
+the staged Node Mach-O slices and minimum OS, then executes the pinned Node
+binary's version probe under TaskPilot's clean environment. That bounded launch
+also verifies the Node binary's required dynamic libraries resolve on the host.
+After package installation, a bounded walk inspects Mach-O `.node` modules for
+the same architecture and OS compatibility. A failed check leaves the current
+installation active; the staged bundle is not promoted.
+
+Audits perform read-only `PRAGMA quick_check(1)` on the known private OpenClaw
+databases, with a short SQLite busy timeout, a progress-handler deadline, and
+an interrupt timer for statements stalled between virtual-machine steps. The
+database's file identity and metadata must still match after inspection.
+Locked, inaccessible, replaced, or over-budget checks are reported as
+inconclusive and retried; they are not called corruption and do not trigger reconfiguration.
+Malformed database files are reported as `database_corrupt`; the host leaves
+them unchanged and requires inspection instead of an automatic destructive
+repair. Database health diagnostics contain only fixed states and retry timing.
+
+Configuration synchronization computes a nested delta from the known local
+configuration and applies only differing TaskPilot-owned leaves through the
+supported `config patch --stdin` interface. The model catalog is replaced as an
+exact leaf when it differs, which removes retired entries without rewriting
+unrelated settings. Repairs read back the managed settings. A state-directory
+and configuration-file device/inode fence is captured around each CLI operation
+and checked again before publishing the runtime descriptor. A changed identity
+stops activation and leaves the prior descriptor in place.
+
+## Gateway lifecycle wakeups
+
+The Gateway host waits for coalesced vnode notifications on its client directory,
+health/configuration request files, and runtime descriptor. The supervised
+Gateway's parent-exit and complete-tree callbacks signal the same condition.
+Unrelated health and process-ledger writes do not wake the host because it
+compares only relevant metadata. A five-second bounded timeout remains the
+fallback for lost, unsupported, or delayed notifications; health and recovery
+budgets are unchanged.
+
+Offline reproduction (from `ProjectFiles`):
+
+```sh
+python3 -m unittest Tests.Python.test_managed_provisioning Tests.Python.test_managed_profiles Tests.Python.test_managed_openclaw
+swift test --filter ManagedOpenClawTests
 ```

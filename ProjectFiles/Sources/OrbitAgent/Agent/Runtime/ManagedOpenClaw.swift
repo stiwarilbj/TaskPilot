@@ -2,6 +2,124 @@ import Darwin
 import Foundation
 import ProcessSupport
 
+/// Coalesces filesystem and process lifecycle events for the Gateway host.
+/// Directory notifications are hints; the host timeout remains the fallback.
+final class ManagedGatewayWake {
+    private struct Identity: Equatable {
+        let device: dev_t; let inode: ino_t; let type: mode_t
+    }
+    private struct Metadata: Equatable {
+        let device: dev_t; let inode: ino_t; let mode: mode_t; let size: off_t
+        let modifiedSeconds: Int; let modifiedNanoseconds: Int
+        let changedSeconds: Int; let changedNanoseconds: Int
+        var identity: Identity { Identity(device: device, inode: inode, type: mode & S_IFMT) }
+        init(_ value: stat) {
+            device = value.st_dev; inode = value.st_ino; mode = value.st_mode; size = value.st_size
+            modifiedSeconds = Int(value.st_mtimespec.tv_sec); modifiedNanoseconds = Int(value.st_mtimespec.tv_nsec)
+            changedSeconds = Int(value.st_ctimespec.tv_sec); changedNanoseconds = Int(value.st_ctimespec.tv_nsec)
+        }
+    }
+    private struct Snapshot: Equatable {
+        let clients: Metadata?
+        let healthRequest: Metadata?
+        let configurationRequest: Metadata?
+        let descriptor: Metadata?
+    }
+    private let root: URL
+    private let queue = DispatchQueue(label: "com.orbitagent.gateway-wake", qos: .utility)
+    private let condition = NSCondition()
+    private var revision: UInt64 = 0
+    private var snapshot: Snapshot
+    private var sources: [URL: DispatchSourceFileSystemObject] = [:]
+    private var sourceIdentities: [URL: Identity] = [:]
+    private var closed = false
+
+    init(root: URL) {
+        self.root = root
+        snapshot = Self.capture(root)
+        queue.sync {
+            installWatch(root)
+            installWatch(root.appendingPathComponent("clients", isDirectory: true))
+            for name in ["health-request.json", "configuration-request.json", "runtime.json"] {
+                installWatch(root.appendingPathComponent(name))
+            }
+        }
+    }
+    private static func metadata(_ url: URL) -> Metadata? {
+        var value = stat()
+        guard lstat(url.path, &value) == 0 else { return nil }
+        return Metadata(value)
+    }
+    private static func capture(_ root: URL) -> Snapshot {
+        Snapshot(clients: metadata(root.appendingPathComponent("clients", isDirectory: true)),
+            healthRequest: metadata(root.appendingPathComponent("health-request.json")),
+            configurationRequest: metadata(root.appendingPathComponent("configuration-request.json")),
+            descriptor: metadata(root.appendingPathComponent("runtime.json")))
+    }
+    private func installWatch(_ url: URL) {
+        guard !closed, sources[url] == nil else { return }
+        guard let expected = Self.metadata(url)?.identity else { return }
+        let descriptor = Darwin.open(url.path, O_EVTONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else { return }
+        var opened = stat()
+        guard fstat(descriptor, &opened) == 0,
+              Metadata(opened).identity == expected else {
+            Darwin.close(descriptor)
+            return
+        }
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: descriptor,
+            eventMask: [.write, .extend, .attrib, .rename, .delete, .revoke], queue: queue)
+        sources[url] = source
+        sourceIdentities[url] = expected
+        source.setEventHandler { [weak self] in self?.refresh() }
+        source.setCancelHandler { Darwin.close(descriptor) }
+        source.resume()
+    }
+    private func replaceWatch(_ url: URL) {
+        sources.removeValue(forKey: url)?.cancel()
+        sourceIdentities.removeValue(forKey: url)
+        installWatch(url)
+    }
+    private func refresh() {
+        guard !closed else { return }
+        let current = Self.capture(root)
+        let clientsReplaced = snapshot.clients?.identity != current.clients?.identity
+        let changed = current != snapshot
+        snapshot = current
+        if clientsReplaced { replaceWatch(root.appendingPathComponent("clients", isDirectory: true)) }
+        let requestURLs = ["health-request.json", "configuration-request.json", "runtime.json"].map {
+            root.appendingPathComponent($0)
+        }
+        for url in requestURLs where sourceIdentities[url] != Self.metadata(url)?.identity {
+            replaceWatch(url)
+        }
+        if changed { signal() }
+    }
+    func token() -> UInt64 { condition.withLock { revision } }
+    func signal() { condition.withLock { revision &+= 1; condition.broadcast() } }
+    @discardableResult
+    func wait(after token: UInt64, timeout: TimeInterval = 5) -> Bool {
+        condition.lock(); defer { condition.unlock() }
+        let deadline = ProcessInfo.processInfo.systemUptime + max(0, timeout)
+        while revision == token {
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            guard remaining > 0 else { break }
+            _ = condition.wait(until: Date(timeIntervalSinceNow: remaining))
+        }
+        return revision != token
+    }
+    func close() {
+        queue.sync {
+            guard !closed else { return }
+            closed = true
+            condition.withLock { revision &+= 1; condition.broadcast() }
+            for source in sources.values { source.cancel() }
+            sources.removeAll()
+            sourceIdentities.removeAll()
+        }
+    }
+}
+
 /// Private runtime compatibility boundary; never falls back to PATH or a shared profile.
 extension ManagedOpenClawDescriptor {
     static let root = GeminiAPIKeyStore.defaultFileURL().deletingLastPathComponent().appendingPathComponent("ManagedOpenClaw")
@@ -217,6 +335,8 @@ enum ManagedGatewayHost {
         var integritySchedule = FullIntegrityAuditSchedule()
         let fileHints = ManagedRuntimeFileHints(root: root)
         defer { fileHints.close() }
+        let wake = ManagedGatewayWake(root: root)
+        defer { wake.close() }
         let resources = runtimeURL.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("OpenClaw/managed")
         var acpVerified = false
         var repair = false
@@ -227,8 +347,17 @@ enum ManagedGatewayHost {
             gateway?.markOutputDrained(); capture?.close()
             gateway = nil; capture = nil; acpVerified = false
         }
+        func collectUnusedProfiles() {
+            // Best effort only, after tree/output drainage; never stop a live
+            // Gateway just for housekeeping or change readiness on a failure.
+            guard let permit = try? ManagedRuntimePermit(root:root, repairing:true) else { return }
+            defer { withExtendedLifetime(permit) {} }
+            _ = OpenClawService.run(executable:runtimeURL,
+                arguments:["--managed-openclaw", "collect-profiles", "--managed-descriptor", descriptorURL.path], timeout:5)
+        }
         defer {
             teardown()
+            collectUnusedProfiles()
             for name in ["gateway-processes.json", "gateway-root.json"] { try? FileManager.default.removeItem(at:root.appendingPathComponent(name)) }
         }
         // The root was durably recorded while suspended, before it could fork.
@@ -255,7 +384,9 @@ enum ManagedGatewayHost {
         let drainage = ProcessInfo.processInfo.systemUptime + 5
         while abandoned.contains(where: { $0.alive }) && ProcessInfo.processInfo.systemUptime < drainage { Thread.sleep(forTimeInterval:0.02) }
         guard !abandoned.contains(where: { $0.alive }) else { return 1 }
+        collectUnusedProfiles()
         while true {
+            let wakeToken = wake.token()
             // Never publish health or launch repair through a replaced private root.
             guard (try? PrivateDirectoryPermissions.check(root)) != nil else { teardown(); return 1 }
             guard clientsAlive(root: root) else { break }
@@ -325,6 +456,19 @@ enum ManagedGatewayHost {
                             succeeded:auditResult?["full_integrity_ok"] as? Bool == true)
                     }
                     if audit.status != 0 || auditResult?["ok"] as? Bool != true {
+                        let causes = Set(auditResult?["causes"] as? [String] ?? [])
+                        if causes.contains("database_inconclusive") {
+                            nextAudit = now + 5; nextHealth = now + 5
+                            writeHealth(current, state:"recovering",
+                                detail:"The private OpenClaw database check was busy or exceeded its short read-only limit. No database files were changed; TaskPilot will check again shortly.", root:root)
+                            continue
+                        }
+                        if causes.contains("database_corrupt") {
+                            teardown(); repair = true; nextAudit = now + 300; nextHealth = now + 300
+                            writeHealth(current, state:"needs_repair",
+                                detail:"A private OpenClaw database failed its read-only integrity check. TaskPilot left it unchanged; inspect or reinstall the private runtime before continuing.", root:root)
+                            continue
+                        }
                         guard let permit = try? ManagedRuntimePermit(root:root, repairing:true) else {
                             nextAudit = now + 1
                             writeHealth(current,state:"recovering",detail:"Waiting for dispatched work to settle before private runtime repair",root:root)
@@ -333,7 +477,12 @@ enum ManagedGatewayHost {
                         defer { withExtendedLifetime(permit) {} }
                         if let cause = Self.directoryAttentionCause(auditResult) {
                             teardown(); repair = true
-                            writeHealth(current,state:"needs_repair",detail:"\(cause): Private storage ownership or identity needs attention; automatic directory repair was withheld.",root:root)
+                            writeHealth(current,state:"needs_repair",detail:"\(cause): Private storage ACL, flags, ownership, or identity needs attention; automatic directory repair was withheld.",root:root)
+                            continue
+                        }
+                        if causes.contains("private_configuration_path_changed") {
+                            teardown(); repair = true; nextAudit = now + 300; nextHealth = now + 300
+                            writeHealth(current,state:"needs_repair",detail:"A private OpenClaw configuration path changed identity during a CLI operation. TaskPilot stopped activation and left the active runtime intact; inspect the private configuration directory before retrying.",root:root)
                             continue
                         }
                         writeHealth(current,state:"recovering",detail:"Repairing TaskPilot-owned runtime settings",root:root)
@@ -345,7 +494,7 @@ enum ManagedGatewayHost {
                                        "--managed-descriptor", descriptorURL.path], timeout:1200)
                         if fixed.status == 0 { descriptor = nil; continue }
                         repair = true
-                        writeHealth(current,state:"needs_repair",detail:"Private runtime repair did not pass its checks. Verify the saved Gemini key or reinstall TaskPilot; repeated repair is bounded.",root:root)
+                        writeHealth(current,state:"needs_repair",detail:Self.provisioningResourceDetail(fixed.output) ?? "Private runtime repair did not pass its checks. Verify the saved Gemini key or reinstall TaskPilot; repeated repair is bounded.",root:root)
                         continue
                     }
                     repair = false
@@ -377,6 +526,8 @@ enum ManagedGatewayHost {
                         let output = try BufferedProcessOutput(maximumBytes:0, merged:true)
                         process.executableURL = URL(fileURLWithPath: current.executable)
                         process.arguments = ["gateway", "run", "--bind", "loopback", "--port", String(current.port)]
+                        process.terminationHandler = { _ in wake.signal() }
+                        process.whenTreeExits { wake.signal() }
                         process.onLaunchAcknowledged = { identity in
                             try write(ManagedProcessIdentity(pid:identity.pid,seconds:identity.seconds,microseconds:identity.microseconds),
                                       to:root.appendingPathComponent("gateway-root.json"))
@@ -452,7 +603,9 @@ enum ManagedGatewayHost {
                 _ = budget.failed(now:Date().timeIntervalSince1970)
                 try? write(budget, to:root.appendingPathComponent("recovery.json"))
             }
-            Thread.sleep(forTimeInterval:1)
+            // Client/request vnode changes and child exits wake this wait. A
+            // bounded five-second timeout preserves recovery if a hint is lost.
+            _ = wake.wait(after: wakeToken, timeout: 5)
         }
         if let descriptor { writeHealth(descriptor, state:"stopped", detail:"TaskPilot closed its private Gateway", root:root) }
         return 0
@@ -460,6 +613,16 @@ enum ManagedGatewayHost {
     static func directoryAttentionCause(_ audit: [String:Any]?) -> String? {
         (audit?["causes"] as? [String])?.first {
             $0.hasPrefix("private_directory_") && $0 != "private_directory_permissions"
+        }
+    }
+    static func provisioningResourceDetail(_ text: String) -> String? {
+        guard let value = object(text), value["kind"] as? String == "error" else { return nil }
+        switch value["error_code"] as? String {
+        case "local_resource_disk_space":
+            return "Not enough disk space to install or repair TaskPilot’s private OpenClaw. Free disk space, then retry. Any existing working installation was left intact."
+        case "local_resource_disk_space_check":
+            return "TaskPilot could not check free disk space for private OpenClaw. Check storage availability, then retry. Any existing working installation was left intact."
+        default: return nil
         }
     }
     static func object(_ text: String) -> [String:Any]? {

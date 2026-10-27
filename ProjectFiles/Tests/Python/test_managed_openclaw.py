@@ -477,9 +477,10 @@ class ManagedRuntimeTests(unittest.TestCase):
         with patch.object(managed,'install',return_value=new),patch.object(managed,'bounded_run'), patch.object(managed,'verify_settings'):
             second=managed.ensure(self.root,self.root)
         self.assertNotEqual(first['instance_id'],second['instance_id'])
-        with patch.object(managed,'bounded_run') as writer:
+        with patch.object(managed,'bounded_run') as writer, patch.object(managed,'verify_settings'):
             self.assertEqual(managed.rollback(self.path),first)
-            self.assertIn('patch',writer.call_args.args[0])
+            self.assertTrue(any('patch' in call.args[0] for call in writer.call_args_list))
+            self.assertTrue(any('validate' in call.args[0] for call in writer.call_args_list))
         with patch.object(managed,'install',return_value=new):
             self.assertEqual(managed.ensure(self.root,self.root),first)
 

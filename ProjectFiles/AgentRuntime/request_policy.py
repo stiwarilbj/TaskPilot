@@ -132,7 +132,7 @@ def classify_failure(error: BaseException, now: float, model: str | None = None,
     lowered = message.lower()
     payload = error.payload if isinstance(error, ProviderRequestError) else message
     fields = facts(payload, getattr(error, "model", None) or model)
-    if str(getattr(error, 'code', '')).startswith('transport_'):
+    if str(getattr(error, 'code', '')).startswith(('transport_', 'local_resource_')):
         fields['code'] = error.code
     code, status, reason = fields.get("code"), fields.get("status"), fields.get("reason")
     tokens = {str(t).lower().replace('-', '_') for t in (*fields.get("codes", []), status, reason) if t is not None}
@@ -145,7 +145,9 @@ def classify_failure(error: BaseException, now: float, model: str | None = None,
     reset = retry_time(payload, message, now)
     scope = fields["scope"]
 
-    if http == 401 or tokens & {"auth", "auth_permanent", "authentication_error", "unauthenticated", "invalid_api_key", "api_key_invalid", "invalid_credentials", "authentication_failed"} or any(s in lowered for s in ("invalid api key", "api key not valid", "api_key_invalid", "api key expired", "invalid credential", "unauthorized", "http 401")):
+    if str(code).startswith('local_resource_'):
+        kind = "configuration"  # Local storage failure: no provider cooldown/fallback.
+    elif http == 401 or tokens & {"auth", "auth_permanent", "authentication_error", "unauthenticated", "invalid_api_key", "api_key_invalid", "invalid_credentials", "authentication_failed"} or any(s in lowered for s in ("invalid api key", "api key not valid", "api_key_invalid", "api key expired", "invalid credential", "unauthorized", "http 401")):
         kind, scope = "credentials", "credential"
     elif "cancelled" in tokens or "canceled" in tokens or any(s in lowered for s in ("cancelled the", "canceled the", "lost contact with the native", "task cancelled")):
         kind = "cancelled"
@@ -390,23 +392,23 @@ def runtime_state_root() -> Path:
 
 
 @contextmanager
-def private_lock(path: Path):
+def private_lock(path: Path, *, blocking=True):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
         yield descriptor
     finally:
         os.close(descriptor)
 
 
 @contextmanager
-def configuration_transaction():
+def configuration_transaction(*, blocking=True):
     """Shared with the native setup/probe coordinator; nested calls are local."""
     if getattr(_configuration_local, "owned", False):
         yield _configuration_local.descriptor
         return
-    with private_lock(runtime_state_root() / "openclaw-configuration.lock") as descriptor:
+    with private_lock(runtime_state_root() / "openclaw-configuration.lock", blocking=blocking) as descriptor:
         _configuration_local.owned = True
         _configuration_local.descriptor = descriptor
         try:

@@ -4988,7 +4988,7 @@ def _stop_handler(_signal_number: int, _frame: Any) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=f"{PRODUCT_NAME} OpenClaw runtime")
-    parser.add_argument("--managed-openclaw", choices=("ensure", "relocate", "rollback", "audit", "repair"))
+    parser.add_argument("--managed-openclaw", choices=("ensure", "relocate", "rollback", "audit", "repair", "collect-profiles"))
     parser.add_argument("--managed-resources")
     parser.add_argument("--managed-descriptor")
     parser.add_argument("--force-integrity-audit", action="store_true")
