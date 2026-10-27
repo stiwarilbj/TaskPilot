@@ -2,6 +2,45 @@ import Darwin
 import Foundation
 import ProcessSupport
 
+/// Narrow checks for explicitly known TaskPilot directories, never recursive.
+enum PrivateDirectoryPermissions {
+    enum Failure: String, LocalizedError {
+        case ownership = "private_directory_ownership"
+        case symlink = "private_directory_symlink"
+        case permissions = "private_directory_permissions"
+        case changed = "private_directory_changed"
+        case unavailable = "private_directory_unavailable"
+        var errorDescription: String? {
+            "\(rawValue): TaskPilot’s private storage needs attention. Verify its ownership and permissions; unrelated directories were not changed."
+        }
+    }
+    private static let repairLock = NSLock()
+    static func check(_ directory: URL, repair: Bool = false) throws {
+        try repairLock.withLock {
+            var before = stat()
+            guard lstat(directory.path, &before) == 0 else { throw Failure.unavailable }
+            guard (before.st_mode & S_IFMT) != S_IFLNK else { throw Failure.symlink }
+            guard (before.st_mode & S_IFMT) == S_IFDIR else { throw Failure.unavailable }
+            guard before.st_uid == getuid() else { throw Failure.ownership }
+            let fd = open(directory.path, O_EVTONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard fd >= 0 else { throw (errno == EACCES || errno == EPERM) ? Failure.permissions : Failure.unavailable }
+            defer { close(fd) }
+            var opened = stat()
+            guard fstat(fd, &opened) == 0, opened.st_dev == before.st_dev, opened.st_ino == before.st_ino,
+                  opened.st_uid == getuid() else { throw Failure.changed }
+            if opened.st_mode & 0o7777 != 0o700 {
+                guard repair else { throw Failure.permissions }
+                guard fchmod(fd, 0o700) == 0 else { throw Failure.permissions }
+            }
+            var after = stat(), named = stat()
+            guard fstat(fd, &after) == 0, lstat(directory.path, &named) == 0,
+                  named.st_dev == after.st_dev, named.st_ino == after.st_ino,
+                  (named.st_mode & S_IFMT) == S_IFDIR, after.st_uid == getuid(), named.st_uid == getuid(),
+                  after.st_mode & 0o7777 == 0o700, named.st_mode & 0o7777 == 0o700 else { throw Failure.changed }
+        }
+    }
+}
+
 /// Private directories for task-owned runtime scratch only. User-selected output
 /// destinations never enter this root or its cleanup path.
 enum TaskTemporaryResourceLedger {
@@ -279,11 +318,21 @@ enum TaskTemporaryResourceLedger {
         return try? JSONDecoder().decode(OwnerRecord.self, from: Data(bytes))
     }
 
-    private static func openRoot(_ root: URL, create: Bool) throws -> Int32 {
-        if create {
+    /// Called by lifecycle startup and reused by scratch allocation. Only this
+    /// known root is created/repaired; foreign ownership and links are rejected.
+    static func prepareStartup(root: URL = defaultRoot) throws {
+        var info = stat()
+        if lstat(root.path, &info) != 0 {
+            guard errno == ENOENT else { throw PrivateDirectoryPermissions.Failure.unavailable }
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
                 attributes: [.posixPermissions: NSNumber(value: directoryPermissions)])
         }
+        try PrivateDirectoryPermissions.check(root, repair: true)
+    }
+
+    private static func openRoot(_ root: URL, create: Bool) throws -> Int32 {
+        if create { try prepareStartup(root: root) }
+        else { try PrivateDirectoryPermissions.check(root) }
         let descriptor = open(root.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard descriptor >= 0 else { throw TaskTemporaryResourceError.unavailable }
         do { try validatePrivateDirectory(descriptor) }
@@ -295,8 +344,12 @@ enum TaskTemporaryResourceLedger {
         var status = stat()
         guard fstat(descriptor, &status) == 0,
               (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR),
-              status.st_uid == getuid(), fchmod(descriptor, directoryPermissions) == 0 else {
+              status.st_uid == getuid() else {
             throw TaskTemporaryResourceError.unavailable
+        }
+        if status.st_mode & 0o7777 != directoryPermissions {
+            guard fchmod(descriptor, directoryPermissions) == 0, fstat(descriptor, &status) == 0,
+                  status.st_mode & 0o7777 == directoryPermissions else { throw TaskTemporaryResourceError.unavailable }
         }
     }
 

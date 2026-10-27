@@ -203,3 +203,33 @@ Offline reproduction: run `ManagedOpenClawTests` and
 The shared `managed-environment-cases.json` covers conflicts and idempotence;
 synthetic child/wrapper tests inspect effective settings without launching
 OpenClaw, a browser, or a desktop task.
+
+## Private-directory startup preflight
+
+Before reporting managed readiness, the lifecycle coordinator checks the scratch
+root and known managed installation, instance, workspace, configuration and
+credential-store directories. Each must be a real directory owned by the current
+user with mode `0700`. The check walks only known paths, without directory scans
+or generation requests. Installation validation also checks its sealed root's
+owner and mode before using the integrity cache.
+
+Known mode drift is repaired through the existing cross-process configuration
+transaction and installation lock, after the owned Gateway drains. Repair uses
+an opened, identity-checked directory descriptor and verifies the resulting mode.
+It does not recursively chmod package contents or alter shared OpenClaw storage.
+The audit reports `private_directory_permissions`; host repairs retain the existing
+failure-fingerprint budget and do not reinstall a healthy runtime for mode drift.
+
+Symlinks, unexpected ownership, identity changes and unavailable directories
+produce classified `private_directory_*` attention conditions. They do not
+trigger automatic replacement, chmod of the unexpected target, or reinstall.
+Even a known directory remains blocked if it cannot be opened safely (for example,
+mode `000` on macOS); no pathname-only chmod fallback is used. These are point-in-time
+checks, not a claim to prevent unrelated processes from changing paths afterward.
+
+Offline reproduction (from `ProjectFiles`):
+
+```sh
+python3 -m unittest discover -s Tests/Python -p test_managed_openclaw.py
+swift test --filter 'TaskTemporaryResourcesTests|ManagedOpenClawTests'
+```

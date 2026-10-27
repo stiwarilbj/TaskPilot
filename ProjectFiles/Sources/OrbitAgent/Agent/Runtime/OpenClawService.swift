@@ -91,8 +91,12 @@ final class OpenClawService {
         let key = (try? GeminiAPIKeyStore().load()) ?? ""
         let runtime = BundledRuntimeLocator().executableURL
         do {
+            try TaskTemporaryResourceLedger.prepareStartup()
             let current = try? ManagedOpenClawDescriptor.load()
-            if force || provisionedCredential != SHA256.hash(data: Data(key.utf8)).description ||
+            var directoryRepair = false
+            do { try current?.checkPrivateDirectories() }
+            catch PrivateDirectoryPermissions.Failure.permissions { directoryRepair = true }
+            if force || directoryRepair || provisionedCredential != SHA256.hash(data: Data(key.utf8)).description ||
                 current == nil || provisionedConfiguration != current?.configurationFingerprint {
                 guard Date() >= provisionAfter else {
                     throw ManagedOpenClawError.command("Private OpenClaw installation is waiting for network recovery; TaskPilot will retry automatically.")
@@ -111,6 +115,7 @@ final class OpenClawService {
                 provisionedCredential = SHA256.hash(data: Data(key.utf8)).description
             }
             let descriptor = try ManagedOpenClawDescriptor.load()
+            try descriptor.checkPrivateDirectories()
             if clientFile == nil { clientFile = try ManagedGatewayHost.registerClient() }
             if host?.isRunning != true {
                 let process = SubprocessSupervisor()

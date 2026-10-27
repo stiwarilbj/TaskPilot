@@ -20,7 +20,9 @@ class ManagedConnectionTests(unittest.TestCase):
             executable=str(self.wrapper),node=sys.executable,entry=str(self.entry),state=str(self.root/'state'),
             config=str(self.root/'config'),workspace=str(self.root/'workspace'),token_file=str(self.root/'token'))
         # Descriptor paths must all be private, including our fixture Node link.
-        node=self.root/'node';node.write_text('fixture');self.d['node']=str(node)
+        for name in ('state', 'workspace', 'installations', 'installations/pin', 'installations/pin/node', 'installations/pin/node/bin'):
+            (self.root/name).mkdir(mode=0o700)
+        node=self.root/'installations/pin/node/bin/node';node.write_text('fixture');self.d['node']=str(node)
         managed.atomic_json(self.path,self.d)
         self.env=patch.dict(os.environ,{'TASKPILOT_MANAGED_DESCRIPTOR':str(self.path)})
         self.env.start();self.addCleanup(self.env.stop)

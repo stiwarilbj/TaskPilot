@@ -13,6 +13,49 @@ final class TaskTemporaryResourcesTests: XCTestCase {
         return root
     }
 
+    func testStartupRepairsOnlyKnownScratchModeAndReadsBack() throws {
+        let root = try fixture()
+        for mode: mode_t in [0o755, 0o777, 0o1700] {
+            XCTAssertEqual(chmod(root.path, mode), 0)
+            XCTAssertThrowsError(try PrivateDirectoryPermissions.check(root)) {
+                XCTAssertEqual($0 as? PrivateDirectoryPermissions.Failure, .permissions)
+            }
+            try TaskTemporaryResourceLedger.prepareStartup(root: root)
+            try PrivateDirectoryPermissions.check(root)
+            var status = stat(); XCTAssertEqual(lstat(root.path, &status), 0)
+            XCTAssertEqual(status.st_mode & 0o7777, 0o700)
+        }
+    }
+
+    func testUnopenableScratchFailsClosedRatherThanPathBasedChmod() throws {
+        let root = try fixture(); XCTAssertEqual(chmod(root.path, 0o000), 0)
+        defer { _ = chmod(root.path, 0o700) }
+        XCTAssertThrowsError(try TaskTemporaryResourceLedger.prepareStartup(root: root)) {
+            XCTAssertEqual($0 as? PrivateDirectoryPermissions.Failure, .permissions)
+        }
+    }
+
+    func testStartupRejectsSymlinkWithoutChangingTarget() throws {
+        let root = try fixture(), target = root.appendingPathComponent("target")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false,
+                                               attributes: [.posixPermissions: 0o755])
+        let link = root.appendingPathComponent("link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        XCTAssertThrowsError(try TaskTemporaryResourceLedger.prepareStartup(root: link)) {
+            XCTAssertEqual($0 as? PrivateDirectoryPermissions.Failure, .symlink)
+        }
+        var status = stat(); XCTAssertEqual(lstat(target.path, &status), 0)
+        XCTAssertEqual(status.st_mode & 0o7777, 0o755)
+        let file = root.appendingPathComponent("file"); try Data().write(to: file)
+        XCTAssertThrowsError(try TaskTemporaryResourceLedger.prepareStartup(root: file))
+    }
+
+    func testStartupCreatesMissingPrivateRoot() throws {
+        let root = try fixture().appendingPathComponent("new-scratch")
+        try TaskTemporaryResourceLedger.prepareStartup(root: root)
+        try PrivateDirectoryPermissions.check(root)
+    }
+
     private func abandonedDirectory(root: URL, processID: Int32, startSeconds: UInt64,
                                    startMicroseconds: UInt64 = 0) throws -> URL {
         let id = UUID().uuidString.lowercased()

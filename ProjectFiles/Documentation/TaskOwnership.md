@@ -78,3 +78,10 @@ checks read metadata only, never image contents, directory listings or user
 outputs. They do not broaden cleanup authority or add provider requests.
 
 Offline accounting regressions: `swift test --filter CaptureArtifactLedgerTests`.
+
+Startup checks the known TaskScratch root before managed-runtime readiness.
+Missing scratch storage is created privately; an existing root must be owned by
+this user and must not be a symlink. Mode drift is repaired under a local lock
+through a checked directory descriptor, with `0700` readback. Unopenable,
+foreign-owned, replaced or symlinked storage fails closed with a classified
+private-directory attention error. No user output path enters this repair path.

@@ -292,9 +292,50 @@ final class ManagedOpenClawTests: XCTestCase {
         let result = OpenClawService.run(executable:URL(fileURLWithPath:"/nonexistent"), arguments:[], timeout:1)
         XCTAssertEqual(result.status,-1)
     }
+    func testDescriptorChecksKnownPrivateAncestorsAndCredentialDirectories() throws {
+        let root = try hintFixture(); XCTAssertEqual(chmod(root.path, 0o700), 0)
+        let state = root.appendingPathComponent("instances/fixture")
+        let install = root.appendingPathComponent("installations/fixture")
+        for path in ["installations", "installations/fixture", "instances", "instances/fixture", "instances/fixture/workspace", "instances/fixture/agents", "instances/fixture/agents/main", "instances/fixture/agents/main/agent"] {
+            try FileManager.default.createDirectory(at: root.appendingPathComponent(path), withIntermediateDirectories: false,
+                                                   attributes: [.posixPermissions: 0o700])
+        }
+        let port = 24200
+        let value: [String:Any] = ["version":1,"instance_id":UUID().uuidString.lowercased(),
+            "installation_fingerprint":"fixture","configuration_fingerprint":"fixture",
+            "executable":state.path+"/openclaw","node":install.path+"/node/bin/node","entry":install.path+"/openclaw.mjs",
+            "state":state.path,"config":state.path+"/openclaw.json","workspace":state.path+"/workspace","token_file":state.path+"/token",
+            "port":port,"endpoint":"ws://127.0.0.1:\(port)","openclaw_version":"fixture","node_version":"fixture"]
+        let url = root.appendingPathComponent("runtime.json")
+        try JSONSerialization.data(withJSONObject:value).write(to:url)
+        let descriptor = try ManagedOpenClawDescriptor.load(from:url)
+        try descriptor.checkPrivateDirectories()
+        let credentialDirectory = state.appendingPathComponent("agents/main/agent")
+        XCTAssertEqual(chmod(credentialDirectory.path, 0o755), 0)
+        XCTAssertThrowsError(try descriptor.checkPrivateDirectories()) {
+            XCTAssertEqual($0 as? PrivateDirectoryPermissions.Failure, .permissions)
+        }
+        try PrivateDirectoryPermissions.check(credentialDirectory, repair:true)
+        try descriptor.checkPrivateDirectories()
+        let workspace = state.appendingPathComponent("workspace")
+        try FileManager.default.removeItem(at:workspace)
+        try FileManager.default.createSymbolicLink(at:workspace, withDestinationURL:state)
+        XCTAssertThrowsError(try descriptor.checkPrivateDirectories()) {
+            XCTAssertEqual($0 as? PrivateDirectoryPermissions.Failure, .symlink)
+        }
+    }
+
+    func testUnsafeDirectoryFaultRequiresAttentionRatherThanReinstall() {
+        for cause in ["private_directory_symlink", "private_directory_ownership", "private_directory_changed", "private_directory_unavailable"] {
+            XCTAssertEqual(ManagedGatewayHost.directoryAttentionCause(["causes":[cause]]), cause)
+        }
+        XCTAssertNil(ManagedGatewayHost.directoryAttentionCause(["causes":["private_directory_permissions"]]))
+        XCTAssertNil(ManagedGatewayHost.directoryAttentionCause(["causes":["installation"]]))
+    }
+
     func testFakeGatewayHasOneOwnerAndDrainsAfterLastClient() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true)
+        try FileManager.default.createDirectory(at:root,withIntermediateDirectories:true, attributes:[.posixPermissions:0o700])
         defer { try? FileManager.default.removeItem(at:root) }
         let cli = root.appendingPathComponent("openclaw")
         let script = """

@@ -41,6 +41,26 @@ struct ManagedOpenClawDescriptor: Codable, Equatable, Sendable {
         value.sourceURL = url
         return value
     }
+    func checkPrivateDirectories() throws {
+        let root = (sourceURL ?? Self.url).deletingLastPathComponent().standardizedFileURL
+        var paths: Set<URL> = [root]
+        let installation = URL(fileURLWithPath: node).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        for leaf in [installation, URL(fileURLWithPath: state), URL(fileURLWithPath: workspace), URL(fileURLWithPath: config).deletingLastPathComponent()] {
+            var current = leaf.standardizedFileURL
+            while current.path != root.path {
+                guard current.path.hasPrefix(root.path + "/") else { throw ManagedOpenClawError.invalidDescriptor }
+                paths.insert(current); current.deleteLastPathComponent()
+            }
+        }
+        for name in ["state", "agents", "agents/main", "agents/main/agent"] {
+            let candidate = URL(fileURLWithPath: state).appendingPathComponent(name)
+            var status = stat()
+            if lstat(candidate.path, &status) == 0 { paths.insert(candidate) }
+        }
+        for path in paths.sorted(by: { $0.pathComponents.count < $1.pathComponents.count }) {
+            try PrivateDirectoryPermissions.check(path)
+        }
+    }
     var environment: [String: String] {
         var env = OpenClawService.managedEnvironment(nodePath: node).values
         env["OPENCLAW_STATE_DIR"] = state; env["OPENCLAW_CONFIG_PATH"] = config
@@ -222,6 +242,7 @@ enum ManagedGatewayHost {
 
     static func run(descriptorURL: URL, runtimeURL: URL) -> Int32 {
         let root = descriptorURL.deletingLastPathComponent()
+        guard (try? PrivateDirectoryPermissions.check(root)) != nil else { return 1 }
         let lock = open(root.appendingPathComponent("gateway-owner.lock").path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
         guard lock >= 0 else { return 1 }
         defer { close(lock) }
@@ -273,7 +294,10 @@ enum ManagedGatewayHost {
         let drainage = ProcessInfo.processInfo.systemUptime + 5
         while abandoned.contains(where: { $0.alive }) && ProcessInfo.processInfo.systemUptime < drainage { Thread.sleep(forTimeInterval:0.02) }
         guard !abandoned.contains(where: { $0.alive }) else { return 1 }
-        while clientsAlive(root: root) {
+        while true {
+            // Never publish health or launch repair through a replaced private root.
+            guard (try? PrivateDirectoryPermissions.check(root)) != nil else { teardown(); return 1 }
+            guard clientsAlive(root: root) else { break }
             do {
                 let current = try ManagedOpenClawDescriptor.load(from: descriptorURL)
                 if current != descriptor {
@@ -346,6 +370,11 @@ enum ManagedGatewayHost {
                             Thread.sleep(forTimeInterval:0.1); continue
                         }
                         defer { withExtendedLifetime(permit) {} }
+                        if let cause = Self.directoryAttentionCause(auditResult) {
+                            teardown(); repair = true
+                            writeHealth(current,state:"needs_repair",detail:"\(cause): Private storage ownership or identity needs attention; automatic directory repair was withheld.",root:root)
+                            continue
+                        }
                         writeHealth(current,state:"recovering",detail:"Repairing TaskPilot-owned runtime settings",root:root)
                         teardown()
                         _ = budget.failed(now:now)
@@ -466,6 +495,11 @@ enum ManagedGatewayHost {
         }
         if let descriptor { writeHealth(descriptor, state:"stopped", detail:"TaskPilot closed its private Gateway", root:root) }
         return 0
+    }
+    static func directoryAttentionCause(_ audit: [String:Any]?) -> String? {
+        (audit?["causes"] as? [String])?.first {
+            $0.hasPrefix("private_directory_") && $0 != "private_directory_permissions"
+        }
     }
     static func object(_ text: String) -> [String:Any]? {
         text.data(using:.utf8).flatMap { try? JSONSerialization.jsonObject(with:$0) as? [String:Any] }

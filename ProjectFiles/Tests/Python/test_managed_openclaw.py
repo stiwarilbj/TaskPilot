@@ -16,10 +16,16 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name); self.path=self.root/'runtime.json'
     def descriptor(self):
-        executable=self.root/'private/openclaw'; executable.parent.mkdir(exist_ok=True);executable.write_text('fixture')
+        state = self.root / 'private'; state.mkdir(mode=0o700, exist_ok=True)
+        workspace = state / 'workspace'; workspace.mkdir(mode=0o700, exist_ok=True)
+        installation = self.root / 'installations/fixture'
+        (self.root / 'installations').mkdir(mode=0o700, exist_ok=True)
+        installation.mkdir(mode=0o700, exist_ok=True)
+        executable = state / 'openclaw'; executable.write_text('fixture')
         return dict(version=1,instance_id='128bdc78-d592-43a3-b4e1-b6fe3a0e57cd',port=24200,
             endpoint='ws://127.0.0.1:24200',installation_fingerprint='fixture',configuration_fingerprint='config',
-            **{k:str(executable) for k in ('executable','node','entry','state','config','workspace','token_file')})
+            executable=str(executable), node=str(installation / 'node/bin/node'), entry=str(installation / 'entry'),
+            state=str(state), workspace=str(workspace), config=str(state/'config'), token_file=str(state/'token'))
     def test_managed_environment_matches_shared_policy_and_contains_no_value_diagnostics(self):
         fixtures=Path(__file__).resolve().parents[1]/'Fixtures/managed-environment-cases.json'
         for case in json.loads(fixtures.read_text()):
@@ -74,7 +80,7 @@ class ManagedRuntimeTests(unittest.TestCase):
             self.assertNotIn('OPENCLAW_GATEWAY_TOKEN',os.environ)
             self.assertTrue(os.environ['TASKPILOT_MANAGED_FINGERPRINT'].endswith(':config'))
     def test_tampered_installed_code_or_escaping_symlink_fails_integrity(self):
-        install=self.root/'install';install.mkdir();f=install/'code';f.write_text('good')
+        install=self.root/'install';install.mkdir(mode=0o700);f=install/'code';f.write_text('good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         self.assertTrue(managed.validate_install(install,'pin'))
         f.write_text('bad');self.assertFalse(managed.validate_install(install,'pin'))
@@ -83,7 +89,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.assertFalse(managed.validate_install(install,'pin'))
 
     def test_full_audits_hint_the_checked_descriptor_before_reading(self):
-        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        install=self.root/'install';install.mkdir(mode=0o700);f=install/'code';f.write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         actual_read=os.read; hinted=set(); reads=[]
         def hint(fd, command, value):
@@ -109,7 +115,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                 with self.assertRaises(OSError):os.fstat(reads[0])
 
     def test_incremental_rehash_and_sealing_do_not_request_uncached_reads(self):
-        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        install=self.root/'install';install.mkdir(mode=0o700);f=install/'code';f.write_bytes(b'good')
         with patch.object(managed,'_hint_uncached_audit_read') as hint:
             managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
             hint.assert_not_called()
@@ -129,7 +135,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                 ('Linux',48,None),('Darwin',None,None),
                 ('Darwin',48,errno.ENOTSUP),('Darwin',48,errno.EINVAL)):
             with self.subTest(system=system,command=command,error=error):
-                install=self.root/str(len(list(self.root.iterdir())));install.mkdir()
+                install=self.root/str(len(list(self.root.iterdir())));install.mkdir(mode=0o700)
                 f=install/'code';f.write_bytes(b'good')
                 managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
                 with patch.object(managed.platform,'system',return_value=system), \
@@ -146,7 +152,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                 self.assertEqual(matching[0]['last_full_audit_monotonic_ns'],100)
 
     def test_cache_write_failure_full_fallback_also_requests_uncached_reads(self):
-        install=self.root/'install';install.mkdir()
+        install=self.root/'install';install.mkdir(mode=0o700)
         for name in ('first','second'):(install/name).write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
@@ -160,7 +166,7 @@ class ManagedRuntimeTests(unittest.TestCase):
             self.assertEqual(hint.call_count,2)
 
     def test_notification_forced_audit_ignores_digest_reuse_but_retains_identity_baseline(self):
-        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        install=self.root/'install';install.mkdir(mode=0o700);f=install/'code';f.write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
         metadata=managed._regular_file_metadata(f.stat())
@@ -177,7 +183,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.assertEqual(cache['last_full_audit_monotonic_ns'],100)
 
     def test_gap_forced_audit_stays_pending_across_invocations_until_full_success(self):
-        install=self.root/'install';install.mkdir()
+        install=self.root/'install';install.mkdir(mode=0o700)
         for name in ('first','second'):(install/name).write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
@@ -197,7 +203,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.assertEqual((stats['audit_mode'],stats['files_hashed'],stats['cache_hits']),('incremental',0,2))
 
     def test_gap_marker_write_failure_discards_stale_cache_and_failed_audit_stays_full(self):
-        install=self.root/'install';install.mkdir();(install/'code').write_bytes(b'good')
+        install=self.root/'install';install.mkdir(mode=0o700);(install/'code').write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
         with patch.object(managed,'_write_integrity_cache',side_effect=OSError('disk full')), \
@@ -209,7 +215,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.assertEqual(stats['cache_hits'],0)
 
     def test_legacy_gap_marker_is_optional_but_malformed_marker_forces_full_pass(self):
-        install=self.root/'install';install.mkdir();(install/'code').write_bytes(b'good')
+        install=self.root/'install';install.mkdir(mode=0o700);(install/'code').write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
         cache_file=next((install.parent/'.integrity-cache').glob('*.json'))
@@ -222,7 +228,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.assertEqual(stats['audit_mode'],'full')
 
     def test_integrity_cache_skips_unchanged_content_reads_and_rehashes_changed_metadata(self):
-        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        install=self.root/'install';install.mkdir(mode=0o700);f=install/'code';f.write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         stats={}
         with patch.object(managed,'_hash_installation_file',wraps=managed._hash_installation_file) as hashing:
@@ -240,7 +246,7 @@ class ManagedRuntimeTests(unittest.TestCase):
             self.assertEqual(stats['files_hashed'],1)
 
     def test_integrity_cache_rejects_replaced_files_even_when_contents_match(self):
-        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        install=self.root/'install';install.mkdir(mode=0o700);f=install/'code';f.write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
         replacement=install/'replacement';replacement.write_bytes(b'good')
@@ -250,7 +256,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.assertEqual(stats['files_hashed'],1)
         self.assertEqual(stats['cache_hits'],0)
 
-        periodic=self.root/'periodic-install';periodic.mkdir();periodic_file=periodic/'code';periodic_file.write_bytes(b'good')
+        periodic=self.root/'periodic-install';periodic.mkdir(mode=0o700);periodic_file=periodic/'code';periodic_file.write_bytes(b'good')
         managed.atomic_json(periodic/'integrity.json',{'fingerprint':'pin','files':managed.seal(periodic)})
         base=100
         self.assertTrue(managed.validate_install(periodic,'pin',now_monotonic_ns=base))
@@ -261,7 +267,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.assertEqual(stats['files_hashed'],1)
 
     def test_integrity_cache_rehashes_permission_and_restored_mtime_changes(self):
-        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        install=self.root/'install';install.mkdir(mode=0o700);f=install/'code';f.write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
         before=f.stat();os.chmod(f,0o600)
@@ -274,7 +280,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.assertEqual(stats['files_hashed'],0)
 
     def test_integrity_manifest_change_forces_full_hash_and_never_changes_expected_digest(self):
-        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        install=self.root/'install';install.mkdir(mode=0o700);f=install/'code';f.write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
         manifest=install/'integrity.json';record=json.loads(manifest.read_text())
@@ -289,7 +295,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.assertEqual(stats['audit_mode'],'full')
 
     def test_integrity_cache_forces_periodic_full_audit_and_incremental_checks_do_not_reset_it(self):
-        install=self.root/'install';install.mkdir()
+        install=self.root/'install';install.mkdir(mode=0o700)
         for name in ('first','second'):(install/name).write_bytes(name.encode())
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         stats={};base=10_000_000_000
@@ -306,7 +312,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.assertEqual(stats['files_hashed'],2)
 
     def test_integrity_cache_rejects_future_timestamp_and_outdated_schema(self):
-        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        install=self.root/'install';install.mkdir(mode=0o700);f=install/'code';f.write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
         cache_file=next((install.parent/'.integrity-cache').glob('*.json'))
@@ -332,13 +338,13 @@ class ManagedRuntimeTests(unittest.TestCase):
             malformed,'pin','manifest',{'path':'/fixture','device':1,'inode':1},{}))
 
     def test_non_object_integrity_manifest_fails_as_unsealed_not_an_exception(self):
-        install=self.root/'install';install.mkdir();(install/'code').write_bytes(b'good')
+        install=self.root/'install';install.mkdir(mode=0o700);(install/'code').write_bytes(b'good')
         (install/'integrity.json').write_text('[]')
         self.assertFalse(managed.validate_install(install,'pin'))
 
     def test_cached_integrity_rejects_symlinked_parent_components_even_when_in_root(self):
-        install=self.root/'install';install.mkdir()
-        actual=install/'real';actual.mkdir();(actual/'code').write_bytes(b'good')
+        install=self.root/'install';install.mkdir(mode=0o700)
+        actual=install/'real';actual.mkdir(mode=0o700);(actual/'code').write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
         (install/'real').rename(install/'moved')
@@ -348,7 +354,7 @@ class ManagedRuntimeTests(unittest.TestCase):
 
     def test_integrity_cache_invalidity_lock_contention_and_cache_write_errors_fall_back_to_hashing(self):
         import fcntl
-        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        install=self.root/'install';install.mkdir(mode=0o700);f=install/'code';f.write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
         cache_files=list((install.parent/'.integrity-cache').glob('*.json'))
@@ -370,7 +376,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         with patch.object(managed,'_write_integrity_cache',side_effect=OSError('read-only')):
             self.assertTrue(managed.validate_install(install,'pin',force_full=True,now_monotonic_ns=400))
 
-        fallback=self.root/'write-failure-install';fallback.mkdir()
+        fallback=self.root/'write-failure-install';fallback.mkdir(mode=0o700)
         first=fallback/'first';first.write_bytes(b'good');second=fallback/'second';second.write_bytes(b'also good')
         managed.atomic_json(fallback/'integrity.json',{'fingerprint':'pin','files':managed.seal(fallback)})
         self.assertTrue(managed.validate_install(fallback,'pin',now_monotonic_ns=500))
@@ -385,9 +391,9 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.assertEqual(hashing.call_count,3)
 
     def test_integrity_cache_symlink_directory_falls_back_to_uncached_hashing(self):
-        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        install=self.root/'install';install.mkdir(mode=0o700);f=install/'code';f.write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
-        outside=self.root/'outside-cache';outside.mkdir()
+        outside=self.root/'outside-cache';outside.mkdir(mode=0o700)
         (install.parent/'.integrity-cache').symlink_to(outside, target_is_directory=True)
         stats={}
         self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100,stats=stats))
@@ -396,7 +402,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.assertEqual(list(outside.iterdir()),[])
 
     def test_integrity_hash_rejects_a_file_modified_while_reading(self):
-        install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
+        install=self.root/'install';install.mkdir(mode=0o700);f=install/'code';f.write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
         self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
         actual_read=os.read;changed=False
@@ -443,6 +449,8 @@ class ManagedRuntimeTests(unittest.TestCase):
         target = self.root/'installations'/pin
         for name in ('node/bin/node','package/node_modules/openclaw/openclaw.mjs'):
             path=target/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text('fixture')
+        target.chmod(0o700)
+        (self.root/'installations').chmod(0o700)
         managed.atomic_json(target/'integrity.json',{'fingerprint':pin,'files':managed.seal(target)})
         return target,pin,{'openclaw_version':'2026.9.5','node_version':'24.22.1'}
     def test_failed_promotion_preserves_descriptor_and_compatible_configuration(self):
@@ -597,7 +605,7 @@ class ManagedRecoveryTests(unittest.TestCase):
 
     def test_credential_presence_reads_only_private_store_without_returning_secrets(self):
         import sqlite3
-        database=self.root/'state/openclaw.sqlite';database.parent.mkdir()
+        database=self.root/'state/openclaw.sqlite';database.parent.mkdir(mode=0o700)
         with sqlite3.connect(database) as c:
             c.execute('CREATE TABLE config_machine_state(state_key TEXT, value_json TEXT)')
             c.execute('INSERT INTO config_machine_state VALUES (?,?)',('authProfiles.store',json.dumps({'profiles':{'google:orbit':{'key':'private fixture','provider':'google','type':'api_key'}}})))
@@ -607,7 +615,7 @@ class ManagedRecoveryTests(unittest.TestCase):
         self.assertFalse(database.exists())
 
     def test_audit_detects_owned_drift_and_repair_preserves_unrelated_configuration(self):
-        parent=self.root; self.root=parent/'managed';self.root.mkdir();self.path=self.root/'runtime.json'
+        parent=self.root; self.root=parent/'managed';self.root.mkdir(mode=0o700);self.path=self.root/'runtime.json'
         key='fixture-private-key-123456789';(parent/'gemini-api-key').write_text(key)
         with patch.object(managed,'install',return_value=self.fake_install('pin')),patch.object(managed,'bounded_run') as cli,patch.object(managed,'verify_settings'),patch.object(managed,'credential_present',return_value=True):
             d=managed.ensure(self.root,self.root,key)
@@ -649,3 +657,137 @@ class ManagedRecoveryTests(unittest.TestCase):
             with patch.dict(os.environ,{'TASKPILOT_MANAGED_FINGERPRINT':'new'}):state.rebind_managed('version','config')
             self.assertNotEqual(state.identity,identity);self.assertEqual(state.credential,credential)
             self.assertEqual(state.health(model)['failure_kind'],'quota')
+
+class PrivateDirectoryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def test_read_only_check_rejects_mode_drift_and_repair_reads_back(self):
+        for mode in (0o755, 0o777, 0o1700):
+            with self.subTest(mode=mode):
+                self.root.chmod(mode)
+                with self.assertRaisesRegex(managed.PrivateDirectoryError, 'permissions'):
+                    managed.check_private_directory(self.root)
+                self.assertEqual(self.root.stat().st_mode & 0o7777, mode)
+                managed.check_private_directory(self.root, repair=True)
+                self.assertEqual(self.root.stat().st_mode & 0o7777, 0o700)
+
+    def test_unopenable_directory_fails_closed_without_path_chmod(self):
+        self.root.chmod(0o000)
+        try:
+            with self.assertRaisesRegex(managed.PrivateDirectoryError, 'permissions'):
+                managed.check_private_directory(self.root, repair=True)
+        finally: self.root.chmod(0o700)
+
+    def test_symlink_file_and_foreign_owner_are_never_repaired(self):
+        target = self.root / 'target'; target.mkdir(mode=0o755)
+        link = self.root / 'link'; link.symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(managed.PrivateDirectoryError, 'symlink'):
+            managed.check_private_directory(link, repair=True)
+        self.assertEqual(target.stat().st_mode & 0o7777, 0o755)
+        file = self.root / 'file'; file.write_text('fixture')
+        with self.assertRaisesRegex(managed.PrivateDirectoryError, 'unavailable'):
+            managed.check_private_directory(file, repair=True)
+        with patch.object(managed.os, 'getuid', return_value=os.getuid() + 1), patch.object(managed.os, 'fchmod') as chmod:
+            with self.assertRaisesRegex(managed.PrivateDirectoryError, 'ownership'):
+                managed.check_private_directory(target, repair=True)
+            chmod.assert_not_called()
+
+    def test_all_targets_validated_before_any_mode_repair(self):
+        self.root.chmod(0o755)
+        other = self.root / 'other'; other.mkdir(mode=0o755)
+        (self.root / 'instances').symlink_to(other, target_is_directory=True)
+        with self.assertRaisesRegex(managed.PrivateDirectoryError, 'symlink'):
+            managed.check_managed_directories(self.root, repair=True)
+        self.assertEqual(self.root.stat().st_mode & 0o7777, 0o755)
+        self.assertEqual(other.stat().st_mode & 0o7777, 0o755)
+
+    def test_lock_does_not_chmod_a_hardlinked_unrelated_file(self):
+        file = self.root / 'unrelated'; file.write_text('fixture'); file.chmod(0o644)
+        os.link(file, self.root / 'installation.lock')
+        with self.assertRaisesRegex(managed.PrivateDirectoryError, 'ownership'):
+            with managed.locked(self.root): self.fail('unexpected lock admission')
+        self.assertEqual(file.stat().st_mode & 0o7777, 0o644)
+
+    def test_path_swap_during_check_is_classified(self):
+        real_stat = managed.os.fstat
+        def replaced(fd):
+            value = real_stat(fd)
+            values = list(value); values[1] += 1
+            return os.stat_result(values)
+        with patch.object(managed.os, 'fstat', side_effect=replaced), patch.object(managed.os, 'fchmod') as chmod:
+            with self.assertRaisesRegex(managed.PrivateDirectoryError, 'changed'):
+                managed.check_private_directory(self.root, repair=True)
+            chmod.assert_not_called()
+
+    def provision(self):
+        install = ManagedRuntimeTests.fake_install(self, 'pin')
+        with patch.object(managed, 'install', return_value=install), patch.object(managed, 'bounded_run'), patch.object(managed, 'verify_settings'):
+            return managed.ensure(self.root, self.root)
+
+    def test_mode_drift_uses_one_serialized_drain_and_preserves_descriptor(self):
+        d = self.provision(); before = (self.root / 'runtime.json').read_bytes()
+        Path(d['workspace']).chmod(0o755)
+        Path(d['state']).chmod(0o755); self.root.chmod(0o755)
+        from contextlib import contextmanager
+        calls = []
+        @contextmanager
+        def hold(*args, **kwargs):
+            calls.append('drained'); yield
+        install = (Path(d['node']).parents[2], 'pin', {'openclaw_version':'2026.9.5','node_version':'24.22.1'})
+        with patch.object(managed, 'configuration_hold', hold), patch.object(managed, 'install', return_value=install), patch.object(managed, 'bounded_run'), patch.object(managed, 'verify_settings'):
+            managed.ensure(self.root, self.root, drained=True)
+        self.assertEqual(calls, ['drained'])
+        managed.check_managed_directories(self.root, d)
+        self.assertEqual((self.root / 'runtime.json').read_bytes(), before)
+
+    def test_directory_audit_stops_before_integrity_or_cli_and_unsafe_repair(self):
+        d = self.provision(); path = self.root / 'runtime.json'
+        Path(d['workspace']).chmod(0o755)
+        with patch.object(managed, 'validate_install') as integrity, patch.object(managed, 'bounded_run') as cli:
+            result = managed.audit(path)
+            self.assertEqual(result['causes'], ['private_directory_permissions'])
+            integrity.assert_not_called(); cli.assert_not_called()
+        workspace = Path(d['workspace']); workspace.rmdir()
+        workspace.symlink_to(self.root, target_is_directory=True)
+        with patch.object(managed, 'ensure') as ensure:
+            with self.assertRaisesRegex(managed.ManagedRuntimeError, 'symlink'):
+                managed.repair(path, self.root)
+            ensure.assert_not_called()
+        self.assertFalse((self.root / 'repair-budget.json').exists())
+
+    def test_escaping_symlink_is_attention_not_new_instance_provisioning(self):
+        d = self.provision(); workspace = Path(d['workspace']); workspace.rmdir()
+        with tempfile.TemporaryDirectory() as outside:
+            workspace.symlink_to(outside, target_is_directory=True)
+            with patch.object(managed, 'install') as install:
+                with self.assertRaisesRegex(managed.PrivateDirectoryError, 'symlink'):
+                    managed.ensure(self.root, self.root)
+                install.assert_not_called()
+            self.assertEqual(managed.audit(self.root/'runtime.json')['causes'], ['private_directory_symlink'])
+
+    def test_permission_repair_is_reserved_and_does_not_reinstall(self):
+        d = self.provision(); Path(d['workspace']).chmod(0o755)
+        path = self.root / 'runtime.json'
+        initial = managed.audit(path)
+        with patch.object(managed, 'audit', side_effect=[initial, {'ok':True}]), patch.object(managed, 'install') as install:
+            self.assertEqual(managed.repair(path, self.root), d)
+            install.assert_not_called()
+        self.assertTrue((self.root / 'repair-budget.json').exists())
+        managed.check_managed_directories(self.root, d)
+
+    def test_activation_rejects_drift_before_environment_or_diagnostic_changes(self):
+        d = self.provision(); Path(d['workspace']).chmod(0o755)
+        before = dict(os.environ)
+        with patch.object(managed, 'atomic_json') as write:
+            with self.assertRaisesRegex(managed.PrivateDirectoryError, 'permissions'):
+                managed.activate_environment(self.root / 'runtime.json')
+            write.assert_not_called()
+        self.assertEqual(dict(os.environ), before)
+
+    def test_installation_mode_drift_invalidates_even_warm_integrity_cache(self):
+        target, pin, _ = ManagedRuntimeTests.fake_install(self, 'pin')
+        self.assertTrue(managed.validate_install(target, pin))
+        target.chmod(0o755)
+        self.assertFalse(managed.validate_install(target, pin))

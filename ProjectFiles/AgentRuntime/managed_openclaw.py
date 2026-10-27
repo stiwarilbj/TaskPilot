@@ -6,6 +6,7 @@ configuration are serialized; no task/provider data is written to diagnostics.
 from __future__ import annotations
 import base64
 import ctypes
+import errno
 import sqlite3
 from contextlib import contextmanager, ExitStack, closing
 import fcntl
@@ -35,6 +36,67 @@ INTEGRITY_CACHE_MAX_BYTES = 64 * 1024 * 1024
 
 class ManagedRuntimeError(RuntimeError): pass
 
+class PrivateDirectoryError(ManagedRuntimeError):
+    def __init__(self, code):
+        self.code = 'private_directory_' + code
+        super().__init__(self.code + ': TaskPilot private storage needs attention; verify ownership and permissions.')
+
+
+def check_private_directory(path, *, repair=False, allow_mode_drift=False):
+    """Known directory only. No symlink following or recursive chmod."""
+    path = Path(path)
+    try:
+        before = path.lstat()
+        if stat.S_ISLNK(before.st_mode): raise PrivateDirectoryError('symlink')
+        if not stat.S_ISDIR(before.st_mode): raise PrivateDirectoryError('unavailable')
+        if before.st_uid != os.getuid(): raise PrivateDirectoryError('ownership')
+        fd = os.open(path, getattr(os, 'O_EVTONLY', os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0))
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino, opened.st_uid) != (before.st_dev, before.st_ino, os.getuid()):
+                raise PrivateDirectoryError('changed')
+            if stat.S_IMODE(opened.st_mode) != 0o700:
+                if repair: os.fchmod(fd, 0o700)
+                elif not allow_mode_drift: raise PrivateDirectoryError('permissions')
+            after, named = os.fstat(fd), path.lstat()
+            if (after.st_dev, after.st_ino, after.st_uid) != (named.st_dev, named.st_ino, os.getuid()) or named.st_uid != os.getuid() or after.st_mode != named.st_mode or not stat.S_ISDIR(named.st_mode):
+                raise PrivateDirectoryError('changed')
+            if not allow_mode_drift and stat.S_IMODE(after.st_mode) != 0o700:
+                raise PrivateDirectoryError('permissions')
+        finally: os.close(fd)
+    except OSError as error:
+        raise PrivateDirectoryError('permissions' if error.errno in (errno.EACCES, errno.EPERM) else 'unavailable') from error
+
+
+def managed_directory_paths(root, descriptor=None):
+    root = Path(root).absolute()
+    leaves = [root]
+    for name in ('installations', 'instances'):
+        candidate = root / name
+        if candidate.exists() or candidate.is_symlink(): leaves.append(candidate)
+    if descriptor:
+        leaves.extend((Path(descriptor['node']).parents[2], Path(descriptor['state']),
+                       Path(descriptor['workspace']), Path(descriptor['config']).parent))
+        # These stores may not exist until first use. Never discover or scan children.
+        for name in ('state', 'agents', 'agents/main', 'agents/main/agent'):
+            candidate = Path(descriptor['state']) / name
+            if candidate.exists() or candidate.is_symlink(): leaves.append(candidate)
+    paths = {root}
+    for leaf in leaves:
+        leaf = leaf.absolute()
+        if not leaf.is_relative_to(root) or '..' in leaf.parts: raise PrivateDirectoryError('changed')
+        while leaf != root:
+            paths.add(leaf); leaf = leaf.parent
+    return sorted(paths, key=lambda path: (len(path.parts), str(path)))
+
+
+def check_managed_directories(root, descriptor=None, *, repair=False):
+    paths = managed_directory_paths(root, descriptor)
+    # Reject unexpected targets before repairing any known mode drift.
+    for path in paths: check_private_directory(path, allow_mode_drift=repair)
+    if repair:
+        for path in paths: check_private_directory(path, repair=True)
+
 class ACPConnectionError(ManagedRuntimeError):
     def __init__(self, cause):
         self.cause = cause
@@ -54,8 +116,13 @@ def atomic_json(path: Path, value):
 @contextmanager
 def locked(root: Path):
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with (root / 'installation.lock').open('a') as f:
-        os.chmod(f.name, 0o600)
+    check_private_directory(root, allow_mode_drift=True)
+    fd = os.open(root / 'installation.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0), 0o600)
+    with os.fdopen(fd, 'a') as f:
+        lock_stat = os.fstat(f.fileno())
+        if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != os.getuid() or lock_stat.st_nlink != 1:
+            raise PrivateDirectoryError('ownership')
+        os.fchmod(f.fileno(), 0o600)
         fcntl.flock(f, fcntl.LOCK_EX)
         yield
 
@@ -225,6 +292,7 @@ def _integrity_cache_location(directory, fingerprint, manifest_digest, identity)
 
 
 def _read_integrity_manifest(directory, fingerprint):
+    check_private_directory(directory)
     root = Path(directory).resolve(strict=True)
     root_stat = root.stat()
     identity = {
@@ -563,6 +631,19 @@ def private_port():
 def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
     from request_policy import configuration_transaction
     with configuration_transaction(), locked(root), ExitStack() as cleanup:
+        offline = False
+        try: existing = load_descriptor(root / 'runtime.json')
+        except PrivateDirectoryError: raise
+        except ManagedRuntimeError: existing = None
+        try: check_managed_directories(root, existing)
+        except PrivateDirectoryError as error:
+            if error.code != 'private_directory_permissions': raise
+            cleanup.enter_context(configuration_hold(root, already_drained=drained))
+            require_offline(root)
+            check_managed_directories(root, existing, repair=True)
+            offline = True
+        for name in ('installations', 'instances'):
+            (root / name).mkdir(exist_ok=True, mode=0o700)
         target, fingerprint, manifest = install(resources, root)
         try:
             rejected = json.loads((root / 'rejected-installation.json').read_text())
@@ -570,6 +651,7 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
                 # Keep a tested rollback usable; do not reactivate a rejected update every refresh.
                 return load_descriptor(root / 'runtime.json')
         except (OSError, ValueError): pass
+        check_private_directory(target)
         active = root / 'runtime.json'
         try: previous = load_descriptor(active)
         except ManagedRuntimeError: previous = None
@@ -589,9 +671,8 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
         try: current_config = json.loads(config.read_text())
         except (OSError, ValueError): current_config = {}
         config_changed = drained or not contains_settings(current_config, desired) or set(current_config.get('agents', {}).get('defaults', {}).get('models', {})) != set(desired['agents']['defaults']['models'])
-        offline = False
         if config_changed:
-            cleanup.enter_context(configuration_hold(root, already_drained=drained)); offline = True
+            if not offline: cleanup.enter_context(configuration_hold(root, already_drained=drained)); offline = True
             require_offline(root)
             atomic_json(config, merge_settings(current_config, desired))
         auth = state / 'agents/main/agent/auth-profiles.json'
@@ -635,6 +716,12 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
             'endpoint':f'ws://127.0.0.1:{port}',
             'configuration_fingerprint':configuration_fingerprint(desired, key_record)}
         bounded_run([str(wrapper),'config','validate'], timeout=45, env=isolated_environment())
+        try: check_managed_directories(root, descriptor)
+        except PrivateDirectoryError as error:
+            if error.code != 'private_directory_permissions': raise
+            if not offline: cleanup.enter_context(configuration_hold(root, already_drained=drained)); offline = True
+            require_offline(root)
+            check_managed_directories(root, descriptor, repair=True)
         atomic_json(active, descriptor)
         if not previous or previous['installation_fingerprint'] != fingerprint:
             atomic_json(root / 'activation-verification.json', {'installation_fingerprint':fingerprint})
@@ -645,8 +732,13 @@ def load_descriptor(path: Path = ROOT / 'runtime.json'):
         d = json.loads(path.read_text())
         if d['version'] != VERSION or str(uuid.UUID(d['instance_id'])) != d['instance_id']: raise ValueError()
         root = path.parent.resolve()
-        for name in ('node','entry','executable','state','config','workspace','token_file'):
-            if not Path(d[name]).is_absolute() or not Path(d[name]).resolve().is_relative_to(root): raise ValueError()
+        names = ('node','entry','executable','state','config','workspace','token_file')
+        if any(not Path(d[name]).is_absolute() for name in names): raise ValueError()
+        # Classify links before resolved-path validation can hide the cause as an
+        # invalid descriptor and accidentally select new-instance provisioning.
+        for directory in managed_directory_paths(path.parent, d):
+            if directory.is_symlink(): raise PrivateDirectoryError('symlink')
+        if any(not Path(d[name]).resolve().is_relative_to(root) for name in names): raise ValueError()
         if type(d['port']) is not int or not 1024 < d['port'] < 65400 or d['endpoint'] != f"ws://127.0.0.1:{d['port']}": raise ValueError()
         return d
     except (OSError, ValueError, KeyError, TypeError) as error:
@@ -654,6 +746,7 @@ def load_descriptor(path: Path = ROOT / 'runtime.json'):
 
 def activate_environment(path):
     d = load_descriptor(path)
+    check_managed_directories(path.parent, d)
     env, diagnostic = managed_environment(dict(os.environ), d['node'])
     # Best-effort, bounded, content-free record. Diagnostic I/O never blocks readiness.
     record = path.parent / 'environment-diagnostics.json'
@@ -848,8 +941,17 @@ def handshake_cause(error):
 
 def audit(path, *, force_integrity=False):
     started = time.monotonic()
-    d = load_descriptor(path)
+    try: d = load_descriptor(path)
+    except PrivateDirectoryError as error:
+        return {'version': VERSION, 'ok': False, 'causes': [error.code],
+                'fingerprint': hashlib.sha256(error.code.encode()).hexdigest(), 'full_integrity_ok': False}
     faults = []
+    try: check_managed_directories(path.parent, d)
+    except PrivateDirectoryError as error:
+        # Do not write diagnostics through a suspect directory or read its contents.
+        return {'version': VERSION, 'ok': False, 'causes': [error.code],
+                'fingerprint': hashlib.sha256((d['installation_fingerprint'] + error.code).encode()).hexdigest(),
+                'full_integrity_ok': False}
     integrity_stats = {}
     installation_ok = validate_install(Path(d['node']).parents[2], d['installation_fingerprint'],
                                         force_full=force_integrity, stats=integrity_stats)
@@ -897,6 +999,8 @@ def audit(path, *, force_integrity=False):
 def repair(path, resources):
     require_offline(path.parent)
     result = audit(path, force_integrity=True)
+    unsafe = [cause for cause in result['causes'] if cause.startswith('private_directory_') and cause != 'private_directory_permissions']
+    if unsafe: raise ManagedRuntimeError(unsafe[0] + ': Private storage needs attention; no automatic repair was attempted.')
     if result['ok']: return load_descriptor(path)
     # Persist reservation before attempting repair; crashes cannot reset it.
     with locked(path.parent):
@@ -907,6 +1011,12 @@ def repair(path, resources):
         if record.get('fingerprint') == result['fingerprint'] and 0 <= now - record.get('attempted_at',0) < 600:
             raise ManagedRuntimeError('This private runtime defect was already repaired recently; waiting before another attempt.')
         atomic_json(record_path, {'fingerprint':result['fingerprint'], 'attempted_at':now})
+    if 'private_directory_permissions' in result['causes']:
+        from request_policy import configuration_transaction
+        with configuration_transaction(), locked(path.parent):
+            check_managed_directories(path.parent, load_descriptor(path), repair=True)
+        result = audit(path, force_integrity=True)
+        if result['ok']: return load_descriptor(path)
     if 'installation' in result['causes']:
         try: return rollback(path)
         except (ManagedRuntimeError, OSError, ValueError): pass
