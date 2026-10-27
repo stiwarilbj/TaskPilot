@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import XCTest
 @testable import OrbitAgent
 
@@ -152,7 +153,7 @@ final class CaptureArtifactLedgerTests: XCTestCase {
         }
     }
 
-    func testReplacedOrModifiedPNGDoesNotCountAsTheRegisteredArtifact() throws {
+    func testReplacedOrModifiedPNGRemainsChargedWithoutAuthorizingCleanup() throws {
         let owner = try owner()
         let original = try file(owner, bytes: 9)
         try owner.ownArtifact(original)
@@ -161,15 +162,118 @@ final class CaptureArtifactLedgerTests: XCTestCase {
         try Data("different".utf8).write(to: original)
         owner.discardArtifact(original)
         XCTAssertEqual(try Data(contentsOf: original), Data("different".utf8))
-        XCTAssertEqual(owner.captureArtifactUsage.fileCount, 0)
+        XCTAssertEqual(owner.captureArtifactUsage, .init(fileCount: 1, totalBytes: 18))
+        XCTAssertThrowsError(try owner.retainCaptureArtifact(original))
 
         let modified = try file(owner, bytes: 9)
         try owner.ownArtifact(modified)
-        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: modified.path)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(60)], ofItemAtPath: modified.path)
         owner.discardArtifact(modified)
         XCTAssertTrue(FileManager.default.fileExists(atPath: modified.path))
-        XCTAssertEqual(owner.captureArtifactUsage.fileCount, 0)
+        XCTAssertEqual(owner.captureArtifactUsage, .init(fileCount: 2, totalBytes: 27))
+        XCTAssertThrowsError(try owner.retainCaptureArtifact(modified))
         owner.revoke(); owner.retire()
+    }
+
+    func testHeldOriginalGrowthAndShrinkRefreshBytesAndEnforceAdmissionLimit() throws {
+        let owner = try owner(bytes: 20)
+        let a = try file(owner, bytes: 9)
+        try owner.ownArtifact(a)
+        var hold: CaptureArtifactHold? = try owner.retainCaptureArtifact(a)
+        let writer = try FileHandle(forWritingTo: a)
+        defer { try? writer.close() }
+        try writer.truncate(atOffset: 21)
+        XCTAssertEqual(owner.captureArtifactUsage, .init(fileCount: 1, totalBytes: 21))
+        let b = try file(owner, bytes: 1)
+        XCTAssertThrowsError(try owner.ownArtifact(b))
+        XCTAssertThrowsError(try owner.retainCaptureArtifact(a), "Accounting must not validate changed pixels")
+        try writer.truncate(atOffset: 4)
+        XCTAssertEqual(owner.captureArtifactUsage.totalBytes, 4)
+        try owner.ownArtifact(b)
+        XCTAssertEqual(owner.captureArtifactUsage.totalBytes, 5)
+        owner.discardArtifact(a)
+        withExtendedLifetime(hold) {}; hold = nil
+        XCTAssertTrue(FileManager.default.fileExists(atPath: a.path), "Changed versions are never silently deleted")
+        XCTAssertEqual(owner.captureArtifactUsage.totalBytes, 5)
+        try FileManager.default.removeItem(at: a)
+        XCTAssertEqual(owner.captureArtifactUsage, .init(fileCount: 1, totalBytes: 1))
+        owner.revoke(); owner.retire()
+    }
+
+    func testHeldReplacementKeepsOriginalAndReplacementChargeUntilResolved() throws {
+        let owner = try owner(bytes: 24)
+        let a = try file(owner, bytes: 9)
+        try owner.ownArtifact(a)
+        var hold: CaptureArtifactHold? = try owner.retainCaptureArtifact(a)
+        let parked = a.appendingPathExtension("old")
+        try FileManager.default.moveItem(at: a, to: parked)
+        try Data(repeating: 1, count: 14).write(to: a)
+        for _ in 0..<3 { XCTAssertEqual(owner.captureArtifactUsage.totalBytes, 23) }
+        let b = try file(owner, bytes: 2)
+        XCTAssertThrowsError(try owner.ownArtifact(b))
+        owner.discardArtifact(a)
+        XCTAssertEqual(try Data(contentsOf: a).count, 14)
+        try FileManager.default.removeItem(at: a)
+        XCTAssertEqual(owner.captureArtifactUsage.totalBytes, 23, "A held original still exists after unlink")
+        withExtendedLifetime(hold) {}; hold = nil
+        XCTAssertEqual(owner.captureArtifactUsage, .init(fileCount: 0, totalBytes: 0))
+        try owner.ownArtifact(b)
+        owner.revoke(); owner.retire()
+    }
+
+    func testRestoredOriginalVersionResolvesAReplacementWithoutDeletingIt() throws {
+        let owner = try owner()
+        let a = try file(owner, bytes: 9)
+        try owner.ownArtifact(a)
+        let parked = a.appendingPathExtension("old")
+        try FileManager.default.moveItem(at: a, to: parked)
+        try Data(repeating: 1, count: 14).write(to: a)
+        owner.discardArtifact(a)
+        XCTAssertEqual(owner.captureArtifactUsage.totalBytes, 23)
+        XCTAssertEqual(try Data(contentsOf: a).count, 14)
+        try FileManager.default.removeItem(at: a)
+        try FileManager.default.moveItem(at: parked, to: a)
+        XCTAssertEqual(owner.captureArtifactUsage, .init(fileCount: 0, totalBytes: 0))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: a.path))
+        owner.revoke(); owner.retire()
+    }
+
+    func testUnreadableMetadataRetainsChargeUntilInspectionCanResolveIt() throws {
+        if geteuid() == 0 { throw XCTSkip("Root bypasses directory search permissions") }
+        let owner = try owner()
+        let a = try file(owner, bytes: 9)
+        try owner.ownArtifact(a)
+        let directory = a.deletingLastPathComponent()
+        let writer = try FileHandle(forWritingTo: a)
+        try writer.truncate(atOffset: 13); try writer.close()
+        XCTAssertEqual(owner.captureArtifactUsage.totalBytes, 13)
+        XCTAssertEqual(chmod(directory.path, 0), 0)
+        defer { _ = chmod(directory.path, 0o700) }
+        owner.discardArtifact(a)
+        XCTAssertEqual(owner.captureArtifactUsage, .init(fileCount: 1, totalBytes: 13))
+        XCTAssertEqual(chmod(directory.path, 0o700), 0)
+        XCTAssertEqual(owner.captureArtifactUsage.totalBytes, 13)
+        try FileManager.default.removeItem(at: a)
+        XCTAssertEqual(owner.captureArtifactUsage.totalBytes, 0)
+        owner.revoke(); owner.retire()
+    }
+
+    func testUnlinkedHeldObjectRetainsItsChargeUntilLastHoldEnds() throws {
+        let owner = try owner()
+        let a = try file(owner, bytes: 9)
+        try owner.ownArtifact(a)
+        var hold: CaptureArtifactHold? = try owner.retainCaptureArtifact(a)
+        try FileManager.default.removeItem(at: a)
+        XCTAssertEqual(owner.captureArtifactUsage.totalBytes, 9)
+        withExtendedLifetime(hold) {}; hold = nil
+        XCTAssertEqual(owner.captureArtifactUsage.totalBytes, 0)
+        owner.revoke(); owner.retire()
+    }
+
+    func testAccountingAdditionSaturatesInsteadOfOverflowing() {
+        XCTAssertEqual(TaskLease.CaptureArtifactUsage.addingBytes(.max - 2, 3), .max)
+        XCTAssertEqual(TaskLease.CaptureArtifactUsage.addingBytes(.max, 0), .max)
+        XCTAssertEqual(TaskLease.CaptureArtifactUsage.addingBytes(9, 14), 23)
     }
 
     func testPartialCaptureDiscardUsesTheDirectoryPinnedBeforeEncoding() throws {

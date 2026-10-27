@@ -57,3 +57,24 @@ Stop and retirement, cancellation before and after parking, concurrent wakeups,
 reparking without authority, generation isolation, nested delivery, bridge
 cancellation, and cancellation between command preflight and native launch. The
 fixtures add no provider requests and do not interact with live desktop apps.
+
+
+Capture retention accounting refreshes every registered path through the pinned
+capture-directory descriptor, including artifacts with reader holds. Device,
+inode and birth time distinguish the original object from a replacement; size
+changes on that same object update its charge in either direction. Full original
+metadata remains required for a new reader or identity-bound deletion: refreshing
+bytes never accepts changed pixels as the original observation.
+
+A replacement retains the last known original charge plus its observed size,
+using a high-water mark so repeated inspection does not double count it or free
+capacity when uncertain metadata shrinks. Metadata errors preserve the previous
+charge. Confirmed absence removes an entry only after all reader holds end;
+restoring the original version permits ordinary expired-file cleanup. Changed
+versions stay charged instead of silently disappearing from the ledger. All
+arithmetic saturates at Int64.max and totals are recomputed from the bounded
+ledger so resolved entries can release capacity even after saturation. These
+checks read metadata only, never image contents, directory listings or user
+outputs. They do not broaden cleanup authority or add provider requests.
+
+Offline accounting regressions: `swift test --filter CaptureArtifactLedgerTests`.

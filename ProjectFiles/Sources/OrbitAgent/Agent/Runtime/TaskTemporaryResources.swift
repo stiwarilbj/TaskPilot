@@ -341,6 +341,12 @@ final class TaskCaptureDirectory: @unchecked Sendable {
             owner = status.st_uid; mode = status.st_mode
             birth = status.st_birthtimespec; modified = status.st_mtimespec
         }
+        /// Object identity excludes size, modification time, mode and owner.
+        /// This is for accounting only; full equality still gates execution and cleanup.
+        func isSameObject(as other: Self) -> Bool {
+            device == other.device && inode == other.inode &&
+                birth.tv_sec == other.birth.tv_sec && birth.tv_nsec == other.birth.tv_nsec
+        }
         static func == (lhs: Self, rhs: Self) -> Bool {
             lhs.device == rhs.device && lhs.inode == rhs.inode && lhs.bytes == rhs.bytes &&
                 lhs.owner == rhs.owner && lhs.mode == rhs.mode &&

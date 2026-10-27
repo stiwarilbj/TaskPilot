@@ -13,7 +13,14 @@ final class TaskLease: @unchecked Sendable {
     private var value: State = .running
     private var discarded = 0
     private var suspensions = 0
-    struct CaptureArtifactUsage: Equatable { let fileCount: Int; let totalBytes: Int64 }
+    struct CaptureArtifactUsage: Equatable {
+        let fileCount: Int
+        let totalBytes: Int64
+        static func addingBytes(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+            let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+            return overflow ? .max : sum
+        }
+    }
     enum CaptureArtifactError: LocalizedError {
         case invalidArtifact, retentionLimit
         var errorDescription: String? {
@@ -24,10 +31,15 @@ final class TaskLease: @unchecked Sendable {
         }
     }
     private struct CaptureArtifact {
-        let bytes: Int64
+        var bytes: Int64
+        var lastKnownObjectBytes: Int64
+        // Original version remains authoritative for reuse and deletion.
         let identity: TaskCaptureDirectory.FileIdentity
         var references = 0
         var expired = false
+        init(bytes: Int64, identity: TaskCaptureDirectory.FileIdentity) {
+            self.bytes = bytes; lastKnownObjectBytes = bytes; self.identity = identity
+        }
     }
     private var artifacts: [URL: CaptureArtifact] = [:]
     private var artifactBytes: Int64 = 0
@@ -587,19 +599,36 @@ final class TaskLease: @unchecked Sendable {
     /// Metadata only: no directory scan, image read, or user output tracking.
     private func pruneCaptureArtifacts() {
         for url in Array(artifacts.keys) {
-            guard let entry = artifacts[url], entry.references == 0 else { continue }
-            guard let captureStorage, let name = captureStorage.filename(for: url) else { continue }
+            guard var entry = artifacts[url], let captureStorage,
+                  let name = captureStorage.filename(for: url) else { continue }
             let current: stat?
-            // An unreadable descriptor is not proof that a retained file is gone.
+            // Failure is not absence; retain the previous conservative charge.
             do { current = try captureStorage.status(named: name) } catch { continue }
-            let matches = current.map { ($0.st_mode & S_IFMT) == S_IFREG &&
-                TaskCaptureDirectory.FileIdentity($0) == entry.identity } ?? false
-            if entry.expired && matches {
-                guard (try? captureStorage.removeFile(named: name, expected: entry.identity)) == true else { continue }
-            } else if matches { continue }
-            artifacts.removeValue(forKey: url)
-            artifactBytes -= entry.bytes
+            guard let info = current else {
+                // An open reader can still own the unlinked original object.
+                if entry.references == 0 { artifacts.removeValue(forKey: url) }
+                continue
+            }
+            let observed = TaskCaptureDirectory.FileIdentity(info)
+            let regular = (info.st_mode & S_IFMT) == S_IFREG && info.st_size >= 0
+            if regular && entry.identity.isSameObject(as: observed) {
+                entry.lastKnownObjectBytes = info.st_size
+                entry.bytes = info.st_size
+            } else {
+                // A replacement does not erase ownership of the original. Keep
+                // a high-water charge for both known objects until resolved.
+                entry.bytes = max(entry.bytes, CaptureArtifactUsage.addingBytes(
+                    entry.lastKnownObjectBytes, max(0, info.st_size)))
+            }
+            artifacts[url] = entry
+            if entry.references == 0 && entry.expired && regular && observed == entry.identity,
+               (try? captureStorage.removeFile(named: name, expected: entry.identity)) == true {
+                artifacts.removeValue(forKey: url)
+            }
         }
+        // Recompute bounded metadata totals so saturation can recover after a
+        // resolved entry disappears; subtracting from a saturated sum cannot.
+        artifactBytes = artifacts.values.reduce(0) { CaptureArtifactUsage.addingBytes($0, $1.bytes) }
         // Retirement occurs after normal drainage; explicit encoder/reader holds
         // also protect early retirement and delayed native image consumers.
         if value == .retired && artifacts.isEmpty && captureEncoders == 0 {
@@ -634,6 +663,7 @@ final class TaskLease: @unchecked Sendable {
         try check()
         let url = url.standardizedFileURL
         let capture = try boundCaptureDirectory()
+        pruneCaptureArtifacts()
         guard var entry = artifacts[url], !entry.expired,
               capture.pathIsCurrent(), let name = capture.filename(for: url),
               let info = try capture.status(named: name), TaskCaptureDirectory.FileIdentity(info) == entry.identity else {
@@ -651,10 +681,10 @@ final class TaskLease: @unchecked Sendable {
         let url = url.standardizedFileURL
         try check()
         let capture = try boundCaptureDirectory()
+        pruneCaptureArtifacts()
         guard capture.pathIsCurrent(), let name = capture.filename(for: url),
               let info = try capture.status(named: name), (info.st_mode & S_IFMT) == S_IFREG,
               info.st_uid == getuid(), info.st_size >= 0 else { throw CaptureArtifactError.invalidArtifact }
-        pruneCaptureArtifacts()
         if let existing = artifacts[url] {
             guard existing.identity == TaskCaptureDirectory.FileIdentity(info) else { throw CaptureArtifactError.invalidArtifact }
             return
