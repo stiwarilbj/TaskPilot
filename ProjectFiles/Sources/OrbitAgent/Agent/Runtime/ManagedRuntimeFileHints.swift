@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import CoreServices
 
 /// Vnode notifications are invalidation hints only. No contents, health verdicts,
 /// recursive scans or timers live here; the host runs its existing audits.
@@ -8,6 +9,18 @@ final class ManagedRuntimeFileHints {
         let rawValue: Int
         static let installation = Self(rawValue: 1)
         static let configuration = Self(rawValue: 2)
+        static let rescanRequired = Self(rawValue: 4)
+    }
+    private final class GapState {
+        private let lock = NSLock()
+        private var pending = false
+        func record(_ flags: FSEventStreamEventFlags) {
+            let mask = kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped |
+                kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagEventIdsWrapped |
+                kFSEventStreamEventFlagRootChanged | kFSEventStreamEventFlagMount | kFSEventStreamEventFlagUnmount
+            if flags & FSEventStreamEventFlags(mask) != 0 { lock.withLock { pending = true } }
+        }
+        func take() -> Bool { lock.withLock { let value = pending; pending = false; return value } }
     }
     private struct Metadata: Equatable {
         let device: dev_t
@@ -46,12 +59,46 @@ final class ManagedRuntimeFileHints {
     private var pending: Changes = []
     private var nextDelivery: TimeInterval = 0
     private var closed = false
+    private let gaps = GapState()
+    private var gapStream: FSEventStreamRef?
 
-    init(root: URL, openDescriptor: @escaping (String) -> Int32 = {
+    init(root: URL, watchNotificationGaps: Bool = true, openDescriptor: @escaping (String) -> Int32 = {
         Darwin.open($0, O_EVTONLY | O_CLOEXEC | O_NOFOLLOW)
     }) {
         self.root = root.standardizedFileURL.resolvingSymlinksInPath()
         self.openDescriptor = openDescriptor
+        if watchNotificationGaps { queue.sync { startGapWatch() } }
+    }
+
+    /// Vnode sources do not expose event loss. FSEvents is used only for its
+    /// loss/rescan flags; normal path changes remain on the existing vnode lane.
+    private func startGapWatch() {
+        var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(gaps).toOpaque(),
+            retain: { pointer in
+                guard let pointer else { return nil }
+                _ = Unmanaged<GapState>.fromOpaque(pointer).retain()
+                return UnsafeRawPointer(pointer)
+            }, release: { pointer in
+                if let pointer { Unmanaged<GapState>.fromOpaque(pointer).release() }
+            }, copyDescription: nil)
+        let callback: FSEventStreamCallback = { _, info, count, _, flags, _ in
+            guard let info else { return }
+            let state = Unmanaged<GapState>.fromOpaque(info).takeUnretainedValue()
+            for index in 0..<count { state.record(flags[index]) }
+        }
+        guard let stream = FSEventStreamCreate(nil, callback, &context, [root.path] as CFArray,
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.25,
+            FSEventStreamCreateFlags(kFSEventStreamCreateFlagWatchRoot | kFSEventStreamCreateFlagFileEvents)) else { return }
+        FSEventStreamSetDispatchQueue(stream, queue)
+        guard FSEventStreamStart(stream) else {
+            FSEventStreamInvalidate(stream); FSEventStreamRelease(stream); return
+        }
+        gapStream = stream
+    }
+
+    /// Also allows deterministic loss-signal fixtures without dropping OS events.
+    func noteEventFlags(_ flags: [FSEventStreamEventFlags]) {
+        queue.sync { if !closed { for value in flags { gaps.record(value) } } }
     }
 
     static func targets(_ descriptor: ManagedOpenClawDescriptor, descriptorURL: URL) -> [URL: Changes] {
@@ -107,7 +154,11 @@ final class ManagedRuntimeFileHints {
     private func reconcile(markChanges: Bool) {
         for (url, scope) in targets {
             let current = metadata(url)
-            if markChanges && snapshots[url] != current { pending.formUnion(scope) }
+            if markChanges && snapshots[url] != current {
+                pending.formUnion(scope)
+                if let previous = snapshots[url], previous.directory,
+                   current.map({ previous.sameIdentity(as: $0) }) != true { pending.insert(.rescanRequired) }
+            }
             snapshots[url] = current
             if let watch = watches[url], current.map({ watch.metadata.sameIdentity(as: $0) }) != true {
                 watches.removeValue(forKey: url)?.source.cancel()
@@ -122,6 +173,10 @@ final class ManagedRuntimeFileHints {
                 eventMask: [.write, .extend, .attrib, .rename, .delete, .revoke], queue: queue)
             source.setEventHandler { [weak self] in
                 guard let self, !self.closed, self.watches[url]?.id == id else { return }
+                let events = self.watches[url]!.source.data
+                if events.contains(.revoke) || current.directory && !events.intersection([.rename, .delete]).isEmpty {
+                    self.pending.insert(.rescanRequired)
+                }
                 // File write notifications invalidate even if metadata appears
                 // unchanged. Directory notifications first inspect relevant children.
                 if !current.directory { self.pending.formUnion(scope) }
@@ -136,6 +191,7 @@ final class ManagedRuntimeFileHints {
 
     func takeChanges(at now: TimeInterval) -> Changes {
         queue.sync {
+            if gaps.take() { pending.insert(.rescanRequired) }
             guard !closed, !pending.isEmpty, now >= nextDelivery else { return [] }
             let value = pending; pending = []; nextDelivery = now + 5
             return value
@@ -146,6 +202,10 @@ final class ManagedRuntimeFileHints {
     func close() {
         queue.sync {
             closed = true; pending = []
+            if let gapStream {
+                FSEventStreamStop(gapStream); FSEventStreamInvalidate(gapStream); FSEventStreamRelease(gapStream)
+                self.gapStream = nil
+            }
             for watch in watches.values { watch.source.cancel() }
             watches.removeAll(); snapshots.removeAll(); targets.removeAll()
         }

@@ -255,9 +255,11 @@ def _read_integrity_manifest(directory, fingerprint):
 
 
 def _valid_integrity_cache(cache, fingerprint, manifest_digest, identity, files):
-    if not isinstance(cache, dict) or set(cache) != {
+    required = {
             'version', 'fingerprint', 'manifest_digest', 'directory',
-            'last_full_audit_monotonic_ns', 'files'}:
+            'last_full_audit_monotonic_ns', 'files'}
+    if (not isinstance(cache, dict) or not required <= set(cache) <= required | {'full_audit_required'} or
+            type(cache.get('full_audit_required', False)) is not bool):
         return False
     cached_identity = cache.get('directory')
     if (not isinstance(cached_identity, dict) or set(cached_identity) != {'path', 'device', 'inode'} or
@@ -308,6 +310,8 @@ def validate_install(directory, fingerprint, *, force_full=False, now_monotonic_
     A changed file is always rehashed against the immutable integrity manifest.
     The native host also passes force_full for installation notification hints:
     discard digest reuse, not the prior inode baseline or expected seal values.
+    A forced pass latches full_audit_required in the cache until successful, so
+    notification loss cannot silently revert to metadata reuse after a failure.
     Missed/unsupported notifications never replace metadata checks or audit age.
     """
     result = stats if stats is not None else {}
@@ -357,12 +361,23 @@ def validate_install(directory, fingerprint, *, force_full=False, now_monotonic_
             except (OSError, ValueError, UnicodeError):
                 cache = None
         cache_valid = _valid_integrity_cache(cache, fingerprint, manifest_digest, identity, files)
+        if force_full and cache_valid and not cache.get('full_audit_required', False):
+            cache = dict(cache, full_audit_required=True)
+            try:
+                _write_integrity_cache(cache_root, cache_key, cache)
+            except OSError:
+                # Still hash everything now; the host retains its pending full
+                # audit too. Cache persistence failure cannot authorize reuse.
+                try:
+                    cache_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         now = time.monotonic_ns() if now_monotonic_ns is None else now_monotonic_ns
         if type(now) is not int or now < 0:
             now = time.monotonic_ns()
             force_full = True
         cache_time = cache.get('last_full_audit_monotonic_ns') if cache_valid else None
-        full_due = (not cache_valid or type(cache_time) is not int or now < cache_time or
+        full_due = (not cache_valid or cache.get('full_audit_required', False) or type(cache_time) is not int or now < cache_time or
                     now - cache_time >= FULL_INTEGRITY_AUDIT_SECONDS * 1_000_000_000)
         do_full = force_full or full_due or cache_fd is None
         result['audit_mode'] = 'full' if do_full else 'incremental'
@@ -423,6 +438,7 @@ def validate_install(directory, fingerprint, *, force_full=False, now_monotonic_
                 'manifest_digest': manifest_digest,
                 'directory': identity,
                 'last_full_audit_monotonic_ns': last_full,
+                'full_audit_required': False,
                 'files': verified,
             }
             if next_cache != cache:

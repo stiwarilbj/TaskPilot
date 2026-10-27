@@ -106,10 +106,13 @@ struct FullIntegrityAuditSchedule {
     static let failedAuditRetryDelay: TimeInterval = 60
     private(set) var lastSuccessfulAudit: TimeInterval?
     private(set) var retryAfter: TimeInterval = 0
+    private(set) var fullAuditRequired = false
+
+    mutating func requireFullAudit() { fullAuditRequired = true }
 
     func shouldRun(at now: TimeInterval, forced: Bool = false) -> Bool {
         if forced { return true }
-        let due = lastSuccessfulAudit.map { now < $0 || now - $0 >= Self.interval } ?? true
+        let due = fullAuditRequired || (lastSuccessfulAudit.map { now < $0 || now - $0 >= Self.interval } ?? true)
         return due && now >= retryAfter
     }
 
@@ -117,6 +120,7 @@ struct FullIntegrityAuditSchedule {
         if succeeded {
             lastSuccessfulAudit = now
             retryAfter = 0
+            fullAuditRequired = false
         } else {
             // Keep the last successful timestamp intact. This is only a retry
             // throttle after a failed pass, never a new audit baseline.
@@ -127,6 +131,7 @@ struct FullIntegrityAuditSchedule {
     mutating func reset() {
         lastSuccessfulAudit = nil
         retryAfter = 0
+        fullAuditRequired = false
     }
 }
 
@@ -285,6 +290,7 @@ enum ManagedGatewayHost {
                 let now = Date().timeIntervalSince1970
                 let monotonicNow = ProcessInfo.processInfo.systemUptime
                 let dirtyMetadata = fileHints.takeChanges(at: monotonicNow)
+                if dirtyMetadata.contains(.rescanRequired) { integritySchedule.requireFullAudit() }
                 let configurationRequest = root.appendingPathComponent("configuration-request.json")
                 if let data = try? Data(contentsOf:configurationRequest),
                    let value = try? JSONSerialization.jsonObject(with:data) as? [String:Any],
@@ -316,7 +322,7 @@ enum ManagedGatewayHost {
                 // Offline repair is excluded from every native delivery commit.
                 let fullIntegrityAuditDue = integritySchedule.shouldRun(at:monotonicNow)
                 let forceFullIntegrityAudit = integritySchedule.shouldRun(
-                    at:monotonicNow, forced:faultRequested || repair || dirtyMetadata.contains(.installation))
+                    at:monotonicNow, forced:faultRequested || repair || dirtyMetadata.contains(.installation) || dirtyMetadata.contains(.rescanRequired))
                 if now >= nextAudit || faultRequested || requested && repair || fullIntegrityAuditDue || !dirtyMetadata.isEmpty {
                     if !dirtyMetadata.isEmpty {
                         writeHealth(current, state:"recovering", detail:"Checking private runtime changes", root:root)

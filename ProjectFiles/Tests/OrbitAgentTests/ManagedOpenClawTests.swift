@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import CoreServices
 import XCTest
 @testable import OrbitAgent
 
@@ -42,6 +43,61 @@ final class ManagedOpenClawTests: XCTestCase {
         } while ProcessInfo.processInfo.systemUptime < deadline
         XCTFail("Expected filesystem invalidation hint")
         return []
+    }
+    func testNotificationLossFlagsRequireFullAuditButOrdinaryEventsDoNot() throws {
+        let root = try hintFixture(), file = root.appendingPathComponent("config")
+        try Data("local".utf8).write(to: file)
+        let hints = ManagedRuntimeFileHints(root: root, watchNotificationGaps: false)
+        defer { hints.close() }
+        hints.configure([file: .configuration])
+        hints.noteEventFlags([FSEventStreamEventFlags(kFSEventStreamEventFlagItemModified),
+                              FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone)])
+        XCTAssertTrue(hints.takeChanges(at: 0).isEmpty)
+        for (index, flag) in [kFSEventStreamEventFlagMustScanSubDirs, kFSEventStreamEventFlagUserDropped,
+                             kFSEventStreamEventFlagKernelDropped, kFSEventStreamEventFlagEventIdsWrapped,
+                             kFSEventStreamEventFlagRootChanged, kFSEventStreamEventFlagMount,
+                             kFSEventStreamEventFlagUnmount].enumerated() {
+            hints.noteEventFlags([FSEventStreamEventFlags(flag)])
+            XCTAssertEqual(hints.takeChanges(at: Double(index * 5)), .rescanRequired)
+        }
+        hints.noteEventFlags([FSEventStreamEventFlags(kFSEventStreamEventFlagUserDropped)])
+        XCTAssertTrue(hints.takeChanges(at: 34).isEmpty)
+        XCTAssertEqual(hints.takeChanges(at: 35), .rescanRequired)
+        try Data("changed".utf8).write(to: file)
+        hints.refresh()
+        XCTAssertEqual(hints.takeChanges(at: 40), .configuration)
+        hints.close()
+        hints.noteEventFlags([FSEventStreamEventFlags(kFSEventStreamEventFlagKernelDropped)])
+        XCTAssertTrue(hints.takeChanges(at: 50).isEmpty)
+    }
+
+    func testDirectoryReplacementRequiresRescanEvenWhenFileMetadataMatches() throws {
+        let root = try hintFixture(), folder = root.appendingPathComponent("instance"), file = folder.appendingPathComponent("config")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        try Data("local".utf8).write(to: file)
+        let hints = ManagedRuntimeFileHints(root: root, watchNotificationGaps: false, openDescriptor: { _ in -1 })
+        defer { hints.close() }
+        hints.configure([file: .configuration])
+        try FileManager.default.moveItem(at: folder, to: root.appendingPathComponent("previous"))
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        try Data("local".utf8).write(to: file)
+        hints.refresh()
+        XCTAssertEqual(hints.takeChanges(at: 0), [.configuration, .rescanRequired])
+    }
+
+    func testGapAuditRequirementSurvivesFailureUntilSuccessfulFullPass() {
+        var schedule = FullIntegrityAuditSchedule()
+        schedule.record(at: 100, succeeded: true)
+        schedule.requireFullAudit()
+        XCTAssertTrue(schedule.shouldRun(at: 200))
+        schedule.record(at: 200, succeeded: false)
+        XCTAssertTrue(schedule.fullAuditRequired)
+        XCTAssertEqual(schedule.lastSuccessfulAudit, 100)
+        XCTAssertFalse(schedule.shouldRun(at: 259))
+        XCTAssertTrue(schedule.shouldRun(at: 260))
+        schedule.record(at: 260, succeeded: true)
+        XCTAssertFalse(schedule.fullAuditRequired)
+        XCTAssertFalse(schedule.shouldRun(at: 261))
     }
     func testFileHintsObserveWritesAndAtomicReplacementAndRearm() throws {
         let root = try hintFixture(), file = root.appendingPathComponent("code")

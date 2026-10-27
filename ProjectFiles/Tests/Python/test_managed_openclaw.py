@@ -176,6 +176,51 @@ class ManagedRuntimeTests(unittest.TestCase):
         cache=json.loads(next((install.parent/'.integrity-cache').glob('*.json')).read_text())
         self.assertEqual(cache['last_full_audit_monotonic_ns'],100)
 
+    def test_gap_forced_audit_stays_pending_across_invocations_until_full_success(self):
+        install=self.root/'install';install.mkdir()
+        for name in ('first','second'):(install/name).write_bytes(b'good')
+        managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
+        cache_file=next((install.parent/'.integrity-cache').glob('*.json'))
+        with patch.object(managed,'_hash_installation_file',return_value=(None,None)):
+            self.assertFalse(managed.validate_install(install,'pin',force_full=True,now_monotonic_ns=200))
+        pending=json.loads(cache_file.read_text())
+        self.assertTrue(pending['full_audit_required'])
+        self.assertEqual(pending['last_full_audit_monotonic_ns'],100)
+        stats={}
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=300,stats=stats))
+        self.assertEqual((stats['audit_mode'],stats['files_hashed'],stats['cache_hits']),('full',2,0))
+        completed=json.loads(cache_file.read_text())
+        self.assertFalse(completed['full_audit_required'])
+        self.assertEqual(completed['last_full_audit_monotonic_ns'],300)
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=400,stats=stats))
+        self.assertEqual((stats['audit_mode'],stats['files_hashed'],stats['cache_hits']),('incremental',0,2))
+
+    def test_gap_marker_write_failure_discards_stale_cache_and_failed_audit_stays_full(self):
+        install=self.root/'install';install.mkdir();(install/'code').write_bytes(b'good')
+        managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
+        with patch.object(managed,'_write_integrity_cache',side_effect=OSError('disk full')), \
+                patch.object(managed,'_hash_installation_file',return_value=(None,None)):
+            self.assertFalse(managed.validate_install(install,'pin',force_full=True,now_monotonic_ns=200))
+        stats={}
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=300,stats=stats))
+        self.assertEqual(stats['audit_mode'],'full')
+        self.assertEqual(stats['cache_hits'],0)
+
+    def test_legacy_gap_marker_is_optional_but_malformed_marker_forces_full_pass(self):
+        install=self.root/'install';install.mkdir();(install/'code').write_bytes(b'good')
+        managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=100))
+        cache_file=next((install.parent/'.integrity-cache').glob('*.json'))
+        value=json.loads(cache_file.read_text());value.pop('full_audit_required');managed.atomic_json(cache_file,value)
+        stats={}
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=200,stats=stats))
+        self.assertEqual(stats['audit_mode'],'incremental')
+        value=json.loads(cache_file.read_text());value['full_audit_required']=1;managed.atomic_json(cache_file,value)
+        self.assertTrue(managed.validate_install(install,'pin',now_monotonic_ns=300,stats=stats))
+        self.assertEqual(stats['audit_mode'],'full')
+
     def test_integrity_cache_skips_unchanged_content_reads_and_rehashes_changed_metadata(self):
         install=self.root/'install';install.mkdir();f=install/'code';f.write_bytes(b'good')
         managed.atomic_json(install/'integrity.json',{'fingerprint':'pin','files':managed.seal(install)})

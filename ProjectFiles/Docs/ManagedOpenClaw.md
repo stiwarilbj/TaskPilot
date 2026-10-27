@@ -155,6 +155,18 @@ scans. Vnode delivery is not recursive or guaranteed: missing/unsupported watche
 retain five-minute configuration checks, per-validation file metadata checks,
 and hourly full integrity audits. No generation requests are added.
 
+A private-root FSEvents subscription supplements vnode watches only for dropped
+history, required rescans, event-ID wrap, root replacement, and mount changes.
+Ordinary FSEvents do not alter the existing per-file/configuration paths. Watched
+directory replacement or revocation also requests a full pass because individual
+child changes may have been missed. These signals perform no directory scans.
+The host latches the full-audit requirement until success, retaining its existing
+failed-audit retry delay. Python persists a pending-full marker under the existing
+cache lock before a forced pass, preserving the seal and prior inode baseline.
+An interrupted or failed pass cannot reset the audit timestamp or clear that
+marker; the next validator must hash every sealed file. Legacy caches remain
+compatible. Unsupported notification delivery retains the timed audit fallback.
+
 ## Managed Node environment policy (version 1)
 
 Swift launch construction and Python configuration/activation use the same
