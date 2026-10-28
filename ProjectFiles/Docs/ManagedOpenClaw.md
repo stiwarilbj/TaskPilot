@@ -456,6 +456,36 @@ After package installation, a bounded walk inspects Mach-O `.node` modules for
 the same architecture and OS compatibility. A failed check leaves the current
 installation active; the staged bundle is not promoted.
 
+The installation seal optionally retains versioned native-add-on facts, indexed
+by SHA-256 digest and the exact process architecture, normalized macOS version,
+and bundled compatibility policy. Facts include all parsed supported slices and
+their minimum OS versions; non-Mach-O and alternative-architecture prebuilds
+remain distinguishable from a verified host-compatible add-on. Compatible
+modules are parsed once instead of twice. Identical bytes share parsed facts.
+
+When resuming a sealed staging directory, the existing forced full integrity
+audit still runs first. The add-on scan then hashes each bounded regular file
+through a no-follow descriptor and checks the seal's expected digest before
+reusing facts. Header parsing and hashing use the same open file, with identity
+and metadata checks afterward. Changed digests, compatibility targets, parser
+versions, and malformed/missing records require fresh parsing; unused facts are
+discarded. Fact refreshes never change expected file digests. A legacy seal needs
+no migration, and failure to save refreshed derived facts only loses cache reuse.
+Changes between initial inspection and sealing prevent promotion. These facts
+do not establish Gateway/provider readiness or replace the integrity seal,
+Node launch probe, timed full audits, or runtime recovery budgets.
+
+Offline cache and crash-resume fixtures (from `ProjectFiles`):
+
+```sh
+python3 -m unittest Tests.Python.test_managed_native_addons Tests.Python.test_managed_provisioning
+```
+
+Fixtures assert one compatibility inspection per distinct digest on a cold scan, none on a
+warm scan, and continued content hashing and seal verification in both cases.
+They include host/policy changes, modified and replaced files, invalid caches,
+and interrupted staging recovery without launching Node or OpenClaw.
+
 Audits perform read-only `PRAGMA quick_check(1)` on the known private OpenClaw
 databases, with a short SQLite busy timeout, a progress-handler deadline, and
 an interrupt timer for statements stalled between virtual-machine steps. The

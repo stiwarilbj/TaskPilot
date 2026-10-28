@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import managed_openclaw as managed
+from Tests.Python.test_managed_native_addons import macho
 
 
 class Interrupted(BaseException):
@@ -72,6 +73,19 @@ class ProvisioningTests(unittest.TestCase):
              patch.object(managed, 'download', side_effect=download) as downloads, \
              patch.object(managed.shutil, 'disk_usage', return_value=SimpleNamespace(free=64 * 1024**3)), \
              patch.object(managed, 'bounded_run', side_effect=self.cli) as runs:
+            yield downloads, runs
+
+    @contextmanager
+    def native_build(self):
+        self.manifest['compatibility'] = dict(version=1, architectures=[platform.machine()], minimum_macos='13.5')
+        scanner = managed.verify_native_addons
+        def cli(argv, **kwargs):
+            result = self.cli(argv, **kwargs)
+            if 'ci' in argv:
+                (Path(kwargs['cwd']) / 'node_modules/openclaw/native.node').write_bytes(macho(platform.machine()))
+            return result
+        with self.build() as (downloads, runs), patch.object(managed, 'verify_native_addons', wraps=scanner):
+            runs.side_effect = cli
             yield downloads, runs
 
     @contextmanager
@@ -657,6 +671,78 @@ class ProvisioningTests(unittest.TestCase):
         self.assertEqual(managed.verify_native_addons(package, manifest, process_arch='arm64', macos_version='14.0'), 1)
         with self.assertRaisesRegex(managed.ManagedRuntimeError, 'bounded work limit'):
             managed.verify_native_addons(package, manifest, maximum_files=0, process_arch='arm64', macos_version='14.0')
+
+    def test_sealed_stage_resumes_with_digest_facts_without_reparsing_native_headers(self):
+        with self.native_build() as (downloads, runs):
+            with self.crash_at('sealed'), self.assertRaises(Interrupted):
+                managed.install(self.resources, self.root)
+            record = self.marker()
+            stage = self.root / 'installations' / ('.stage-' + record['stage_id'])
+            integrity = json.loads((stage / 'integrity.json').read_text())
+            value = integrity['files']['package/node_modules/openclaw/native.node']
+            self.assertIn(value, integrity['native_addons']['digests'])
+            downloads.reset_mock(); runs.reset_mock()
+            with patch.object(managed, '_thin_mach_o_slice') as parse:
+                target, fingerprint, _ = managed.install(self.resources, self.root)
+                parse.assert_not_called()
+            downloads.assert_not_called(); runs.assert_not_called()
+        self.assertTrue(managed.validate_install(target, fingerprint, force_full=True))
+        self.assertEqual(json.loads((target / 'integrity.json').read_text()), integrity)
+
+    def test_legacy_or_corrupt_seal_facts_are_rebuilt_on_stage_recovery(self):
+        for legacy in (True, False):
+            with self.subTest(legacy=legacy):
+                self.root = self.base / ('legacy' if legacy else 'corrupt-facts')
+                self.root.mkdir(mode=0o700); (self.root / 'installations').mkdir(mode=0o700)
+                with self.native_build() as (downloads, runs):
+                    with self.crash_at('sealed'), self.assertRaises(Interrupted):
+                        managed.install(self.resources, self.root)
+                    stage = self.root / 'installations' / ('.stage-' + self.marker()['stage_id'])
+                    integrity = json.loads((stage / 'integrity.json').read_text())
+                    if legacy: del integrity['native_addons']
+                    else: integrity['native_addons'] = {'version':999, 'digests':'invalid'}
+                    managed.atomic_json(stage / 'integrity.json', integrity)
+                    downloads.reset_mock(); runs.reset_mock()
+                    with patch.object(managed, '_thin_mach_o_slice', wraps=managed._thin_mach_o_slice) as parse:
+                        target, fingerprint, _ = managed.install(self.resources, self.root)
+                        parse.assert_called_once()
+                    downloads.assert_not_called(); runs.assert_not_called()
+                refreshed = json.loads((target / 'integrity.json').read_text())
+                self.assertEqual(refreshed['files'], integrity['files'])
+                self.assertEqual(refreshed['native_addons']['version'], managed.NATIVE_ADDON_FACTS_VERSION)
+                self.assertTrue(managed.validate_install(target, fingerprint, force_full=True))
+
+    def test_native_addon_change_between_inspection_and_sealing_prevents_promotion(self):
+        before = self.preserve_active()
+        original = managed.seal
+        def replace(directory):
+            (directory / 'package/node_modules/openclaw/native.node').write_bytes(macho(platform.machine(), (15, 0, 0)))
+            return original(directory)
+        with self.native_build(), patch.object(managed, 'seal', side_effect=replace), \
+             self.assertRaisesRegex(managed.ManagedRuntimeError, 'changed while'):
+            managed.install(self.resources, self.root)
+        self.assert_preserved(before)
+        self.assertFalse((self.root / 'installations' / self.fingerprint).exists())
+        self.assertEqual(list((self.root / 'installations').glob('.stage-*')), [])
+
+    def test_optional_fact_refresh_write_failure_does_not_change_the_verified_seal(self):
+        with self.native_build() as (downloads, runs):
+            with self.crash_at('sealed'), self.assertRaises(Interrupted):
+                managed.install(self.resources, self.root)
+            stage = self.root / 'installations' / ('.stage-' + self.marker()['stage_id'])
+            integrity = json.loads((stage / 'integrity.json').read_text())
+            del integrity['native_addons']
+            managed.atomic_json(stage / 'integrity.json', integrity)
+            original = managed.atomic_json
+            def fail(path, value):
+                if path == stage / 'integrity.json': raise OSError('injected optional cache write failure')
+                return original(path, value)
+            downloads.reset_mock(); runs.reset_mock()
+            with patch.object(managed, 'atomic_json', side_effect=fail):
+                target, fingerprint, _ = managed.install(self.resources, self.root)
+            downloads.assert_not_called(); runs.assert_not_called()
+        self.assertEqual(json.loads((target / 'integrity.json').read_text()), integrity)
+        self.assertTrue(managed.validate_install(target, fingerprint, force_full=True))
 
     def test_live_helper_retains_lease_after_controller_exit(self):
         ready = self.base / 'ready'; release = self.base / 'release'

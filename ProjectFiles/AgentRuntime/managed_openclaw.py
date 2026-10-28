@@ -41,6 +41,7 @@ INTEGRITY_CACHE_VERSION = 1
 FULL_INTEGRITY_AUDIT_SECONDS = 60 * 60
 INTEGRITY_READ_CHUNK_BYTES = 1024 * 1024
 INTEGRITY_CACHE_MAX_BYTES = 64 * 1024 * 1024
+NATIVE_ADDON_FACTS_VERSION = 1
 PROVISIONING_RESERVE_BYTES = 512 * 1024 * 1024
 PROVISIONING_TEMPORARY_BYTES = 256 * 1024 * 1024
 SQLITE_HEALTH_TIMEOUT_SECONDS = 0.75
@@ -296,11 +297,34 @@ def _thin_mach_o_slice(fd, offset, size):
 
 def inspect_mach_o(path):
     """Read bounded Mach-O headers through a no-follow descriptor."""
+    return _inspect_mach_o_file(path)[1]
+
+
+def _inspect_mach_o_file(path, *, cached_facts=None, expected_digest=None):
+    """When caching, hash and parse the same open object before retaining facts."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0))
     try:
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode) or before.st_size > 512 * 1024 * 1024:
             raise ManagedRuntimeError('Managed runtime binary is not a bounded regular file.')
+        digest_value = None
+        if cached_facts is not None:
+            hasher = hashlib.sha256(); bytes_read = 0
+            while True:
+                try: chunk = os.read(fd, INTEGRITY_READ_CHUNK_BYTES)
+                except InterruptedError: continue
+                if not chunk: break
+                bytes_read += len(chunk)
+                if bytes_read > before.st_size:
+                    raise ManagedRuntimeError('Managed runtime binary changed during compatibility inspection.')
+                hasher.update(chunk)
+            digest_value = hasher.hexdigest()
+            if expected_digest is not None and digest_value != expected_digest:
+                raise ManagedRuntimeError('Native module does not match the installation seal.')
+            cached = cached_facts.get(digest_value)
+            if cached is not None:
+                _check_binary_identity(path, fd, before)
+                return digest_value, cached
         prefix = _read_exact(fd, 0, min(before.st_size, 8), limit=8)
         fat = {b'\xca\xfe\xba\xbe': ('>', False), b'\xbe\xba\xfe\xca': ('<', False),
                b'\xca\xfe\xba\xbf': ('>', True), b'\xbf\xba\xfe\xca': ('<', True)}
@@ -324,15 +348,23 @@ def inspect_mach_o(path):
         else:
             parsed = _thin_mach_o_slice(fd, 0, before.st_size)
             if parsed is not None: slices.append(parsed)
-        after = os.fstat(fd)
-        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
-            raise ManagedRuntimeError('Managed runtime binary changed during compatibility inspection.')
-        return slices
+        _check_binary_identity(path, fd, before)
+        return digest_value, slices
     finally: os.close(fd)
 
 
+def _check_binary_identity(path, fd, before):
+    metadata = _regular_file_metadata(before)
+    if metadata != _regular_file_metadata(os.fstat(fd)) or metadata != _regular_file_metadata(Path(path).lstat()):
+        raise ManagedRuntimeError('Managed runtime binary changed during compatibility inspection.')
+
+
 def verify_binary_compatibility(path, manifest, *, process_arch=None, macos_version=None, required=True):
+    target = _binary_compatibility_target(manifest, process_arch, macos_version)
+    return _verify_binary_slices(inspect_mach_o(path), target, required=required)
+
+
+def _binary_compatibility_target(manifest, process_arch, macos_version):
     supported, minimum = runtime_compatibility(manifest)
     process_arch = process_arch or platform.machine()
     if process_arch not in supported:
@@ -340,20 +372,56 @@ def verify_binary_compatibility(path, manifest, *, process_arch=None, macos_vers
     if macos_version is None: macos_version = platform.mac_ver()[0]
     if macos_version and _version_tuple(macos_version) < minimum:
         raise ManagedRuntimeError('This macOS version is older than the bundled private runtime supports.')
-    slices = inspect_mach_o(path)
+    return dict(architecture=process_arch, macos_version=list(_version_tuple(macos_version)) if macos_version else None,
+                minimum_macos=list(minimum), supported_architectures=sorted(supported))
+
+
+def _verify_binary_slices(slices, target, *, required=True):
     if not slices and not required: return False
-    matching = [minimum_os for architecture, minimum_os in slices if architecture == process_arch]
+    matching = [minimum_os for architecture, minimum_os in slices if architecture == target['architecture']]
     if not matching or any(version is None for version in matching):
         raise ManagedRuntimeError('Staged OpenClaw binary does not declare a supported macOS architecture and minimum version.')
-    if any(version > (macos_version and _version_tuple(macos_version) or minimum) for version in matching):
+    if any(tuple(version) > tuple(target['macos_version'] or target['minimum_macos']) for version in matching):
         raise ManagedRuntimeError('Staged OpenClaw binary requires a newer macOS version than this app process.')
     return True
 
 
+def _native_addon_cached_facts(facts, target, maximum_files):
+    """Malformed or differently targeted facts are only cache misses."""
+    if (not isinstance(facts, dict) or set(facts) != {'version', 'target', 'digests'} or
+            type(facts['version']) is not int or facts['version'] != NATIVE_ADDON_FACTS_VERSION or
+            not isinstance(facts['target'], dict) or facts['target'] != target or
+            json.dumps(facts['target'], sort_keys=True) != json.dumps(target, sort_keys=True) or
+            not isinstance(facts['digests'], dict) or
+            len(facts['digests']) > maximum_files):
+        return {}
+    for digest_value, slices in facts['digests'].items():
+        if (not isinstance(digest_value, str) or not re.fullmatch('[0-9a-f]{64}', digest_value) or
+                not isinstance(slices, list) or len(slices) > 16): return {}
+        for item in slices:
+            if (not isinstance(item, list) or len(item) != 2 or not isinstance(item[0], str) or
+                    item[0] not in _MACH_CPU_ARCHITECTURES.values()): return {}
+            minimum = item[1]
+            if minimum is not None and (not isinstance(minimum, list) or len(minimum) != 3 or
+                    any(type(value) is not int or not 0 <= value <= limit
+                        for value, limit in zip(minimum, (65535, 255, 255)))): return {}
+    return facts['digests']
+
+
 def verify_native_addons(package, manifest, *, process_arch=None, macos_version=None,
-                         maximum_directories=8192, maximum_files=32768, timeout=30):
+                         maximum_directories=8192, maximum_files=32768, timeout=30,
+                         facts=None, sealed_files=None):
+    """Reuse parsed facts only for a checked digest and the exact host/policy target.
+
+    `facts` is an optional in/out seal extension. Every file is still hashed;
+    recovered stages additionally require the seal's expected file digest.
+    """
     started = time.monotonic(); directories = 0; files = 0; addons = 0
-    root = Path(package)
+    root = Path(package).resolve(strict=True)
+    root_identity = root.stat()
+    target = _binary_compatibility_target(manifest, process_arch, macos_version)
+    cached = dict(_native_addon_cached_facts(facts, target, maximum_files))
+    inspected = {}; inspected_paths = set()
     for current, names, filenames in os.walk(root, followlinks=False):
         directories += 1; files += len(filenames)
         if (directories > maximum_directories or files > maximum_files or
@@ -364,17 +432,34 @@ def verify_native_addons(package, manifest, *, process_arch=None, macos_version=
             if not filename.endswith('.node'): continue
             path = Path(current) / filename
             if path.is_symlink(): continue
-            slices = inspect_mach_o(path)
-            if not slices or not any(architecture == (process_arch or platform.machine())
-                                     for architecture, _ in slices):
+            name = str(path.relative_to(root))
+            if _has_symlink_component(root, name) or sealed_files is not None and name not in sealed_files:
+                raise ManagedRuntimeError('Native module changed or does not match the installation seal.')
+            value, slices = _inspect_mach_o_file(path, cached_facts=cached,
+                                               expected_digest=sealed_files[name] if sealed_files is not None else None)
+            if _has_symlink_component(root, name):
+                raise ManagedRuntimeError('Native module changed during compatibility inspection.')
+            inspected_paths.add(name)
+            inspected[value] = cached[value] = [[arch, list(minimum) if minimum is not None else None]
+                                               for arch, minimum in slices]
+            if time.monotonic() - started > timeout:
+                raise ManagedRuntimeError('Native module compatibility inspection exceeded its bounded work limit.')
+            if not slices or not any(architecture == target['architecture'] for architecture, _ in slices):
                 # Packages may ship alternative platform prebuilds beside the
                 # host-selected module. OpenClaw's own --version launch above
                 # already proves its eagerly loaded native dependencies resolve.
                 continue
-            if verify_binary_compatibility(path, manifest, process_arch=process_arch,
-                                           macos_version=macos_version, required=False):
+            if _verify_binary_slices(slices, target, required=False):
                 addons += 1
                 if addons > 512: raise ManagedRuntimeError('Native module compatibility inspection exceeded its file limit.')
+    current_root = root.stat()
+    if (root_identity.st_dev, root_identity.st_ino) != (current_root.st_dev, current_root.st_ino):
+        raise ManagedRuntimeError('Native module directory changed during compatibility inspection.')
+    if sealed_files is not None and inspected_paths != {name for name in sealed_files if name.endswith('.node')}:
+        raise ManagedRuntimeError('Native module inventory does not match the installation seal.')
+    if facts is not None:
+        facts.clear()
+        facts.update(version=NATIVE_ADDON_FACTS_VERSION, target=target, digests=inspected)
     return addons
 
 
@@ -1058,6 +1143,21 @@ def install(resources, root, *, journal=None):
         if recovered: journal.discard_stage(recovered)
         return target, fingerprint, manifest
     if recovered:
+        stage = journal.stage(recovered)
+        integrity = json.loads((stage / 'integrity.json').read_text())
+        previous_facts = integrity.get('native_addons')
+        facts = dict(previous_facts) if isinstance(previous_facts, dict) else {}
+        prefix = 'package/node_modules/'
+        sealed_files = {name[len(prefix):]: value for name, value in integrity['files'].items()
+                        if name.startswith(prefix)}
+        verify_native_addons(stage / 'package/node_modules', manifest, facts=facts, sealed_files=sealed_files)
+        if facts != previous_facts:
+            # Optional derived facts may be refreshed without changing a single
+            # expected file digest. A cache-write failure only loses this reuse.
+            try:
+                atomic_json(stage / 'integrity.json', dict(integrity, native_addons=facts))
+                sync_directory(stage)
+            except OSError: pass
         _promote_installation(journal, recovered, target, manifest)
         return target, fingerprint, manifest
     require_provisioning_space(root / 'installations', manifest, 'download')
@@ -1098,9 +1198,15 @@ def install(resources, root, *, journal=None):
         if actual['version'] != manifest['openclaw_version']: raise ManagedRuntimeError('Unexpected OpenClaw version.')
         version = journal.run([str(stage / 'node/bin/node'), str(package / 'node_modules/openclaw/openclaw.mjs'), '--version'], env=env)
         if manifest['openclaw_version'] not in version: raise ManagedRuntimeError('OpenClaw did not pass its launch check.')
-        verify_native_addons(package / 'node_modules', manifest)
+        addon_facts = {}
+        verify_native_addons(package / 'node_modules', manifest, facts=addon_facts)
         record = journal.record('sealing', fingerprint, stage_id, identity)
-        atomic_json(stage / 'integrity.json', {'fingerprint': fingerprint, 'files': seal(stage)})
+        files = seal(stage)
+        sealed_addons = {value for name, value in files.items()
+                         if name.startswith('package/node_modules/') and name.endswith('.node')}
+        if set(addon_facts.get('digests', {})) != sealed_addons:
+            raise ManagedRuntimeError('Native modules changed while the installation was being sealed.')
+        atomic_json(stage / 'integrity.json', {'fingerprint': fingerprint, 'files': files, 'native_addons': addon_facts})
         sync_directory(stage)
         record = journal.record('sealed', fingerprint, stage_id, identity)
     except Exception:
