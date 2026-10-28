@@ -63,6 +63,12 @@ CLI_PROBE_OUTPUT_BYTES = 16384
 
 class ManagedRuntimeError(RuntimeError): pass
 
+class ManagedLockIdentityError(ManagedRuntimeError):
+    code = 'managed_lock_identity_mismatch'
+
+    def __init__(self):
+        super().__init__('TaskPilot could not verify its private installation lock; no configuration writes were started.')
+
 class CLIContractError(ManagedRuntimeError):
     code = 'managed_cli_contract'
     def __init__(self):
@@ -790,15 +796,42 @@ def locked(root: Path, *, blocking=True):
     with reserve(LockCategory.INSTALLATION) as rank:
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         check_private_directory(root, allow_mode_drift=True)
-        fd = os.open(root / 'installation.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0), 0o600)
-        with os.fdopen(fd, 'a') as f:
-            lock_stat = os.fstat(f.fileno())
-            if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != os.getuid() or lock_stat.st_nlink != 1:
-                raise PrivateDirectoryError('ownership')
-            os.fchmod(f.fileno(), 0o600)
+        path = root / 'installation.lock'
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW |
+                         getattr(os, 'O_CLOEXEC', 0), 0o600)
+        except OSError as error:
+            if error.errno == errno.ELOOP: raise ManagedLockIdentityError() from error
+            raise
+        acquired = False
+        try:
+            def checked_identity():
+                try:
+                    opened = os.fstat(fd)
+                    named = os.stat(path, follow_symlinks=False)
+                except OSError as error:
+                    raise ManagedLockIdentityError() from error
+                if (not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(named.st_mode) or
+                        opened.st_uid != os.getuid() or named.st_uid != os.getuid() or
+                        opened.st_nlink != 1 or named.st_nlink != 1 or
+                        (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+                    raise ManagedLockIdentityError()
+                return opened.st_dev, opened.st_ino, opened.st_uid
+
+            identity = checked_identity()
+            os.fchmod(fd, 0o600)
             with rank.waiting():
-                fcntl.flock(f, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+                fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            acquired = True
+            if checked_identity() != identity:
+                raise ManagedLockIdentityError()
             yield
+        finally:
+            if acquired:
+                # close() would also release it; unlock explicitly for clarity.
+                try: fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError: pass
+            os.close(fd)
 
 def digest(path):
     """Hash a file with bounded memory rather than loading the whole file."""

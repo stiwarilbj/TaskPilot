@@ -761,7 +761,7 @@ class PrivateDirectoryTests(unittest.TestCase):
     def test_lock_does_not_chmod_a_hardlinked_unrelated_file(self):
         file = self.root / 'unrelated'; file.write_text('fixture'); file.chmod(0o644)
         os.link(file, self.root / 'installation.lock')
-        with self.assertRaisesRegex(managed.PrivateDirectoryError, 'ownership'):
+        with self.assertRaises(managed.ManagedLockIdentityError):
             with managed.locked(self.root): self.fail('unexpected lock admission')
         self.assertEqual(file.stat().st_mode & 0o7777, 0o644)
 

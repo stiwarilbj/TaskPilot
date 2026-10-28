@@ -273,11 +273,44 @@ final class OpenClawService {
         deinit { release() }
     }
 
+    private struct ConfigurationLockIdentity: Equatable {
+        let device: dev_t
+        let inode: ino_t
+        let owner: uid_t
+    }
+
+    private static func validateConfigurationLock(path: String, descriptor: Int32) throws -> ConfigurationLockIdentity {
+        var opened = stat(), named = stat()
+        guard Darwin.fstat(descriptor, &opened) == 0,
+              Darwin.lstat(path, &named) == 0,
+              opened.st_mode & S_IFMT == S_IFREG,
+              named.st_mode & S_IFMT == S_IFREG,
+              opened.st_uid == geteuid(), named.st_uid == geteuid(),
+              opened.st_nlink == 1, named.st_nlink == 1 else {
+            throw OpenClawServiceError.configurationLockIdentityMismatch
+        }
+        let openedIdentity = ConfigurationLockIdentity(device: opened.st_dev, inode: opened.st_ino,
+                                                        owner: opened.st_uid)
+        let namedIdentity = ConfigurationLockIdentity(device: named.st_dev, inode: named.st_ino,
+                                                      owner: named.st_uid)
+        guard openedIdentity == namedIdentity else {
+            throw OpenClawServiceError.configurationLockIdentityMismatch
+        }
+        return openedIdentity
+    }
+
     static func configurationLease(root: URL? = nil, timeout: TimeInterval = 5,
-                                   order: BackendLockOrder = .current) throws -> ConfigurationLease? {
+                                   order: BackendLockOrder = .current,
+                                   onContention: (() -> Void)? = nil) throws -> ConfigurationLease? {
         let rank = try order.reserve(.configuration)
         var transferred = false
-        defer { if !transferred { rank.release() } }
+        var descriptor: Int32 = -1
+        defer {
+            if !transferred {
+                if descriptor >= 0 { Darwin.close(descriptor) }
+                rank.release()
+            }
+        }
         let directory = root ?? ProcessInfo.processInfo.environment["ORBIT_RUNTIME_STATE_DIRECTORY"].map {
             URL(fileURLWithPath: $0, isDirectory: true)
         } ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Orbit Agent", isDirectory: true)
@@ -285,23 +318,39 @@ final class OpenClawService {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                     attributes: [.posixPermissions: 0o700])
         } catch { return nil }
-        let descriptor = open(directory.appendingPathComponent("openclaw-configuration.lock").path,
-                              O_CREAT | O_RDWR | O_CLOEXEC, mode_t(0o600))
-        guard descriptor >= 0 else { return nil }
+        let lockPath = directory.appendingPathComponent("openclaw-configuration.lock").path
+        descriptor = open(lockPath, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, mode_t(0o600))
+        guard descriptor >= 0 else {
+            if errno == ELOOP { throw OpenClawServiceError.configurationLockIdentityMismatch }
+            return nil
+        }
+        let originalIdentity = try Self.validateConfigurationLock(path: lockPath, descriptor: descriptor)
+        guard Darwin.fchmod(descriptor, mode_t(0o600)) == 0 else {
+            throw OpenClawServiceError.configurationLockIdentityMismatch
+        }
+        var announcedContention = false
         let acquired = rank.measureWait {
             let deadline = ProcessInfo.processInfo.systemUptime + timeout
             repeat {
                 if flock(descriptor, LOCK_SH | LOCK_NB) == 0 { return true }
                 guard errno == EWOULDBLOCK || errno == EINTR else { break }
+                if !announcedContention {
+                    announcedContention = true
+                    onContention?()
+                }
                 Thread.sleep(forTimeInterval: 0.025)
             } while ProcessInfo.processInfo.systemUptime < deadline
             return false
         }
         if acquired {
+            let currentIdentity = try Self.validateConfigurationLock(path: lockPath, descriptor: descriptor)
+            guard currentIdentity == originalIdentity else {
+                throw OpenClawServiceError.configurationLockIdentityMismatch
+            }
+            let lease = ConfigurationLease(descriptor: descriptor, rank: rank)
             transferred = true
-            return ConfigurationLease(descriptor: descriptor, rank: rank)
+            return lease
         }
-        close(descriptor)
         return nil
     }
 
@@ -403,6 +452,7 @@ private enum OpenClawServiceError: LocalizedError {
     case automatedSetupAlreadyRunning
     case dashboardUnavailable
     case dashboardLaunchFailed
+    case configurationLockIdentityMismatch
 
     var errorDescription: String? {
         switch self {
@@ -416,6 +466,8 @@ private enum OpenClawServiceError: LocalizedError {
             return "OpenClaw is not installed yet"
         case .dashboardLaunchFailed:
             return "OpenClaw could not start its authenticated dashboard. Click Recheck, then try again."
+        case .configurationLockIdentityMismatch:
+            return "TaskPilot could not verify its private configuration lock; no configuration changes were made."
         }
     }
 }

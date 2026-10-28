@@ -8,6 +8,7 @@ from provider_errors import ProviderRequestError, facts, retry_time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
+import errno
 import fcntl
 from contextlib import contextmanager
 import tempfile
@@ -17,6 +18,7 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import time
 from typing import Any, Callable
 from lock_order import LockCategory, reserve
@@ -392,15 +394,49 @@ def runtime_state_root() -> Path:
     return Path(os.environ.get("ORBIT_RUNTIME_STATE_DIRECTORY", str(Path.home() / "Library/Application Support/Orbit Agent")))
 
 
+class PrivateLockIdentityError(RuntimeError):
+    code = "private_lock_identity_mismatch"
+
+    def __init__(self):
+        super().__init__(self.code)
+
+
+def private_lock_identity(path: Path, descriptor: int) -> tuple[int, int, int]:
+    try:
+        opened = os.fstat(descriptor)
+        named = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise PrivateLockIdentityError() from error
+    if (not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(named.st_mode) or
+            opened.st_uid != os.getuid() or named.st_uid != os.getuid() or
+            opened.st_nlink != 1 or named.st_nlink != 1 or
+            (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+        raise PrivateLockIdentityError()
+    return opened.st_dev, opened.st_ino, opened.st_uid
+
+
 @contextmanager
 def private_lock(path: Path, *, blocking=True, category=LockCategory.STATE):
     with reserve(category) as rank:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
         try:
+            descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC |
+                                 getattr(os, "O_NOFOLLOW", 0), 0o600)
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise PrivateLockIdentityError() from error
+            raise
+        try:
+            identity = private_lock_identity(path, descriptor)
+            os.fchmod(descriptor, 0o600)
             with rank.waiting():
                 fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
-            yield descriptor
+            if private_lock_identity(path, descriptor) != identity:
+                raise PrivateLockIdentityError()
+            try:
+                yield descriptor
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
 

@@ -43,6 +43,60 @@ final class ProviderConfigurationTests: XCTestCase {
         reader.release()
     }
 
+    func testWaiterRejectsReplacedConfigurationLockNameAfterAcquiringOldObject() throws {
+        let root = try directory()
+        let lockURL = root.appendingPathComponent("openclaw-configuration.lock")
+        let writer = open(lockURL.path, O_CREAT | O_RDWR | O_CLOEXEC, mode_t(0o600))
+        XCTAssertGreaterThanOrEqual(writer, 0)
+        defer { close(writer) }
+        XCTAssertEqual(flock(writer, LOCK_EX), 0)
+
+        let contended = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        let resultLock = NSLock()
+        var result = ""
+        DispatchQueue.global().async {
+            do {
+                let lease = try OpenClawService.configurationLease(root: root, timeout: 2,
+                    onContention: { contended.signal() })
+                lease?.release()
+                resultLock.withLock { result = "entered" }
+            } catch {
+                resultLock.withLock { result = error.localizedDescription }
+            }
+            finished.signal()
+        }
+
+        XCTAssertEqual(contended.wait(timeout: .now() + 1), .success)
+        let displaced = root.appendingPathComponent("configuration-lock.displaced")
+        XCTAssertEqual(rename(lockURL.path, displaced.path), 0)
+        let replacement = open(lockURL.path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, mode_t(0o600))
+        XCTAssertGreaterThanOrEqual(replacement, 0)
+        close(replacement)
+        XCTAssertEqual(flock(writer, LOCK_UN), 0)
+        XCTAssertEqual(finished.wait(timeout: .now() + 2), .success)
+        resultLock.withLock {
+            XCTAssertEqual(result, "TaskPilot could not verify its private configuration lock; no configuration changes were made.")
+        }
+
+        let nextLease = try XCTUnwrap(OpenClawService.configurationLease(root: root))
+        nextLease.release()
+    }
+
+    func testConfigurationLeaseRejectsSymlinkLockPath() throws {
+        let root = try directory()
+        let target = root.appendingPathComponent("other.lock")
+        let lock = root.appendingPathComponent("openclaw-configuration.lock")
+        let targetDescriptor = open(target.path, O_CREAT | O_RDWR | O_CLOEXEC, mode_t(0o600))
+        XCTAssertGreaterThanOrEqual(targetDescriptor, 0)
+        close(targetDescriptor)
+        try FileManager.default.createSymbolicLink(at: lock, withDestinationURL: target)
+        XCTAssertThrowsError(try OpenClawService.configurationLease(root: root)) {
+            XCTAssertEqual($0.localizedDescription,
+                "TaskPilot could not verify its private configuration lock; no configuration changes were made.")
+        }
+    }
+
     func testPythonWriterAndNativeReaderUseSameLeaseProtocol() throws {
         let root = try directory()
         let ready = root.appendingPathComponent("ready")

@@ -2,6 +2,8 @@
 import fcntl
 import os
 from pathlib import Path
+import select
+import subprocess
 import sys
 import tempfile
 import threading
@@ -74,6 +76,77 @@ class LockOrderTests(unittest.TestCase):
         fd = os.open(self.root / 'openclaw-configuration.lock', os.O_RDWR)
         try: fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally: os.close(fd)
+
+    def assert_waiter_rejects_replaced_lock(self, kind):
+        root = self.root / kind
+        root.mkdir(mode=0o700)
+        lock_path = root / ("openclaw-configuration.lock" if kind == "configuration" else "installation.lock")
+        holder = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        runtime_path = Path(__file__).resolve().parents[2] / 'AgentRuntime'
+        script = r'''import fcntl, pathlib, sys
+sys.path.insert(0, sys.argv[1])
+kind, path = sys.argv[2], pathlib.Path(sys.argv[3])
+if kind == "configuration":
+    import request_policy as target
+    acquire = lambda: target.private_lock(path)
+else:
+    import managed_openclaw as target
+    acquire = lambda: target.locked(path.parent)
+real_flock = target.fcntl.flock
+announced = False
+def observed_flock(fd, operation):
+    global announced
+    if not announced:
+        announced = True
+        print("WAITING", flush=True)
+    return real_flock(fd, operation)
+target.fcntl.flock = observed_flock
+try:
+    with acquire():
+        print("ENTERED", flush=True)
+except Exception as error:
+    print("REJECTED:" + getattr(error, "code", "") + ":" + str(error), flush=True)
+'''
+        process = subprocess.Popen([sys.executable, '-c', script, str(runtime_path), kind, str(lock_path)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        try:
+            ready, _, _ = select.select([process.stdout], [], [], 3)
+            self.assertTrue(ready, f'{kind} lock contender did not reach flock')
+            self.assertEqual(process.stdout.readline().strip(), 'WAITING')
+            displaced = lock_path.with_name(lock_path.name + '.displaced')
+            os.replace(lock_path, displaced)
+            replacement = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_CLOEXEC, 0o600)
+            os.close(replacement)
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            stdout, stderr = process.communicate(timeout=4)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertNotIn('ENTERED', stdout)
+            self.assertIn('REJECTED:', stdout)
+            if kind == 'configuration':
+                self.assertIn('private_lock_identity_mismatch', stdout)
+            else:
+                self.assertIn('managed_lock_identity_mismatch', stdout)
+        finally:
+            try: fcntl.flock(holder, fcntl.LOCK_UN)
+            except OSError: pass
+            os.close(holder)
+            if process.poll() is None:
+                process.kill(); process.wait()
+
+    def test_python_configuration_and_installation_waiters_reject_replaced_lock_names(self):
+        self.assert_waiter_rejects_replaced_lock('configuration')
+        self.assert_waiter_rejects_replaced_lock('installation')
+
+    def test_python_lock_open_rejects_symlink_paths(self):
+        target = self.root / 'target.lock'; target.touch(mode=0o600)
+        link = self.root / 'linked.lock'; link.symlink_to(target)
+        with self.assertRaises(policy.PrivateLockIdentityError):
+            with policy.private_lock(link): pass
+        managed_root = self.root / 'managed'; managed_root.mkdir(mode=0o700)
+        managed_link = managed_root / 'installation.lock'; managed_link.symlink_to(target)
+        with self.assertRaises(managed.ManagedLockIdentityError):
+            with managed.locked(managed_root): pass
 
     def test_installation_failures_release_reservation(self):
         for failure in ('open', 'wait', 'body'):
