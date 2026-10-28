@@ -34,7 +34,7 @@ import tempfile
 import struct
 import zlib
 from datetime import datetime
-from typing import Any
+from typing import Any, NamedTuple
 
 
 MAX_STEPS = 100
@@ -46,6 +46,7 @@ LOCAL_CHANGE_VERSION = 1
 COMMAND_CAPABILITY_VERSION = 1
 PRODUCT_NAME = "TaskPilot"
 LEGACY_APPLICATION_SUPPORT_FOLDER = "Orbit Agent"
+SESSION_TRANSCRIPT_TAIL_BYTES = 262_144
 from request_policy import (
     ALL_MODELS, PRIMARY_MODELS, FALLBACK_MODELS, CONFIG_VERSION, configuration_transaction,
     AdaptiveModelRouter, Failure, ModelAttemptError, RecoveryExhaustedError, RuntimeState, classify_failure, model_route,
@@ -1277,68 +1278,159 @@ def _sync_openclaw_google_key(
         temporary.unlink(missing_ok=True)
 
 
-def session_transcript_cursor(session_id: str, sessions_root: Path | None = None) -> tuple[Path, int] | None:
+class SessionTranscriptCursor(NamedTuple):
+    path: Path
+    offset: int
+    identity: tuple[int, int, int | None, int | None]
+    record_boundary: bool
+
+
+def transcript_file_identity(info: os.stat_result) -> tuple[int, int, int | None, int | None]:
+    birthtime_ns = getattr(info, "st_birthtime_ns", None)
+    if birthtime_ns is None and getattr(info, "st_birthtime", None) is not None:
+        birthtime_ns = int(info.st_birthtime * 1_000_000_000)
+    generation = getattr(info, "st_gen", None)
+    return info.st_dev, info.st_ino, birthtime_ns, generation
+
+
+def session_transcript_path(session_id: str, sessions_root: Path | None = None) -> tuple[Path, Path] | None:
     root = sessions_root or Path(os.environ.get("OPENCLAW_STATE_DIR", str(Path.home() / ".openclaw"))) / "agents/main/sessions"
     try:
-        registry = json.loads((root / "sessions.json").read_text())
+        root = root.resolve(strict=True)
+        registry = json.loads((root / "sessions.json").read_text(encoding="utf-8"))
         for name, value in registry.items():
             if name.endswith(f":{session_id}") and isinstance(value, dict):
-                path = Path(value.get("sessionFile", "")).expanduser().resolve()
-                if path.is_relative_to(root.resolve()) and path.is_file():
-                    return path, path.stat().st_size
-    except (OSError, ValueError, AttributeError):
+                raw_path = value.get("sessionFile")
+                if not isinstance(raw_path, str) or not raw_path:
+                    return None
+                path = Path(raw_path).expanduser().resolve(strict=True)
+                if path.is_relative_to(root):
+                    return root, path
+    except (OSError, ValueError, AttributeError, RuntimeError):
         pass
     return None
 
 
+def open_transcript_descriptor(path: Path) -> tuple[int, os.stat_result] | None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        info = os.fstat(descriptor)
+        path_info = os.stat(path, follow_symlinks=False)
+        if (not stat.S_ISREG(info.st_mode) or not stat.S_ISREG(path_info.st_mode) or
+                transcript_file_identity(info) != transcript_file_identity(path_info)):
+            os.close(descriptor)
+            return None
+        return descriptor, info
+    except OSError:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        return None
+
+
+def session_transcript_cursor(session_id: str, sessions_root: Path | None = None) -> SessionTranscriptCursor | None:
+    located = session_transcript_path(session_id, sessions_root)
+    if located is None:
+        return None
+    _, path = located
+    opened = open_transcript_descriptor(path)
+    if opened is None:
+        return None
+    descriptor, info = opened
+    try:
+        offset = info.st_size
+        last_byte = os.pread(descriptor, 1, offset - 1) if offset else b"\n"
+        path_info = os.stat(path, follow_symlinks=False)
+        if (transcript_file_identity(path_info) != transcript_file_identity(info) or
+                info.st_nlink == 0):
+            return None
+        return SessionTranscriptCursor(path, offset, transcript_file_identity(info), last_byte == b"\n")
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
 def openclaw_session_error(session_id: str, sessions_root: Path | None = None,
-                           after_cursor: tuple[Path, int] | None = None, *,
+                           after_cursor: SessionTranscriptCursor | tuple[Path, int] | None = None, *,
                            structured: bool = False, started_at: float | None = None) -> Any:
     """Recover provider failures that the current ACP bridge does not stream.
 
     OpenClaw records some Google capacity failures as a normal assistant
     message (for example, "temporarily overloaded") with stopReason=stop.
-    ACP currently completes those turns without streaming the message body, so
-    inspect the newest assistant record as well as explicit error records.
+    ACP currently completes those turns without streaming the message body.
+    Bind recovery to the cursor's descriptor identity, read a fixed-size tail,
+    and parse only complete JSONL records. Changed files require turn timestamps.
     """
-    root = sessions_root or Path(os.environ.get("OPENCLAW_STATE_DIR", str(Path.home() / ".openclaw"))) / "agents/main/sessions"
+    located = session_transcript_path(session_id, sessions_root)
+    if located is None:
+        return ""
+    _, session_file = located
+    opened = open_transcript_descriptor(session_file)
+    if opened is None:
+        return ""
+    descriptor, info = opened
     try:
-        registry = json.loads((root / "sessions.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return ""
-    if not isinstance(registry, dict):
-        return ""
-    entry: dict[str, Any] | None = None
-    for key, value in registry.items():
-        if isinstance(key, str) and key.endswith(f":{session_id}") and isinstance(value, dict):
-            entry = value
-            break
-    if entry is None:
-        return ""
-    raw_session_file = entry.get("sessionFile")
-    if not isinstance(raw_session_file, str) or not raw_session_file:
-        return ""
-    try:
-        resolved_root = root.resolve()
-        session_file = Path(raw_session_file).expanduser().resolve()
-        if not session_file.is_relative_to(resolved_root):
+        identity = transcript_file_identity(info)
+        cursor_path = getattr(after_cursor, "path", None)
+        cursor_offset = getattr(after_cursor, "offset", None)
+        cursor_identity = getattr(after_cursor, "identity", None)
+        cursor_boundary = getattr(after_cursor, "record_boundary", False)
+        continuity = (
+            isinstance(cursor_path, Path) and cursor_path == session_file and
+            type(cursor_offset) is int and 0 <= cursor_offset <= info.st_size and
+            cursor_identity == identity and cursor_boundary is True
+        )
+        # Legacy path/offset tuples have no descriptor identity and cannot
+        # establish continuity. They may only be used with current-turn time.
+        if not continuity and started_at is None:
             return ""
-        with session_file.open("rb") as handle:
-            size = handle.seek(0, os.SEEK_END)
-            offset = after_cursor[1] if after_cursor and after_cursor[0] == session_file else 0
-            handle.seek(max(offset, size - 262_144, 0), os.SEEK_SET)
-            tail = handle.read().decode("utf-8", errors="ignore")
+        offset = cursor_offset if continuity else 0
+        size = info.st_size
+        read_start = max(offset, size - SESSION_TRANSCRIPT_TAIL_BYTES, 0)
+        read_count = min(SESSION_TRANSCRIPT_TAIL_BYTES, max(0, size - read_start))
+        tail_bytes = os.pread(descriptor, read_count, read_start) if read_count else b""
+        after_info = os.fstat(descriptor)
+        path_info = os.stat(session_file, follow_symlinks=False)
+        if (transcript_file_identity(after_info) != identity or
+                transcript_file_identity(path_info) != identity or
+                after_info.st_nlink == 0 or after_info.st_size < info.st_size):
+            return ""
     except OSError:
         return ""
-    for raw_line in reversed(tail.splitlines()):
+    finally:
+        os.close(descriptor)
+
+    starts_at_boundary = (read_start == 0 or
+                          (continuity and read_start == cursor_offset and cursor_boundary is True))
+    if not starts_at_boundary:
+        first_newline = tail_bytes.find(b"\n")
+        if first_newline < 0:
+            return ""
+        tail_bytes = tail_bytes[first_newline + 1:]
+    last_complete_newline = tail_bytes.rfind(b"\n")
+    if last_complete_newline < 0:
+        return ""
+    complete_tail = tail_bytes[:last_complete_newline]
+    for raw_line in reversed(complete_tail.split(b"\n")):
+        if not raw_line:
+            continue
         try:
-            item = json.loads(raw_line)
-        except json.JSONDecodeError:
+            item = json.loads(raw_line.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
             continue
         message = item.get("message") if isinstance(item, dict) else None
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
-        if started_at is not None and after_cursor is None and not current_transcript_message(message, item, started_at):
+        has_timestamp = message.get("timestamp") is not None or item.get("timestamp") is not None
+        if (started_at is not None and has_timestamp and
+                not current_transcript_message(message, item, started_at)):
+            return ""
+        if not continuity and (started_at is None or not current_transcript_message(message, item, started_at)):
             return ""
         if message.get("stopReason") == "error":
             detail = message.get("errorMessage") or message.get("error")

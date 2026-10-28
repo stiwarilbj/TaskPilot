@@ -646,6 +646,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
                 json.dumps({"type": "session", "id": "internal"}) + "\n" +
                 json.dumps({
                     "type": "message",
+                    "timestamp": 2000,
                     "message": {
                         "role": "assistant",
                         "stopReason": "error",
@@ -663,7 +664,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(
-                runtime.openclaw_session_error(session_id, root),
+                runtime.openclaw_session_error(session_id, root, started_at=1000),
                 "RESOURCE_EXHAUSTED: quota reached",
             )
 
@@ -675,6 +676,7 @@ class OpenClawRuntimeTests(unittest.TestCase):
             transcript.write_text(
                 json.dumps({
                     "type": "message",
+                    "timestamp": 2000,
                     "message": {
                         "role": "assistant",
                         "stopReason": "stop",
@@ -694,9 +696,151 @@ class OpenClawRuntimeTests(unittest.TestCase):
                 }),
                 encoding="utf-8",
             )
-            detail = runtime.openclaw_session_error(session_id, root)
+            detail = runtime.openclaw_session_error(session_id, root, started_at=1000)
             self.assertIn("temporarily overloaded", detail)
             self.assertTrue(runtime.is_model_capacity_failure(detail))
+
+    def test_transcript_rotation_and_truncation_require_current_turn_correlation(self):
+        stale = {"type": "message", "timestamp": 900,
+                 "message": {"role": "assistant", "stopReason": "error",
+                             "errorMessage": "old invalid API key"}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session_id = "rotating-session"
+            transcript = root / "transcript.jsonl"
+            transcript.write_text(json.dumps(stale) + "\n" + (" " * 1024) + "\n", encoding="utf-8")
+            (root / "sessions.json").write_text(json.dumps({
+                f"agent:main:acp-bridge:{session_id}": {"sessionFile": str(transcript)}
+            }), encoding="utf-8")
+            cursor = runtime.session_transcript_cursor(session_id, root)
+            self.assertIsNotNone(cursor)
+
+            replacement = root / "replacement.jsonl"
+            stale_without_timestamp = {"type": "message",
+                                       "message": stale["message"]}
+            replacement.write_bytes(
+                ("x" * cursor.offset + "\n" + json.dumps(stale_without_timestamp) + "\n").encode("utf-8"))
+            self.assertGreaterEqual(replacement.stat().st_size, cursor.offset)
+            replacement.replace(transcript)
+            self.assertEqual(runtime.openclaw_session_error(
+                session_id, root, cursor, started_at=1000), "")
+            current = {"type": "message", "timestamp": 1100,
+                       "message": {"role": "assistant", "stopReason": "error",
+                                   "errorMessage": "current HTTP 503"}}
+            transcript.write_text(json.dumps(current) + "\n", encoding="utf-8")
+            self.assertEqual(runtime.openclaw_session_error(
+                session_id, root, cursor, started_at=1000), "current HTTP 503")
+
+            # Recreate and capture a new cursor, then truncate the same inode.
+            transcript.write_text(json.dumps(stale) + "\n" + (" " * 1024) + "\n", encoding="utf-8")
+            cursor = runtime.session_transcript_cursor(session_id, root)
+            transcript.write_text(json.dumps(stale) + "\n", encoding="utf-8")
+            self.assertLess(transcript.stat().st_size, cursor.offset)
+            self.assertEqual(runtime.openclaw_session_error(
+                session_id, root, cursor, started_at=1000), "")
+
+    def test_transcript_append_does_not_recover_an_earlier_timestamp_and_reads_bounded_tail(self):
+        stale = {"type": "message", "timestamp": 900,
+                 "message": {"role": "assistant", "stopReason": "error",
+                             "errorMessage": "old RESOURCE_EXHAUSTED"}}
+        current = {"type": "message", "timestamp": 1100,
+                   "message": {"role": "assistant", "stopReason": "error",
+                               "errorMessage": "new HTTP 503"}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); session_id = "append-session"
+            transcript = root / "transcript.jsonl"
+            transcript.write_text(json.dumps(stale) + "\n", encoding="utf-8")
+            (root / "sessions.json").write_text(json.dumps({
+                f"agent:main:acp-bridge:{session_id}": {"sessionFile": str(transcript)}
+            }), encoding="utf-8")
+            cursor = runtime.session_transcript_cursor(session_id, root)
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(stale) + "\n")
+            self.assertEqual(runtime.openclaw_session_error(
+                session_id, root, cursor, started_at=1000), "")
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write("x" * (runtime.SESSION_TRANSCRIPT_TAIL_BYTES + 1024) + "\n")
+                handle.write(json.dumps(current) + "\n")
+
+            real_pread = os.pread
+            read_sizes = []
+            appended_during_read = False
+            def bounded_pread(descriptor, count, offset):
+                nonlocal appended_during_read
+                read_sizes.append(count)
+                if not appended_during_read:
+                    appended_during_read = True
+                    with transcript.open("ab") as handle:
+                        handle.write(b"y" * (runtime.SESSION_TRANSCRIPT_TAIL_BYTES + 4096) + b"\n")
+                return real_pread(descriptor, count, offset)
+            with mock.patch.object(runtime.os, "pread", side_effect=bounded_pread):
+                detail = runtime.openclaw_session_error(
+                    session_id, root, cursor, started_at=1000)
+            self.assertIn("new HTTP 503", detail)
+            self.assertTrue(appended_during_read)
+            self.assertLessEqual(sum(read_sizes), runtime.SESSION_TRANSCRIPT_TAIL_BYTES)
+            self.assertTrue(all(size <= runtime.SESSION_TRANSCRIPT_TAIL_BYTES for size in read_sizes))
+
+    def test_transcript_replacement_or_truncation_during_tail_read_is_discarded(self):
+        old = {"type": "message", "timestamp": 900,
+               "message": {"role": "assistant", "stopReason": "error",
+                           "errorMessage": "old provider error"}}
+        current = {"type": "message", "timestamp": 1100,
+                   "message": {"role": "assistant", "stopReason": "error",
+                               "errorMessage": "current HTTP 503"}}
+        for mutation in ("replace", "truncate"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); session_id = f"{mutation}-session"
+                transcript = root / "transcript.jsonl"
+                transcript.write_text(json.dumps(old) + "\n", encoding="utf-8")
+                (root / "sessions.json").write_text(json.dumps({
+                    f"agent:main:acp-bridge:{session_id}": {"sessionFile": str(transcript)}
+                }), encoding="utf-8")
+                cursor = runtime.session_transcript_cursor(session_id, root)
+                with transcript.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(current) + "\n")
+
+                real_pread = os.pread
+                changed = False
+                def mutate_before_read(descriptor, count, offset):
+                    nonlocal changed
+                    if not changed:
+                        changed = True
+                        if mutation == "replace":
+                            replacement = root / "replacement.jsonl"
+                            replacement.write_text(json.dumps(old) + "\n", encoding="utf-8")
+                            replacement.replace(transcript)
+                        else:
+                            with transcript.open("wb") as handle:
+                                handle.truncate()
+                    return real_pread(descriptor, count, offset)
+                with mock.patch.object(runtime.os, "pread", side_effect=mutate_before_read):
+                    detail = runtime.openclaw_session_error(
+                        session_id, root, cursor, started_at=1000)
+                self.assertTrue(changed)
+                self.assertEqual(detail, "")
+
+    def test_transcript_recovery_ignores_incomplete_final_records(self):
+        message = {"type": "message", "timestamp": 1100,
+                   "message": {"role": "assistant", "stopReason": "error",
+                               "errorMessage": "current HTTP 503"}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); session_id = "partial-session"
+            transcript = root / "transcript.jsonl"
+            transcript.write_text("", encoding="utf-8")
+            (root / "sessions.json").write_text(json.dumps({
+                f"agent:main:acp-bridge:{session_id}": {"sessionFile": str(transcript)}
+            }), encoding="utf-8")
+            cursor = runtime.session_transcript_cursor(session_id, root)
+            encoded = json.dumps(message)
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write(encoded)
+            self.assertEqual(runtime.openclaw_session_error(
+                session_id, root, cursor, started_at=1000), "")
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write("\n")
+            self.assertEqual(runtime.openclaw_session_error(
+                session_id, root, cursor, started_at=1000), "current HTTP 503")
 
     def test_saved_key_is_synchronized_once_without_putting_it_in_arguments(self):
         with tempfile.TemporaryDirectory() as directory:
