@@ -97,8 +97,11 @@ class ManagedRuntimeTests(unittest.TestCase):
             self.assertEqual(os.fstat(fd).st_ino,f.stat().st_ino)
             hinted.add(fd)
         def read(fd,count):
-            self.assertIn(fd,hinted)
-            reads.append(fd)
+            # The bounded metadata reader also uses os.read; the no-cache hint
+            # applies only to sealed payload content, never its small manifest.
+            if os.fstat(fd).st_ino == f.stat().st_ino:
+                self.assertIn(fd,hinted)
+                reads.append(fd)
             return actual_read(fd,count)
         with patch.object(managed.platform,'system',return_value='Darwin'), \
                 patch.object(managed.fcntl,'F_NOCACHE',48,create=True), \
@@ -409,7 +412,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         def mutate_during_read(fd,count):
             nonlocal changed
             data=actual_read(fd,count)
-            if not changed:
+            if not changed and os.fstat(fd).st_ino == f.stat().st_ino:
                 changed=True;f.write_bytes(b'evil')
             return data
         with patch.object(managed.os,'read',side_effect=mutate_during_read):

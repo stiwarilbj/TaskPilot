@@ -30,6 +30,7 @@ import unicodedata
 import uuid
 
 import runtime_descriptor_generated as descriptor_contract
+import private_runtime_metadata as private_metadata
 from managed_spawn import spawn as spawn_bounded_helper
 from lock_order import LockCategory, reserve
 
@@ -647,23 +648,9 @@ class ProvisioningJournal:
 
     def read(self):
         try:
-            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
-            with os.fdopen(fd, 'rb') as source:
-                info = os.fstat(source.fileno())
-                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or
-                        stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1 or info.st_size > 4096):
-                    raise ValueError()
-                def unique(pairs):
-                    result = {}
-                    for key, value in pairs:
-                        if key in result: raise ValueError()
-                        result[key] = value
-                    return result
-                data = source.read(4097)
-                if len(data) > 4096: raise ValueError()
-                record = json.loads(data.decode('utf-8'), object_pairs_hook=unique)
-                if not self.valid(record): raise ValueError()
-                return record
+            record = private_metadata.read(self.path, private_metadata.REQUEST_BYTES, required_mode=0o600)
+            if not self.valid(record): raise ValueError()
+            return record
         except FileNotFoundError: return None
         except (OSError, ValueError, TypeError, RecursionError) as error:
             raise ManagedRuntimeError('Private provisioning journal needs attention; the active installation was left unchanged.') from error
@@ -979,9 +966,9 @@ def _read_integrity_manifest(directory, fingerprint):
     manifest_path = root / 'integrity.json'
     if manifest_path.is_symlink():
         return None
-    manifest_bytes = manifest_path.read_bytes()
+    manifest_bytes = private_metadata.read_bytes(manifest_path, private_metadata.INTEGRITY_BYTES)
     manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
-    record = json.loads(manifest_bytes)
+    record = private_metadata.parse(manifest_bytes)
     if not isinstance(record, dict):
         return None
     files = record.get('files')
@@ -1100,8 +1087,7 @@ def validate_install(directory, fingerprint, *, force_full=False, now_monotonic_
         cache = None
         if cache_fd is not None:
             try:
-                if not cache_path.is_symlink() and cache_path.stat().st_size <= INTEGRITY_CACHE_MAX_BYTES:
-                    cache = json.loads(cache_path.read_text())
+                cache = private_metadata.read(cache_path, INTEGRITY_CACHE_MAX_BYTES)
             except (OSError, ValueError, UnicodeError):
                 cache = None
         cache_valid = _valid_integrity_cache(cache, fingerprint, manifest_digest, identity, files)
@@ -1277,7 +1263,7 @@ def install(resources, root, *, journal=None):
         return target, fingerprint, manifest
     if recovered:
         stage = journal.stage(recovered)
-        integrity = json.loads((stage / 'integrity.json').read_text())
+        integrity = private_metadata.read(stage / 'integrity.json', private_metadata.INTEGRITY_BYTES)
         previous_facts = integrity.get('native_addons')
         facts = dict(previous_facts) if isinstance(previous_facts, dict) else {}
         prefix = 'package/node_modules/'
@@ -1329,7 +1315,7 @@ def install(resources, root, *, journal=None):
             'ci', '--ignore-scripts', '--no-audit', '--no-fund', '--registry=https://registry.npmjs.org/',
             '--cache', str(stage / 'npm-cache')], env=env, timeout=900, cwd=package)
         shutil.rmtree(stage / 'npm-cache', ignore_errors=True)
-        actual = json.loads((package / 'node_modules/openclaw/package.json').read_text())
+        actual = private_metadata.read(package / 'node_modules/openclaw/package.json', private_metadata.CONFIGURATION_BYTES)
         if actual['version'] != manifest['openclaw_version']: raise ManagedRuntimeError('Unexpected OpenClaw version.')
         version = journal.run([str(stage / 'node/bin/node'), str(package / 'node_modules/openclaw/openclaw.mjs'), '--version'], env=env)
         if manifest['openclaw_version'] not in version: raise ManagedRuntimeError('OpenClaw did not pass its launch check.')
@@ -1443,7 +1429,7 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
             sync_directory(root)
         target, fingerprint, manifest = install(resources, root, journal=journal)
         try:
-            rejected = json.loads((root / 'rejected-installation.json').read_text())
+            rejected = private_metadata.read(root / 'rejected-installation.json')
         except (OSError, ValueError): rejected = None
         if isinstance(rejected, dict) and rejected.get('fingerprint') == fingerprint:
             # Keep a tested rollback usable; do not reactivate a rejected update every refresh.
@@ -1473,7 +1459,7 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
         if previous and previous['installation_fingerprint'] != fingerprint:
             atomic_json(root / 'previous-runtime.json', previous)
             if config.exists(): shutil.copyfile(config, state / 'previous-config.json')
-        try: current_config = json.loads(config.read_text())
+        try: current_config = private_metadata.read(config, private_metadata.CONFIGURATION_BYTES)
         except (OSError, ValueError): current_config = {}
         config_changed = drained or interrupted is not None or not contains_settings(current_config, desired) or set(current_config.get('agents', {}).get('defaults', {}).get('models', {})) != set(desired['agents']['defaults']['models'])
         if config_changed:
@@ -1505,7 +1491,7 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
             verify_settings(wrapper, desired, pass_fds=(journal.fd,), path_fence=configuration_fence)
         if key:
             key_fingerprint = hashlib.sha256(key.strip().encode()).hexdigest()
-            try: saved_fingerprint = json.loads(key_record.read_text()).get('fingerprint')
+            try: saved_fingerprint = private_metadata.read(key_record).get('fingerprint')
             except (OSError, ValueError): saved_fingerprint = None
             if saved_fingerprint != key_fingerprint or not credential_present(state):
                 if not offline: cleanup.enter_context(configuration_hold(root, already_drained=drained)); offline = True
@@ -1552,11 +1538,12 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
 
 def load_descriptor(path: Path = ROOT / 'runtime.json'):
     try:
-        return descriptor_contract.parse_descriptor(path.read_bytes(), path.parent)
+        return descriptor_contract.parse_descriptor(private_metadata.read_bytes(path, private_metadata.DESCRIPTOR_BYTES), path.parent)
     except descriptor_contract.DescriptorError as error:
         if error.code == 'symlink': raise PrivateDirectoryError('symlink') from error
         raise ManagedRuntimeError('TaskPilot private OpenClaw is not installed or its descriptor is invalid.') from error
-    except OSError as error:
+    except (OSError, private_metadata.MetadataError) as error:
+        if isinstance(error, OSError) and error.errno == errno.ELOOP: raise PrivateDirectoryError('symlink') from error
         raise ManagedRuntimeError('TaskPilot private OpenClaw is not installed or its descriptor is invalid.') from error
 
 def activate_environment(path):
@@ -1568,13 +1555,15 @@ def activate_environment(path):
     # Best-effort, bounded, content-free record. Diagnostic I/O never blocks readiness.
     record = path.parent / 'environment-diagnostics.json'
     try:
-        if not record.exists() or record.stat().st_size > 256 or json.loads(record.read_text()) != diagnostic:
+        if private_metadata.read(record, 256) != diagnostic:
             atomic_json(record, diagnostic)
     except ValueError:
         try: atomic_json(record, diagnostic)
         except OSError: pass
-    except OSError:
-        pass
+    except OSError as error:
+        if error.errno == errno.ENOENT:
+            try: atomic_json(record, diagnostic)
+            except OSError: pass
     os.environ.clear(); os.environ.update(env)
     os.environ.update(OPENCLAW_STATE_DIR=d['state'], OPENCLAW_CONFIG_PATH=d['config'],
         OPENCLAW_PROFILE='taskpilot', ORBIT_OPENCLAW_PATH=d['executable'],
@@ -1591,7 +1580,7 @@ def wait_for_health(path, *, sleep=time.sleep, now=time.monotonic, status=None, 
     requested = False
     while True:
         try:
-            state = json.loads((path.parent / 'health.json').read_text())
+            state = private_metadata.read(path.parent / 'health.json')
             descriptor = load_descriptor(path)
             if state.get('instance_id') == descriptor['instance_id'] and state.get('configuration_fingerprint') == descriptor['configuration_fingerprint']:
                 if state.get('state') == 'needs_repair': raise ManagedRuntimeError(state.get('detail','Private OpenClaw needs repair in Settings.'))
@@ -1609,7 +1598,7 @@ def relocate(path):
         fence = ConfigurationPathFence(d['state'], d['config'])
         before = fence.snapshot()
         port = private_port()
-        config = Path(d['config']); value = json.loads(config.read_text())
+        config = Path(d['config']); value = private_metadata.read(config, private_metadata.CONFIGURATION_BYTES)
         value['gateway']['port'] = port
         bounded_run([d['executable'], 'config', 'patch', '--stdin'],
                     input_data=json.dumps({'gateway':{'port':port}}).encode(), env=isolated_environment(),
@@ -1652,7 +1641,7 @@ def mark_working(path):
     with locked(path.parent):
         d = load_descriptor(path)
         atomic_json(path.parent / 'working-runtime.json', d)
-        atomic_json(path.parent / 'working-config.json', json.loads(Path(d['config']).read_text()))
+        atomic_json(path.parent / 'working-config.json', private_metadata.read(Path(d['config']), private_metadata.CONFIGURATION_BYTES))
 
 def rollback(path):
     require_offline(path.parent)
@@ -1664,7 +1653,7 @@ def rollback(path):
         failed = load_descriptor(path)
         if d['installation_fingerprint'] == failed['installation_fingerprint']:
             raise ManagedRuntimeError('No different verified compatible installation is available for rollback.')
-        configuration = json.loads((path.parent / 'working-config.json').read_text())
+        configuration = private_metadata.read(path.parent / 'working-config.json', private_metadata.CONFIGURATION_BYTES)
         fence = ConfigurationPathFence(d['state'], d['config'])
         before = fence.snapshot()
         bounded_run([d['executable'], 'config', 'patch', '--stdin'],
@@ -1728,10 +1717,14 @@ def require_offline(root):
     # The supervisor must drain its owned tree before any offline CLI writer.
     for name in ('gateway-root.json', 'gateway-processes.json'):
         try:
-            value = json.loads((root / name).read_text())
+            value = private_metadata.read(root / name,
+                private_metadata.PROCESS_LIST_BYTES if name == 'gateway-processes.json' else private_metadata.RECORD_BYTES,
+                expected=list if name == 'gateway-processes.json' else dict)
             if any(identity_alive(v) for v in (value if isinstance(value, list) else [value])):
                 raise ManagedRuntimeError('Private Gateway must finish drainage before configuration repair.')
-        except (OSError, ValueError): pass
+        except FileNotFoundError: pass
+        except (OSError, ValueError) as error:
+            raise ManagedRuntimeError('Private Gateway ownership metadata needs inspection before configuration repair.') from error
 
 
 def contains_settings(actual, expected):
@@ -1940,7 +1933,7 @@ def audit(path, *, force_integrity=False):
         if Path(d['executable']).read_text() != wrapper_script(d['state'], d['config'], d['node'], d['entry']) or not os.access(d['executable'], os.X_OK): faults.append('wrapper')
     except (OSError, UnicodeError): faults.append('wrapper')
     try:
-        config = json.loads(Path(d['config']).read_text())
+        config = private_metadata.read(Path(d['config']), private_metadata.CONFIGURATION_BYTES)
         from request_policy import ALL_MODELS
         required = desired_settings(d['workspace'], Path(d['token_file']), d['port'])
         key_record = Path(d['state']) / 'credential-fingerprint.json'
@@ -1957,7 +1950,7 @@ def audit(path, *, force_integrity=False):
         faults.append('credential_store')
     try:
         saved_key = (path.parent.parent / 'gemini-api-key').read_text().strip()
-        record = json.loads((Path(d['state']) / 'credential-fingerprint.json').read_text())
+        record = private_metadata.read(Path(d['state']) / 'credential-fingerprint.json')
         key_matches = hashlib.sha256(saved_key.encode()).hexdigest() == record['fingerprint']
         # Explicit Check may temporarily install an unsaved candidate. It cannot
         # displace the saved key indefinitely after cancellation or failure.
@@ -1997,7 +1990,7 @@ def repair(path, resources):
     # Persist reservation before attempting repair; crashes cannot reset it.
     with locked(path.parent):
         record_path = path.parent / 'repair-budget.json'
-        try: record = json.loads(record_path.read_text())
+        try: record = private_metadata.read(record_path)
         except (OSError, ValueError): record = {}
         now = time.time()
         if record.get('fingerprint') == result['fingerprint'] and 0 <= now - record.get('attempted_at',0) < 600:
@@ -2031,7 +2024,7 @@ def configuration_hold(root, *, timeout=60, already_drained=False):
     try:
         require_offline(root)
         if not already_drained:
-            try: health = json.loads((root / 'health.json').read_text())
+            try: health = private_metadata.read(root / 'health.json')
             except (OSError, ValueError): health = {}
             if health.get('state') != 'stopped' and identity_alive(health.get('host_identity')):
                 raise ManagedRuntimeError('The owner must suspend startup before configuration changes.')
@@ -2045,7 +2038,7 @@ def configuration_hold(root, *, timeout=60, already_drained=False):
             deadline = time.monotonic() + timeout
             while True:
                 try:
-                    ack = json.loads((root / 'configuration-ack.json').read_text())
+                    ack = private_metadata.read(root / 'configuration-ack.json', private_metadata.REQUEST_BYTES)
                     if ack.get('request_id') == token:
                         require_offline(root)
                         break

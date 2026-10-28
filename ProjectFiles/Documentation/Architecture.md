@@ -7,6 +7,10 @@ verification and drainage.
 
 TaskPilot is split by responsibility, so the folder name tells you why the code exists before you even open a file.
 
+[Private runtime metadata](PrivateRuntimeMetadata.md) uses matching bounded,
+descriptor-checked JSON readers in Swift and Python before lifecycle state is
+accepted.
+
 Background prompt changes can be evaluated against private sanitized cases
 using the [offline prompt regression workflow](PromptRegression.md). It
 exercises the existing runtime without desktop events or provider calls and

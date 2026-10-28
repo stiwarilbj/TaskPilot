@@ -125,7 +125,10 @@ extension ManagedOpenClawDescriptor {
     static let root = GeminiAPIKeyStore.defaultFileURL().deletingLastPathComponent().appendingPathComponent("ManagedOpenClaw")
     static let url = root.appendingPathComponent("runtime.json")
     static func load(from url: URL = Self.url) throws -> Self {
-        let data = try Data(contentsOf: url)
+        let data: Data
+        do { data = try PrivateRuntimeMetadata.document(url, maximum: RuntimeDescriptorContract.maxBytes).data }
+        catch PrivateRuntimeMetadata.Failure.symlink { throw PrivateDirectoryPermissions.Failure.symlink }
+        catch { throw ManagedOpenClawError.invalidDescriptor }
         do { _ = try RuntimeDescriptorContract.parse(data, root: url.deletingLastPathComponent()) }
         catch let error as RuntimeDescriptorContract.Failure where error.code == "symlink" {
             throw PrivateDirectoryPermissions.Failure.symlink
@@ -364,7 +367,7 @@ enum ManagedGatewayHost {
     static func clientsAlive(root: URL) -> Bool {
         var alive = false
         for file in (try? FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("clients"), includingPropertiesForKeys: nil)) ?? [] {
-            if let data = try? Data(contentsOf: file), let identity = try? JSONDecoder().decode(ManagedProcessIdentity.self, from: data), identity.alive {
+            if let identity = try? PrivateRuntimeMetadata.decode(ManagedProcessIdentity.self, from: file), identity.alive {
                 alive = true
             } else { try? FileManager.default.removeItem(at: file) }
         }
@@ -400,8 +403,7 @@ enum ManagedGatewayHost {
         }
         let limit = ProcessInfo.processInfo.systemUptime + 600
         repeat {
-            if let data = try? Data(contentsOf:root.appendingPathComponent("health.json")),
-               let value = try? JSONSerialization.jsonObject(with:data) as? [String:Any],
+            if let value = try? PrivateRuntimeMetadata.object(root.appendingPathComponent("health.json")),
                let descriptor = try? ManagedOpenClawDescriptor.load(from:descriptorURL),
                descriptor.acceptsHealth(value) {
                 let input = FileHandle.standardInput.readData(ofLength:16384)
@@ -441,7 +443,11 @@ enum ManagedGatewayHost {
         guard lock >= 0 else { return 1 }
         defer { close(lock) }
         guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { return 0 } // Another valid host owns drainage too.
-        var budget = (try? JSONDecoder().decode(GatewayRecoveryBudget.self, from: Data(contentsOf: root.appendingPathComponent("recovery.json")))) ?? GatewayRecoveryBudget()
+        var budget: GatewayRecoveryBudget
+        do {
+            budget = try PrivateRuntimeMetadata.decodeIfPresent(GatewayRecoveryBudget.self,
+                from: root.appendingPathComponent("recovery.json")) ?? GatewayRecoveryBudget()
+        } catch { return 1 } // An invalid record cannot clear a persisted restart budget.
         var gateway: SubprocessSupervisor?
         var capture: BufferedProcessOutput?
         var descriptor: ManagedOpenClawDescriptor?
@@ -470,17 +476,19 @@ enum ManagedGatewayHost {
             _ = OpenClawService.run(executable:runtimeURL,
                 arguments:["--managed-openclaw", "collect-profiles", "--managed-descriptor", descriptorURL.path], timeout:5)
         }
-        defer {
-            teardown()
-            collectUnusedProfiles()
-            for name in ["gateway-processes.json", "gateway-root.json"] { try? FileManager.default.removeItem(at:root.appendingPathComponent(name)) }
-        }
         // The root was durably recorded while suspended, before it could fork.
         // Capture live group members before retirement; after root exit, signal
         // only those recorded birth identities (never a potentially reused group).
         var abandoned: [ManagedProcessIdentity] = []
-        if let data = try? Data(contentsOf:root.appendingPathComponent("gateway-root.json")),
-           let owner = try? JSONDecoder().decode(ManagedProcessIdentity.self,from:data), owner.alive {
+        let oldOwner: ManagedProcessIdentity?
+        let oldProcesses: [ManagedProcessIdentity]?
+        do {
+            oldOwner = try PrivateRuntimeMetadata.decodeIfPresent(ManagedProcessIdentity.self,
+                from: root.appendingPathComponent("gateway-root.json"))
+            oldProcesses = try PrivateRuntimeMetadata.decodeIfPresent([ManagedProcessIdentity].self,
+                from: root.appendingPathComponent("gateway-processes.json"), maximum: PrivateRuntimeMetadata.processListBytes)
+        } catch { return 1 } // Unknown ownership cannot authorize a replacement Gateway.
+        if let owner = oldOwner, owner.alive {
             var members = [TPProcessIdentity](repeating:TPProcessIdentity(),count:65536)
             let count = tp_process_group_snapshot(owner.pid,&members,Int32(members.count))
             if count < 0 { return 1 } // Ownership cannot be safely handed off.
@@ -488,8 +496,7 @@ enum ManagedGatewayHost {
             if owner.alive { _ = Darwin.kill(-owner.pid,SIGTERM) }
         }
         // Recover only recorded birth identities. Never signal a reused PID or an unrelated listener.
-        if let data = try? Data(contentsOf: root.appendingPathComponent("gateway-processes.json")),
-           let old = try? JSONDecoder().decode([ManagedProcessIdentity].self, from: data) {
+        if let old = oldProcesses {
             abandoned += old
             for process in abandoned where process.alive { _ = Darwin.kill(process.pid, SIGTERM) }
             Thread.sleep(forTimeInterval: 0.2)
@@ -499,6 +506,13 @@ enum ManagedGatewayHost {
         let drainage = ProcessInfo.processInfo.systemUptime + 5
         while abandoned.contains(where: { $0.alive }) && ProcessInfo.processInfo.systemUptime < drainage { Thread.sleep(forTimeInterval:0.02) }
         guard !abandoned.contains(where: { $0.alive }) else { return 1 }
+        // Install cleanup only after ownership records have been accepted and
+        // their processes drained. Invalid records must survive for inspection.
+        defer {
+            teardown()
+            collectUnusedProfiles()
+            for name in ["gateway-processes.json", "gateway-root.json"] { try? FileManager.default.removeItem(at:root.appendingPathComponent(name)) }
+        }
         collectUnusedProfiles()
         while true {
             let wakeToken = wake.token()
@@ -523,8 +537,8 @@ enum ManagedGatewayHost {
                 let dirtyMetadata = fileHints.takeChanges(at: monotonicNow)
                 if dirtyMetadata.contains(.rescanRequired) { integritySchedule.requireFullAudit() }
                 let configurationRequest = root.appendingPathComponent("configuration-request.json")
-                if let data = try? Data(contentsOf:configurationRequest),
-                   let value = try? JSONSerialization.jsonObject(with:data) as? [String:Any],
+                if let requestDocument = try? PrivateRuntimeMetadata.document(configurationRequest, maximum: PrivateRuntimeMetadata.requestBytes),
+                   let value = requestDocument.value as? [String:Any],
                    let id = value["request_id"] as? String, UUID(uuidString:id) != nil,
                    let ownerData = try? JSONSerialization.data(withJSONObject:value["owner"] ?? [:]),
                    let owner = try? JSONDecoder().decode(ManagedProcessIdentity.self,from:ownerData) {
@@ -537,7 +551,8 @@ enum ManagedGatewayHost {
                         teardown()
                         try write(["request_id":id],to:root.appendingPathComponent("configuration-ack.json"))
                         while clientsAlive(root:root) && owner.alive,
-                              let pending = try? Data(contentsOf:configurationRequest), pending == data {
+                              let pending = try? PrivateRuntimeMetadata.document(configurationRequest, maximum: PrivateRuntimeMetadata.requestBytes),
+                              pending.data == requestDocument.data {
                             Thread.sleep(forTimeInterval:0.1)
                         }
                         try? FileManager.default.removeItem(at:root.appendingPathComponent("configuration-ack.json"))
@@ -546,8 +561,9 @@ enum ManagedGatewayHost {
                     } else { try? FileManager.default.removeItem(at:configurationRequest) }
                 }
                 let request = root.appendingPathComponent("health-request.json")
-                let requested = FileManager.default.fileExists(atPath: request.path)
-                let faultRequested = (try? Data(contentsOf:request)).flatMap { try? JSONSerialization.jsonObject(with:$0) as? [String:Any] }?["fault"] as? Bool == true
+                let requestValue = try? PrivateRuntimeMetadata.object(request, maximum: PrivateRuntimeMetadata.requestBytes)
+                let requested = requestValue != nil
+                let faultRequested = requestValue?["fault"] as? Bool == true
                 if requested { try? FileManager.default.removeItem(at: request) }
                 // Audits are local CLI/readback work, not provider generation.
                 // Offline repair is excluded from every native delivery commit.
@@ -665,7 +681,7 @@ enum ManagedGatewayHost {
                         } while process.isRunning && ProcessInfo.processInfo.systemUptime < deadline
                     }
                     let result = ownedCommand(root:root, executable:URL(fileURLWithPath:current.executable), arguments:["health", "--json", "--timeout", "4000"], timeout:7, environment:current.environment)
-                    let healthy = result.status == 0 && (result.output.data(using:.utf8).flatMap { try? JSONSerialization.jsonObject(with:$0) as? [String:Any] })?["ok"] as? Bool == true
+                    let healthy = result.status == 0 && Self.object(result.output)?["ok"] as? Bool == true
                     if healthy && !acpVerified {
                         let acp = ownedCommand(root:root, executable:runtimeURL, arguments:["--managed-acp-probe", "--managed-descriptor", descriptorURL.path], timeout:150, environment:current.environment)
                         acpVerified = acp.status == 0
@@ -747,7 +763,9 @@ enum ManagedGatewayHost {
         }
     }
     static func object(_ text: String) -> [String:Any]? {
-        text.data(using:.utf8).flatMap { try? JSONSerialization.jsonObject(with:$0) as? [String:Any] }
+        guard text.utf8.count <= PrivateRuntimeMetadata.configurationBytes,
+              let data = text.data(using:.utf8) else { return nil }
+        return (try? PrivateRuntimeMetadata.parse(data)) as? [String:Any]
     }
     static func portAvailable(_ port: Int) -> Bool { (try? portCollision(port)) == false }
     static func portCollision(_ port: Int) throws -> Bool {

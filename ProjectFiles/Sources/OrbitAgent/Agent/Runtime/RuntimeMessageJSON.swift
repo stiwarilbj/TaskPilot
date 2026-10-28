@@ -6,11 +6,15 @@ enum RuntimeMessageJSON {
     enum Failure: Error { case malformed, duplicateField }
 
     static func decode(_ data: Data) throws -> [String: Any] {
-        try rejectDuplicateFields(data)
-        guard let message = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        guard let message = try decodeValue(data) as? [String: Any] else {
             throw Failure.malformed
         }
         return message
+    }
+
+    static func decodeValue(_ data: Data) throws -> Any {
+        try rejectDuplicateFields(data)
+        return try JSONSerialization.jsonObject(with: data)
     }
 
     private static func rejectDuplicateFields(_ data: Data) throws {

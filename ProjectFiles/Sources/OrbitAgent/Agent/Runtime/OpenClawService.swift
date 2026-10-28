@@ -130,7 +130,7 @@ final class OpenClawService {
             // Startup may be in progress. Return promptly; ordinary refreshes
             // neither reset the circuit nor launch a provider generation.
             let healthURL = ManagedOpenClawDescriptor.root.appendingPathComponent("health.json")
-            let health = (try? Data(contentsOf: healthURL)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            let health = try? PrivateRuntimeMetadata.object(healthURL)
             let matchesInstance = health?["instance_id"] as? String == descriptor.instanceID &&
                 health?["configuration_fingerprint"] as? String == descriptor.configurationFingerprint
             let ready = health.map { descriptor.acceptsHealth($0) } ?? false

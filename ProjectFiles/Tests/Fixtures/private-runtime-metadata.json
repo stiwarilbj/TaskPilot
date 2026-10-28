@@ -1,0 +1,25 @@
+{
+  "limits": {"request":4096,"record":65536,"descriptor":131072,"configuration":4194304,"process_list":8388608,"integrity":67108864},
+  "cases": [
+    {"name":"object","json":"{\"version\":1,\"unknown\":true}","valid":true},
+    {"name":"array","json":"[{\"pid\":1},{\"pid\":2}]","valid":true},
+    {"name":"duplicate","json":"{\"state\":\"healthy\",\"state\":\"stopped\"}","valid":false},
+    {"name":"same value duplicate","json":"{\"fault\":false,\"fault\":false}","valid":false},
+    {"name":"escaped key","json":"{\"request_id\":1,\"request\\u005fid\":2}","valid":false},
+    {"name":"nested duplicate","json":"{\"owner\":{\"pid\":1,\"pid\":2}}","valid":false},
+    {"name":"array duplicate","json":"[{\"seconds\":1,\"seconds\":2}]","valid":false},
+    {"name":"unicode equivalent","json":"{\"é\":1,\"e\\u0301\":2}","valid":false},
+    {"name":"different scopes","json":"{\"a\":{\"pid\":1},\"b\":{\"pid\":2}}","valid":true},
+    {"name":"unicode values","json":"{\"title\":\"é😀\",\"escaped\":\"\\u0000\"}","valid":true},
+    {"name":"negative finite","json":"{\"value\":-1.5e2}","valid":true},
+    {"name":"nan","json":"{\"checked_at\":NaN}","valid":false},
+    {"name":"infinity","json":"{\"checked_at\":Infinity}","valid":false},
+    {"name":"overflow","json":"{\"checked_at\":1e400}","valid":false},
+    {"name":"surrogate","json":"{\"title\":\"\\ud800\"}","valid":false},
+    {"name":"multiple","json":"{} {}","valid":false},
+    {"name":"scalar","json":"true","valid":false},
+    {"name":"null","json":"null","valid":false},
+    {"name":"truncated","json":"{\"owner\":","valid":false},
+    {"name":"bom","json":"﻿{}","valid":false}
+  ]
+}
