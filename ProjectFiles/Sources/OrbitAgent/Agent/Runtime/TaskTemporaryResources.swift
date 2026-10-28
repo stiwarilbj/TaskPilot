@@ -61,6 +61,143 @@ enum PrivateDirectoryPermissions {
     }
 }
 
+/// Feature preflight, not a substitute for identity checks or syncing actual
+/// commits. Profiles hold no descriptors and never cache directory permissions.
+enum PrivateVolumeCapabilities {
+    struct Identity: Hashable {
+        let device: Int32
+        let filesystemFirst: Int32
+        let filesystemSecond: Int32
+        let mountFlags: UInt32
+    }
+    struct Profile: Equatable {
+        let atomicRename: Bool
+        let directorySync: Bool
+        func require() throws {
+            if !atomicRename { throw Failure.atomicRename }
+            if !directorySync { throw Failure.directorySync }
+        }
+    }
+    enum Failure: String, LocalizedError {
+        case unavailable = "private_directory_volume_unavailable"
+        case atomicRename = "private_directory_volume_atomic_rename"
+        case directorySync = "private_directory_volume_directory_sync"
+        var errorDescription: String? {
+            "\(rawValue): TaskPilot’s private storage could not verify safe replacement and directory syncing. Check the storage volume before retrying; installation or repair cannot proceed on this volume."
+        }
+    }
+    final class Cache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var profiles: [Identity: Profile] = [:]
+        private var order: [Identity] = []
+        private let capacity: Int
+        init(capacity: Int = 8) { self.capacity = max(1, capacity) }
+        func profile(for identity: Identity, probe: () throws -> Profile) throws -> Profile {
+            try lock.withLock {
+                if let profile = profiles[identity] { return profile }
+                let profile = try probe() // Transient failures never poison the cache.
+                if order.count == capacity { profiles.removeValue(forKey: order.removeFirst()) }
+                profiles[identity] = profile; order.append(identity)
+                return profile
+            }
+        }
+    }
+    private static let cache = Cache()
+    static func identity(_ descriptor: Int32) throws -> Identity {
+        var info = stat(), volume = statfs()
+        guard fstat(descriptor, &info) == 0, fstatfs(descriptor, &volume) == 0 else { throw Failure.unavailable }
+        return Identity(device: info.st_dev, filesystemFirst: volume.f_fsid.val.0,
+                        filesystemSecond: volume.f_fsid.val.1, mountFlags: volume.f_flags)
+    }
+    static func require(_ directory: URL, cache: Cache = cache) throws {
+        try PrivateDirectoryPermissions.check(directory)
+        let descriptor = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { throw Failure.unavailable }
+        defer { close(descriptor) }
+        var opened = stat(), named = stat()
+        guard fstat(descriptor, &opened) == 0, lstat(directory.path, &named) == 0,
+              opened.st_dev == named.st_dev, opened.st_ino == named.st_ino,
+              opened.st_uid == getuid(), opened.st_mode & 0o7777 == 0o700 else { throw Failure.unavailable }
+        let key = try identity(descriptor)
+        let profile = try cache.profile(for: key) {
+            let result = try probe(descriptor)
+            guard try identity(descriptor) == key else { throw Failure.unavailable }
+            return result
+        }
+        guard try identity(descriptor) == key, lstat(directory.path, &named) == 0,
+              opened.st_dev == named.st_dev, opened.st_ino == named.st_ino else { throw Failure.unavailable }
+        try profile.require()
+    }
+    static func probe(_ root: Int32,
+                      rename: (Int32, String, Int32, String) -> Int32 = { renameat($0, $1, $2, $3) },
+                      sync: (Int32) -> Int32 = { fsync($0) }) throws -> Profile {
+        let name = ".volume-probe-\(UUID().uuidString.lowercased())"
+        guard mkdirat(root, name, 0o700) == 0 else { throw Failure.unavailable }
+        var created = stat()
+        guard fstatat(root, name, &created, AT_SYMLINK_NOFOLLOW) == 0 else { throw Failure.unavailable }
+        defer {
+            var current = stat()
+            if fstatat(root, name, &current, AT_SYMLINK_NOFOLLOW) == 0,
+               current.st_dev == created.st_dev, current.st_ino == created.st_ino {
+                _ = unlinkat(root, name, AT_REMOVEDIR)
+            }
+        }
+        let scratch = openat(root, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard scratch >= 0 else { throw Failure.unavailable }
+        var entries: [String: stat] = [:]
+        defer {
+            // Delete only the exact tiny objects created by this probe.
+            for (entry, expected) in entries {
+                var current = stat()
+                if fstatat(scratch, entry, &current, AT_SYMLINK_NOFOLLOW) == 0,
+                   current.st_dev == expected.st_dev, current.st_ino == expected.st_ino {
+                    _ = unlinkat(scratch, entry, current.st_mode & S_IFMT == S_IFDIR ? AT_REMOVEDIR : 0)
+                }
+            }
+            close(scratch)
+        }
+        var opened = stat()
+        guard fstat(scratch, &opened) == 0, opened.st_dev == created.st_dev,
+              opened.st_ino == created.st_ino, opened.st_dev == (try identity(root)).device,
+              opened.st_mode & 0o7777 == 0o700 else { throw Failure.unavailable }
+        for entry in ["source", "destination"] {
+            let file = openat(scratch, entry, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0o600)
+            guard file >= 0 else { throw Failure.unavailable }
+            var info = stat()
+            let valid = fstat(file, &info) == 0
+            close(file)
+            guard valid else { throw Failure.unavailable }
+            entries[entry] = info
+        }
+        func unsupported(_ code: Int32) -> Bool { [ENOTSUP, EXDEV, EINVAL].contains(code) }
+        guard rename(scratch, "source", scratch, "destination") == 0 else {
+            if unsupported(errno) { return Profile(atomicRename: false, directorySync: false) }
+            throw Failure.unavailable
+        }
+        let source = entries.removeValue(forKey: "source")!
+        entries["destination"] = source
+        var replaced = stat()
+        guard fstatat(scratch, "destination", &replaced, AT_SYMLINK_NOFOLLOW) == 0,
+              replaced.st_dev == source.st_dev, replaced.st_ino == source.st_ino else { throw Failure.unavailable }
+        // Installation promotion also needs same-volume directory rename.
+        guard mkdirat(scratch, "stage", 0o700) == 0,
+              fstatat(scratch, "stage", &opened, AT_SYMLINK_NOFOLLOW) == 0 else { throw Failure.unavailable }
+        entries["stage"] = opened
+        guard rename(scratch, "stage", scratch, "active") == 0 else {
+            if unsupported(errno) { return Profile(atomicRename: false, directorySync: false) }
+            throw Failure.unavailable
+        }
+        entries["active"] = entries.removeValue(forKey: "stage")
+        guard fstatat(scratch, "active", &replaced, AT_SYMLINK_NOFOLLOW) == 0,
+              replaced.st_dev == opened.st_dev, replaced.st_ino == opened.st_ino else { throw Failure.unavailable }
+        guard sync(scratch) == 0 else {
+            if unsupported(errno) { return Profile(atomicRename: true, directorySync: false) }
+            throw Failure.unavailable
+        }
+        return Profile(atomicRename: true, directorySync: true)
+    }
+}
+
 /// Private directories for task-owned runtime scratch only. User-selected output
 /// destinations never enter this root or its cleanup path.
 enum TaskTemporaryResourceLedger {
@@ -348,6 +485,7 @@ enum TaskTemporaryResourceLedger {
                 attributes: [.posixPermissions: NSNumber(value: directoryPermissions)])
         }
         try PrivateDirectoryPermissions.check(root, repair: true)
+        try PrivateVolumeCapabilities.require(root)
     }
 
     private static func openRoot(_ root: URL, create: Bool) throws -> Int32 {

@@ -85,3 +85,11 @@ this user and must not be a symlink. Mode drift is repaired under a local lock
 through a checked directory descriptor, with `0700` readback. Unopenable,
 foreign-owned, replaced or symlinked storage fails closed with a classified
 private-directory attention error. No user output path enters this repair path.
+
+After permission validation, startup checks the scratch volume's replacement and
+directory-sync capabilities. A bounded in-memory profile is shared by directories
+on the same device/filesystem identity and mount flags. Probes create only tiny,
+private temporary entries and remove them relative to checked descriptors. Warm
+checks perform metadata reads without repeating those writes. Permission, ACL,
+identity, capacity, and actual commit checks retain their existing authority.
+See `Docs/ManagedOpenClaw.md` for the corresponding managed-runtime preflight.

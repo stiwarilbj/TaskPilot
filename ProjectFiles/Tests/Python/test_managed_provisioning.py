@@ -357,9 +357,9 @@ class ProvisioningTests(unittest.TestCase):
             journal.record('configuration', 'old')
         previous = (self.root / 'provisioning.json').read_bytes()
         replace = os.replace
-        def fail(source, target):
+        def fail(source, target, **kwargs):
             if Path(target).name == 'provisioning.json': raise OSError('injected write failure')
-            return replace(source, target)
+            return replace(source, target, **kwargs)
         with self.build() as (downloads, runs), patch.object(os, 'replace', side_effect=fail):
             with self.assertRaises(OSError): managed.install(self.resources, self.root)
             downloads.assert_not_called(); runs.assert_not_called()

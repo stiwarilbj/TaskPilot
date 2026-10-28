@@ -592,7 +592,7 @@ enum ManagedGatewayHost {
                         defer { withExtendedLifetime(permit) {} }
                         if let cause = Self.directoryAttentionCause(auditResult) {
                             teardown(); repair = true
-                            writeHealth(current,state:"needs_repair",detail:"\(cause): Private storage ACL, flags, ownership, or identity needs attention; automatic directory repair was withheld.",root:root)
+                            writeHealth(current,state:"needs_repair",detail:PrivateVolumeCapabilities.Failure(rawValue: cause)?.localizedDescription ?? "\(cause): Private storage ACL, flags, ownership, or identity needs attention; automatic directory repair was withheld.",root:root)
                             continue
                         }
                         if causes.contains("private_configuration_path_changed") {
@@ -741,6 +741,8 @@ enum ManagedGatewayHost {
             return "Not enough disk space to install or repair TaskPilot’s private OpenClaw. Free disk space, then retry. Any existing working installation was left intact."
         case "local_resource_disk_space_check":
             return "TaskPilot could not check free disk space for private OpenClaw. Check storage availability, then retry. Any existing working installation was left intact."
+        case "private_directory_volume_unavailable", "private_directory_volume_atomic_rename", "private_directory_volume_directory_sync":
+            return "TaskPilot could not verify replacement and directory syncing on its private storage volume. Check storage availability before retrying installation or repair."
         default: return nil
         }
     }

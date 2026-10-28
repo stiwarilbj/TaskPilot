@@ -108,6 +108,133 @@ class PrivateDirectoryError(ManagedRuntimeError):
         super().__init__(self.code + ': TaskPilot private storage needs attention; verify ownership and permissions.')
 
 
+class PrivateVolumeError(PrivateDirectoryError):
+    def __init__(self, capability):
+        self.code = 'private_directory_volume_' + capability
+        ManagedRuntimeError.__init__(self, self.code + ': TaskPilot could not verify private-volume replacement '
+                                     'and directory syncing. Check the storage volume before retrying; '
+                                     'installation or repair cannot proceed on this volume.')
+
+
+class PrivateVolumeCache:
+    """Bounded process-local capability facts, never permissions or readiness."""
+    def __init__(self, capacity=8):
+        self.capacity = max(1, capacity)
+        self.profiles = {}
+        self.lock = threading.Lock()
+
+    def profile(self, identity, probe):
+        with self.lock:
+            if identity in self.profiles: return self.profiles[identity]
+            profile = probe()  # Do not retain transient failures (ENOSPC, EIO, etc.).
+            if len(self.profiles) == self.capacity: self.profiles.pop(next(iter(self.profiles)))
+            self.profiles[identity] = profile
+            return profile
+
+
+_private_volume_cache = PrivateVolumeCache()
+
+
+def _reset_private_volume_cache():
+    global _private_volume_cache
+    _private_volume_cache = PrivateVolumeCache()
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_reset_private_volume_cache)
+
+
+def _private_volume_identity(fd):
+    info, volume = os.fstat(fd), os.fstatvfs(fd)
+    return info.st_dev, volume.f_fsid, volume.f_flag
+
+
+def _probe_private_volume(root_fd):
+    """Exercise POSIX replacement/promotion and directory fsync in private scratch.
+
+    This is a feature check, not a power-loss/atomicity certification. Actual
+    commits must still check their identities and fsync their own descriptors.
+    """
+    name = '.volume-probe-' + uuid.uuid4().hex
+    os.mkdir(name, 0o700, dir_fd=root_fd)
+    created = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+    scratch = -1
+    entries = {}
+    identity = lambda info: (info.st_dev, info.st_ino)
+    unsupported = {errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.EINVAL}
+    try:
+        scratch = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd)
+        opened = os.fstat(scratch)
+        if (identity(opened) != identity(created) or opened.st_dev != os.fstat(root_fd).st_dev or
+                opened.st_uid != os.getuid() or stat.S_IMODE(opened.st_mode) != 0o700):
+            raise PrivateVolumeError('unavailable')
+        for entry in ('source', 'destination'):
+            fd = os.open(entry, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o600, dir_fd=scratch)
+            try: entries[entry] = os.fstat(fd)
+            finally: os.close(fd)
+        try: os.replace('source', 'destination', src_dir_fd=scratch, dst_dir_fd=scratch)
+        except OSError as error:
+            if error.errno in unsupported: return False, False
+            raise
+        entries['destination'] = entries.pop('source')
+        if identity(os.stat('destination', dir_fd=scratch, follow_symlinks=False)) != identity(entries['destination']):
+            raise PrivateVolumeError('unavailable')
+        os.mkdir('stage', 0o700, dir_fd=scratch)
+        entries['stage'] = os.stat('stage', dir_fd=scratch, follow_symlinks=False)
+        try: os.rename('stage', 'active', src_dir_fd=scratch, dst_dir_fd=scratch)
+        except OSError as error:
+            if error.errno in unsupported: return False, False
+            raise
+        entries['active'] = entries.pop('stage')
+        if identity(os.stat('active', dir_fd=scratch, follow_symlinks=False)) != identity(entries['active']):
+            raise PrivateVolumeError('unavailable')
+        try: os.fsync(scratch)
+        except OSError as error:
+            if error.errno in unsupported: return True, False
+            raise
+        return True, True
+    finally:
+        # No directory scan or recursive/path-based removal. Preserve anything
+        # whose identity changed instead of deleting an unexpected replacement.
+        for entry, expected in entries.items():
+            try:
+                current = os.stat(entry, dir_fd=scratch, follow_symlinks=False)
+                if identity(current) == identity(expected):
+                    if stat.S_ISDIR(current.st_mode): os.rmdir(entry, dir_fd=scratch)
+                    else: os.unlink(entry, dir_fd=scratch)
+            except OSError: pass
+        if scratch >= 0: os.close(scratch)
+        try:
+            if identity(os.stat(name, dir_fd=root_fd, follow_symlinks=False)) == identity(created):
+                os.rmdir(name, dir_fd=root_fd)
+        except OSError: pass
+
+
+def require_private_volume(path, *, cache=None):
+    check_private_directory(path)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            opened, named = os.fstat(fd), Path(path).lstat()
+            identity = lambda info: (info.st_dev, info.st_ino, info.st_uid, info.st_mode)
+            if identity(opened) != identity(named) or opened.st_uid != os.getuid() or stat.S_IMODE(opened.st_mode) != 0o700:
+                raise PrivateVolumeError('unavailable')
+            key = _private_volume_identity(fd)
+            def probe():
+                profile = _probe_private_volume(fd)
+                if _private_volume_identity(fd) != key: raise PrivateVolumeError('unavailable')
+                return profile
+            rename, sync = (cache if cache is not None else _private_volume_cache).profile(key, probe)
+            if _private_volume_identity(fd) != key or identity(opened) != identity(Path(path).lstat()):
+                raise PrivateVolumeError('unavailable')
+            if not rename: raise PrivateVolumeError('atomic_rename')
+            if not sync: raise PrivateVolumeError('directory_sync')
+        finally: os.close(fd)
+    except OSError as error:
+        raise PrivateVolumeError('unavailable') from error
+
+
 def _extended_acl_entry_count(fd):
     """Return the number of extended ACL entries, failing closed if unreadable."""
     library = ctypes.CDLL(None, use_errno=True)
@@ -203,6 +330,7 @@ def check_managed_directories(root, descriptor=None, *, repair=False):
     for path in paths: check_private_directory(path, allow_mode_drift=repair)
     if repair:
         for path in paths: check_private_directory(path, repair=True)
+    for path in paths: require_private_volume(path)
 
 class ACPConnectionError(ManagedRuntimeError):
     def __init__(self, cause):
@@ -1131,10 +1259,14 @@ def validate_node_archive_members(members, stage):
 def install(resources, root, *, journal=None):
     root = Path(root)
     if journal is None:
-        with locked(root), ProvisioningJournal(root) as owned:
-            (root / 'installations').mkdir(exist_ok=True, mode=0o700)
-            check_private_directory(root / 'installations')
-            return install(resources, root, journal=owned)
+        with locked(root):
+            require_private_volume(root)
+            with ProvisioningJournal(root) as owned:
+                (root / 'installations').mkdir(exist_ok=True, mode=0o700)
+                check_private_directory(root / 'installations')
+                return install(resources, root, journal=owned)
+    require_private_volume(root)
+    require_private_volume(root / 'installations')
     manifest, fingerprint = specification(resources)
     pending = journal.read()
     recovered = journal.recover_stage(fingerprint)

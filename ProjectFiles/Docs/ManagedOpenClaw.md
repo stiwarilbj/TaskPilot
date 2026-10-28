@@ -360,6 +360,56 @@ python3 -m unittest discover -s Tests/Python -p test_managed_openclaw.py
 swift test --filter 'TaskTemporaryResourcesTests|ManagedOpenClawTests'
 ```
 
+## Private-volume capability profiles
+
+After validating all known private directories, Python checks the underlying
+volume before provisioning or configuration repair. Native TaskScratch startup
+uses the equivalent preflight. Each process keeps at most eight profiles, keyed
+by device/filesystem identity and mount flags, not a pathname. Different private
+roots on the same volume share a profile; a changed identity or mount flags
+requires a fresh probe. The cache is in memory only, is reset across Python
+forks, and retains no descriptors, paths, contents, or readiness assertions.
+
+A cold probe creates a random mode-700 scratch directory beneath a validated
+private root. Inside it, it replaces a mode-600 file, renames a staged directory,
+checks the resulting object identities, and syncs the scratch directory. Cleanup
+uses directory-relative operations and recorded identities; unexpected
+replacements are left untouched. It neither scans directories nor touches user
+output paths. Concurrent checks share one probe. Warm checks read current volume
+metadata and continue checking directory permissions/ACLs without creating probe
+files. Profiles are bounded; an evicted volume is probed when next encountered.
+
+An explicitly unsupported rename or directory sync is cached as unsupported and
+reported through `private_directory_volume_atomic_rename` or
+`private_directory_volume_directory_sync`. Inspection or transient I/O failures
+use `private_directory_volume_unavailable` and remain uncached. Installation,
+configuration repair, and rollback do not proceed through a failing preflight;
+the existing active runtime is retained. No repair/restart budget, model call,
+timer, or public protocol is added by this check.
+
+These probes exercise required POSIX operations; they cannot establish
+power-loss durability or prove atomicity experimentally. Existing commit-time
+identity checks, fsync calls, disk headroom checks, integrity audits, and Gateway
+and provider verification remain authoritative. A cached capability never
+authorizes a write, proves readiness, or promises that storage cannot fail later.
+
+Offline reproduction from `ProjectFiles`:
+
+```sh
+python3 -m unittest discover -s Tests/Python -p test_private_volume_capabilities.py
+swift test --filter PrivateVolumeCapabilitiesTests
+```
+
+Fixtures cover shared and changed identities, concurrent/bounded reuse,
+unsupported and transient failures, permission drift, scratch cleanup, replaced
+probe directories, and installation/repair rejection before payload work. They
+launch no OpenClaw or desktop tasks. Live storage-failure validation is incomplete.
+
+A local synthetic run measured 0.823 ms for a cold check and 0.078 ms per warm
+check across 100 repetitions. All 101 checks shared one probe, so the warm checks
+made zero probe writes. Timings are illustrative; regression assertions use
+probe counts and filesystem state rather than timing thresholds.
+
 ## Provisioning disk headroom
 
 The pinned manifest includes versioned conservative space estimates: 128 MiB
