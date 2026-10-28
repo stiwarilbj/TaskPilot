@@ -6,6 +6,53 @@ lock in `Resources/OpenClaw/managed` pin official Node checksums and every npm
 integrity. Provisioning stages, checks, seals, and then activates an installation.
 Updates ship with TaskPilot; runtime provisioning never requests `latest`.
 
+## Pinned CLI capabilities
+
+The manifest's versioned `cli_contract` pins the complete package-lock SHA-256
+and TaskPilot's fixed required capability codes. Staged validation runs seven
+local commands through the pinned Node entry point before sealing or promotion:
+stdin patching with and without `--replace-path`, JSON readback of each result,
+valid and invalid configuration validation, and auth-import option discovery.
+The negative validation uses a fresh disposable state so SQLite export cannot
+hide the invalid JSON. Auth discovery checks only help for the exact command and
+its provider/profile options; no credentials are imported by a probe.
+
+All probe state is temporary inside the owned stage, with a private HOME, config,
+state, and environment containing no inherited provider credentials. Probes
+start no Gateway or provider generation. Each command has at most 15 seconds,
+the sequence shares one 60-second deadline, and accepted output is at most
+16 KiB per command. Errors expose a fixed `managed_cli_contract` cause, never
+subprocess output. Temporary transcripts and probe profiles are discarded.
+
+Only `taskpilot-cli-capabilities.json` remains: a version, package-lock digest,
+and the small fixed capability set. The normal installation seal includes it.
+Successful existing or recovered sealed installations reuse this record and
+launch no probes. Health checks compare the sealed record with current required
+capabilities without CLI discovery. Configuration repairs, endpoint relocation,
+and rollback stop before writes if capabilities are absent, malformed, stale,
+or incompatible. The Gateway reports an actionable attention condition instead
+of spending restart attempts on interface drift. These facts do not establish
+Gateway connectivity, credentials, or provider readiness.
+
+Changing the bundled manifest changes the existing installation fingerprint;
+normal provisioning validates the new stage while retaining the previous
+installation. Legacy seals are not edited to manufacture capabilities. A failed
+probe cannot promote or configure the staged runtime, and an interrupted sealed
+stage can resume only after its ordinary integrity and capability checks pass.
+
+Offline reproduction from `ProjectFiles`:
+
+```sh
+python3 -m unittest Tests.Python.test_managed_cli_contract Tests.Python.test_managed_provisioning
+swift test --filter ManagedOpenClawTests
+```
+
+Fixtures cover ignored flags, incorrect readback, duplicate JSON, a no-op
+validator, missing auth options, timeout/size/deadline limits, lock changes,
+crash recovery, zero reprobes on reuse, and writes withheld on mismatch. Local
+headless probes also passed against the installed pinned CLI in a disposable
+profile; live provider and desktop validation remain separate and incomplete.
+
 Before extracting Node, the installer validates the entire tar namespace with
 canonical Unicode decomposition and case folding, regardless of the staging
 volume's case sensitivity. Both explicit members and implicit parent directories

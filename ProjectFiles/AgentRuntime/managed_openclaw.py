@@ -47,8 +47,19 @@ SQLITE_HEALTH_TIMEOUT_SECONDS = 0.75
 SQLITE_BUSY_TIMEOUT_MILLISECONDS = 100
 SQLITE_PROGRESS_INTERVAL = 500
 SQLITE_HEALTH_FILES = ('openclaw.sqlite', 'agents/main/agent/openclaw-agent.sqlite')
+CLI_CAPABILITIES = ('auth_paste_key_options', 'config_get_json', 'config_patch_replace_path',
+                    'config_patch_stdin', 'config_validate')
+CLI_CAPABILITY_FILE = 'taskpilot-cli-capabilities.json'
+CLI_PROBE_SECONDS = 60
+CLI_PROBE_OUTPUT_BYTES = 16384
 
 class ManagedRuntimeError(RuntimeError): pass
+
+class CLIContractError(ManagedRuntimeError):
+    code = 'managed_cli_contract'
+    def __init__(self):
+        super().__init__('The pinned OpenClaw CLI does not match TaskPilot’s required configuration interface. '
+                         'No configuration repair was authorized. Install a compatible TaskPilot runtime.')
 
 class ConfigurationPathError(ManagedRuntimeError):
     code = 'private_configuration_path_changed'
@@ -770,6 +781,9 @@ def specification(resources: Path):
             raise ManagedRuntimeError('Bundled dependency lock contains an unverified source.')
     provisioning_space(manifest)
     runtime_compatibility(manifest)
+    required_cli_contract(manifest)
+    if digest(resources / 'package-lock.json') != manifest['cli_contract']['package_lock_sha256']:
+        raise CLIContractError()
     fingerprint = hashlib.sha256(b''.join((resources / n).read_bytes() for n in
         ('runtime-manifest.json', 'package.json', 'package-lock.json'))).hexdigest()
     return manifest, fingerprint
@@ -819,7 +833,8 @@ class ConfigurationPathFence:
             raise ConfigurationPathError('A private configuration path was replaced during a CLI operation.')
 
 
-def bounded_run(argv, *, env=None, timeout=45, cwd=None, input_data=None, result=False, pass_fds=(), path_fence=None):
+def bounded_run(argv, *, env=None, timeout=45, cwd=None, input_data=None, result=False, pass_fds=(), path_fence=None,
+                maximum_output=None):
     # Disk-backed capture prevents unbounded communicate() allocation for npm.
     fence_snapshot = path_fence.snapshot() if path_fence is not None else None
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as input_file, open(os.devnull, 'rb') as null_input:
@@ -838,10 +853,106 @@ def bounded_run(argv, *, env=None, timeout=45, cwd=None, input_data=None, result
             process.wait(); raise
         if path_fence is not None:
             path_fence.verify(fence_snapshot)
+        if maximum_output is not None and os.fstat(output.fileno()).st_size > maximum_output:
+            raise ManagedRuntimeError('Managed runtime command output exceeded its limit.')
         output.seek(0); text = output.read(65536).decode('utf-8', 'replace')
         if result: return code, text
         if code: raise ManagedRuntimeError('Managed runtime validation failed; the previous installation remains available.')
         return text
+
+
+def required_cli_contract(manifest):
+    contract = manifest.get('cli_contract')
+    if (not isinstance(contract, dict) or set(contract) != {'version', 'required_capabilities', 'package_lock_sha256'} or
+            type(contract['version']) is not int or contract['version'] != 1 or
+            contract['required_capabilities'] != list(CLI_CAPABILITIES) or
+            not isinstance(contract['package_lock_sha256'], str) or
+            re.fullmatch(r'[a-f0-9]{64}', contract['package_lock_sha256']) is None):
+        raise CLIContractError()
+    return contract
+
+
+def require_cli_capabilities(installation, manifest=None):
+    """Read sealed facts only; health/repair must never rerun installation probes."""
+    try:
+        record = private_metadata.read(Path(installation) / CLI_CAPABILITY_FILE, private_metadata.REQUEST_BYTES)
+        lock = private_metadata.read_bytes(Path(installation) / 'package/package-lock.json', private_metadata.INTEGRITY_BYTES)
+        lock_fingerprint = hashlib.sha256(lock).hexdigest()
+        if (set(record) != {'version', 'package_lock_sha256', 'capabilities'} or
+                type(record['version']) is not int or record['version'] != 1 or
+                record['package_lock_sha256'] != lock_fingerprint or
+                record['capabilities'] != list(CLI_CAPABILITIES)):
+            raise CLIContractError()
+        if manifest is not None and required_cli_contract(manifest)['package_lock_sha256'] != lock_fingerprint:
+            raise CLIContractError()
+        return record
+    except (OSError, ValueError) as error:
+        raise CLIContractError() from error
+
+
+def probe_cli_contract(stage, manifest, *, run=None, now=time.monotonic):
+    """Local, credential-free semantic probes; no active profile or Gateway."""
+    contract = required_cli_contract(manifest)
+    if run is None: run = bounded_run
+    lock_fingerprint = hashlib.sha256(private_metadata.read_bytes(
+        stage / 'package/package-lock.json', private_metadata.INTEGRITY_BYTES)).hexdigest()
+    if lock_fingerprint != contract['package_lock_sha256']: raise CLIContractError()
+    executable = [str(stage / 'node/bin/node'), str(stage / 'package/node_modules/openclaw/openclaw.mjs')]
+    deadline = now() + CLI_PROBE_SECONDS
+    try:
+        with tempfile.TemporaryDirectory(prefix='.cli-probe-', dir=stage) as temporary:
+            scratch = Path(temporary)
+            state = scratch / 'state'; state.mkdir(mode=0o700)
+            config = state / 'openclaw.json'
+            clean = isolated_environment()
+            env = {k:clean[k] for k in ('LANG', 'LC_ALL', 'OPENCLAW_HIDE_BANNER', 'OPENCLAW_SUPPRESS_NOTES', 'OPENCLAW_NO_RESPAWN')}
+            env.update(HOME=str(scratch), TMPDIR=str(scratch), PATH=str(stage / 'node/bin') + ':/usr/bin:/bin',
+                       OPENCLAW_STATE_DIR=str(state), OPENCLAW_CONFIG_PATH=str(config), OPENCLAW_PROFILE='taskpilot-cli-probe')
+            def invoke(arguments, **kwargs):
+                remaining = deadline - now()
+                if remaining <= 0: raise CLIContractError()
+                return run(executable + arguments, env=env, cwd=scratch, timeout=min(15, remaining),
+                           maximum_output=CLI_PROBE_OUTPUT_BYTES, **kwargs)
+            def decoded(arguments):
+                return private_metadata.parse(invoke(arguments).encode('utf-8'))
+            old_models = {'google/gemini-2.5-flash': {}}
+            new_models = {'google/gemini-2.5-flash-lite': {}}
+            atomic_json(config, {'gateway': {'mode':'local'}, 'plugins': {'enabled':False},
+                                 'agents': {'defaults': {'models':old_models}}})
+            invoke(['config', 'patch', '--stdin', '--replace-path', 'agents.defaults.models'],
+                   input_data=json.dumps({'agents':{'defaults':{'models':new_models}}}).encode())
+            if decoded(['config', 'get', 'agents.defaults.models', '--json']) != new_models: raise CLIContractError()
+            invoke(['config', 'patch', '--stdin'], input_data=b'{"gateway":{"port":24200}}')
+            gateway = decoded(['config', 'get', 'gateway', '--json'])
+            if not isinstance(gateway, dict) or gateway.get('port') != 24200: raise CLIContractError()
+            valid = decoded(['config', 'validate', '--json'])
+            if not isinstance(valid, dict) or valid.get('valid') is not True: raise CLIContractError()
+            # A fresh state prevents the CLI's SQLite export from hiding the
+            # deliberately invalid config. A no-op validator cannot pass.
+            invalid_state = scratch / 'invalid'; invalid_state.mkdir(mode=0o700)
+            invalid_config = invalid_state / 'openclaw.json'
+            atomic_json(invalid_config, {'gateway':{'mode':42}, 'plugins':{'enabled':False}})
+            env.update(OPENCLAW_STATE_DIR=str(invalid_state), OPENCLAW_CONFIG_PATH=str(invalid_config))
+            code, output = invoke(['config', 'validate', '--json'], result=True)
+            invalid = private_metadata.parse(output.encode('utf-8'))
+            if code == 0 or not isinstance(invalid, dict) or invalid.get('valid') is not False: raise CLIContractError()
+            env.update(OPENCLAW_STATE_DIR=str(state), OPENCLAW_CONFIG_PATH=str(config))
+            help_text = invoke(['models', 'auth', 'paste-api-key', '--help'])
+            if re.search(r'^Usage:\s+\S+ models auth paste-api-key(?:\s|$)', help_text, re.MULTILINE) is None:
+                raise CLIContractError()
+            for option in ('provider', 'profile-id'):
+                if re.search(r'^\s+--' + option + r'\s+<[^>]+>', help_text, re.MULTILINE) is None:
+                    raise CLIContractError()
+            if now() > deadline: raise CLIContractError()
+            if hashlib.sha256(private_metadata.read_bytes(
+                    stage / 'package/package-lock.json', private_metadata.INTEGRITY_BYTES)).hexdigest() != lock_fingerprint:
+                raise CLIContractError()
+    except Exception as error:
+        # Fixed classification only; never retain help, config, or subprocess output.
+        raise CLIContractError() from error
+    record = dict(version=1, package_lock_sha256=lock_fingerprint, capabilities=list(CLI_CAPABILITIES))
+    atomic_json(stage / CLI_CAPABILITY_FILE, record)
+    return record
 
 def seal(directory):
     # Hash the installed code, not only package.json. Excludes npm cache/logs.
@@ -1259,10 +1370,12 @@ def install(resources, root, *, journal=None):
     recovered = journal.recover_stage(fingerprint)
     target = root / 'installations' / fingerprint
     if validate_install(target, fingerprint, force_full=pending is not None):
+        require_cli_capabilities(target, manifest)
         if recovered: journal.discard_stage(recovered)
         return target, fingerprint, manifest
     if recovered:
         stage = journal.stage(recovered)
+        require_cli_capabilities(stage, manifest)
         integrity = private_metadata.read(stage / 'integrity.json', private_metadata.INTEGRITY_BYTES)
         previous_facts = integrity.get('native_addons')
         facts = dict(previous_facts) if isinstance(previous_facts, dict) else {}
@@ -1321,6 +1434,7 @@ def install(resources, root, *, journal=None):
         if manifest['openclaw_version'] not in version: raise ManagedRuntimeError('OpenClaw did not pass its launch check.')
         addon_facts = {}
         verify_native_addons(package / 'node_modules', manifest, facts=addon_facts)
+        probe_cli_contract(stage, manifest, run=journal.run)
         record = journal.record('sealing', fingerprint, stage_id, identity)
         files = seal(stage)
         sealed_addons = {value for name, value in files.items()
@@ -1428,6 +1542,7 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
             atomic_json(root / 'activation-verification.json', {'installation_fingerprint':interrupted['fingerprint']})
             sync_directory(root)
         target, fingerprint, manifest = install(resources, root, journal=journal)
+        require_cli_capabilities(target, manifest)
         try:
             rejected = private_metadata.read(root / 'rejected-installation.json')
         except (OSError, ValueError): rejected = None
@@ -1594,6 +1709,9 @@ def wait_for_health(path, *, sleep=time.sleep, now=time.monotonic, status=None, 
 def relocate(path):
     with locked(path.parent):
         d = load_descriptor(path)
+        installation = Path(d['node']).parents[2]
+        if not validate_install(installation, d['installation_fingerprint']): raise CLIContractError()
+        require_cli_capabilities(installation)
         active_identity = _identity_at(path, 'file')
         fence = ConfigurationPathFence(d['state'], d['config'])
         before = fence.snapshot()
@@ -1650,6 +1768,7 @@ def rollback(path):
         d = load_descriptor(path.parent / 'working-runtime.json')
         if not validate_install(Path(d['node']).parents[2], d['installation_fingerprint'], force_full=True):
             raise ManagedRuntimeError('The last working OpenClaw installation is unavailable; reconfigure in Settings.')
+        require_cli_capabilities(Path(d['node']).parents[2])
         failed = load_descriptor(path)
         if d['installation_fingerprint'] == failed['installation_fingerprint']:
             raise ManagedRuntimeError('No different verified compatible installation is available for rollback.')
@@ -1925,6 +2044,9 @@ def audit(path, *, force_integrity=False):
     installation_ok = validate_install(Path(d['node']).parents[2], d['installation_fingerprint'],
                                         force_full=force_integrity, stats=integrity_stats)
     if not installation_ok: faults.append('installation')
+    else:
+        try: require_cli_capabilities(Path(d['node']).parents[2])
+        except CLIContractError: faults.append(CLIContractError.code)
     database_health = known_database_health(d['state'])
     database_values = tuple(database_health.values())
     if 'corrupt' in database_values: faults.append('database_corrupt')
@@ -1980,6 +2102,7 @@ def audit(path, *, force_integrity=False):
 def repair(path, resources):
     require_offline(path.parent)
     result = audit(path, force_integrity=True)
+    if CLIContractError.code in result['causes']: raise CLIContractError()
     if 'database_inconclusive' in result['causes']:
         raise ManagedRuntimeError('Private OpenClaw database health was inconclusive; no repair was attempted. Wait briefly and retry the read-only check.')
     if 'database_corrupt' in result['causes'] or 'private_configuration_path_changed' in result['causes']:

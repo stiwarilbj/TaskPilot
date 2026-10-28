@@ -616,6 +616,11 @@ enum ManagedGatewayHost {
                             writeHealth(current,state:"needs_repair",detail:"A private OpenClaw configuration path changed identity during a CLI operation. TaskPilot stopped activation and left the active runtime intact; inspect the private configuration directory before retrying.",root:root)
                             continue
                         }
+                        if let detail = Self.cliContractAttentionDetail(auditResult) {
+                            teardown(); repair = true; nextAudit = now + 300; nextHealth = ProcessInfo.processInfo.systemUptime + 300
+                            writeHealth(current, state:"needs_repair", detail:detail, root:root)
+                            continue
+                        }
                         writeHealth(current,state:"recovering",detail:"Repairing TaskPilot-owned runtime settings",root:root)
                         teardown()
                         _ = budget.failed()
@@ -766,6 +771,10 @@ enum ManagedGatewayHost {
         guard text.utf8.count <= PrivateRuntimeMetadata.configurationBytes,
               let data = text.data(using:.utf8) else { return nil }
         return (try? PrivateRuntimeMetadata.parse(data)) as? [String:Any]
+    }
+    static func cliContractAttentionDetail(_ audit: [String:Any]?) -> String? {
+        guard (audit?["causes"] as? [String])?.contains("managed_cli_contract") == true else { return nil }
+        return "The pinned OpenClaw CLI does not match TaskPilot’s required configuration interface. Configuration repair was withheld; install a compatible TaskPilot runtime."
     }
     static func portAvailable(_ port: Int) -> Bool { (try? portCollision(port)) == false }
     static func portCollision(_ port: Int) throws -> Bool {

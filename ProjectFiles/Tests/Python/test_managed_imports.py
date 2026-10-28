@@ -52,6 +52,9 @@ class ManagedImportTests(unittest.TestCase):
                 for path in (node, entry):
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text('fixture')
+                lock = installation / 'package/package-lock.json'; lock.write_text('{}')
+                managed.atomic_json(installation / managed.CLI_CAPABILITY_FILE, dict(version=1,
+                    package_lock_sha256=managed.digest(lock), capabilities=list(managed.CLI_CAPABILITIES)))
                 managed.atomic_json(installation / 'integrity.json',
                                     dict(fingerprint='fixture', files=managed.seal(installation)))
                 token = state / 'gateway-token'; token.write_text('fixture-token')
@@ -95,9 +98,14 @@ class ManagedImportTests(unittest.TestCase):
                 target = root / 'installations/fixture'; target.mkdir(parents=True, mode=0o700)
                 (root / 'installations').chmod(0o700)
                 (target / 'code').write_text('fixture')
+                (target / 'package').mkdir()
+                lock = target / 'package/package-lock.json'; lock.write_text('{}')
+                contract = dict(version=1, required_capabilities=list(managed.CLI_CAPABILITIES), package_lock_sha256=managed.digest(lock))
+                managed.atomic_json(target / managed.CLI_CAPABILITY_FILE, dict(version=1,
+                    package_lock_sha256=managed.digest(lock), capabilities=list(managed.CLI_CAPABILITIES)))
                 managed.atomic_json(target / 'integrity.json', dict(fingerprint='fixture', files=managed.seal(target)))
-                with patch.object(managed, 'specification', return_value=({}, 'fixture')):
-                    assert managed.install(root, root) == (target, 'fixture', {})
+                with patch.object(managed, 'specification', return_value=({'cli_contract':contract}, 'fixture')):
+                    assert managed.install(root, root) == (target, 'fixture', {'cli_contract':contract})
                 try: managed.command('unknown', descriptor=str(root / 'runtime.json'))
                 except managed.ManagedRuntimeError: pass
                 else: raise AssertionError('Unsupported operation accepted')

@@ -8,6 +8,17 @@
     "minimum_macos": "13.5"
   },
   "openclaw_integrity": "sha512-TCO/ImVLh5HkF4tdfo7iriIa7kT6iYkIr/jR5ZOkePGFGhUx5Oe7DE716Y1DzzG2teRAVDdCjgJDu1A24Yta7w==",
+  "cli_contract": {
+    "version": 1,
+    "package_lock_sha256": "feb8426db2779eb228526118286b43435d4948289aece27d744595a8df9db4fa",
+    "required_capabilities": [
+      "auth_paste_key_options",
+      "config_get_json",
+      "config_patch_replace_path",
+      "config_patch_stdin",
+      "config_validate"
+    ]
+  },
   "provisioning_space": {
     "version": 1,
     "node_archive_bytes": 134217728,

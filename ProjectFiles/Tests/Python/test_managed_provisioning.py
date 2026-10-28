@@ -46,6 +46,8 @@ class ProvisioningTests(unittest.TestCase):
                 archive.addfile(info, io.BytesIO(b'fixture'))
         self.fingerprint = hashlib.sha256(b'fixture-installation').hexdigest()
         self.manifest = dict(openclaw_version='2026.9.5', node_version='24.22.1',
+                             cli_contract=dict(version=1, required_capabilities=list(managed.CLI_CAPABILITIES),
+                                               package_lock_sha256=hashlib.sha256(b'{}').hexdigest()),
                              provisioning_space=dict(version=1, node_archive_bytes=1024, node_expanded_bytes=4096,
                                                      package_archive_bytes=8192, package_expanded_bytes=32768),
                              node_archives={platform.machine(): dict(name='fixture.tar.gz', sha256=managed.digest(self.archive))})
@@ -60,6 +62,23 @@ class ProvisioningTests(unittest.TestCase):
             (package / 'openclaw.mjs').write_text('fixture module')
         if '--version' in argv:
             return 'v' + self.manifest['node_version'] if len(argv) == 2 else self.manifest['openclaw_version']
+        if 'config' in argv and 'OPENCLAW_CONFIG_PATH' in kwargs.get('env', {}):
+            config = Path(kwargs['env']['OPENCLAW_CONFIG_PATH'])
+            value = json.loads(config.read_text())
+            if 'patch' in argv:
+                patch_value = json.loads(kwargs['input_data'])
+                if '--replace-path' in argv: value['agents']['defaults']['models'] = patch_value['agents']['defaults']['models']
+                else: value.setdefault('gateway', {}).update(patch_value['gateway'])
+                managed.atomic_json(config, value)
+            if 'get' in argv:
+                for part in argv[argv.index('get') + 1].split('.'): value = value[part]
+                return json.dumps(value)
+            if 'validate' in argv and '--json' in argv:
+                valid = type(value.get('gateway', {}).get('mode')) is str
+                output = json.dumps(dict(valid=valid))
+                return (0 if valid else 1, output) if kwargs.get('result') else output
+        if 'paste-api-key' in argv and '--help' in argv:
+            return 'Usage: openclaw models auth paste-api-key [options]\n  --provider <id> Provider\n  --profile-id <id> Profile\n'
         return ''
 
     @contextmanager
@@ -102,6 +121,10 @@ class ProvisioningTests(unittest.TestCase):
     def sealed(self, directory, fingerprint):
         directory.mkdir(mode=0o700)
         (directory / 'code').write_text('previous verified code')
+        (directory / 'package').mkdir()
+        (directory / 'package/package-lock.json').write_text('{}')
+        managed.atomic_json(directory / managed.CLI_CAPABILITY_FILE, dict(version=1,
+            package_lock_sha256=hashlib.sha256(b'{}').hexdigest(), capabilities=list(managed.CLI_CAPABILITIES)))
         managed.atomic_json(directory / 'integrity.json', dict(fingerprint=fingerprint, files=managed.seal(directory)))
         return directory
 
@@ -397,7 +420,7 @@ class ProvisioningTests(unittest.TestCase):
                     self.assertEqual(capacity.call_count, index + 1)
                     self.assertEqual(downloads.call_count, 0 if index == 0 else 1)
                     self.assertEqual(extract.call_count, 0 if index < 2 else 1)
-                    self.assertEqual(runs.call_count, {2: 1, 3: 3}.get(index, 0))
+                    self.assertEqual(runs.call_count, {2: 1, 3: 10}.get(index, 0))
                 self.assert_preserved(before)
                 stages = list((self.root / 'installations').glob('.stage-*'))
                 self.assertEqual(len(stages), 1 if phase == 'promotion' else 0)
@@ -477,7 +500,7 @@ class ProvisioningTests(unittest.TestCase):
         with self.build() as (downloads, runs):
             target, fingerprint, _ = managed.install(self.resources, self.root)
             downloads.assert_called_once()
-            self.assertEqual(runs.call_count, 3)
+            self.assertEqual(runs.call_count, 10)  # Three launch/install commands plus seven contract probes.
         self.assertTrue(managed.validate_install(target, fingerprint, force_full=True))
         self.assertEqual((target / 'node/bin/npm').read_bytes(), b'fixture')
         self.assertTrue((target / 'node/bin/npm').is_symlink())

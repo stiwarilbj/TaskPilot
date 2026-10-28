@@ -5,6 +5,15 @@ import XCTest
 @testable import OrbitAgent
 
 final class ManagedOpenClawTests: XCTestCase {
+    func testCLIContractMismatchStopsRepairWithFixedDetail() {
+        let detail = ManagedGatewayHost.cliContractAttentionDetail(["causes":["managed_cli_contract"], "detail":"untrusted output"])
+        XCTAssertTrue(detail?.contains("repair was withheld") == true)
+        XCTAssertFalse(detail?.contains("untrusted") == true)
+        let audits: [[String:Any]?] = [nil, [:], ["causes":["installation"]], ["causes":"managed_cli_contract"]]
+        for audit in audits {
+            XCTAssertNil(ManagedGatewayHost.cliContractAttentionDetail(audit))
+        }
+    }
     func testProvisioningResourceErrorsStaySpecificWithoutExposingChildPayloads() {
         let disk = #"{"kind":"error","error_code":"local_resource_disk_space","message":"untrusted child payload"}"#
         let unavailable = #"{"kind":"error","error_code":"local_resource_disk_space_check"}"#

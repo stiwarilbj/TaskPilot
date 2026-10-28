@@ -454,8 +454,12 @@ class ManagedRuntimeTests(unittest.TestCase):
             path=target/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text('fixture')
         target.chmod(0o700)
         (self.root/'installations').chmod(0o700)
+        lock = target / 'package/package-lock.json'; lock.write_text('{}')
+        contract = dict(version=1, required_capabilities=list(managed.CLI_CAPABILITIES), package_lock_sha256=managed.digest(lock))
+        managed.atomic_json(target / managed.CLI_CAPABILITY_FILE,
+                            dict(version=1, package_lock_sha256=contract['package_lock_sha256'], capabilities=list(managed.CLI_CAPABILITIES)))
         managed.atomic_json(target/'integrity.json',{'fingerprint':pin,'files':managed.seal(target)})
-        return target,pin,{'openclaw_version':'2026.9.5','node_version':'24.22.1'}
+        return target,pin,{'openclaw_version':'2026.9.5','node_version':'24.22.1', 'cli_contract':contract}
     def test_failed_promotion_preserves_descriptor_and_compatible_configuration(self):
         with patch.object(managed,'install',return_value=self.fake_install('old')), patch.object(managed,'bounded_run'), patch.object(managed,'verify_settings'):
             first=managed.ensure(self.root,self.root)
@@ -739,7 +743,10 @@ class PrivateDirectoryTests(unittest.TestCase):
         @contextmanager
         def hold(*args, **kwargs):
             calls.append('drained'); yield
-        install = (Path(d['node']).parents[2], 'pin', {'openclaw_version':'2026.9.5','node_version':'24.22.1'})
+        target = Path(d['node']).parents[2]
+        contract = dict(version=1, required_capabilities=list(managed.CLI_CAPABILITIES),
+                        package_lock_sha256=managed.digest(target / 'package/package-lock.json'))
+        install = (target, 'pin', {'openclaw_version':'2026.9.5', 'node_version':'24.22.1', 'cli_contract':contract})
         with patch.object(managed, 'configuration_hold', hold), patch.object(managed, 'install', return_value=install), patch.object(managed, 'bounded_run'), patch.object(managed, 'verify_settings'):
             managed.ensure(self.root, self.root, drained=True)
         self.assertEqual(calls, ['drained'])
