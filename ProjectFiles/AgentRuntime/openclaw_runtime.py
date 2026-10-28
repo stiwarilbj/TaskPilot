@@ -4989,6 +4989,8 @@ def _stop_handler(_signal_number: int, _frame: Any) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=f"{PRODUCT_NAME} OpenClaw runtime")
     parser.add_argument("--managed-openclaw", choices=("ensure", "relocate", "rollback", "audit", "repair", "collect-profiles"))
+    parser.add_argument("--managed-download-worker", nargs=4, metavar=("URL", "SHA256", "FD", "SECONDS"),
+                        help=argparse.SUPPRESS)
     parser.add_argument("--managed-resources")
     parser.add_argument("--managed-descriptor")
     parser.add_argument("--force-integrity-audit", action="store_true")
@@ -5101,6 +5103,8 @@ def main() -> int:
     signal.signal(signal.SIGINT, _stop_handler)
     args = parse_args()
     try:
+        if args.managed_download_worker:
+            return managed_openclaw.download_worker_cli(args.managed_download_worker)
         if args.managed_openclaw:
             return managed_openclaw.command(args.managed_openclaw, args.managed_resources,
                                             args.managed_descriptor, force_integrity=args.force_integrity_audit)

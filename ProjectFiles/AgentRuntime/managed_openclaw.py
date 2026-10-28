@@ -23,6 +23,7 @@ import shutil
 import socket
 import stat
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -43,6 +44,12 @@ INTEGRITY_CACHE_MAX_BYTES = 64 * 1024 * 1024
 NATIVE_ADDON_FACTS_VERSION = 1
 PROVISIONING_RESERVE_BYTES = 512 * 1024 * 1024
 PROVISIONING_TEMPORARY_BYTES = 256 * 1024 * 1024
+RUNTIME_DOWNLOAD_TOTAL_SECONDS = 5 * 60
+RUNTIME_DOWNLOAD_READ_TIMEOUT_SECONDS = 45
+RUNTIME_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
+RUNTIME_DOWNLOAD_MAX_BYTES = 1024 * 1024 * 1024
+DOWNLOAD_WORKER_CHECKSUM_EXIT = 65
+DOWNLOAD_WORKER_DEADLINE_EXIT = 66
 SQLITE_HEALTH_TIMEOUT_SECONDS = 0.75
 SQLITE_BUSY_TIMEOUT_MILLISECONDS = 100
 SQLITE_PROGRESS_INTERVAL = 500
@@ -77,6 +84,20 @@ class ProvisioningResourceError(ManagedRuntimeError):
             detail = (f'Not enough disk space before private OpenClaw {phase}: '
                       f'at least {needed} MiB free is needed; {free} MiB is available. Free disk space and retry.')
         super().__init__(self.code + ': ' + detail + ' The current working runtime was left intact.')
+
+
+class RuntimeDownloadDeadlineError(ManagedRuntimeError):
+    code = 'runtime_download_deadline'
+
+    def __init__(self):
+        super().__init__('The pinned runtime download exceeded its total time limit; the partial staged download was discarded. The working installation was left intact.')
+
+
+class RuntimeDownloadChecksumError(ManagedRuntimeError):
+    code = 'runtime_download_checksum'
+
+    def __init__(self):
+        super().__init__('The official Node checksum did not match. The partial staged download was discarded; the working installation was left intact.')
 
 
 def provisioning_space(manifest):
@@ -788,18 +809,162 @@ def specification(resources: Path):
         ('runtime-manifest.json', 'package.json', 'package-lock.json'))).hexdigest()
     return manifest, fingerprint
 
-def download(url, destination, expected):
+def _download_socket(response):
+    """Return urllib's underlying socket when its concrete response exposes it."""
+    stream = getattr(response, 'fp', None)
+    raw = getattr(stream, 'raw', None)
+    return getattr(raw, '_sock', None) or getattr(stream, '_sock', None)
+
+
+def _download_worker(url, expected, descriptor, total_seconds, *, opener=None, monotonic=time.monotonic):
+    """Write one bounded download to an already-owned staged file descriptor."""
     # Health checks never need the HTTP/TLS download stack.
     import urllib.request
-    h = hashlib.sha256(); count = 0
-    with urllib.request.urlopen(url, timeout=45) as response, destination.open('wb') as f:
-        while chunk := response.read(1024 * 1024):
-            count += len(chunk)
-            if count > 1024 * 1024 * 1024: raise ManagedRuntimeError('Runtime download exceeds its size limit.')
-            h.update(chunk); f.write(chunk)
-    if h.hexdigest() != expected:
-        destination.unlink(missing_ok=True)
-        raise ManagedRuntimeError('Official Node checksum did not match. Installation was not activated.')
+    if opener is None: opener = urllib.request.urlopen
+    if (not isinstance(url, str) or not url.startswith(('https://', 'http://', 'data:')) or
+            not isinstance(expected, str) or re.fullmatch(r'[a-f0-9]{64}', expected) is None or
+            type(descriptor) is not int or descriptor < 0 or
+            not isinstance(total_seconds, (int, float)) or isinstance(total_seconds, bool) or
+            not math.isfinite(total_seconds) or total_seconds <= 0):
+        raise ManagedRuntimeError('Runtime download parameters are invalid.')
+
+    deadline = monotonic() + total_seconds
+    h, count = hashlib.sha256(), 0
+    try:
+        # The parent supervisor enforces the absolute wall-clock bound even if
+        # connection setup or an HTTP header read blocks. These socket timeouts
+        # make ordinary blocked body reads stop at the smaller remaining bound.
+        with opener(url, timeout=min(RUNTIME_DOWNLOAD_READ_TIMEOUT_SECONDS, total_seconds)) as response:
+            while True:
+                remaining = deadline - monotonic()
+                if remaining <= 0: raise RuntimeDownloadDeadlineError()
+                sock = _download_socket(response)
+                if sock is not None: sock.settimeout(min(RUNTIME_DOWNLOAD_READ_TIMEOUT_SECONDS, remaining))
+                read = getattr(response, 'read1', response.read)
+                chunk = read(min(RUNTIME_DOWNLOAD_CHUNK_BYTES, RUNTIME_DOWNLOAD_MAX_BYTES - count + 1))
+                if monotonic() >= deadline: raise RuntimeDownloadDeadlineError()
+                if not chunk: break
+                count += len(chunk)
+                if count > RUNTIME_DOWNLOAD_MAX_BYTES:
+                    raise ManagedRuntimeError('Runtime download exceeds its size limit.')
+                h.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    if monotonic() >= deadline: raise RuntimeDownloadDeadlineError()
+                    written = os.write(descriptor, view)
+                    if written <= 0: raise OSError(errno.EIO, 'runtime download write made no progress')
+                    view = view[written:]
+        if monotonic() >= deadline: raise RuntimeDownloadDeadlineError()
+        if h.hexdigest() != expected: raise RuntimeDownloadChecksumError()
+    except RuntimeDownloadDeadlineError:
+        raise
+    except Exception:
+        if monotonic() >= deadline: raise RuntimeDownloadDeadlineError()
+        raise
+
+
+def download_worker_cli(arguments):
+    """Private frozen-runtime entry point; return fixed codes, never network text."""
+    if not isinstance(arguments, (list, tuple)) or len(arguments) != 4: return 64
+    url, expected, raw_descriptor, raw_seconds = arguments
+    try:
+        descriptor, seconds = int(raw_descriptor), float(raw_seconds)
+        _download_worker(url, expected, descriptor, seconds)
+        return 0
+    except RuntimeDownloadChecksumError:
+        return DOWNLOAD_WORKER_CHECKSUM_EXIT
+    except RuntimeDownloadDeadlineError:
+        return DOWNLOAD_WORKER_DEADLINE_EXIT
+    except Exception:
+        return 1
+
+
+def _download_worker_argv(url, expected, descriptor, total_seconds):
+    if getattr(sys, 'frozen', False):
+        return [sys.executable, '--managed-download-worker', url, expected,
+                str(descriptor), repr(float(total_seconds))]
+    # Source-tree tests and local development use the same runtime code in a
+    # supervised Python child; packaged TaskPilot invokes its frozen entrypoint.
+    source = ('import sys; sys.path.insert(0, sys.argv.pop(1)); '
+              'import managed_openclaw; '
+              'raise SystemExit(managed_openclaw.download_worker_cli(sys.argv[1:]))')
+    return [sys.executable, '-c', source, str(Path(__file__).resolve().parent),
+            url, expected, str(descriptor), repr(float(total_seconds))]
+
+
+def _same_file_identity(left, right):
+    return (left.st_dev, left.st_ino, stat.S_IFMT(left.st_mode), left.st_uid) == \
+        (right.st_dev, right.st_ino, stat.S_IFMT(right.st_mode), right.st_uid)
+
+
+def _unlink_download_if_owned(parent_fd, name, descriptor):
+    try:
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        opened = os.fstat(descriptor)
+        if stat.S_ISREG(named.st_mode) and named.st_uid == os.getuid() and _same_file_identity(named, opened):
+            os.unlink(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        pass
+
+
+def download(url, destination, expected, *, total_seconds=RUNTIME_DOWNLOAD_TOTAL_SECONDS,
+             monotonic=time.monotonic):
+    """Supervise a staged download with one elapsed-time and byte ceiling."""
+    # Import only when provisioning requests an actual download. This keeps the
+    # HTTP/TLS stack absent from normal readiness and installation audits.
+    import subprocess
+    import urllib.request
+    if (not isinstance(total_seconds, (int, float)) or isinstance(total_seconds, bool) or
+            not math.isfinite(total_seconds) or not 0 < total_seconds <= RUNTIME_DOWNLOAD_TOTAL_SECONDS):
+        raise ManagedRuntimeError('Runtime download time limit is invalid.')
+    destination = Path(destination)
+    name = destination.name
+    if not name or name in ('.', '..') or destination.parent == destination:
+        raise ManagedRuntimeError('Runtime download destination is invalid.')
+    deadline = monotonic() + total_seconds
+    parent_fd = descriptor = -1
+    succeeded = False
+    try:
+        before = destination.parent.lstat()
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode) or before.st_uid != os.getuid():
+            raise ManagedRuntimeError('Private runtime staging directory changed before download.')
+        parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0))
+        parent_info = os.fstat(parent_fd)
+        if not _same_file_identity(before, parent_info):
+            raise ManagedRuntimeError('Private runtime staging directory changed before download.')
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0)
+        descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        created = os.fstat(descriptor)
+        if not stat.S_ISREG(created.st_mode) or created.st_uid != os.getuid() or created.st_nlink != 1:
+            raise ManagedRuntimeError('Private runtime staging file could not be safely created.')
+        remaining = deadline - monotonic()
+        if remaining <= 0: raise RuntimeDownloadDeadlineError()
+        argv = _download_worker_argv(url, expected, descriptor, remaining)
+        try:
+            status, _ = bounded_run(argv, env=isolated_environment(), timeout=remaining,
+                                   cwd=destination.parent, result=True, pass_fds=(descriptor,),
+                                   maximum_output=4096)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeDownloadDeadlineError() from error
+        if status == DOWNLOAD_WORKER_CHECKSUM_EXIT: raise RuntimeDownloadChecksumError()
+        if status == DOWNLOAD_WORKER_DEADLINE_EXIT: raise RuntimeDownloadDeadlineError()
+        if status != 0: raise ManagedRuntimeError('The pinned runtime download failed; its staged partial file was discarded. The working installation was left intact.')
+        if monotonic() >= deadline: raise RuntimeDownloadDeadlineError()
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        current_parent = destination.parent.lstat()
+        if (not stat.S_ISREG(named.st_mode) or named.st_nlink != 1 or
+                not _same_file_identity(named, os.fstat(descriptor)) or
+                not _same_file_identity(current_parent, parent_info)):
+            raise ManagedRuntimeError('Private runtime staging file changed during download.')
+        succeeded = True
+    except BaseException:
+        if parent_fd >= 0 and descriptor >= 0:
+            _unlink_download_if_owned(parent_fd, name, descriptor)
+        raise
+    finally:
+        if descriptor >= 0: os.close(descriptor)
+        if parent_fd >= 0: os.close(parent_fd)
+    if not succeeded: raise ManagedRuntimeError('Runtime download did not complete.')
 
 def _identity_at(path, expected):
     path = Path(path)

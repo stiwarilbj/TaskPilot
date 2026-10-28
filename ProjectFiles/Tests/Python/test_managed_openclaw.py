@@ -1,10 +1,13 @@
 """Offline installation/descriptor/recovery safety. No real downloads/providers."""
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'AgentRuntime'))
@@ -430,12 +433,56 @@ class ManagedRuntimeTests(unittest.TestCase):
         (self.root/'package-lock.json').write_text(json.dumps(lock))
         with self.assertRaises(managed.ManagedRuntimeError):managed.specification(self.root)
     def test_checksum_failure_cannot_activate_download(self):
-        import io
         destination=self.root/'archive'
-        with patch('urllib.request.urlopen',return_value=io.BytesIO(b'tampered')):
-            with self.assertRaisesRegex(managed.ManagedRuntimeError,'checksum'):
-                managed.download('https://nodejs.org/fixture',destination,'0'*64)
+        with self.assertRaisesRegex(managed.ManagedRuntimeError,'checksum'):
+            managed.download('data:,tampered',destination,'0'*64,total_seconds=5)
         self.assertFalse(destination.exists());self.assertFalse(self.path.exists())
+
+    def test_slow_progress_download_hits_total_deadline_and_preserves_active_install(self):
+        active = self.root/'installations/active'; active.mkdir(parents=True,mode=0o700)
+        active_file = active/'node'; active_file.write_bytes(b'last working runtime')
+        managed.atomic_json(self.path, {'active':str(active), 'version':'working'})
+        before_descriptor = self.path.read_bytes()
+        before_runtime = active_file.read_bytes()
+        stage = self.root/'installations/.stage-download'; stage.mkdir(mode=0o700)
+        payload = stage/'node.tar.gz'
+
+        class SlowHandler(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Length', '10000')
+                self.end_headers()
+                try:
+                    for _ in range(10000):
+                        self.wfile.write(b'x')
+                        self.wfile.flush()
+                        time.sleep(0.01)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+            def log_message(self, *_):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), SlowHandler)
+        server.daemon_threads = True
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        def stop_server():
+            server.shutdown()
+            server.server_close()
+            server_thread.join(2)
+        self.addCleanup(stop_server)
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(managed.RuntimeDownloadDeadlineError, 'total time limit'):
+            managed.download(f'http://127.0.0.1:{server.server_port}/node.tar.gz', payload,
+                             hashlib.sha256(b'x'*10000).hexdigest(), total_seconds=0.35)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.0, 'the supervisor must stop a continuously progressing stream near its total allowance')
+        self.assertFalse(payload.exists(), 'only the owned partial staged download should be removed')
+        self.assertEqual(list(stage.iterdir()), [])
+        self.assertEqual(self.path.read_bytes(), before_descriptor)
+        self.assertEqual(active_file.read_bytes(), before_runtime)
     def test_failed_install_leaves_active_descriptor_and_no_staging_directory(self):
         resources=Path(__file__).resolve().parents[2]/'Resources/OpenClaw/managed'
         managed.atomic_json(self.path,{'original':True})
