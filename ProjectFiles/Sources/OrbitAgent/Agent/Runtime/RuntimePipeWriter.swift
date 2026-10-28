@@ -18,7 +18,9 @@ final class RuntimePipeWriter {
     private let telemetry: BackendTelemetry
     // Injectable only so tests can force partial POSIX writes; production uses Darwin.write.
     private let writeOperation: WriteOperation
-    private var frames: [Frame] = []
+    // A consumed slot is cleared as soon as its completion callback is taken.
+    // The head index still avoids shifting live frames on every write.
+    private var frames: [Frame?] = []
     private var frameHead = 0
     private var bytes = 0
     private var source: DispatchSourceWrite?
@@ -98,32 +100,40 @@ final class RuntimePipeWriter {
             // Once any bytes are dispatched, finish the frame under the
             // existing transport timeout. Dropping its suffix corrupts framing
             // and cannot establish that an associated action failed.
-            if frames[frameHead].offset == 0 {
-                do { try frames[frameHead].budget?.check(phase: "pipe_queue") }
+            if frames[frameHead]!.offset == 0 {
+                do { try frames[frameHead]!.budget?.check(phase: "pipe_queue") }
                 catch {
-                    let frame = frames[frameHead]; frameHead += 1; bytes -= frame.data.count
+                    let index = frameHead
+                    let frameBytes = frames[index]!.data.count
+                    let ticket = frames[index]!.waitTicket
+                    let completion = frames[index]!.completion
+                    frameHead += 1; bytes -= frameBytes
+                    frames[index] = nil
                     compactConsumedPrefixIfNeeded()
-                    rejectExpired(frame.waitTicket, completion: frame.completion, error: error)
+                    rejectExpired(ticket, completion: completion, error: error)
                     continue
                 }
             }
-            frames[frameHead].waitTicket.start()
-            let written = frames[frameHead].data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
-                writeOperation(descriptor, buffer.baseAddress!.advanced(by: frames[frameHead].offset),
-                               min(allowance, buffer.count - frames[frameHead].offset))
+            frames[frameHead]!.waitTicket.start()
+            let written = frames[frameHead]!.data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
+                writeOperation(descriptor, buffer.baseAddress!.advanced(by: frames[frameHead]!.offset),
+                               min(allowance, buffer.count - frames[frameHead]!.offset))
             }
             if written < 0 {
                 if errno == EAGAIN || errno == EINTR { return }
                 fail("transport_closed"); return
             }
             guard written > 0 else { return }
-            frames[frameHead].offset += written; allowance -= written
-            if frames[frameHead].offset == frames[frameHead].data.count {
-                let frame = frames[frameHead]
+            frames[frameHead]!.offset += written; allowance -= written
+            if frames[frameHead]!.offset == frames[frameHead]!.data.count {
+                let index = frameHead
+                let frameBytes = frames[index]!.data.count
+                let completion = frames[index]!.completion
                 frameHead += 1
-                bytes -= frame.data.count
+                bytes -= frameBytes
+                frames[index] = nil
                 compactConsumedPrefixIfNeeded()
-                frame.completion(true)
+                completion(true)
                 if pendingFrameCount > 0 { armDeadline() }
             }
         }
@@ -149,7 +159,7 @@ final class RuntimePipeWriter {
     func cancel() {
         guard !closed else { return }
         closed = true; source?.cancel(); source = nil; deadline?.cancel(); deadline = nil
-        let pending = Array(frames[frameHead...])
+        let pending = frames[frameHead...].compactMap { $0 }
         frames.removeAll(keepingCapacity: true); frameHead = 0; bytes = 0
         for frame in pending {
             frame.waitTicket.discard(.cancelled)

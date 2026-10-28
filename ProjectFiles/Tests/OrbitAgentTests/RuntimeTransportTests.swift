@@ -171,6 +171,47 @@ final class RuntimeTransportTests: XCTestCase {
         queue.sync { XCTAssertEqual(writer.pendingBytes, 0); writer.cancel() }
     }
 
+    func testCompletedFrameStorageReleasesBeforePrefixCompaction() {
+        let queue = DispatchQueue(label: "fixture.writer.release-consumed-frame"), pipe = Pipe()
+        let storageReleased = expectation(description: "Completed frame storage is released")
+        var calls = 0
+        var completions: [Bool] = []
+        var writer: RuntimePipeWriter!
+        var allocation: UnsafeMutableRawPointer? = .allocate(byteCount: 48 * 1024, alignment: 1)
+        allocation!.initializeMemory(as: UInt8.self, repeating: 0x5A, count: 48 * 1024)
+        var payload: Data? = Data(bytesNoCopy: allocation!, count: 48 * 1024, deallocator: .custom { pointer, _ in
+            pointer.deallocate()
+            storageReleased.fulfill()
+        })
+        allocation = nil // Data owns the allocation from this point onward.
+
+        queue.sync {
+            writer = RuntimePipeWriter(handle: pipe.fileHandleForWriting, queue: queue,
+                writeOperation: { _, _, requested in
+                    calls += 1
+                    if calls == 1 { return requested } // Complete the large first frame.
+                    errno = EAGAIN // Keep later frames queued so the consumed prefix cannot compact.
+                    return -1
+                }, failure: { XCTFail($0) })
+            writer.enqueue(payload!) { completions.append($0) }
+            payload = nil
+            for _ in 1..<65 {
+                writer.enqueue(Data([0x5A])) { completions.append($0) }
+            }
+        }
+
+        wait(for: [storageReleased], timeout: 2)
+        queue.sync {
+            XCTAssertEqual(writer.pendingBytes, 64)
+            XCTAssertEqual(completions, [true])
+            writer.cancel()
+            XCTAssertEqual(completions.count, 65)
+            XCTAssertEqual(completions.filter { $0 }.count, 1)
+            writer.cancel() // A second cancellation must not settle callbacks again.
+            XCTAssertEqual(completions.count, 65)
+        }
+    }
+
     func testWriterQueueWaitEndsAtFirstWriteAndSeparatesPendingCancellation() {
         let queue = DispatchQueue(label: "fixture.writer.queue-wait"), pipe = Pipe()
         let clock = FakeClock(), telemetry = BackendTelemetry(now: { clock.now() })
