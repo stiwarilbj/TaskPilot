@@ -1572,7 +1572,17 @@ final class AccessibilityController {
                 throw AccessibilityActionError.invalidAction("Invalid local dialog check")
             }
         } else if effect != nil { throw AccessibilityActionError.invalidAction("Unsupported local screen check") }
-        let elements = record.map { [$0.element] + ($0.window.map { [$0] } ?? []) } ?? []
+        let elements: [AXUIElement]
+        if let record {
+            var candidates = [record.element]
+            let applicationElement = AXUIElementCreateApplication(record.pid)
+            if let container = accessibilityElement(record.element, kAXParentAttribute),
+               !CFEqual(container, applicationElement), !CFEqual(container, record.element) {
+                candidates.append(container)
+            }
+            if let window = record.window { candidates.append(window) }
+            elements = candidates
+        } else { elements = [] }
         let probe: () throws -> Bool? = { [self] in
             try TaskOwnership.check()
             if let pid, let application {

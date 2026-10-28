@@ -76,9 +76,79 @@ protocol LocalChangeSource: AnyObject {
     func close() async
 }
 
+/// Builds a bounded, ordered set of native element/notification pairs. AXUIElement
+/// wrappers may be repeated in candidate lists, so identity is supplied by the
+/// native caller (CFHash/CFEqual for Accessibility) rather than presentation data.
+struct AccessibilityNotificationRegistrationPlanner {
+    struct Pair<Element, Event> {
+        let element: Element
+        let event: Event
+    }
+
+    static func plan<Element, Event>(
+        elements: [Element], application: Element,
+        elementEvents: [Event], applicationEvents: [Event], maximum: Int,
+        identityHash: (Element) -> UInt,
+        elementsEqual: (Element, Element) -> Bool,
+        eventsEqual: (Event, Event) -> Bool
+    ) -> [Pair<Element, Event>] {
+        guard maximum > 0 else { return [] }
+
+        // Keep only the first two distinct elements for priority, ensuring a
+        // repeated target cannot displace its container and a large candidate
+        // list never becomes another unbounded allocation.
+        var priorityElements: [Element] = []
+        var priorityBuckets: [UInt: [Element]] = [:]
+        for element in elements {
+            if priorityElements.count == 2 { break }
+            let hash = identityHash(element)
+            guard !(priorityBuckets[hash] ?? []).contains(where: { elementsEqual($0, element) }) else { continue }
+            priorityBuckets[hash, default: []].append(element)
+            priorityElements.append(element)
+        }
+
+        var pairs: [Pair<Element, Event>] = []
+        var pairBuckets: [UInt: [Pair<Element, Event>]] = [:]
+        func append(_ element: Element, _ event: Event) {
+            guard pairs.count < maximum else { return }
+            let hash = identityHash(element)
+            if (pairBuckets[hash] ?? []).contains(where: {
+                elementsEqual($0.element, element) && eventsEqual($0.event, event)
+            }) { return }
+            let pair = Pair(element: element, event: event)
+            pairBuckets[hash, default: []].append(pair)
+            pairs.append(pair)
+        }
+
+        // Callers place the intended target first and its container second.
+        // Register those before application events, then use remaining capacity
+        // for additional candidates. This keeps the useful wakeups when a large
+        // candidate list reaches the ceiling.
+        for element in priorityElements {
+            for event in elementEvents {
+                append(element, event)
+                if pairs.count == maximum { return pairs }
+            }
+        }
+        for event in applicationEvents {
+            append(application, event)
+            if pairs.count == maximum { return pairs }
+        }
+        for element in elements where !priorityElements.contains(where: { elementsEqual($0, element) }) {
+            for event in elementEvents {
+                append(element, event)
+                if pairs.count == maximum { return pairs }
+            }
+        }
+        return pairs
+    }
+}
+
 /// One scoped native subscription. AX registration/removal and callbacks use
 /// the main run loop; vnode descriptors are closed before the wait drains.
 final class NativeChangeSubscription: LocalChangeSource {
+    static let accessibilityRegistrationLimit = 32
+
     private struct FileWatch {
         let path: String
         let device: dev_t
@@ -88,6 +158,7 @@ final class NativeChangeSubscription: LocalChangeSource {
     }
     private let signal: LocalChangeSignal
     private var observer: AXObserver?
+    private var observerSourceInstalled = false
     private var registrations: [(AXUIElement, CFString)] = []
     private var fileURL: URL?
     private var files: [FileWatch] = []
@@ -116,17 +187,30 @@ final class NativeChangeSubscription: LocalChangeSource {
             let controlEvents = [kAXValueChangedNotification, kAXSelectedChildrenChangedNotification,
                 kAXElementBusyChangedNotification, kAXUIElementDestroyedNotification]
             let context = Unmanaged.passUnretained(signal).toOpaque()
-            for (element, events) in [(app, applicationEvents)] + elements.map({ ($0, controlEvents) }) {
-                // Unsupported registrations simply leave polling available.
-                defer { AXUIElementSetMessagingTimeout(element, 0) }
-                for event in events where signal.isCurrent && !Task.isCancelled && ProcessInfo.processInfo.systemUptime < deadline {
-                    AXUIElementSetMessagingTimeout(element, Float(min(0.05, max(0.001, deadline - ProcessInfo.processInfo.systemUptime))))
-                    if AXObserverAddNotification(observer, element, event as CFString, context) == .success {
-                        source.registrations.append((element, event as CFString))
-                    }
-                }
+            let plan = AccessibilityNotificationRegistrationPlanner.plan(
+                elements: elements, application: app,
+                elementEvents: controlEvents, applicationEvents: applicationEvents,
+                maximum: Self.accessibilityRegistrationLimit,
+                identityHash: { UInt(CFHash($0)) }, elementsEqual: { CFEqual($0, $1) },
+                eventsEqual: ==
+            )
+            for pair in plan {
+                // Unsupported or over-ceiling pairs retain the existing bounded
+                // polling fallback. Every planned pair consumes at most one AX
+                // call, and accepted registrations alone are removed at close.
+                guard signal.isCurrent, !Task.isCancelled,
+                      ProcessInfo.processInfo.systemUptime < deadline else { break }
+                AXUIElementSetMessagingTimeout(pair.element,
+                    Float(min(0.05, max(0.001, deadline - ProcessInfo.processInfo.systemUptime))))
+                let notification = pair.event as CFString
+                let status = AXObserverAddNotification(observer, pair.element, notification, context)
+                AXUIElementSetMessagingTimeout(pair.element, 0)
+                if status == .success { source.registrations.append((pair.element, notification)) }
             }
-            CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+            if !source.registrations.isEmpty {
+                CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+                source.observerSourceInstalled = true
+            }
         }
         return source
     }
@@ -197,7 +281,10 @@ final class NativeChangeSubscription: LocalChangeSource {
         guard !closed else { return }; closed = true; signal.close()
         await MainActor.run {
             if let observer {
-                CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+                if observerSourceInstalled {
+                    CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+                    observerSourceInstalled = false
+                }
                 for (element, event) in registrations {
                     // Cleanup must not wait on a hung application's default AX
                     // timeout. Releasing the observer also removes its source.

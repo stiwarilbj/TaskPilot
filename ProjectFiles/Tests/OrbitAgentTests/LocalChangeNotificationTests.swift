@@ -3,6 +3,11 @@ import XCTest
 @testable import OrbitAgent
 
 final class LocalChangeNotificationTests: XCTestCase {
+    private final class ElementIdentityFixture {
+        let nativeIdentity: Int
+        init(_ nativeIdentity: Int) { self.nativeIdentity = nativeIdentity }
+    }
+
     private final class FakeSource: LocalChangeSource {
         var supported = true
         var refreshes = 0
@@ -15,6 +20,50 @@ final class LocalChangeNotificationTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         return directory
+    }
+
+    func testAccessibilityRegistrationPlanDeduplicatesNativePairsAndCapsAttempts() {
+        let target = ElementIdentityFixture(1), repeatedTarget = ElementIdentityFixture(1)
+        let container = ElementIdentityFixture(2), repeatedContainer = ElementIdentityFixture(2)
+        let application = ElementIdentityFixture(3)
+        let additional = (4..<20).map(ElementIdentityFixture.init)
+        let elementEvents = ["value", "selection", "busy", "destroyed"]
+        let applicationEvents = ["window", "focused-window", "focused-control", "layout", "menu-opened", "menu-closed"]
+
+        let plan = AccessibilityNotificationRegistrationPlanner.plan(
+            elements: [target, repeatedTarget, container, repeatedContainer] + additional,
+            application: application, elementEvents: elementEvents,
+            applicationEvents: applicationEvents,
+            maximum: NativeChangeSubscription.accessibilityRegistrationLimit,
+            // Force hash collisions: equality must still distinguish native
+            // objects, while wrappers for the same object collapse.
+            identityHash: { _ in 7 },
+            elementsEqual: { $0.nativeIdentity == $1.nativeIdentity },
+            eventsEqual: ==
+        )
+
+        XCTAssertEqual(plan.count, NativeChangeSubscription.accessibilityRegistrationLimit)
+        XCTAssertLessThanOrEqual(plan.count, NativeChangeSubscription.accessibilityRegistrationLimit)
+        let pairKeys = plan.map { "\($0.element.nativeIdentity):\($0.event)" }
+        XCTAssertEqual(Array(pairKeys.prefix(4)), elementEvents.map { "1:\($0)" })
+        XCTAssertEqual(Array(pairKeys.dropFirst(4).prefix(4)), elementEvents.map { "2:\($0)" })
+        XCTAssertEqual(Array(pairKeys.dropFirst(8).prefix(applicationEvents.count)),
+                       applicationEvents.map { "3:\($0)" })
+        XCTAssertEqual(Set(pairKeys).count, pairKeys.count)
+        XCTAssertTrue(plan.dropFirst(14).allSatisfy { $0.element.nativeIdentity >= 4 })
+    }
+
+    func testUnsupportedAccessibilityRegistrationStillUsesReadbackPollingAndCloses() async throws {
+        let source = FakeSource(); source.supported = false
+        var clock = 0.0, checks = 0
+        let result = try await LocalChangeWait.run(signal: LocalChangeSignal(lease: nil), source: source,
+            deadline: 1, check: { checks += 1; return checks == 2 }, now: { clock },
+            wake: { interval in clock += interval; return .poll })
+        XCTAssertFalse(result.supported)
+        XCTAssertTrue(result.candidate == true)
+        XCTAssertEqual(result.checks, 2)
+        XCTAssertEqual(source.refreshes, 1)
+        XCTAssertEqual(source.closes, 1)
     }
 
     func testAlreadySatisfiedConditionChecksOnceAndNeverWaits() async throws {

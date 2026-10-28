@@ -12,6 +12,14 @@ irrelevant, missing, and coalesced events retain a maximum 500 ms polling
 fallback. Notification bursts have a bounded 50 ms debounce. Existing settling
 deadlines and the two-second file/readback bounds are shared rather than renewed.
 
+Accessibility registration deduplicates element/notification pairs by native
+element identity (`CFHash` with `CFEqual` collision checks), never by labels or
+coordinates. The intended target and its container are considered first,
+followed by application-level notifications and then remaining candidates. A
+wait attempts at most 32 registrations; unsupported or over-limit pairs do not
+disable the existing polling fallback. Successful pairs alone are removed when
+the scoped observer closes.
+
 For a supported field expectation, the native probe reads the current observed
 field and checks its app identity, owner window, label, role, and secure-input
 exclusion. Dialog probes search only the intended app's window subtree, bounded
