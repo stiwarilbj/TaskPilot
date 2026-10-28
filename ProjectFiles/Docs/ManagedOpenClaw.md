@@ -127,6 +127,26 @@ cleared by healthy refreshes or new tasks. Unsupported ACP/configuration stops
 restarts and reports repair or selects a verified compatible rollback. Gateway
 output is continuously drained and discarded with bounded retention.
 
+The private recovery record also carries a versioned boot-session UUID, uptime
+restart timestamps and probe deadline, and a paired wall/uptime anchor. On the
+same boot, admission and ten-minute expiry use uptime, including after a host
+restart. A wall/uptime disagreement greater than five seconds adds a 60-second
+probe hold without erasing spent attempts or shortening a later valid circuit.
+Reboot, uptime regression, and invalid timing metadata rebase existing spent
+attempts into one conservative ten-minute window and replace uncertain deadlines
+with a 60-second hold. Repeated refreshes or host restarts on that boot do not
+extend the hold. Local probes remain distinct from permission to launch another
+Gateway; the three-attempt window still applies. A healthy empty budget gains no
+reboot penalty. If the boot UUID cannot be read, a host-local opaque marker makes
+cross-host timing uncertain rather than trusting another boot's uptime.
+
+Legacy records still decode their wall fields and optional reservation flag;
+their plausible ages/deadlines are translated once, with future or inconsistent
+dates taking the conservative path. Changed timing is persisted before launch;
+unchanged refreshes do not rewrite the record. Timing metadata contains no task,
+provider, credential, command, or response contents. Offline clock fixtures run
+with `swift test --filter 'GatewayRecoveryBudgetTests|ManagedOpenClawTests'`.
+
 Python's recovering state permits no action, planning, or completion. A lost
 reasoning transport first ends its ACP child, waits for private health, and
 requires the Gateway's terminal abort acknowledgement before one reasoning

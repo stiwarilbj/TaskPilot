@@ -172,13 +172,50 @@ struct ManagedProcessIdentity: Codable, Equatable {
     var alive: Bool { Self.read(pid) == self }
 }
 
+struct GatewayRecoveryClock: Codable, Equatable {
+    let bootSession: String
+    let wall: TimeInterval
+    let monotonic: TimeInterval
+
+    private static let systemBootSession: String = {
+        var bytes = [CChar](repeating: 0, count: 128)
+        var size = bytes.count
+        let result = bytes.withUnsafeMutableBytes {
+            sysctlbyname("kern.bootsessionuuid", $0.baseAddress, &size, nil, 0)
+        }
+        if result == 0, size > 1, size <= bytes.count, bytes[size - 1] == 0,
+           let uuid = UUID(uuidString: String(cString: bytes)) { return uuid.uuidString }
+        // If boot identity is unavailable, trust uptime only within this host.
+        return "host-" + UUID().uuidString
+    }()
+    static var current: Self {
+        Self(bootSession: systemBootSession, wall: Date().timeIntervalSince1970,
+             monotonic: ProcessInfo.processInfo.systemUptime)
+    }
+    fileprivate var valid: Bool {
+        !bootSession.isEmpty && bootSession.utf8.count <= 128 &&
+            wall.isFinite && monotonic.isFinite && monotonic >= 0
+    }
+}
+
 /// A single budget survives host/app restarts. Refresh and task starts cannot reset it.
 struct GatewayRecoveryBudget: Codable, Equatable {
+    static let restartWindow: TimeInterval = 600
+    static let uncertainClockCooldown: TimeInterval = 60
+    private static let clockTolerance: TimeInterval = 5
+    private struct Timing: Codable, Equatable {
+        var version = 1
+        var anchor: GatewayRecoveryClock
+        var restarts: [TimeInterval]
+        var nextProbe: TimeInterval
+    }
+    // Retain the original wall-clock fields for older records and diagnostics.
     var restarts: [TimeInterval] = []
     var nextProbe: TimeInterval = 0
     var circuits = 0
     var restartReserved = false
-    enum CodingKeys: String, CodingKey { case restarts, nextProbe, circuits, restartReserved }
+    private var timing: Timing?
+    enum CodingKeys: String, CodingKey { case restarts, nextProbe, circuits, restartReserved, timing }
     init() {}
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -186,18 +223,96 @@ struct GatewayRecoveryBudget: Codable, Equatable {
         nextProbe = try values.decode(TimeInterval.self, forKey:.nextProbe)
         circuits = try values.decode(Int.self, forKey:.circuits)
         restartReserved = try values.decodeIfPresent(Bool.self, forKey:.restartReserved) ?? false
-    }
-    mutating func failed(now: TimeInterval) -> TimeInterval {
-        restarts.removeAll { now - $0 >= 600 }
-        if restarts.count < 3 {
-            let delay: TimeInterval = [1, 3, 10][restarts.count]
-            restarts.append(now); restartReserved = true; nextProbe = now + delay; return delay
+        if values.contains(.timing) {
+            // Damage to new clock metadata must not discard the legacy budget.
+            timing = (try? values.decode(Timing.self, forKey:.timing)) ?? Timing(version:0,
+                anchor:GatewayRecoveryClock(bootSession:"", wall:0, monotonic:0), restarts:[], nextProbe:0)
         }
-        let delay = min(300.0, 60.0 * pow(2, Double(min(circuits, 3))))
-        restartReserved = false
-        circuits += 1; nextProbe = now + delay; return delay
     }
-    mutating func healthy() { restartReserved = false; circuits = 0; nextProbe = 0 } // Restarts remain spent for ten minutes.
+
+    private mutating func store(_ value: Timing, at clock: GatewayRecoveryClock) {
+        var value = value
+        value.anchor = clock
+        timing = value
+        restarts = value.restarts.map { clock.wall - (clock.monotonic - $0) }
+        nextProbe = value.nextProbe == 0 ? 0 : clock.wall + max(0, value.nextProbe - clock.monotonic)
+    }
+
+    /// Call before admission and persist a changed result before launching work.
+    /// An unchanged refresh does not rewrite the clock anchor or the record.
+    @discardableResult
+    mutating func synchronize(at clock: GatewayRecoveryClock) -> Bool {
+        precondition(clock.valid)
+        let previous = self
+        let hasRecovery = !restarts.isEmpty || nextProbe != 0 || circuits != 0 || restartReserved ||
+            timing.map { !$0.restarts.isEmpty || $0.nextProbe != 0 } == true
+        circuits = min(3, max(0, circuits))
+        func uncertainTiming() -> Timing {
+            // Unknown elapsed time must not erase spent attempts. Rebase them
+            // into one bounded window, never preserve an hours-away deadline.
+            let count = min(3, max(restarts.count, timing?.restarts.count ?? 0))
+            return Timing(anchor: clock, restarts: Array(repeating: clock.monotonic, count: count),
+                nextProbe: hasRecovery ? clock.monotonic + Self.uncertainClockCooldown : 0)
+        }
+        if var value = timing {
+            let valid = value.version == 1 && value.anchor.valid && value.restarts.count == restarts.count &&
+                value.restarts.count <= 3 && value.restarts.allSatisfy { $0.isFinite && $0 >= 0 && $0 <= value.anchor.monotonic } &&
+                value.nextProbe.isFinite && (value.nextProbe == 0 ||
+                    value.nextProbe >= value.anchor.monotonic && value.nextProbe - value.anchor.monotonic <= 300)
+            if !valid || value.anchor.bootSession != clock.bootSession || clock.monotonic < value.anchor.monotonic {
+                store(uncertainTiming(), at: clock)
+            } else {
+                value.restarts.removeAll { clock.monotonic - $0 >= Self.restartWindow }
+                let drift = (clock.wall - value.anchor.wall) - (clock.monotonic - value.anchor.monotonic)
+                if abs(drift) > Self.clockTolerance {
+                    if hasRecovery { value.nextProbe = max(value.nextProbe, clock.monotonic + Self.uncertainClockCooldown) }
+                    value.anchor = clock
+                }
+                if value.nextProbe <= clock.monotonic { value.nextProbe = 0 }
+                if value != timing { store(value, at: clock) }
+            }
+        } else {
+            // Legacy records use their original wall-clock ages once, then gain
+            // boot-aware timing. Future/inconsistent dates take the safe path.
+            let valid = restarts.count <= 3 && restarts.allSatisfy { $0.isFinite && $0 >= 0 && $0 <= clock.wall } &&
+                nextProbe.isFinite && nextProbe >= 0 && nextProbe - clock.wall <= 300
+            let recent = restarts.filter { clock.wall - $0 < Self.restartWindow }
+            if valid && recent.allSatisfy({ clock.wall - $0 <= clock.monotonic }) {
+                store(Timing(anchor: clock, restarts: recent.map { clock.monotonic - (clock.wall - $0) },
+                    nextProbe: nextProbe > clock.wall ? clock.monotonic + (nextProbe - clock.wall) : 0), at: clock)
+            } else { store(uncertainTiming(), at: clock) }
+        }
+        return self != previous
+    }
+
+    func probeIsDue(at clock: GatewayRecoveryClock) -> Bool {
+        guard let timing, timing.anchor.bootSession == clock.bootSession,
+              clock.monotonic >= timing.anchor.monotonic else { return false }
+        return clock.monotonic >= timing.nextProbe
+    }
+    var monotonicProbeDeadline: TimeInterval { timing?.nextProbe ?? .infinity }
+
+    mutating func failed(at clock: GatewayRecoveryClock = .current) -> TimeInterval {
+        synchronize(at: clock)
+        var value = timing!
+        let delay: TimeInterval
+        if restarts.count < 3 {
+            delay = [1, 3, 10][restarts.count]
+            value.restarts.append(clock.monotonic); restartReserved = true
+        } else {
+            delay = min(300, 60 * pow(2, Double(circuits)))
+            restartReserved = false; circuits = min(3, circuits + 1)
+        }
+        value.nextProbe = max(value.nextProbe, clock.monotonic + delay)
+        store(value, at: clock)
+        return max(0, value.nextProbe - clock.monotonic)
+    }
+    mutating func healthy(at clock: GatewayRecoveryClock = .current) {
+        synchronize(at: clock)
+        restartReserved = false; circuits = 0
+        var value = timing!; value.nextProbe = 0
+        store(value, at: clock) // Restarts remain spent for ten minutes.
+    }
 }
 
 struct FullIntegrityAuditSchedule {
@@ -458,13 +573,13 @@ enum ManagedGatewayHost {
                     if audit.status != 0 || auditResult?["ok"] as? Bool != true {
                         let causes = Set(auditResult?["causes"] as? [String] ?? [])
                         if causes.contains("database_inconclusive") {
-                            nextAudit = now + 5; nextHealth = now + 5
+                            nextAudit = now + 5; nextHealth = ProcessInfo.processInfo.systemUptime + 5
                             writeHealth(current, state:"recovering",
                                 detail:"The private OpenClaw database check was busy or exceeded its short read-only limit. No database files were changed; TaskPilot will check again shortly.", root:root)
                             continue
                         }
                         if causes.contains("database_corrupt") {
-                            teardown(); repair = true; nextAudit = now + 300; nextHealth = now + 300
+                            teardown(); repair = true; nextAudit = now + 300; nextHealth = ProcessInfo.processInfo.systemUptime + 300
                             writeHealth(current, state:"needs_repair",
                                 detail:"A private OpenClaw database failed its read-only integrity check. TaskPilot left it unchanged; inspect or reinstall the private runtime before continuing.", root:root)
                             continue
@@ -481,13 +596,13 @@ enum ManagedGatewayHost {
                             continue
                         }
                         if causes.contains("private_configuration_path_changed") {
-                            teardown(); repair = true; nextAudit = now + 300; nextHealth = now + 300
+                            teardown(); repair = true; nextAudit = now + 300; nextHealth = ProcessInfo.processInfo.systemUptime + 300
                             writeHealth(current,state:"needs_repair",detail:"A private OpenClaw configuration path changed identity during a CLI operation. TaskPilot stopped activation and left the active runtime intact; inspect the private configuration directory before retrying.",root:root)
                             continue
                         }
                         writeHealth(current,state:"recovering",detail:"Repairing TaskPilot-owned runtime settings",root:root)
                         teardown()
-                        _ = budget.failed(now:now)
+                        _ = budget.failed()
                         try write(budget,to:root.appendingPathComponent("recovery.json"))
                         let fixed = ownedCommand(root:root, executable:runtimeURL,
                             arguments:["--managed-openclaw", "repair", "--managed-resources", resources.path,
@@ -499,10 +614,14 @@ enum ManagedGatewayHost {
                     }
                     repair = false
                 }
-                if !repair && now >= budget.nextProbe && (now >= nextHealth || requested || gateway?.isRunning == false) {
-                    budget.restarts.removeAll { now - $0 >= 600 }
+                let recoveryClock = GatewayRecoveryClock.current
+                if budget.synchronize(at: recoveryClock) {
+                    try write(budget, to:root.appendingPathComponent("recovery.json"))
+                }
+                if !repair && budget.probeIsDue(at: recoveryClock) &&
+                    (recoveryClock.monotonic >= nextHealth || requested || gateway?.isRunning == false) {
                     if gateway == nil && !budget.restartReserved && budget.restarts.count >= 3 {
-                        _ = budget.failed(now: now)
+                        _ = budget.failed()
                         try write(budget, to:root.appendingPathComponent("recovery.json"))
                         writeHealth(current, state:"recovering", detail:"Private Gateway restart circuit is open; waiting before another local probe", root:root)
                         continue
@@ -570,7 +689,7 @@ enum ManagedGatewayHost {
                         }
                     }
                     if healthy && acpVerified {
-                        budget.healthy(); nextHealth = now + 30
+                        budget.healthy(); nextHealth = ProcessInfo.processInfo.systemUptime + 30
                         writeHealth(current, state:"healthy", detail:"Private Gateway connected; ACP compatible", root:root, gateway:gateway)
                     } else {
                         guard let permit = try? ManagedRuntimePermit(root:root, repairing:true) else {
@@ -579,8 +698,8 @@ enum ManagedGatewayHost {
                         defer { withExtendedLifetime(permit) {} }
                         teardown()
                         nextAudit = 0
-                        _ = budget.failed(now: Date().timeIntervalSince1970)
-                        nextHealth = budget.nextProbe
+                        _ = budget.failed()
+                        nextHealth = budget.monotonicProbeDeadline
                         writeHealth(current, state:"recovering", detail:"Private Gateway unavailable; automatic recovery is waiting for its cooldown", root:root)
                     }
                     try write(budget, to:root.appendingPathComponent("recovery.json"))
@@ -600,7 +719,7 @@ enum ManagedGatewayHost {
                 }
                 if let descriptor { writeHealth(descriptor, state:"recovering", detail:"Private Gateway local recovery failed; waiting for the next bounded check", root:root) }
                 nextAudit = 0
-                _ = budget.failed(now:Date().timeIntervalSince1970)
+                _ = budget.failed()
                 try? write(budget, to:root.appendingPathComponent("recovery.json"))
             }
             // Client/request vnode changes and child exits wake this wait. A

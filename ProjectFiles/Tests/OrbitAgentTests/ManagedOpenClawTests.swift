@@ -241,24 +241,27 @@ final class ManagedOpenClawTests: XCTestCase {
         XCTAssertNoThrow(try ManagedRuntimePermit(root:root,repairing:true))
     }
     func testRestartBudgetSurvivesSerializationAndHealthyRefreshDoesNotEraseAttempts() throws {
+        func clock(_ time: TimeInterval) -> GatewayRecoveryClock {
+            GatewayRecoveryClock(bootSession:"boot-a", wall:time, monotonic:time)
+        }
         var budget = GatewayRecoveryBudget()
-        XCTAssertEqual(budget.failed(now:1000),1)
-        XCTAssertEqual(budget.failed(now:1001),3)
-        XCTAssertEqual(budget.failed(now:1004),10)
-        XCTAssertEqual(budget.failed(now:1014),60)
+        XCTAssertEqual(budget.failed(at:clock(1000)),1)
+        XCTAssertEqual(budget.failed(at:clock(1001)),3)
+        XCTAssertEqual(budget.failed(at:clock(1004)),10)
+        XCTAssertEqual(budget.failed(at:clock(1014)),60)
         XCTAssertFalse(budget.restartReserved)
-        for delay in [120.0,240,300,300] { XCTAssertEqual(budget.failed(now:1015),delay) }
+        for delay in [120.0,240,300,300] { XCTAssertEqual(budget.failed(at:clock(1015)),delay) }
         budget = try JSONDecoder().decode(GatewayRecoveryBudget.self,from:JSONEncoder().encode(budget))
-        budget.healthy()
+        budget.healthy(at:clock(1015))
         XCTAssertEqual(budget.restarts.count,3)
-        XCTAssertEqual(budget.failed(now:1020),60)
-        XCTAssertEqual(budget.failed(now:1610),1)
+        XCTAssertEqual(budget.failed(at:clock(1020)),60)
+        XCTAssertEqual(budget.failed(at:clock(1610)),1)
     }
     func testOldBudgetDecodesWithoutResettingSpentAttempts() throws {
         let data = Data(#"{"restarts":[1,2,3],"nextProbe":70,"circuits":1}"#.utf8)
         var budget = try JSONDecoder().decode(GatewayRecoveryBudget.self,from:data)
         XCTAssertFalse(budget.restartReserved)
-        XCTAssertEqual(budget.failed(now:10),120)
+        XCTAssertEqual(budget.failed(at:GatewayRecoveryClock(bootSession:"boot-a", wall:10, monotonic:10)),120)
         XCTAssertEqual(budget.restarts.count,3)
     }
     func testClientLeaseMatchesBirthIdentityAndRejectsReusedPID() throws {
