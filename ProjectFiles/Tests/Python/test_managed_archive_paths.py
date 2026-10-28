@@ -9,9 +9,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import managed_openclaw as managed
 
 
-def member(name, kind=tarfile.REGTYPE, target=''):
+def member(name, kind=tarfile.REGTYPE, target='', size=0):
     value = tarfile.TarInfo(name)
-    value.type, value.linkname = kind, target
+    value.type, value.linkname, value.size = kind, target, size
     return value
 
 
@@ -20,9 +20,12 @@ class ManagedArchivePathTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.stage = Path(temporary.name)
+        self.limits = dict(version=1, max_members=20000, max_namespace_nodes=250000,
+                           max_expanded_bytes=512 * 1024**2,
+                           max_file_bytes=256 * 1024**2, max_depth=64)
 
-    def validate(self, entries):
-        managed.validate_node_archive_members(entries, self.stage)
+    def validate(self, entries, limits=None):
+        return managed.validate_node_archive_members(entries, self.stage, limits or self.limits)
 
     def test_duplicates_and_canonical_caseless_aliases_are_rejected_in_either_order(self):
         pairs = [
@@ -98,6 +101,48 @@ class ManagedArchivePathTests(unittest.TestCase):
                              (tarfile.SYMTYPE, '/outside')]:
             with self.subTest(kind=kind, target=target), self.assertRaisesRegex(managed.ManagedRuntimeError, 'Unsafe Node archive link'):
                 self.validate([member('fixture/link', kind, target)])
+
+    def test_archive_member_count_stops_stream_enumeration_at_the_first_excess(self):
+        yielded = []
+        def entries():
+            for index in range(1000):
+                yielded.append(index)
+                yield member(f'fixture/file-{index}')
+        limits = dict(self.limits, max_members=3)
+        with self.assertRaisesRegex(managed.ManagedRuntimeError, 'member-count'):
+            self.validate(entries(), limits)
+        self.assertEqual(len(yielded), 4)
+
+    def test_expanded_bytes_file_size_and_depth_are_checked_as_members_arrive(self):
+        cases = [
+            ([member('fixture/a', size=6), member('fixture/b', size=6)],
+             dict(self.limits, max_expanded_bytes=10, max_file_bytes=8), 'total expanded-size'),
+            ([member('fixture/large', size=7)], dict(self.limits, max_file_bytes=6), 'individual-file size'),
+            ([member('fixture/one/two/file', size=1)], dict(self.limits, max_depth=3), 'path-depth'),
+            ([member('fixture/negative', size=-1)], self.limits, 'invalid file size'),
+        ]
+        for entries, limits, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(managed.ManagedRuntimeError, message):
+                self.validate(entries, limits)
+
+    def test_namespace_entries_are_bounded_before_adding_more_collision_state(self):
+        limits = dict(self.limits, max_namespace_nodes=5)
+        # Root plus fixture/a/b consume four nodes. The second path adds one
+        # node, then its leaf would exceed the cap and must be rejected.
+        with self.assertRaisesRegex(managed.ManagedRuntimeError, 'namespace-entry'):
+            self.validate([member('fixture/a/b'), member('another/file')], limits)
+
+    def test_manifest_archive_limits_reject_unknown_or_unsafe_values(self):
+        base = dict(version=1, max_members=20_000, max_namespace_nodes=250_000,
+                    max_expanded_bytes=512 * 1024**2,
+                    max_file_bytes=256 * 1024**2, max_depth=64)
+        cases = [None, {}, {**base, 'extra': 1}, {**base, 'max_members': 50_001},
+                 {**base, 'max_namespace_nodes': 500_001},
+                 {**base, 'max_expanded_bytes': True}, {**base, 'max_file_bytes': 512 * 1024**2 + 1},
+                 {**base, 'max_depth': 257}]
+        for limits in cases:
+            with self.subTest(limits=limits), self.assertRaises(managed.ManagedRuntimeError):
+                managed.validate_node_archive_limits(limits)
 
 
 if __name__ == '__main__': unittest.main()

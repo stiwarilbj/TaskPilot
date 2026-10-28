@@ -50,6 +50,8 @@ class ProvisioningTests(unittest.TestCase):
                                                package_lock_sha256=hashlib.sha256(b'{}').hexdigest()),
                              provisioning_space=dict(version=1, node_archive_bytes=1024, node_expanded_bytes=4096,
                                                      package_archive_bytes=8192, package_expanded_bytes=32768),
+                             node_archive_limits=dict(version=1, max_members=20000, max_namespace_nodes=250000,
+                                                      max_expanded_bytes=4096, max_file_bytes=2048, max_depth=64),
                              node_archives={platform.machine(): dict(name='fixture.tar.gz', sha256=managed.digest(self.archive))})
         self.calls = []
 
@@ -485,6 +487,57 @@ class ProvisioningTests(unittest.TestCase):
                 self.assertIsNone(self.marker())
                 self.assertFalse(list((self.root / 'installations').glob('.stage-*')))
                 self.assertFalse((self.root / 'installations' / self.fingerprint).exists())
+
+    def test_archive_limits_reject_before_extraction_and_preserve_active_install(self):
+        cases = [
+            ('member-count', dict(max_members=2), [('fixture/a', 1), ('fixture/b', 1), ('fixture/c', 1)]),
+            ('total expanded-size', dict(max_expanded_bytes=10, max_file_bytes=8), [('fixture/a', 6), ('fixture/b', 6)]),
+            ('individual-file size', dict(max_file_bytes=5), [('fixture/a', 6)]),
+            ('path-depth', dict(max_depth=2), [('fixture/bin/node', 1)]),
+        ]
+        for index, (reason, overrides, entries) in enumerate(cases):
+            with self.subTest(reason=reason):
+                self.root = self.base / f'archive-limit-{index}'; self.root.mkdir(mode=0o700)
+                (self.root / 'installations').mkdir(mode=0o700)
+                before = self.preserve_active()
+                limits = dict(version=1, max_members=20000, max_namespace_nodes=250000,
+                              max_expanded_bytes=4096,
+                              max_file_bytes=2048, max_depth=64)
+                limits.update(overrides)
+                self.manifest['node_archive_limits'] = limits
+                with tarfile.open(self.archive, 'w:') as archive:
+                    for name, size in entries:
+                        info = tarfile.TarInfo(name); info.size = size
+                        archive.addfile(info, io.BytesIO(b'x' * size))
+                self.manifest['node_archives'][platform.machine()]['sha256'] = managed.digest(self.archive)
+                with self.build() as (downloads, runs), patch.object(tarfile.TarFile, 'extractall') as extract:
+                    with self.assertRaisesRegex(managed.ManagedRuntimeError, reason):
+                        managed.install(self.resources, self.root)
+                    downloads.assert_called_once(); extract.assert_not_called(); runs.assert_not_called()
+                self.assert_preserved(before)
+                self.assertIsNone(self.marker())
+                self.assertFalse(list((self.root / 'installations').glob('.stage-*')))
+
+    def test_huge_declared_file_is_rejected_from_tiny_tar_header_before_extraction(self):
+        self.root = self.base / 'archive-huge'; self.root.mkdir(mode=0o700)
+        (self.root / 'installations').mkdir(mode=0o700)
+        before = self.preserve_active()
+        self.manifest['node_archive_limits'] = dict(version=1, max_members=20000, max_namespace_nodes=250000,
+            max_expanded_bytes=4096, max_file_bytes=2048, max_depth=64)
+        # Only a tar header and end markers are written. Validation must reject
+        # the declared size without seeking through or extracting a huge body.
+        info = tarfile.TarInfo('fixture/huge.bin'); info.size = 1024 * 1024 * 1024
+        with self.archive.open('wb') as output:
+            output.write(info.tobuf())
+            output.write(b'\0' * 1024)
+        self.manifest['node_archives'][platform.machine()]['sha256'] = managed.digest(self.archive)
+        with self.build() as (downloads, runs), patch.object(tarfile.TarFile, 'extractall') as extract:
+            with self.assertRaisesRegex(managed.ManagedRuntimeError, 'individual-file size'):
+                managed.install(self.resources, self.root)
+            downloads.assert_called_once(); extract.assert_not_called(); runs.assert_not_called()
+        self.assert_preserved(before)
+        self.assertIsNone(self.marker())
+        self.assertFalse(list((self.root / 'installations').glob('.stage-*')))
 
     def test_unambiguous_archive_with_late_directories_and_internal_link_installs(self):
         with tarfile.open(self.archive, 'w:gz') as archive:

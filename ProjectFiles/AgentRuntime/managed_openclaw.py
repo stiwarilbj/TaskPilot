@@ -44,6 +44,7 @@ INTEGRITY_CACHE_MAX_BYTES = 64 * 1024 * 1024
 NATIVE_ADDON_FACTS_VERSION = 1
 PROVISIONING_RESERVE_BYTES = 512 * 1024 * 1024
 PROVISIONING_TEMPORARY_BYTES = 256 * 1024 * 1024
+NODE_ARCHIVE_PATH_BYTES = 4096
 RUNTIME_DOWNLOAD_TOTAL_SECONDS = 5 * 60
 RUNTIME_DOWNLOAD_READ_TIMEOUT_SECONDS = 45
 RUNTIME_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
@@ -131,6 +132,24 @@ def require_provisioning_space(directory, manifest, phase):
     except (OSError, ValueError, OverflowError) as error:
         raise ProvisioningResourceError(phase) from error
     if available < required: raise ProvisioningResourceError(phase, required, available)
+
+
+def validate_node_archive_limits(value):
+    fields = {'version', 'max_members', 'max_namespace_nodes', 'max_expanded_bytes', 'max_file_bytes', 'max_depth'}
+    if (not isinstance(value, dict) or set(value) != fields or
+            type(value.get('version')) is not int or value['version'] != 1 or
+            type(value.get('max_members')) is not int or not 1 <= value['max_members'] <= 50_000 or
+            type(value.get('max_namespace_nodes')) is not int or not 1 <= value['max_namespace_nodes'] <= 500_000 or
+            type(value.get('max_expanded_bytes')) is not int or not 1 <= value['max_expanded_bytes'] <= 8 * 1024**3 or
+            type(value.get('max_file_bytes')) is not int or
+            not 1 <= value['max_file_bytes'] <= value['max_expanded_bytes'] or
+            type(value.get('max_depth')) is not int or not 1 <= value['max_depth'] <= 256):
+        raise ManagedRuntimeError('Bundled Node archive limits are invalid; reinstall TaskPilot.')
+    return value
+
+
+def node_archive_limits(manifest):
+    return validate_node_archive_limits(manifest.get('node_archive_limits'))
 
 
 class PrivateDirectoryError(ManagedRuntimeError):
@@ -801,6 +820,7 @@ def specification(resources: Path):
         if not entry.get('integrity') or not entry.get('resolved', '').startswith('https://registry.npmjs.org/'):
             raise ManagedRuntimeError('Bundled dependency lock contains an unverified source.')
     provisioning_space(manifest)
+    node_archive_limits(manifest)
     runtime_compatibility(manifest)
     required_cli_contract(manifest)
     if digest(resources / 'package-lock.json') != manifest['cli_contract']['package_lock_sha256']:
@@ -1484,26 +1504,47 @@ def validate_install(directory, fingerprint, *, force_full=False, now_monotonic_
                 pass
             os.close(cache_fd)
 
-def validate_node_archive_members(members, stage):
+def validate_node_archive_members(members, stage, limits):
     """Validate the entire namespace before extraction, independent of volume settings.
 
     Keys use canonical caseless Unicode matching. Original member names remain
     unchanged; normalization detects ambiguity rather than silently renaming it.
     Implicit directories participate, including when declared later in the tar.
+    The returned list is bounded by the pinned manifest's member limit; callers
+    must pass a streaming TarFile iterator rather than pre-building getmembers().
     """
+    limits = validate_node_archive_limits(limits)
     stage = Path(stage).resolve()
     paths = {(): ((), True, False)}  # spelling, directory, explicitly declared
+    validated, expanded_bytes = [], 0
     for member in members:
-        parts = member.name.split('/')
-        if member.name.startswith('/') or '\0' in member.name or '..' in parts:
+        if len(validated) >= limits['max_members']:
+            raise ManagedRuntimeError('Node archive exceeds its member-count limit.')
+        name = member.name
+        if (not isinstance(name, str) or not name or
+                len(name.encode('utf-8', 'surrogatepass')) > NODE_ARCHIVE_PATH_BYTES or
+                name.startswith('/') or '\0' in name):
             raise ManagedRuntimeError('Unsafe Node archive.')
-        parts = tuple(part for part in parts if part not in ('', '.'))
-        resolved = (stage / member.name).resolve()
+        raw_parts = name.split('/')
+        if '..' in raw_parts: raise ManagedRuntimeError('Unsafe Node archive.')
+        parts = tuple(part for part in raw_parts if part not in ('', '.'))
+        if len(parts) > limits['max_depth']:
+            raise ManagedRuntimeError('Node archive exceeds its path-depth limit.')
+        resolved = (stage / name).resolve()
         if not resolved.is_relative_to(stage): raise ManagedRuntimeError('Unsafe Node archive.')
         if member.issym() or member.islnk():
             parent = resolved.parent if member.issym() else stage
             if not (parent / member.linkname).resolve().is_relative_to(stage):
                 raise ManagedRuntimeError('Unsafe Node archive link.')
+        if member.isfile():
+            size = member.size
+            if type(size) is not int or size < 0:
+                raise ManagedRuntimeError('Node archive contains an invalid file size.')
+            if size > limits['max_file_bytes']:
+                raise ManagedRuntimeError('Node archive exceeds its individual-file size limit.')
+            if size > limits['max_expanded_bytes'] - expanded_bytes:
+                raise ManagedRuntimeError('Node archive exceeds its total expanded-size limit.')
+            expanded_bytes += size
         keys = tuple(unicodedata.normalize('NFD', unicodedata.normalize('NFD', part).casefold()) for part in parts)
         for length in range(len(parts) + 1):
             key, spelling = keys[:length], parts[:length]
@@ -1515,8 +1556,12 @@ def validate_node_archive_members(members, stage):
                 if old_spelling != spelling or old_directory != directory or leaf and declared:
                     raise ManagedRuntimeError('Unsafe Node archive path collision.')
             else:
+                if len(paths) >= limits['max_namespace_nodes']:
+                    raise ManagedRuntimeError('Node archive exceeds its namespace-entry limit.')
                 declared = False
             paths[key] = (spelling, directory, declared or leaf)
+        validated.append(member)
+    return validated
 
 
 def install(resources, root, *, journal=None):
@@ -1573,8 +1618,8 @@ def install(resources, root, *, journal=None):
         # Existing installations and failed downloads never need archive support.
         import tarfile
         with tarfile.open(payload) as tar:
-            members = tar.getmembers()
-            validate_node_archive_members(members, stage)
+            limits = node_archive_limits(manifest)
+            members = validate_node_archive_members(tar, stage, limits)
             require_provisioning_space(stage, manifest, 'extraction')
             tar.extractall(stage, members=members, filter='data')
         payload.unlink()

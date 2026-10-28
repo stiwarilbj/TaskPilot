@@ -26,6 +26,14 @@
     "package_archive_bytes": 536870912,
     "package_expanded_bytes": 2147483648
   },
+  "node_archive_limits": {
+    "version": 1,
+    "max_members": 20000,
+    "max_namespace_nodes": 250000,
+    "max_expanded_bytes": 536870912,
+    "max_file_bytes": 268435456,
+    "max_depth": 64
+  },
   "node_archives": {
     "arm64": {
       "name": "node-v24.22.1-darwin-arm64.tar.gz",
