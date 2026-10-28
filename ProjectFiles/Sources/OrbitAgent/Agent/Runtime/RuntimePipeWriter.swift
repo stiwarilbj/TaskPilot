@@ -3,6 +3,7 @@ import Foundation
 
 /// Confined to the invocation's I/O queue. No pipe write can block Stop.
 final class RuntimePipeWriter {
+    static let maximumWriteAttemptsPerPump = 64
     typealias WriteOperation = (Int32, UnsafeRawPointer, Int) -> Int
 
     private struct Frame {
@@ -96,7 +97,8 @@ final class RuntimePipeWriter {
 
     private func pump() {
         var allowance = 64 * 1024
-        while frameHead < frames.count && allowance > 0 && !closed {
+        var attempts = 0
+        while frameHead < frames.count && allowance > 0 && attempts < Self.maximumWriteAttemptsPerPump && !closed {
             // Once any bytes are dispatched, finish the frame under the
             // existing transport timeout. Dropping its suffix corrupts framing
             // and cannot establish that an associated action failed.
@@ -115,6 +117,7 @@ final class RuntimePipeWriter {
                 }
             }
             frames[frameHead]!.waitTicket.start()
+            attempts += 1
             let written = frames[frameHead]!.data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
                 writeOperation(descriptor, buffer.baseAddress!.advanced(by: frames[frameHead]!.offset),
                                min(allowance, buffer.count - frames[frameHead]!.offset))

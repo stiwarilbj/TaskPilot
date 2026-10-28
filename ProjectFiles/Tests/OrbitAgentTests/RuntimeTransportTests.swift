@@ -171,6 +171,72 @@ final class RuntimeTransportTests: XCTestCase {
         queue.sync { XCTAssertEqual(writer.pendingBytes, 0); writer.cancel() }
     }
 
+    func testWriterYieldsForCancellationDuringOneByteWrites() {
+        let queue = DispatchQueue(label: "fixture.writer.one-byte-cancel"), pipe = Pipe()
+        let cancellation = expectation(description: "Queued cancellation gets a turn")
+        let completion = expectation(description: "Pending frame settles on cancellation")
+        var writer: RuntimePipeWriter!
+        var attempts = 0
+        queue.sync {
+            writer = RuntimePipeWriter(handle: pipe.fileHandleForWriting, queue: queue,
+                writeOperation: { descriptor, pointer, _ in
+                    attempts += 1
+                    let result = Darwin.write(descriptor, pointer, 1)
+                    if attempts == 1 {
+                        queue.async {
+                            writer.cancel()
+                            cancellation.fulfill()
+                        }
+                    }
+                    return result
+                }, failure: { XCTFail($0) })
+            writer.enqueue(Data(repeating: 0x51, count: 4096)) { success in
+                XCTAssertFalse(success)
+                completion.fulfill()
+            }
+        }
+
+        wait(for: [cancellation, completion], timeout: 2)
+        queue.sync {
+            XCTAssertEqual(attempts, RuntimePipeWriter.maximumWriteAttemptsPerPump)
+            XCTAssertEqual(writer.pendingBytes, 0)
+            writer.cancel()
+        }
+    }
+
+    func testOneByteWritesResumeAcrossPumpsWithoutChangingFrameOrder() throws {
+        let queue = DispatchQueue(label: "fixture.writer.one-byte-fifo"), pipe = Pipe()
+        let frameCount = 3, frameSize = RuntimePipeWriter.maximumWriteAttemptsPerPump + 32
+        let completed = expectation(description: "All frames complete")
+        completed.expectedFulfillmentCount = frameCount
+        var callbacks: [Int] = []
+        var writer: RuntimePipeWriter!
+        let frames = (0..<frameCount).map { frame in
+            Data((0..<frameSize).map { UInt8((frame * 71 + $0) % 251) })
+        }
+        queue.sync {
+            writer = RuntimePipeWriter(handle: pipe.fileHandleForWriting, queue: queue,
+                writeOperation: { descriptor, pointer, _ in Darwin.write(descriptor, pointer, 1) },
+                failure: { XCTFail($0) })
+            for (index, frame) in frames.enumerated() {
+                writer.enqueue(frame) { success in
+                    XCTAssertTrue(success)
+                    callbacks.append(index)
+                    completed.fulfill()
+                }
+            }
+        }
+
+        wait(for: [completed], timeout: 3)
+        let expected = frames.reduce(into: Data()) { $0.append($1) }
+        XCTAssertEqual(try pipe.fileHandleForReading.read(upToCount: expected.count), expected)
+        queue.sync {
+            XCTAssertEqual(callbacks, Array(0..<frameCount))
+            XCTAssertEqual(writer.pendingBytes, 0)
+            writer.cancel()
+        }
+    }
+
     func testCompletedFrameStorageReleasesBeforePrefixCompaction() {
         let queue = DispatchQueue(label: "fixture.writer.release-consumed-frame"), pipe = Pipe()
         let storageReleased = expectation(description: "Completed frame storage is released")
