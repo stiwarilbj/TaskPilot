@@ -28,6 +28,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.request
 import uuid
 
@@ -1007,6 +1008,41 @@ def validate_install(directory, fingerprint, *, force_full=False, now_monotonic_
                 pass
             os.close(cache_fd)
 
+def validate_node_archive_members(members, stage):
+    """Validate the entire namespace before extraction, independent of volume settings.
+
+    Keys use canonical caseless Unicode matching. Original member names remain
+    unchanged; normalization detects ambiguity rather than silently renaming it.
+    Implicit directories participate, including when declared later in the tar.
+    """
+    stage = Path(stage).resolve()
+    paths = {(): ((), True, False)}  # spelling, directory, explicitly declared
+    for member in members:
+        parts = member.name.split('/')
+        if member.name.startswith('/') or '\0' in member.name or '..' in parts:
+            raise ManagedRuntimeError('Unsafe Node archive.')
+        parts = tuple(part for part in parts if part not in ('', '.'))
+        resolved = (stage / member.name).resolve()
+        if not resolved.is_relative_to(stage): raise ManagedRuntimeError('Unsafe Node archive.')
+        if member.issym() or member.islnk():
+            parent = resolved.parent if member.issym() else stage
+            if not (parent / member.linkname).resolve().is_relative_to(stage):
+                raise ManagedRuntimeError('Unsafe Node archive link.')
+        keys = tuple(unicodedata.normalize('NFD', unicodedata.normalize('NFD', part).casefold()) for part in parts)
+        for length in range(len(parts) + 1):
+            key, spelling = keys[:length], parts[:length]
+            leaf = length == len(parts)
+            directory = not leaf or member.isdir()
+            previous = paths.get(key)
+            if previous is not None:
+                old_spelling, old_directory, declared = previous
+                if old_spelling != spelling or old_directory != directory or leaf and declared:
+                    raise ManagedRuntimeError('Unsafe Node archive path collision.')
+            else:
+                declared = False
+            paths[key] = (spelling, directory, declared or leaf)
+
+
 def install(resources, root, *, journal=None):
     root = Path(root)
     if journal is None:
@@ -1038,16 +1074,10 @@ def install(resources, root, *, journal=None):
         payload = stage / 'node.tar.gz'
         download('https://nodejs.org/dist/v' + manifest['node_version'] + '/' + archive['name'], payload, archive['sha256'])
         with tarfile.open(payload) as tar:
-            # Reject traversal and escaping links, including on older Python.
-            for member in tar.getmembers():
-                resolved = (stage / member.name).resolve()
-                if not resolved.is_relative_to(stage.resolve()): raise ManagedRuntimeError('Unsafe Node archive.')
-                if member.issym() or member.islnk():
-                    parent = resolved.parent if member.issym() else stage
-                    if not (parent / member.linkname).resolve().is_relative_to(stage.resolve()):
-                        raise ManagedRuntimeError('Unsafe Node archive link.')
+            members = tar.getmembers()
+            validate_node_archive_members(members, stage)
             require_provisioning_space(stage, manifest, 'extraction')
-            tar.extractall(stage, filter='data')
+            tar.extractall(stage, members=members, filter='data')
         payload.unlink()
         extracted = stage / archive['name'].removesuffix('.tar.gz')
         extracted.rename(stage / 'node')

@@ -414,6 +414,61 @@ class ProvisioningTests(unittest.TestCase):
             with patch.object(managed.shutil, 'disk_usage', side_effect=AssertionError('healthy runtime must not provision')):
                 self.assertEqual(managed.install(self.resources, self.root), first)
 
+    def test_archive_collisions_reject_before_any_extraction_or_cli_and_preserve_active_install(self):
+        cases = [
+            [('fixture/extra', tarfile.REGTYPE), ('fixture/extra', tarfile.REGTYPE)],
+            [('fixture/Extra', tarfile.REGTYPE), ('fixture/extra', tarfile.REGTYPE)],
+            [('fixture/caf\u00e9', tarfile.REGTYPE), ('fixture/cafe\u0301', tarfile.REGTYPE)],
+            [('fixture/More/a', tarfile.REGTYPE), ('fixture/more/b', tarfile.REGTYPE)],
+            [('fixture/extra', tarfile.REGTYPE), ('fixture/extra/child', tarfile.REGTYPE)],
+            [('fixture/extra/child', tarfile.REGTYPE), ('fixture/extra', tarfile.REGTYPE)],
+            [('fixture/extra', tarfile.SYMTYPE), ('fixture/extra/child', tarfile.REGTYPE)],
+            [('fixture/extra', tarfile.DIRTYPE), ('fixture/extra/', tarfile.DIRTYPE)],
+        ]
+        for index, entries in enumerate(cases):
+            with self.subTest(entries=entries):
+                self.root = self.base / f'archive-{index}'; self.root.mkdir(mode=0o700)
+                (self.root / 'installations').mkdir(mode=0o700)
+                before = self.preserve_active()
+                with tarfile.open(self.archive, 'w:gz') as archive:
+                    # A collision late in the archive must not extract earlier valid entries.
+                    for name, kind in [('fixture/bin/node', tarfile.REGTYPE), *entries]:
+                        info = tarfile.TarInfo(name); info.type = kind
+                        if kind == tarfile.REGTYPE:
+                            info.size = 7; archive.addfile(info, io.BytesIO(b'fixture'))
+                        else:
+                            info.linkname = 'target' if kind == tarfile.SYMTYPE else ''
+                            archive.addfile(info)
+                self.manifest['node_archives'][platform.machine()]['sha256'] = managed.digest(self.archive)
+                with self.build() as (downloads, runs), patch.object(tarfile.TarFile, 'extractall') as extract:
+                    with self.assertRaisesRegex(managed.ManagedRuntimeError, 'path collision'):
+                        managed.install(self.resources, self.root)
+                    downloads.assert_called_once(); extract.assert_not_called(); runs.assert_not_called()
+                self.assert_preserved(before)
+                self.assertIsNone(self.marker())
+                self.assertFalse(list((self.root / 'installations').glob('.stage-*')))
+                self.assertFalse((self.root / 'installations' / self.fingerprint).exists())
+
+    def test_unambiguous_archive_with_late_directories_and_internal_link_installs(self):
+        with tarfile.open(self.archive, 'w:gz') as archive:
+            for name in ('bin/node', 'lib/node_modules/npm/bin/npm-cli.js'):
+                info = tarfile.TarInfo('./fixture/' + name); info.size = 7; info.mode = 0o700
+                archive.addfile(info, io.BytesIO(b'fixture'))
+            link = tarfile.TarInfo('fixture/bin/npm'); link.type = tarfile.SYMTYPE
+            link.linkname = '../lib/node_modules/npm/bin/npm-cli.js'; archive.addfile(link)
+            for name in ('fixture/', 'fixture/bin/'):
+                info = tarfile.TarInfo(name); info.type = tarfile.DIRTYPE; info.mode = 0o700
+                archive.addfile(info)
+        self.manifest['node_archives'][platform.machine()]['sha256'] = managed.digest(self.archive)
+        with self.build() as (downloads, runs):
+            target, fingerprint, _ = managed.install(self.resources, self.root)
+            downloads.assert_called_once()
+            self.assertEqual(runs.call_count, 3)
+        self.assertTrue(managed.validate_install(target, fingerprint, force_full=True))
+        self.assertEqual((target / 'node/bin/npm').read_bytes(), b'fixture')
+        self.assertTrue((target / 'node/bin/npm').is_symlink())
+        self.assertEqual((target / 'node/bin/node').read_bytes(), b'fixture')
+
     def test_unreadable_capacity_fails_before_download_instead_of_assuming_room(self):
         for free in (None, -1, True, float('inf')):
             with self.subTest(free=free), patch.object(managed.shutil, 'disk_usage', return_value=SimpleNamespace(free=free)):

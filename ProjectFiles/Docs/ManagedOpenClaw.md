@@ -6,6 +6,22 @@ lock in `Resources/OpenClaw/managed` pin official Node checksums and every npm
 integrity. Provisioning stages, checks, seals, and then activates an installation.
 Updates ship with TaskPilot; runtime provisioning never requests `latest`.
 
+Before extracting Node, the installer validates the entire tar namespace with
+canonical Unicode decomposition and case folding, regardless of the staging
+volume's case sensitivity. Both explicit members and implicit parent directories
+participate. Duplicate entries, alternative case/Unicode spellings, and paths
+used as both a non-directory and a parent are rejected in either archive order.
+An implicit directory may be declared once later with the same spelling. Member
+names are never rewritten; ambiguous packages fail before extraction or CLI
+launch. Absolute and parent-traversal member paths are prohibited, link
+targets must stay inside staging, and extraction retains Python's data filter.
+Valid internal leaf links are supported. Failed validation discards only the
+owned incomplete stage and preserves the active installation.
+
+Offline namespace and installer fixtures run with
+`python3 -m unittest Tests.Python.test_managed_archive_paths Tests.Python.test_managed_provisioning`
+from `ProjectFiles`; they use tiny synthetic archives and no network or runtime.
+
 ## Interrupted provisioning
 
 Provisioning keeps one bounded, versioned, mode-600 `provisioning.json` beside
