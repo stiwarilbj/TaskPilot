@@ -8,7 +8,8 @@ typedef struct {
     int zombie;
 } TPProcessIdentity;
 // Acknowledges SETPGROUP and starts suspended; the owner installs observers
-// before releasing the requested program with SIGCONT.
+// before releasing the requested program with SIGCONT. Installs an empty mask
+// and the existing full set of resettable defaults in the child only.
 int tp_spawn(pid_t *pid, const char *path, char *const argv[], char *const env[],
              const char *directory, int input, int output, int error);
 // Read-only advisory snapshot. Returns 1 only for a complete bounded sample;

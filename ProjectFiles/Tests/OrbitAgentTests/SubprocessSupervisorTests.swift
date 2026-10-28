@@ -98,6 +98,43 @@ final class SubprocessSupervisorTests: XCTestCase {
         XCTAssertTrue(process.snapshot.outputDrained)
     }
 
+    func testSignalNormalizationWithDirtyEmbeddingHostPreservesGroupAndStreams() throws {
+        let project = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let probe = try fixture().appendingPathComponent("signal-probe")
+        let compiler = SubprocessSupervisor(), compilation = try BufferedProcessOutput(merged: true)
+        defer { compilation.close(); compiler.beginTeardown(); _ = compiler.waitForTree(until: .now() + 2, ignoreInterrupt: true) }
+        compiler.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        compiler.arguments = ["clang", "-Werror", "-Wno-deprecated-declarations", "-I",
+                              project.appendingPathComponent("Sources/ProcessSupport/include").path,
+                              project.appendingPathComponent("Tests/Fixtures/signal_state_probe.c").path,
+                              project.appendingPathComponent("Sources/ProcessSupport/ProcessSupport.c").path,
+                              "-o", probe.path]
+        compiler.standardOutput = compilation.stdout; compiler.standardError = compilation.stderr
+        let compiled = ProcessExitNotification(compiler)
+        try compiler.run(); compilation.closeWriters()
+        XCTAssertEqual(compiled.waitForExit(until: .now() + 15), 0)
+        guard case .finished = compiler.waitForTree(until: .now() + 3) else { return XCTFail("Compiler did not drain") }
+        let diagnostics = try compilation.finish(); compiler.markOutputDrained()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: probe.path), diagnostics.stdout.text)
+
+        let process = SubprocessSupervisor(), output = try BufferedProcessOutput()
+        defer { output.close(); process.beginTeardown(); _ = process.waitForTree(until: .now() + 2, ignoreInterrupt: true) }
+        process.executableURL = probe; process.arguments = ["--native-host"]
+        process.standardOutput = output.stdout; process.standardError = output.stderr
+        let exited = ProcessExitNotification(process)
+        try process.run(); output.closeWriters()
+        XCTAssertTrue(process.snapshot.groupAcknowledged)
+        XCTAssertEqual(exited.waitForExit(until: .now() + 5), 0)
+        guard case .finished = process.waitForTree(until: .now() + 3) else { return XCTFail("Signal fixture did not drain") }
+        let result = try output.finish(); process.markOutputDrained()
+        let report = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(result.stdout.text.utf8)) as? [String: Bool])
+        XCTAssertEqual(report, ["mask_empty": true, "defaults": true, "unrelated_ignored": false,
+                                "own_group": true, "own_session": false])
+        XCTAssertEqual(result.stderr.text, "")
+        XCTAssertTrue(process.snapshot.outputDrained)
+    }
+
     func testPrivatePipesProtectBothControllerEnds() throws {
         let pipe = try SubprocessSupervisor.makePrivatePipe()
         defer { try? pipe.fileHandleForReading.close(); try? pipe.fileHandleForWriting.close() }

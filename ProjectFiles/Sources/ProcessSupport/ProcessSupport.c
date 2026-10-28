@@ -17,6 +17,8 @@ int tp_spawn(pid_t *pid, const char *path, char *const argv[], char *const env[]
     result = posix_spawn_file_actions_init(&actions);
     if (result) { posix_spawnattr_destroy(&attributes); return result; }
     sigset_t empty, defaults;
+    // Preserve the native launcher's existing full-default policy, including
+    // teardown/release and pipe signals; SIGKILL/SIGSTOP cannot be reset.
     sigemptyset(&empty); sigfillset(&defaults);
     sigdelset(&defaults, SIGKILL); sigdelset(&defaults, SIGSTOP);
     // Never repair failed group creation after launching an unowned child.

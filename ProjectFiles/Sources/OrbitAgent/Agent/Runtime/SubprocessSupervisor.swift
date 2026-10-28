@@ -128,6 +128,8 @@ final class SubprocessSupervisor: @unchecked Sendable {
                 return descriptor < 0 ? null : descriptor // Foundation's null-device sentinel.
             }
             var pid: pid_t = 0
+            // tp_spawn installs an empty child mask and explicit teardown-signal
+            // defaults atomically with launch, without touching controller state.
             let code = tp_spawn(&pid, executableURL.path, argv, env,
                 (currentDirectoryURL ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)).path,
                 descriptor(standardInput, reading: true), descriptor(standardOutput, reading: false), descriptor(standardError, reading: false))

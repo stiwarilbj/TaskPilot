@@ -9,7 +9,8 @@ operation is checked. A group-setup failure rejects the launch before the
 requested executable runs. There is no optimistic parent-side `setpgid` repair
 or fallback to signaling an arbitrary PID. Unrelated descriptors are closed at
 exec, working directories and literal argument arrays are preserved, and the
-child receives a fresh signal mask and default dispositions.
+child receives a fresh signal mask and the existing full set of resettable
+default dispositions, including teardown, release, and pipe signals.
 Controller-owned runtime and command pipes are created with `FD_CLOEXEC` on
 both ends before readers or writers receive them. Spawn retains its
 `POSIX_SPAWN_CLOEXEC_DEFAULT` allowlist, maps only the intended standard streams,
@@ -107,6 +108,53 @@ inheritable unrelated handles and standard-stream source handles. They verify
 that none survive exec, intended stdin/stdout/stderr still work, merged output
 is preserved, and runtime completion without a final newline is drained exactly
 once. These fixtures require no desktop interactions or provider calls.
+
+## Bounded configuration-helper signal state
+
+`managed_openclaw.bounded_run()` uses the private `managed_spawn.py` Darwin
+launcher. It sets an empty signal mask and default dispositions for `SIGHUP`,
+`SIGINT`, `SIGQUIT`, `SIGTERM`, `SIGCONT`, `SIGPIPE`, and `SIGXFSZ` in checked
+`posix_spawn` attributes. KILL/STOP cannot be reset and are excluded. PIPE/XFSZ
+retain Python's existing restore-signals behavior. Other ignored signals remain
+inherited on this Python path. The native supervisor retains its preexisting,
+broader full-default policy; its groups, suspended-start acknowledgement and
+release behavior are unchanged.
+
+Python 3.11's `Popen` interface cannot supply this mask/default set together with
+working-directory and explicit lease inheritance. The private launcher binds
+the supported Darwin libc spawn API through ctypes, including its opaque
+attribute/action handles and SDK flag values. This avoids Python `preexec_fn`,
+which can deadlock after forking a multithreaded controller, and avoids changing
+process-global signal dispositions or the controller thread's mask. No extra
+launcher process, shell, or executable is introduced. Attribute/action failures
+reject before exec; both native objects are destroyed on every return path.
+
+The Python helper still starts a new session with its PID as group ID. Literal
+arguments, child environment/PATH, working directory, standard input, merged
+disk-backed output and explicit provisioning-lease descriptors are preserved.
+Darwin's close-on-exec-default policy passes only the intended standard streams
+and explicit leases, without changing controller descriptor flags. Stable source
+copies handle closed controller standard descriptors. The small pid/wait adapter
+preserves normal and signal exit codes, timeout exceptions and bounded waits;
+`bounded_run` retains its existing group-KILL/reap interruption path, output limit,
+and post-command configuration-path fence. This does not add process-tree policy,
+model requests, observations, diagnostics, or task contents to persistence.
+
+Offline reproduction from `ProjectFiles`:
+
+```sh
+python3 -m unittest discover -s Tests/Python -p test_managed_spawn.py
+swift test --filter SubprocessSupervisorTests
+```
+
+Both suites compile a tiny raw C observer so interpreter/shell startup cannot
+hide inherited signal state. Altered dispositions and masks live only in
+disposable hosts. Fixtures verify empty masks and default teardown signals,
+unchanged host state, concurrent launches, TERM delivery, groups/sessions,
+streams, leases, descriptor closure, launch failures, timeout, interruption and
+drainage. Native integration runs through the actual supervisor. No provider,
+Chrome, fixer, live-control tester, or desktop task runs; live validation remains
+incomplete.
 
 ## Advisory descriptor headroom
 

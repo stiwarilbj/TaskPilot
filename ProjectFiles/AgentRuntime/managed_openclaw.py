@@ -23,7 +23,6 @@ import shutil
 import socket
 import stat
 import struct
-import subprocess
 import tarfile
 import tempfile
 import threading
@@ -33,6 +32,7 @@ import urllib.request
 import uuid
 
 import runtime_descriptor_generated as descriptor_contract
+from managed_spawn import spawn as spawn_bounded_helper
 from lock_order import LockCategory, reserve
 
 VERSION = 1
@@ -835,13 +835,14 @@ class ConfigurationPathFence:
 def bounded_run(argv, *, env=None, timeout=45, cwd=None, input_data=None, result=False, pass_fds=(), path_fence=None):
     # Disk-backed capture prevents unbounded communicate() allocation for npm.
     fence_snapshot = path_fence.snapshot() if path_fence is not None else None
-    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as input_file:
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as input_file, open(os.devnull, 'rb') as null_input:
         if input_data is not None:
             input_file.write(input_data); input_file.seek(0)
-        process = subprocess.Popen(argv, stdout=output, stderr=output,
-                                   stdin=input_file if input_data is not None else subprocess.DEVNULL,
-                                   env=env, cwd=cwd, start_new_session=True, pass_fds=pass_fds)
+        process = spawn_bounded_helper(argv, stdout=output.fileno(), stderr=output.fileno(),
+                                       stdin=input_file.fileno() if input_data is not None else null_input.fileno(),
+                                       env=env, cwd=cwd, pass_fds=pass_fds)
         try:
+            null_input.close()
             code = process.wait(timeout=timeout)
         except BaseException:
             import signal
