@@ -102,6 +102,64 @@ final class BufferedProcessOutputTests: XCTestCase {
         }
     }
 
+    func testSpillReadbackSkipsSlowSyncAndPreservesBytesAndTruncation() throws {
+        let root = try fixture()
+        let command = "printf '%257s' ''; printf '%193s' '' >&2"
+        let expectedStdout = Data(repeating: 0x20, count: 200)
+        let expectedStderr = Data(repeating: 0x20, count: 193)
+        let fastCapture = try BufferedProcessOutput(maximumBytes: 200, memoryThreshold: 128, spillRoot: root)
+        defer { fastCapture.close() }
+        let fastStarted = ProcessInfo.processInfo.systemUptime
+        let fast = try run(fastCapture, command)
+        let fastDuration = ProcessInfo.processInfo.systemUptime - fastStarted
+        XCTAssertEqual(fast.stdout.data, expectedStdout)
+        XCTAssertEqual(fast.stderr.data, expectedStderr)
+        XCTAssertTrue(fast.stdout.truncated)
+        XCTAssertFalse(fast.stderr.truncated)
+        XCTAssertEqual(fastCapture.statistics.spillFiles, 2)
+        fastCapture.close()
+
+        // Recreate the former readback cost as a test-only injected baseline.
+        var slowSynchronizationCalls = 0
+        let slowCapture = try BufferedProcessOutput(maximumBytes: 200, memoryThreshold: 128, spillRoot: root,
+            spillReadback: { handle in
+                slowSynchronizationCalls += 1
+                Thread.sleep(forTimeInterval: 0.15)
+                try handle.synchronize()
+                try handle.seek(toOffset: 0)
+                return try handle.readToEnd() ?? Data()
+            })
+        defer { slowCapture.close() }
+        let slowStarted = ProcessInfo.processInfo.systemUptime
+        let slow = try run(slowCapture, command)
+        let slowDuration = ProcessInfo.processInfo.systemUptime - slowStarted
+        XCTAssertEqual(slow.stdout.data, fast.stdout.data)
+        XCTAssertEqual(slow.stderr.data, fast.stderr.data)
+        XCTAssertEqual(slow.stdout.truncated, fast.stdout.truncated)
+        XCTAssertEqual(slow.stderr.truncated, fast.stderr.truncated)
+        XCTAssertEqual(slowSynchronizationCalls, 2)
+        XCTAssertGreaterThan(slowDuration - fastDuration, 0.1,
+                             "Default disposable-spill readback should not wait for the injected sync operation")
+        slowCapture.close()
+        XCTAssertTrue(try children(root).isEmpty)
+    }
+
+    func testCancellationAfterSpillRemovesDisposableOutputFiles() throws {
+        let root = try fixture()
+        let capture = try BufferedProcessOutput(maximumBytes: 128, memoryThreshold: 16, spillRoot: root)
+        capture.stdout.write(Data(repeating: 0x78, count: 256))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while capture.statistics.spillFiles == 0 && ContinuousClock.now < deadline {
+            Thread.sleep(forTimeInterval: 0.002)
+        }
+        XCTAssertEqual(capture.statistics.spillFiles, 1)
+        XCTAssertFalse(try children(root).isEmpty)
+
+        capture.close()
+        capture.close()
+        XCTAssertTrue(try children(root).isEmpty)
+    }
+
     func testBothNoisyStreamsDrainBeyondRetentionCapsWithoutBlocking() throws {
         let root = try fixture(), capture = try BufferedProcessOutput(maximumBytes: 65_536, spillRoot: root)
         defer { capture.close() }

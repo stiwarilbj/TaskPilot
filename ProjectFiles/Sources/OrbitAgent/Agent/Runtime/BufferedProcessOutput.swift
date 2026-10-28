@@ -61,6 +61,7 @@ final class BufferedProcessOutput: @unchecked Sendable {
     private let combinedLimit: UInt64?
     private let memoryThreshold: Int
     private let spillRoot: URL
+    private let spillReadback: (FileHandle) throws -> Data
     private let onInterruption: @Sendable () -> Void
     private var scratch = [UInt8](repeating: 0, count: 16_384)
     private var directory: URL?
@@ -76,12 +77,17 @@ final class BufferedProcessOutput: @unchecked Sendable {
     init(maximumBytes: Int? = nil, combinedLimit: Int? = nil, merged: Bool = false,
          memoryThreshold: Int = BufferedProcessOutput.memoryLimit,
          spillRoot: URL = FileManager.default.temporaryDirectory,
+         spillReadback: @escaping (FileHandle) throws -> Data = { handle in
+             try handle.seek(toOffset: 0)
+             return try handle.readToEnd() ?? Data()
+         },
          onInterruption: @escaping @Sendable () -> Void = {}) throws {
         precondition(memoryThreshold >= 0 && maximumBytes.map { $0 >= 0 } != false && combinedLimit.map { $0 >= 0 } != false)
         self.maximumBytes = maximumBytes
         self.combinedLimit = combinedLimit.map(UInt64.init)
         self.memoryThreshold = memoryThreshold
         self.spillRoot = spillRoot
+        self.spillReadback = spillReadback
         self.onInterruption = onInterruption
         streams = try (0..<(merged ? 1 : 2)).map { _ in try Stream() }
         do {
@@ -249,9 +255,10 @@ final class BufferedProcessOutput: @unchecked Sendable {
                 let bytes: Data
                 if let spill = stream.spill {
                     do {
-                        try spill.synchronize()
-                        try spill.seek(toOffset: 0)
-                        bytes = try spill.readToEnd() ?? Data()
+                        // The producer has exited and this same open handle
+                        // owns every completed write. Readback needs visible
+                        // writes, not a durable flush for a disposable buffer.
+                        bytes = try spillReadback(spill)
                     } catch { throw CaptureError.storage }
                     guard bytes.count == stream.retained else { throw CaptureError.storage }
                 } else { bytes = stream.memory }
