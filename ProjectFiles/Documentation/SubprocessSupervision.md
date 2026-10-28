@@ -111,6 +111,17 @@ once. These fixtures require no desktop interactions or provider calls.
 
 ## Bounded configuration-helper signal state
 
+Managed-helper startup keeps audit dependencies eager, including SQLite health,
+descriptor validation and the bounded subprocess launcher. `command()` dispatch
+does not preload provisioning libraries: `download()` imports `urllib.request`
+when a download starts, and `install()` imports `tarfile` only after a successful
+download reaches extraction. Valid existing installations, full/incremental
+audits and failed downloads do not load archive support. Checksum, archive
+namespace validation, staging cleanup and activation rules are unchanged. Static
+function-local imports remain discoverable by the bundled runtime builder.
+`python3 -m unittest Tests.Python.test_managed_imports` checks these boundaries
+in fresh processes; its downloads use only an in-memory data URL.
+
 `managed_openclaw.bounded_run()` uses the private `managed_spawn.py` Darwin
 launcher. It sets an empty signal mask and default dispositions for `SIGHUP`,
 `SIGINT`, `SIGQUIT`, `SIGTERM`, `SIGCONT`, `SIGPIPE`, and `SIGXFSZ` in checked

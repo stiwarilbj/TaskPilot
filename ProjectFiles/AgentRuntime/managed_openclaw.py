@@ -23,12 +23,10 @@ import shutil
 import socket
 import stat
 import struct
-import tarfile
 import tempfile
 import threading
 import time
 import unicodedata
-import urllib.request
 import uuid
 
 import runtime_descriptor_generated as descriptor_contract
@@ -790,6 +788,8 @@ def specification(resources: Path):
     return manifest, fingerprint
 
 def download(url, destination, expected):
+    # Health checks never need the HTTP/TLS download stack.
+    import urllib.request
     h = hashlib.sha256(); count = 0
     with urllib.request.urlopen(url, timeout=45) as response, destination.open('wb') as f:
         while chunk := response.read(1024 * 1024):
@@ -1306,6 +1306,8 @@ def install(resources, root, *, journal=None):
         if archive is None: raise ManagedRuntimeError('This Mac architecture is unsupported by the bundled runtime.')
         payload = stage / 'node.tar.gz'
         download('https://nodejs.org/dist/v' + manifest['node_version'] + '/' + archive['name'], payload, archive['sha256'])
+        # Existing installations and failed downloads never need archive support.
+        import tarfile
         with tarfile.open(payload) as tar:
             members = tar.getmembers()
             validate_node_archive_members(members, stage)
