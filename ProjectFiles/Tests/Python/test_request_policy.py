@@ -187,6 +187,293 @@ class RequestPolicyTests(unittest.TestCase):
             self.assertEqual(policy.RuntimeState('fingerprint', 'v1', root).health(policy.PRIMARY_MODELS[0])['state'], 'temporary')
             self.assertEqual(state.path.stat().st_mode & 0o777, 0o600)
 
+    def test_readiness_pruning_is_bounded_and_preserves_current_rollback_and_cooldowns(self):
+        now = 50_000.0
+        model = policy.PRIMARY_MODELS[0]
+        old_id, rollback_id, active_id, invalidated_id = (letter * 64 for letter in "abcd")
+        old_credential = "e" * 64
+        current_managed = "f" * 64
+        rollback_managed = "1" * 64
+        obsolete_managed = "2" * 64
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.dict(os.environ, {"TASKPILOT_MANAGED_FINGERPRINT": "current:install:config"}), \
+             mock.patch.object(policy.time, "time", return_value=now):
+            root = Path(directory)
+            state = policy.RuntimeState("key", "version", root)
+            current_managed = __import__("hashlib").sha256(state.managed_configuration.encode()).hexdigest()
+            active_lock = root / ("readiness-" + active_id + ".lock")
+            obsolete_bucket = {
+                "records": {"e" * 64: {"verified": {model: now - 601}}},
+                "health": {"google/old-model": {"state": "temporary", "retry_at": now + 300, "revision": 9}},
+                "credential_health": {"google": {"state": "temporary", "retry_at": None,
+                                                     "failure_kind": "quota", "revision": 8}},
+            }
+            bucket = {
+                "records": {
+                    state.identity: {"verified": {model: now - 20}},
+                    old_id: {"verified": {model: now - 601}},
+                    rollback_id: {"verified": {model: now - 601}},
+                    active_id: {"verified": {model: now - 601}},
+                    invalidated_id: {"verified": {model: now - 601}, "invalidations": {"*": 4},
+                                     "check_revision": 3, "check_success": False},
+                },
+                "health": {},
+                "credential_health": {},
+                "managed_health": {
+                    current_managed: {"google/other-model": {"state": "repair", "revision": 7}},
+                    rollback_managed: {model: {"state": "repair", "revision": 6}},
+                    obsolete_managed: {model: {"state": "temporary", "retry_at": now - 1, "revision": 2}},
+                },
+            }
+            document = {"revision": 3, "credentials": {state.credential: bucket, old_credential: obsolete_bucket}}
+            state.path.write_text(json.dumps(document))
+            state.path.chmod(0o600)
+            before_size = state.path.stat().st_size
+
+            rollback_context = mock.patch.object(policy, "_rollback_readiness_protection",
+                return_value=({old_credential}, {rollback_id}, {rollback_managed}, False))
+            with rollback_context:
+                with policy.private_lock(active_lock, category=policy.LockCategory.SINGLE_FLIGHT):
+                    state.finish_check(True)
+                first = json.loads(state.path.read_text())
+                self.assertNotIn(old_id, first["credentials"][state.credential]["records"])
+                self.assertIn(rollback_id, first["credentials"][state.credential]["records"])
+                self.assertIn(active_id, first["credentials"][state.credential]["records"])
+                invalidated = first["credentials"][state.credential]["records"][invalidated_id]
+                self.assertNotIn("verified", invalidated)
+                self.assertEqual(invalidated["invalidations"], {"*": 4})
+                self.assertEqual(invalidated["check_revision"], 3)
+                self.assertIn(obsolete_managed, first["credentials"][state.credential]["managed_health"])
+                self.assertEqual(first["credentials"][old_credential]["credential_health"]["google"]["retry_at"], None)
+                self.assertEqual(first["credentials"][old_credential]["health"]["google/old-model"]["retry_at"], now + 300)
+                self.assertGreater(before_size, state.path.stat().st_size)
+                self.assertEqual(first["credentials"][state.credential]["records"][state.identity]["verified"][model], now - 20)
+                with mock.patch.object(runtime, "RuntimeState", return_value=state), \
+                     mock.patch.object(runtime, "openclaw_version", return_value="version"), \
+                     mock.patch.object(runtime, "ACPClient") as client, mock.patch.object(runtime, "emit"):
+                    self.assertTrue(runtime.check_models("fixture", "key", read_only=True))
+                    client.assert_not_called()
+
+                # An applicable indefinite account cooldown is still retained
+                # and prevents a read-only check from attempting a provider call.
+                first["credentials"][state.credential]["credential_health"]["google"] = {
+                    "state": "temporary", "retry_at": None, "failure_kind": "quota",
+                    "failure_scope": "credential", "revision": 5,
+                }
+                state.path.write_text(json.dumps(first)); state.path.chmod(0o600)
+                state.finish_check(True)
+                self.assertIsNone(state.verified_model())
+                self.assertIsNone(state.credential_health(model)["retry_at"])
+                with mock.patch.object(runtime, "RuntimeState", return_value=state), \
+                     mock.patch.object(runtime, "openclaw_version", return_value="version"), \
+                     mock.patch.object(runtime, "ACPClient") as client, mock.patch.object(runtime, "emit"):
+                    self.assertFalse(runtime.check_models("fixture", "key", read_only=True))
+                    client.assert_not_called()
+
+                # Once the active check lease is gone, a later existing write can
+                # reclaim its expired verification and the obsolete health entry.
+                state.finish_check(True)
+                second = json.loads(state.path.read_text())
+                self.assertNotIn(active_id, second["credentials"][state.credential]["records"])
+                self.assertNotIn(obsolete_managed, second["credentials"][state.credential]["managed_health"])
+                self.assertIn(rollback_managed, second["credentials"][state.credential]["managed_health"])
+                self.assertEqual(second["credentials"][state.credential]["credential_health"]["google"]["retry_at"], None)
+                self.assertEqual(second["credentials"][old_credential]["credential_health"]["google"]["retry_at"], None)
+
+    def test_readiness_pruning_retains_every_namespace_when_rollback_identity_is_uncertain(self):
+        now = 60_000.0
+        model = policy.PRIMARY_MODELS[0]
+        old_id = "a" * 64
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(policy.time, "time", return_value=now):
+            root = Path(directory)
+            state = policy.RuntimeState("key", "version", root)
+            record = {"verified": {model: now - 1000}}
+            document = {"revision": 0, "credentials": {state.credential: {
+                "records": {state.identity: {"verified": {model: now - 10}}, old_id: record},
+                "health": {}, "credential_health": {}, "managed_health": {"3" * 64: {model: {"state": "temporary", "retry_at": now - 1}}},
+            }}}
+            state.path.write_text(json.dumps(document)); state.path.chmod(0o600)
+            with mock.patch.object(policy, "_rollback_readiness_protection", return_value=(set(), set(), set(), True)):
+                state.finish_check(True)
+            recovered = json.loads(state.path.read_text())["credentials"][state.credential]
+            self.assertEqual(recovered["records"][old_id], record)
+            self.assertIn("3" * 64, recovered["managed_health"])
+
+    def test_readiness_pruning_visits_only_a_bounded_rotating_slice(self):
+        now = 70_000.0
+        model = policy.PRIMARY_MODELS[0]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(policy.time, "time", return_value=now), \
+             mock.patch.object(policy, "_check_lease_state", return_value=False), \
+             mock.patch.object(policy, "_any_active_check_lease", return_value=False), \
+             mock.patch.object(policy, "_rollback_readiness_protection", return_value=(set(), set(), set(), False)):
+            root = Path(directory)
+            state = policy.RuntimeState("key", "version", root)
+            records = {f"{index + 1000:064x}": {"verified": {model: now - 601}} for index in range(200)}
+            records[state.identity] = {"verified": {model: now - 10}}
+            document = {"revision": 0, "credentials": {state.credential: {
+                "records": records, "health": {}, "credential_health": {}, "managed_health": {},
+            }}}
+            state.path.write_text(json.dumps(document)); state.path.chmod(0o600)
+
+            state.finish_check(True)
+            first = json.loads(state.path.read_text())
+            remaining = first["credentials"][state.credential]["records"]
+            self.assertEqual(sum(key != state.identity for key in remaining), 200 - policy.READINESS_PRUNE_MAX_IDENTITIES)
+
+            state.finish_check(True)
+            second = json.loads(state.path.read_text())
+            remaining = second["credentials"][state.credential]["records"]
+            self.assertEqual(set(remaining), {state.identity})
+            self.assertEqual(state.verified_model(), model)
+
+    def test_readiness_pruning_rotates_across_credential_namespaces(self):
+        import hashlib
+        now = 80_000.0
+        model = policy.PRIMARY_MODELS[0]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(policy.time, "time", return_value=now), \
+             mock.patch.object(policy, "_check_lease_state", return_value=False), \
+             mock.patch.object(policy, "_any_active_check_lease", return_value=False):
+            root = Path(directory)
+            state = policy.RuntimeState("key", "version", root)
+            credentials = {}
+            credential_order = []
+            for index in range(130):
+                credential = hashlib.sha256(f"obsolete-credential-{index}".encode()).hexdigest()
+                credential_order.append(credential)
+                records = {}
+                for number in range(2):
+                    identity = hashlib.sha256(f"obsolete-runtime-{index}-{number}".encode()).hexdigest()
+                    records[identity] = {"verified": {model: now - 601}}
+                credentials[credential] = {
+                    "records": records, "health": {},
+                    "credential_health": {"google": {"state": "temporary", "retry_at": None,
+                                                         "failure_kind": "quota", "revision": index}},
+                }
+            credentials[state.credential] = {"records": {state.identity: {"verified": {model: now - 10}}},
+                                             "health": {}, "credential_health": {}}
+            document = {"revision": 0, "credentials": credentials}
+            state.path.write_text(json.dumps(document)); state.path.chmod(0o600)
+
+            state.finish_check(True)
+            first = json.loads(state.path.read_text())
+            remaining_first = sum(len(value.get("records", {})) for key, value in first["credentials"].items()
+                                  if key != state.credential)
+            self.assertEqual(remaining_first, 260 - policy.READINESS_PRUNE_MAX_IDENTITIES)
+            first_keys = list(first["credentials"])
+            self.assertEqual(first_keys[0], credential_order[policy.READINESS_PRUNE_MAX_CREDENTIALS])
+            self.assertEqual(first_keys[-1], credential_order[policy.READINESS_PRUNE_MAX_CREDENTIALS - 1])
+
+            state.finish_check(True)
+            second = json.loads(state.path.read_text())
+            remaining_second = sum(len(value.get("records", {})) for key, value in second["credentials"].items()
+                                   if key != state.credential)
+            self.assertLess(remaining_second, remaining_first)
+            for bucket in second["credentials"].values():
+                if bucket.get("credential_health"):
+                    self.assertIsNone(bucket["credential_health"]["google"]["retry_at"])
+
+    def test_readiness_pruning_rotates_past_live_records_and_unexpired_health(self):
+        now = 85_000.0
+        model = policy.PRIMARY_MODELS[0]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(policy.time, "time", return_value=now), \
+             mock.patch.object(policy, "_any_active_check_lease", return_value=False), \
+             mock.patch.object(policy, "_rollback_readiness_protection", return_value=(set(), set(), set(), False)):
+            root = Path(directory)
+            state = policy.RuntimeState("key", "version", root)
+            live_order = [f"{index + 5000:064x}" for index in range(policy.READINESS_PRUNE_MAX_IDENTITIES)]
+            expired_order = [f"{index + 6000:064x}" for index in range(policy.READINESS_PRUNE_MAX_IDENTITIES)]
+            live_ids = set(live_order)
+            expired_ids = set(expired_order)
+            records = {identity: {"verified": {model: now - 601}}
+                       for identity in live_order + expired_order}
+            records[state.identity] = {"verified": {model: now - 10}}
+            health = {f"google/model-{index}": {"state": "temporary", "retry_at": now + 100}
+                      for index in range(policy.READINESS_PRUNE_MAX_HEALTH_RECORDS)}
+            health["google/expired"] = {"state": "temporary", "retry_at": now - 1}
+            managed_health = {
+                f"{index + 1:064x}": {model: {"state": "temporary", "retry_at": now + 100}}
+                for index in range(policy.READINESS_PRUNE_MAX_HEALTH_RECORDS)
+            }
+            managed_health[f"{policy.READINESS_PRUNE_MAX_HEALTH_RECORDS + 1:064x}"] = {
+                model: {"state": "temporary", "retry_at": now - 1}
+            }
+            state.path.write_text(json.dumps({"revision": 0, "credentials": {state.credential: {
+                "records": records, "health": health, "managed_health": managed_health,
+                "credential_health": {},
+            }}})); state.path.chmod(0o600)
+
+            with mock.patch.object(policy, "_check_lease_state", side_effect=lambda _root, identity: identity in live_ids):
+                state.finish_check(True)
+                first = json.loads(state.path.read_text())["credentials"][state.credential]
+                self.assertEqual(first["records"][live_order[0]]["verified"][model], now - 601)
+                self.assertIn("google/expired", first["health"])
+                self.assertIn(f"{policy.READINESS_PRUNE_MAX_HEALTH_RECORDS + 1:064x}", first["managed_health"])
+
+                state.finish_check(True)
+                second = json.loads(state.path.read_text())["credentials"][state.credential]
+                self.assertTrue(expired_ids.isdisjoint(second["records"]))
+                self.assertNotIn("google/expired", second["health"])
+                self.assertNotIn(f"{policy.READINESS_PRUNE_MAX_HEALTH_RECORDS + 1:064x}", second["managed_health"])
+                self.assertTrue(live_ids.issubset(second["records"]))
+
+    def test_pruning_expiry_checks_retain_ambiguous_values(self):
+        now = 90_000.0
+        for value in (True, "old", now + 1, 10 ** 10000):
+            self.assertFalse(policy._expired_verification(value, now))
+        self.assertFalse(policy._expired_verification(now - 601, float("inf")))
+        for failure in (
+            {"state": "repair", "retry_at": now - 1},
+            {"state": "temporary", "retry_at": None},
+            {"state": "temporary", "retry_at": "expired"},
+            {"state": "temporary", "retry_at": 10 ** 10000},
+        ):
+            self.assertFalse(policy._expired_temporary_failure(failure, now))
+
+    def test_rollback_readiness_protection_uses_only_validated_private_metadata(self):
+        import hashlib
+        import uuid
+        with tempfile.TemporaryDirectory() as directory:
+            support = Path(directory)
+            managed_root = support / "ManagedOpenClaw"
+            instance = str(uuid.uuid4())
+            state_path = managed_root / "instances" / instance
+            state_path.mkdir(parents=True, mode=0o700)
+            (managed_root / "installations" / "pkg" / "node" / "bin").mkdir(parents=True)
+            (managed_root / "installations" / "pkg" / "package" / "node_modules" / "openclaw").mkdir(parents=True)
+            (state_path / "workspace").mkdir()
+            (state_path / "credential-fingerprint.json").write_text(json.dumps({"fingerprint": "a" * 64}))
+            defaults = {"model": {"primary": "google/model"}, "modelPolicy": [], "imageModel": None, "models": {}}
+            (state_path / "openclaw.json").write_text(json.dumps({"agents": {"defaults": defaults}}))
+            descriptor = {
+                "version": 1, "instance_id": instance, "installation_fingerprint": "install-fingerprint",
+                "configuration_fingerprint": "configuration-fingerprint", "openclaw_version": "2026.9.5",
+                "node_version": "24.22.1", "node": str(managed_root / "installations" / "pkg" / "node" / "bin" / "node"),
+                "entry": str(managed_root / "installations" / "pkg" / "package" / "node_modules" / "openclaw" / "openclaw.mjs"),
+                "executable": str(state_path / "openclaw"), "state": str(state_path),
+                "config": str(state_path / "openclaw.json"), "workspace": str(state_path / "workspace"),
+                "token_file": str(state_path / "gateway-token"), "port": 12345, "endpoint": "ws://127.0.0.1:12345",
+            }
+            previous = managed_root / "previous-runtime.json"
+            previous.write_text(json.dumps(descriptor)); previous.chmod(0o600)
+
+            cache = {}
+            protection = policy._rollback_readiness_protection(support, cache)
+            import private_runtime_metadata
+            with mock.patch.object(private_runtime_metadata, "read_bytes", side_effect=AssertionError("cache missed")):
+                self.assertEqual(policy._rollback_readiness_protection(support, cache), protection)
+            credentials, records, managed, uncertain = protection
+            self.assertFalse(uncertain)
+            self.assertEqual(credentials, {hashlib.sha256(("a" * 64).encode()).hexdigest()})
+            self.assertEqual(managed, {hashlib.sha256((instance + ":install-fingerprint:configuration-fingerprint").encode()).hexdigest()})
+            config_fingerprint = hashlib.sha256(json.dumps(defaults, sort_keys=True).encode()).hexdigest()
+            source = "a" * 64
+            expected_identity = hashlib.sha256(json.dumps([
+                source, "OpenClaw 2026.9.5", policy.CONFIG_VERSION, policy.ALL_MODELS,
+                config_fingerprint, runtime.VALIDATION_VERSION, runtime.CONTRACT_HASH,
+                policy.ERROR_POLICY_VERSION, instance + ":install-fingerprint:configuration-fingerprint",
+            ]).encode()).hexdigest()
+            self.assertEqual(records, {expected_identity})
+
     def test_credential_error_invalidates_all_verification(self):
         with tempfile.TemporaryDirectory() as directory:
             state = policy.RuntimeState('key', 'version', Path(directory))

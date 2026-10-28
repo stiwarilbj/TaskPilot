@@ -31,6 +31,13 @@ FALLBACK_MODELS = (
 ALL_MODELS = PRIMARY_MODELS + FALLBACK_MODELS
 CONFIG_VERSION = 5
 ERROR_POLICY_VERSION = 1
+VERIFICATION_CACHE_SECONDS = 600
+READINESS_PRUNE_MAX_CREDENTIALS = 64
+READINESS_PRUNE_MAX_IDENTITIES = 128
+READINESS_PRUNE_MAX_HEALTH_RECORDS = 128
+READINESS_PRUNE_MAX_LEASE_SCAN = 64
+READINESS_PRUNE_MAX_DIRECTORY_ENTRIES = 256
+_READINESS_IDENTITY = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass
@@ -435,6 +442,298 @@ def sync_state_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _check_lease_state(root: Path, identity: str) -> bool | None:
+    """Return False only when no active lease is established; uncertainty retains state."""
+    if not isinstance(identity, str) or not _READINESS_IDENTITY.fullmatch(identity):
+        return None
+    path = root / ("readiness-" + identity + ".lock")
+    flags = (os.O_RDWR | os.O_CLOEXEC | os.O_NONBLOCK |
+             getattr(os, "O_NOFOLLOW", 0))
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    try:
+        try:
+            opened_identity = private_lock_identity(path, descriptor)
+        except (OSError, PrivateLockIdentityError):
+            return None
+        try:
+            # This is a nonblocking lease probe while the state lock is held;
+            # it never waits on the lower-ranked single-flight lock.
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return None
+        try:
+            if private_lock_identity(path, descriptor) != opened_identity:
+                return None
+            return False
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _any_active_check_lease(root: Path) -> bool:
+    """Bounded conservative scan used before pruning installation health namespaces."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(root, flags | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return True
+    try:
+        with os.scandir(descriptor) as entries:
+            inspected = scanned = 0
+            for entry in entries:
+                scanned += 1
+                if scanned > READINESS_PRUNE_MAX_DIRECTORY_ENTRIES:
+                    return True
+                if not entry.name.startswith("readiness-") or not entry.name.endswith(".lock"):
+                    continue
+                inspected += 1
+                if inspected > READINESS_PRUNE_MAX_LEASE_SCAN:
+                    return True
+                identity = entry.name[len("readiness-"):-len(".lock")]
+                state = _check_lease_state(root, identity)
+                if state is not False:
+                    return True
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def _rollback_readiness_protection(root: Path, cache: dict | None = None) -> tuple[set[str], set[str], set[str], bool]:
+    """Return rollback credential, record, and managed-health keys plus uncertainty.
+
+    This reads only the one known TaskPilot descriptor and its two referenced
+    metadata files. It never scans profiles. If any identity cannot be proved,
+    the caller retains all candidate records rather than guessing.
+    """
+    descriptor_path = root / "ManagedOpenClaw" / "previous-runtime.json"
+
+    def signature(path: Path):
+        try:
+            info = os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1):
+            raise OSError("rollback metadata identity is uncertain")
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+                info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    if cache is not None and cache.get("paths"):
+        try:
+            signatures = tuple(signature(path) for path in cache["paths"])
+            if signatures == cache.get("signatures"):
+                return cache["values"]
+        except (OSError, TypeError):
+            pass
+        cache.clear()
+
+    try:
+        descriptor_signature = signature(descriptor_path)
+    except FileNotFoundError:
+        descriptor_signature = None
+    except OSError:
+        return set(), set(), set(), True
+    if descriptor_signature is None:
+        values = (set(), set(), set(), False)
+        if cache is not None:
+            cache.update(paths=(descriptor_path,), signatures=(None,), values=values)
+        return values
+    try:
+        import private_runtime_metadata as private_metadata
+        import runtime_descriptor_generated as descriptor_contract
+
+        descriptor = descriptor_contract.parse_descriptor(
+            private_metadata.read_bytes(descriptor_path, private_metadata.DESCRIPTOR_BYTES),
+            descriptor_path.parent)
+        managed = ":".join((descriptor["instance_id"], descriptor["installation_fingerprint"],
+                            descriptor["configuration_fingerprint"]))
+        managed_key = hashlib.sha256(managed.encode()).hexdigest()
+        state_path = Path(descriptor["state"])
+        key_path = state_path / "credential-fingerprint.json"
+        config_path = Path(descriptor["config"])
+        paths = (descriptor_path, key_path, config_path)
+        before = tuple(signature(path) for path in paths)
+        if before[0] != descriptor_signature:
+            return set(), set(), set(), True
+        key_record = private_metadata.read(key_path, 4096)
+        source_fingerprint = key_record.get("fingerprint")
+        if not isinstance(source_fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", source_fingerprint):
+            return set(), set(), {managed_key}, True
+        credential = hashlib.sha256(source_fingerprint.encode()).hexdigest()
+        config = private_metadata.read(config_path, private_metadata.CONFIGURATION_BYTES)
+        defaults = config.get("agents", {}).get("defaults", {})
+        if not isinstance(defaults, dict):
+            return {credential}, set(), {managed_key}, True
+        settings = {key: defaults.get(key) for key in ("model", "modelPolicy", "imageModel", "models")}
+        model_configuration = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
+        runtime_version = "OpenClaw " + descriptor["openclaw_version"]
+        record_identity = hashlib.sha256(json.dumps([
+            source_fingerprint, runtime_version, CONFIG_VERSION, ALL_MODELS,
+            model_configuration, VALIDATION_VERSION, CONTRACT_HASH, ERROR_POLICY_VERSION, managed,
+        ]).encode()).hexdigest()
+        after = tuple(signature(path) for path in paths)
+        if before != after:
+            return set(), set(), set(), True
+        values = ({credential}, {record_identity}, {managed_key}, False)
+        if cache is not None:
+            cache.update(paths=paths, signatures=after, values=values)
+        return values
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError):
+        # On any path, parse, or identity uncertainty, retain every candidate.
+        return set(), set(), set(), True
+
+
+def _expired_verification(value: Any, now: float) -> bool:
+    # Booleans, malformed values, future timestamps, and clock anomalies are
+    # retained. Only a finite, non-boolean timestamp past the known TTL expires.
+    try:
+        return (type(value) in (int, float) and math.isfinite(now) and math.isfinite(value) and
+                value <= now and now - value >= VERIFICATION_CACHE_SECONDS)
+    except (OverflowError, ValueError):
+        return False
+
+
+def _expired_temporary_failure(value: Any, now: float) -> bool:
+    if not isinstance(value, dict) or value.get("state") != "temporary":
+        return False
+    retry_at = value.get("retry_at")
+    # Null means no reset was supplied and is an indefinite restriction.
+    try:
+        return (type(retry_at) in (int, float) and math.isfinite(now) and
+                math.isfinite(retry_at) and retry_at <= now)
+    except (OverflowError, ValueError):
+        return False
+
+
+def _bounded_items(mapping: dict, limit: int):
+    """Copy at most limit entries so mutation never requires an unbounded key list."""
+    if limit <= 0:
+        return []
+    result = []
+    for item in mapping.items():
+        result.append(item)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _rotate_items(mapping: dict, items: list[tuple[Any, Any]]) -> None:
+    """Move visited entries behind unvisited entries without scanning the map."""
+    for key, value in items:
+        if key in mapping:
+            mapping.pop(key)
+            mapping[key] = value
+
+
+def _prune_readiness_document(document: dict[str, Any], state: "RuntimeState", now: float) -> None:
+    """Bounded, conservative cleanup performed only while the state write lock is held."""
+    credentials = document.get("credentials")
+    if not isinstance(credentials, dict):
+        return
+    rollback_credentials, rollback_records, rollback_managed, rollback_unknown = \
+        _rollback_readiness_protection(state.root, state._rollback_protection_cache)
+    any_active_lease = _any_active_check_lease(state.root)
+    current_managed = hashlib.sha256(state.managed_configuration.encode()).hexdigest() if state.managed_configuration else None
+
+    (examined_records, examined_verification, examined_health,
+     examined_managed_namespaces, examined_managed_health) = (0, 0, 0, 0, 0)
+    credential_slice = _bounded_items(credentials, READINESS_PRUNE_MAX_CREDENTIALS)
+    for credential, bucket in credential_slice:
+        if not isinstance(bucket, dict):
+            continue
+        current_credential = credential == state.credential
+
+        # Verification records are scoped by the complete runtime identity. A
+        # current or rollback installation is never pruned, even if its cache
+        # timestamp is old. Active/uncertain check leases also retain records.
+        records = bucket.get("records")
+        if isinstance(records, dict) and not rollback_unknown:
+            remaining = READINESS_PRUNE_MAX_IDENTITIES - examined_records
+            if remaining > 0:
+                record_slice = _bounded_items(records, remaining)
+                examined_records += len(record_slice)
+            else:
+                record_slice = []
+            for identity, record in record_slice:
+                if identity == state.identity or identity in rollback_records or not isinstance(record, dict):
+                    continue
+                if _check_lease_state(state.root, identity) is not False:
+                    continue
+                verified = record.get("verified")
+                if isinstance(verified, dict) and examined_verification < READINESS_PRUNE_MAX_HEALTH_RECORDS:
+                    remaining_health = READINESS_PRUNE_MAX_HEALTH_RECORDS - examined_verification
+                    for model, timestamp in _bounded_items(verified, remaining_health):
+                        examined_verification += 1
+                        if _expired_verification(timestamp, now):
+                            verified.pop(model, None)
+                    if not verified:
+                        record.pop("verified", None)
+                # Keep invalidation markers, single-flight results, and any
+                # unknown future fields. Delete only a cache-only empty shell.
+                if not record:
+                    records.pop(identity, None)
+            _rotate_items(records, record_slice)
+
+        # Account-wide health is intentionally never pruned here. In particular,
+        # retry_at:null encodes an indefinite quota restriction. Model health is
+        # trimmed only after its explicit finite cooldown has expired.
+        if not any_active_lease:
+            health = bucket.get("health")
+            if isinstance(health, dict) and examined_health < READINESS_PRUNE_MAX_HEALTH_RECORDS:
+                remaining_health = READINESS_PRUNE_MAX_HEALTH_RECORDS - examined_health
+                health_slice = _bounded_items(health, remaining_health)
+                for model, failure in health_slice:
+                    examined_health += 1
+                    if _expired_temporary_failure(failure, now):
+                        health.pop(model, None)
+                _rotate_items(health, health_slice)
+            managed_health = bucket.get("managed_health")
+            if (isinstance(managed_health, dict) and not rollback_unknown and
+                    examined_managed_namespaces < READINESS_PRUNE_MAX_HEALTH_RECORDS):
+                remaining_namespaces = READINESS_PRUNE_MAX_HEALTH_RECORDS - examined_managed_namespaces
+                managed_slice = _bounded_items(managed_health, remaining_namespaces)
+                examined_managed_namespaces += len(managed_slice)
+                for managed_key, health_records in managed_slice:
+                    if examined_managed_health >= READINESS_PRUNE_MAX_HEALTH_RECORDS:
+                        break
+                    if managed_key == current_managed or managed_key in rollback_managed:
+                        continue
+                    if not isinstance(health_records, dict):
+                        continue
+                    if examined_managed_health >= READINESS_PRUNE_MAX_HEALTH_RECORDS:
+                        continue
+                    remaining_health = READINESS_PRUNE_MAX_HEALTH_RECORDS - examined_managed_health
+                    health_slice = _bounded_items(health_records, remaining_health)
+                    for model, failure in health_slice:
+                        examined_managed_health += 1
+                        if _expired_temporary_failure(failure, now):
+                            health_records.pop(model, None)
+                    if not health_records:
+                        managed_health.pop(managed_key, None)
+                    _rotate_items(health_records, health_slice)
+                _rotate_items(managed_health, managed_slice)
+
+        # Remove only an entirely empty obsolete bucket. Unknown fields,
+        # invalidation markers, credential health, and cooldowns keep it alive.
+        if not current_credential and credential not in rollback_credentials:
+            for field in ("records", "managed_health", "health", "credential_health"):
+                value = bucket.get(field)
+                if isinstance(value, dict) and not value:
+                    bucket.pop(field, None)
+            if not bucket:
+                credentials.pop(credential, None)
+    _rotate_items(credentials, credential_slice)
+
+
 @contextmanager
 def private_lock(path: Path, *, blocking=True, category=LockCategory.STATE):
     with reserve(category) as rank:
@@ -490,6 +789,7 @@ class RuntimeState:
         configuration_path = os.path.abspath(os.path.expanduser(os.environ.get("OPENCLAW_CONFIG_PATH", "~/.openclaw/openclaw.json")))
         self.configuration_key = hashlib.sha256(configuration_path.encode()).hexdigest()
         self.value: dict[str, Any] = {}
+        self._rollback_protection_cache: dict[str, Any] = {}
         self.refresh()
 
     def rebind_managed(self, version: str, configuration: str) -> None:
@@ -533,6 +833,9 @@ class RuntimeState:
                           "config_version": document.get("configurations", {}).get(self.configuration_key), "revision": document.get("revision", 0)}
             yield document, bucket, record
             if write:
+                # Best-effort and strictly bounded. Any uncertain descriptor,
+                # lease, timestamp, or quota state is retained by the pruner.
+                _prune_readiness_document(document, self, time.time())
                 document["revision"] = int(document.get("revision", 0)) + 1
                 self.value["revision"] = document["revision"]
                 fd, name = tempfile.mkstemp(prefix=".runtime-readiness-", dir=self.root)
@@ -634,7 +937,7 @@ class RuntimeState:
     def verified_model(self) -> str | None:
         with self.transaction():
             now = time.time()
-            return next((m for m in ALL_MODELS if not self.current_health(self.value["credential_health"].get(m.split('/', 1)[0], {})) and not self.current_health(self.value["health"].get(m, {})) and isinstance(self.value["verified"].get(m), (int, float)) and 0 <= now - self.value["verified"][m] < 600), None)
+            return next((m for m in ALL_MODELS if not self.current_health(self.value["credential_health"].get(m.split('/', 1)[0], {})) and not self.current_health(self.value["health"].get(m, {})) and type(self.value["verified"].get(m)) in (int, float) and 0 <= now - self.value["verified"][m] < VERIFICATION_CACHE_SECONDS), None)
 
     def check_revision(self) -> int:
         with self.transaction():
