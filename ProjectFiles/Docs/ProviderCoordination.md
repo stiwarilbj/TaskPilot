@@ -48,8 +48,26 @@ then releases the lease before the separate ACP verification check. No credentia
 is sent to this phase. Other OpenClaw clients do not participate in these advisory
 locks; this coordinates TaskPilot processes, not arbitrary external writers.
 
-Lock ordering is single-flight → configuration → short state transaction. Initial
-configuration preparation completes before acquiring single-flight. No code
+Lock ordering is single-flight (10) → configuration (20) → installation (30) →
+short state transaction (40). Python's `private_lock`, configuration transaction,
+and managed installation lock reserve their rank before filesystem setup or
+waiting on `flock`. A lower-ranked acquisition while a higher rank is held throws
+the fixed `internal_lock_order` error. Reentrant configuration transactions reuse
+their already-owned descriptor without a new acquisition. Equal ranks remain
+permitted, including native shared configuration readers; this is an ordering
+guard for these lock categories, not detection of every possible deadlock.
+
+Python bookkeeping belongs to the synchronous thread operation and resets after
+fork. Native synchronous operations use a thread context; asynchronous operations
+retaining leases across suspension bind `BackendLockOrder.operation` for the
+operation's lifetime. The private native configuration lease owns both its file
+descriptor and rank reservation, releasing both on explicit release or deinit.
+Failed opens, failed waits, and exceptional exits release reservations too.
+The two languages use identical fixed ranks. Each retains at most 128 wait
+samples in memory, containing only a fixed lock category and wait duration.
+No path, request, credential, owner identity, or task content is recorded.
+
+Initial configuration preparation completes before acquiring single-flight. No code
 waits for a model response while holding the configuration or state lock.
 
 Offline coverage includes real multiprocess merge races, late success versus

@@ -257,7 +257,27 @@ final class OpenClawService {
 
     // Same stable inode and flock protocol as Python configuration_transaction.
     // Never hold this lease while waiting for an explicit generation check.
-    static func configurationLease(root: URL? = nil, timeout: TimeInterval = 5) -> Int32? {
+    final class ConfigurationLease {
+        private let lock = NSLock()
+        private var descriptor: Int32?
+        private let rank: BackendLockOrder.Reservation
+        fileprivate init(descriptor: Int32, rank: BackendLockOrder.Reservation) {
+            self.descriptor = descriptor; self.rank = rank
+        }
+        func release() {
+            lock.withLock {
+                if let descriptor { Darwin.close(descriptor); self.descriptor = nil }
+                rank.release()
+            }
+        }
+        deinit { release() }
+    }
+
+    static func configurationLease(root: URL? = nil, timeout: TimeInterval = 5,
+                                   order: BackendLockOrder = .current) throws -> ConfigurationLease? {
+        let rank = try order.reserve(.configuration)
+        var transferred = false
+        defer { if !transferred { rank.release() } }
         let directory = root ?? ProcessInfo.processInfo.environment["ORBIT_RUNTIME_STATE_DIRECTORY"].map {
             URL(fileURLWithPath: $0, isDirectory: true)
         } ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Orbit Agent", isDirectory: true)
@@ -268,12 +288,19 @@ final class OpenClawService {
         let descriptor = open(directory.appendingPathComponent("openclaw-configuration.lock").path,
                               O_CREAT | O_RDWR | O_CLOEXEC, mode_t(0o600))
         guard descriptor >= 0 else { return nil }
-        let deadline = ProcessInfo.processInfo.systemUptime + timeout
-        repeat {
-            if flock(descriptor, LOCK_SH | LOCK_NB) == 0 { return descriptor }
-            guard errno == EWOULDBLOCK || errno == EINTR else { break }
-            Thread.sleep(forTimeInterval: 0.025)
-        } while ProcessInfo.processInfo.systemUptime < deadline
+        let acquired = rank.measureWait {
+            let deadline = ProcessInfo.processInfo.systemUptime + timeout
+            repeat {
+                if flock(descriptor, LOCK_SH | LOCK_NB) == 0 { return true }
+                guard errno == EWOULDBLOCK || errno == EINTR else { break }
+                Thread.sleep(forTimeInterval: 0.025)
+            } while ProcessInfo.processInfo.systemUptime < deadline
+            return false
+        }
+        if acquired {
+            transferred = true
+            return ConfigurationLease(descriptor: descriptor, rank: rank)
+        }
         close(descriptor)
         return nil
     }

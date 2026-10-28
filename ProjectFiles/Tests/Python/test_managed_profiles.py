@@ -1,4 +1,5 @@
 """Offline profile retirement: synthetic owners, private fixtures, no OpenClaw."""
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -229,9 +230,13 @@ class ManagedProfileTests(unittest.TestCase):
 
     def test_busy_configuration_installation_and_provisioning_are_not_waited_on(self):
         state = self.tracked(); self.aged(state)
-        with policy.private_lock(policy.runtime_state_root() / 'openclaw-configuration.lock'):
-            self.assertEqual(self.collect()['deferred'], 1)
-        with managed.locked(self.root): self.assertEqual(self.collect()['deferred'], 1)
+        # Model an independent holder, not an inverted acquisition by this operation.
+        paths = (policy.runtime_state_root() / 'openclaw-configuration.lock', self.root / 'installation.lock')
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with path.open('a') as holder:
+                fcntl.flock(holder, fcntl.LOCK_EX)
+                self.assertEqual(self.collect()['deferred'], 1)
         with managed.ProvisioningJournal(self.root), self.assertRaises(managed.ManagedRuntimeError): self.collect()
         self.assertTrue(state.exists())
 

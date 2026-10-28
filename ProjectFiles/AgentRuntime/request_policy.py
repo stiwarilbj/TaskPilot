@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import time
 from typing import Any, Callable
+from lock_order import LockCategory, reserve
 
 PRIMARY_MODELS = ("google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite")
 FALLBACK_MODELS = (
@@ -392,14 +393,16 @@ def runtime_state_root() -> Path:
 
 
 @contextmanager
-def private_lock(path: Path, *, blocking=True):
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
-        yield descriptor
-    finally:
-        os.close(descriptor)
+def private_lock(path: Path, *, blocking=True, category=LockCategory.STATE):
+    with reserve(category) as rank:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+        try:
+            with rank.waiting():
+                fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            yield descriptor
+        finally:
+            os.close(descriptor)
 
 
 @contextmanager
@@ -408,7 +411,8 @@ def configuration_transaction(*, blocking=True):
     if getattr(_configuration_local, "owned", False):
         yield _configuration_local.descriptor
         return
-    with private_lock(runtime_state_root() / "openclaw-configuration.lock", blocking=blocking) as descriptor:
+    with private_lock(runtime_state_root() / "openclaw-configuration.lock", blocking=blocking,
+                      category=LockCategory.CONFIGURATION) as descriptor:
         _configuration_local.owned = True
         _configuration_local.descriptor = descriptor
         try:
@@ -583,7 +587,8 @@ class RuntimeState:
     def explicit_check(self):
         # Followers reuse the leader's terminal result, including a failure.
         observed = self.check_revision()
-        with private_lock(self.root / ("readiness-" + self.identity + ".lock")):
+        with private_lock(self.root / ("readiness-" + self.identity + ".lock"),
+                          category=LockCategory.SINGLE_FLIGHT):
             yield self.check_revision() != observed
 
     def finish_check(self, success: bool) -> None:

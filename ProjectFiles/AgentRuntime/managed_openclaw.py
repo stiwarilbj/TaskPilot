@@ -32,6 +32,7 @@ import urllib.request
 import uuid
 
 import runtime_descriptor_generated as descriptor_contract
+from lock_order import LockCategory, reserve
 
 VERSION = 1
 ROOT = Path.home() / 'Library/Application Support/Orbit Agent/ManagedOpenClaw'
@@ -536,16 +537,18 @@ class ProvisioningJournal:
 
 @contextmanager
 def locked(root: Path, *, blocking=True):
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    check_private_directory(root, allow_mode_drift=True)
-    fd = os.open(root / 'installation.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0), 0o600)
-    with os.fdopen(fd, 'a') as f:
-        lock_stat = os.fstat(f.fileno())
-        if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != os.getuid() or lock_stat.st_nlink != 1:
-            raise PrivateDirectoryError('ownership')
-        os.fchmod(f.fileno(), 0o600)
-        fcntl.flock(f, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
-        yield
+    with reserve(LockCategory.INSTALLATION) as rank:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        check_private_directory(root, allow_mode_drift=True)
+        fd = os.open(root / 'installation.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | getattr(os, 'O_CLOEXEC', 0), 0o600)
+        with os.fdopen(fd, 'a') as f:
+            lock_stat = os.fstat(f.fileno())
+            if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != os.getuid() or lock_stat.st_nlink != 1:
+                raise PrivateDirectoryError('ownership')
+            os.fchmod(f.fileno(), 0o600)
+            with rank.waiting():
+                fcntl.flock(f, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            yield
 
 def digest(path):
     """Hash a file with bounded memory rather than loading the whole file."""
