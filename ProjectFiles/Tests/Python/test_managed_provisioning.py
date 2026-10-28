@@ -245,9 +245,9 @@ class ProvisioningTests(unittest.TestCase):
     def test_marker_is_private_bounded_and_contains_only_opaque_fields(self):
         snapshots = []
         original = managed.atomic_json
-        def capture(path, value):
+        def capture(path, value, **kwargs):
             if path.name == 'provisioning.json': snapshots.append(value.copy())
-            result = original(path, value)
+            result = original(path, value, **kwargs)
             if path.name == 'provisioning.json':
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             return result
@@ -289,9 +289,9 @@ class ProvisioningTests(unittest.TestCase):
 
     def test_activation_flag_survives_repeated_interruption(self):
         original = managed.atomic_json
-        def interrupt(path, value):
+        def interrupt(path, value, **kwargs):
             if path.name == 'activation-verification.json': raise Interrupted()
-            original(path, value)
+            original(path, value, **kwargs)
         with self.build(), patch.object(managed, 'verify_settings'):
             with patch.object(managed, 'atomic_json', side_effect=interrupt), self.assertRaises(Interrupted):
                 managed.ensure(self.resources, self.root)
@@ -810,9 +810,9 @@ class ProvisioningTests(unittest.TestCase):
             del integrity['native_addons']
             managed.atomic_json(stage / 'integrity.json', integrity)
             original = managed.atomic_json
-            def fail(path, value):
+            def fail(path, value, **kwargs):
                 if path == stage / 'integrity.json': raise OSError('injected optional cache write failure')
-                return original(path, value)
+                return original(path, value, **kwargs)
             downloads.reset_mock(); runs.reset_mock()
             with patch.object(managed, 'atomic_json', side_effect=fail):
                 target, fingerprint, _ = managed.install(self.resources, self.root)

@@ -1,5 +1,7 @@
 import json
+import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import unittest
@@ -17,6 +19,64 @@ class RequestPolicyTests(unittest.TestCase):
         def sleep(seconds):
             self.now += seconds
         return policy.AdaptiveModelRouter(lambda *a, **k: None, clock=lambda: self.now, sleep=sleep)
+
+    def test_runtime_state_persists_file_before_syncing_its_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = policy.RuntimeState('key', 'version', Path(directory))
+            synced_kinds = []
+            real_fsync = os.fsync
+
+            def observe(descriptor):
+                synced_kinds.append(stat.S_ISDIR(os.fstat(descriptor).st_mode))
+                return real_fsync(descriptor)
+
+            with mock.patch.object(policy.os, 'fsync', side_effect=observe):
+                state.invalidate(policy.PRIMARY_MODELS[0])
+
+            self.assertEqual(synced_kinds, [False, True])
+            document = json.loads(state.path.read_text())
+            self.assertEqual(document['revision'], 1)
+
+    def test_runtime_state_persistence_failures_preserve_complete_conservative_cooldowns(self):
+        model = policy.PRIMARY_MODELS[0]
+        for phase in ('write', 'file_sync', 'replace', 'directory_sync'):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state = policy.RuntimeState('key', 'version', root)
+                state.record_failure(model, policy.Failure(
+                    'quota', 'fixture cooldown', retry_at=10**12, scope='model'))
+                previous = state.path.read_bytes()
+                real_fsync = os.fsync
+                fsync_calls = [0]
+
+                def fail_dump(document, stream, *args, **kwargs):
+                    stream.write('{"revision":')
+                    raise OSError('injected write failure')
+
+                def fail_sync(descriptor):
+                    fsync_calls[0] += 1
+                    if phase == 'file_sync' or phase == 'directory_sync' and fsync_calls[0] == 2:
+                        raise OSError('injected synchronization failure')
+                    return real_fsync(descriptor)
+
+                if phase == 'write':
+                    failure = mock.patch.object(policy.json, 'dump', side_effect=fail_dump)
+                elif phase == 'replace':
+                    failure = mock.patch.object(policy.os, 'replace', side_effect=OSError('injected replace failure'))
+                else:
+                    failure = mock.patch.object(policy.os, 'fsync', side_effect=fail_sync)
+                with failure, self.assertRaises(OSError):
+                    state.invalidate(model)
+
+                recovered = policy.RuntimeState('key', 'version', root)
+                health = recovered.health(model)
+                self.assertEqual(health['state'], 'temporary')
+                self.assertGreaterEqual(health['retry_at'], 10**12)
+                complete = json.loads(recovered.path.read_text())
+                if phase == 'directory_sync':
+                    self.assertGreater(complete['revision'], json.loads(previous)['revision'])
+                else:
+                    self.assertEqual(recovered.path.read_bytes(), previous)
 
     def test_healthy_sticky_one_call_per_decision(self):
         router = self.router()

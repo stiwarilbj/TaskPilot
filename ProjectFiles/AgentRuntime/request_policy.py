@@ -415,6 +415,26 @@ def private_lock_identity(path: Path, descriptor: int) -> tuple[int, int, int]:
     return opened.st_dev, opened.st_ino, opened.st_uid
 
 
+def sync_state_directory(path: Path) -> None:
+    """Persist a readiness-state rename without following a directory symlink."""
+    flags = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+             getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        try:
+            named = os.stat(path, follow_symlinks=False)
+        except OSError as error:
+            raise OSError(errno.EIO, "runtime state directory changed during persistence") from error
+        if (not stat.S_ISDIR(opened.st_mode) or not stat.S_ISDIR(named.st_mode) or
+                opened.st_uid != os.getuid() or named.st_uid != os.getuid() or
+                (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)):
+            raise OSError(errno.EIO, "runtime state directory changed during persistence")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 @contextmanager
 def private_lock(path: Path, *, blocking=True, category=LockCategory.STATE):
     with reserve(category) as rank:
@@ -522,6 +542,7 @@ class RuntimeState:
                         output.flush()
                         os.fsync(output.fileno())
                     os.replace(name, self.path)
+                    sync_state_directory(self.root)
                 finally:
                     if os.path.exists(name): os.unlink(name)
 

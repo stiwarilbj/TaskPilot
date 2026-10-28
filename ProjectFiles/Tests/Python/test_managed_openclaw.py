@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import threading
@@ -570,7 +571,85 @@ class ManagedRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(managed.ManagedRuntimeError,'Repair private config'):
             managed.wait_for_health(self.path,sleep=lambda _:self.fail('permanent error polled'))
 
+class AtomicJSONDurabilityTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def test_durable_replace_syncs_file_then_containing_directory(self):
+        path = self.root / 'activation.json'
+        synced_kinds = []
+        real_fsync = os.fsync
+
+        def observe(descriptor):
+            synced_kinds.append(stat.S_ISDIR(os.fstat(descriptor).st_mode))
+            return real_fsync(descriptor)
+
+        with patch.object(managed.os, 'fsync', side_effect=observe):
+            managed.atomic_json(path, {'generation': 2}, durable=True)
+
+        self.assertEqual(synced_kinds, [False, True])
+        self.assertEqual(json.loads(path.read_text()), {'generation': 2})
+
+    def test_regenerable_replace_keeps_the_file_only_sync_path(self):
+        path = self.root / 'health.json'
+        real_fsync = os.fsync
+        synced_kinds = []
+
+        def observe(descriptor):
+            synced_kinds.append(stat.S_ISDIR(os.fstat(descriptor).st_mode))
+            return real_fsync(descriptor)
+
+        with patch.object(managed.os, 'fsync', side_effect=observe), \
+                patch.object(managed, 'sync_directory') as sync_directory:
+            managed.atomic_json(path, {'state': 'healthy'})
+
+        self.assertEqual(synced_kinds, [False])
+        sync_directory.assert_not_called()
+
+    def test_provisioning_phase_records_use_the_durable_path(self):
+        with patch.object(managed, 'sync_directory', wraps=managed.sync_directory) as sync:
+            with managed.ProvisioningJournal(self.root) as journal:
+                journal.record('configuration', 'fixture')
+
+        sync.assert_called_once_with(self.root)
+        self.assertEqual(managed.ProvisioningJournal(self.root).read()['phase'], 'configuration')
+
+    def test_failures_leave_only_the_old_or_complete_new_record(self):
+        for phase in ('write', 'file_sync', 'replace', 'directory_sync'):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); path = root / 'runtime.json'
+                managed.atomic_json(path, {'generation': 1, 'state': 'old'})
+                real_fsync = os.fsync
+                fsync_calls = [0]
+
+                def fail_dump(value, stream, *args, **kwargs):
+                    stream.write('{"generation":')
+                    raise OSError('injected write failure')
+
+                def fail_sync(descriptor):
+                    fsync_calls[0] += 1
+                    if phase == 'file_sync' or phase == 'directory_sync' and fsync_calls[0] == 2:
+                        raise OSError('injected synchronization failure')
+                    return real_fsync(descriptor)
+
+                if phase == 'write':
+                    failure = patch.object(managed.json, 'dump', side_effect=fail_dump)
+                elif phase == 'replace':
+                    failure = patch.object(managed.os, 'replace', side_effect=OSError('injected replace failure'))
+                else:
+                    failure = patch.object(managed.os, 'fsync', side_effect=fail_sync)
+                with failure, self.assertRaises(OSError):
+                    managed.atomic_json(path, {'generation': 2, 'state': 'new'}, durable=True)
+
+                record = json.loads(path.read_text())
+                expected = {'generation': 2, 'state': 'new'} if phase == 'directory_sync' else {'generation': 1, 'state': 'old'}
+                self.assertEqual(record, expected)
+                self.assertEqual(sorted(p.name for p in root.iterdir()), ['runtime.json'])
+
+
 if __name__=='__main__':unittest.main()
+
 
 class ManagedRecoveryTests(unittest.TestCase):
     setUp = ManagedRuntimeTests.setUp

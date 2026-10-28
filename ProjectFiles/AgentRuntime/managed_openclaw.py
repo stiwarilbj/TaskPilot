@@ -394,13 +394,22 @@ class ACPConnectionError(ManagedRuntimeError):
         self.code = 'transport_' + cause
         super().__init__('Private OpenClaw ACP connection failed (' + cause + '); supervised recovery is required.')
 
-def atomic_json(path: Path, value):
+def atomic_json(path: Path, value, *, durable=False):
+    """Replace a JSON record atomically, optionally persisting its directory entry.
+
+    Every replacement syncs the complete temporary file before rename. Records
+    that affect activation, recovery, or configuration ownership pass
+    ``durable=True`` to also sync the containing directory after replacement.
+    Regenerable health and audit snapshots intentionally keep the lighter path.
+    """
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, name = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
     try:
         with os.fdopen(fd, 'w') as f:
             json.dump(value, f, separators=(',', ':')); f.flush(); os.fsync(f.fileno())
         os.replace(name, path)
+        if durable:
+            sync_directory(path.parent)
     finally:
         Path(name).unlink(missing_ok=True)
 
@@ -716,8 +725,7 @@ class ProvisioningJournal:
         value = dict(version=1, phase=phase, fingerprint=fingerprint,
                      stage_id=stage_id, stage_identity=stage_identity)
         if self.fd is None or not self.valid(value): raise ManagedRuntimeError('Invalid private provisioning phase.')
-        atomic_json(self.path, value)
-        sync_directory(self.root)
+        atomic_json(self.path, value, durable=True)
         return value
 
     def clear(self):
@@ -1782,8 +1790,8 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
         # interruption during configuration must not lose this obligation.
         if (interrupted is not None and interrupted['phase'] in {'activating', 'activated'} and
                 existing and existing['installation_fingerprint'] == interrupted['fingerprint']):
-            atomic_json(root / 'activation-verification.json', {'installation_fingerprint':interrupted['fingerprint']})
-            sync_directory(root)
+            atomic_json(root / 'activation-verification.json',
+                        {'installation_fingerprint':interrupted['fingerprint']}, durable=True)
         target, fingerprint, manifest = install(resources, root, journal=journal)
         require_cli_capabilities(target, manifest)
         try:
@@ -1815,7 +1823,7 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
         desired = desired_settings(workspace, token, port)
         # Save a compatible snapshot before promoting a changed installation.
         if previous and previous['installation_fingerprint'] != fingerprint:
-            atomic_json(root / 'previous-runtime.json', previous)
+            atomic_json(root / 'previous-runtime.json', previous, durable=True)
             if config.exists(): shutil.copyfile(config, state / 'previous-config.json')
         try: current_config = private_metadata.read(config, private_metadata.CONFIGURATION_BYTES)
         except (OSError, ValueError): current_config = {}
@@ -1823,7 +1831,7 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
         if config_changed:
             if not offline: cleanup.enter_context(configuration_hold(root, already_drained=drained)); offline = True
             require_offline(root)
-            atomic_json(config, merge_settings(current_config, desired))
+            atomic_json(config, merge_settings(current_config, desired), durable=True)
         configuration_fence = ConfigurationPathFence(state, config)
         configuration_snapshot = configuration_fence.snapshot()
         auth = state / 'agents/main/agent/auth-profiles.json'
@@ -1865,7 +1873,8 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
             try: saved_key = (root.parent / 'gemini-api-key').read_text().strip()
             except OSError: saved_key = ''
             atomic_json(key_record, {'fingerprint':key_fingerprint,
-                                    'verification_until':time.time() + 300 if saved_key and saved_key != key.strip() else 0})
+                                    'verification_until':time.time() + 300 if saved_key and saved_key != key.strip() else 0},
+                        durable=True)
         descriptor = {'version':descriptor_contract.DESCRIPTOR_VERSION, 'instance_id':identity, 'installation_fingerprint':fingerprint,
             'openclaw_version':manifest['openclaw_version'], 'node_version':manifest['node_version'],
             'node':str(node),'entry':str(entry),'executable':str(wrapper),'state':str(state),
@@ -1884,12 +1893,12 @@ def ensure(resources: Path, root: Path = ROOT, key: str = '', *, drained=False):
             check_managed_directories(root, descriptor, repair=True)
         journal.record('activating', fingerprint)
         active_path_fence.verify(active_path_snapshot)
-        atomic_json(active, descriptor)
-        sync_directory(root)
+        atomic_json(active, descriptor, durable=True)
         if (not previous or previous['installation_fingerprint'] != fingerprint or
                 interrupted is not None and interrupted['fingerprint'] == fingerprint and
                 interrupted['phase'] in {'activating', 'activated'}):
-            atomic_json(root / 'activation-verification.json', {'installation_fingerprint':fingerprint})
+            atomic_json(root / 'activation-verification.json',
+                        {'installation_fingerprint':fingerprint}, durable=True)
         journal.record('activated', fingerprint)
         journal.clear()
         return descriptor
@@ -1965,7 +1974,7 @@ def relocate(path):
                     input_data=json.dumps({'gateway':{'port':port}}).encode(), env=isolated_environment(),
                     path_fence=fence)
         fence.verify(before)
-        atomic_json(config, value)
+        atomic_json(config, value, durable=True)
         updated = fence.snapshot()
         d.update(port=port, endpoint=f'ws://127.0.0.1:{port}')
         d['configuration_fingerprint'] = configuration_fingerprint(desired_settings(d['workspace'], Path(d['token_file']), port), Path(d['state']) / 'credential-fingerprint.json')
@@ -1976,7 +1985,7 @@ def relocate(path):
         fence.verify(updated)
         if _identity_at(path, 'file') != active_identity:
             raise ConfigurationPathError('Active descriptor changed during endpoint relocation.')
-        atomic_json(path, d)
+        atomic_json(path, d, durable=True)
         return d
 
 
@@ -2001,8 +2010,9 @@ def command(operation, resources=None, descriptor=None, *, force_integrity=False
 def mark_working(path):
     with locked(path.parent):
         d = load_descriptor(path)
-        atomic_json(path.parent / 'working-runtime.json', d)
-        atomic_json(path.parent / 'working-config.json', private_metadata.read(Path(d['config']), private_metadata.CONFIGURATION_BYTES))
+        atomic_json(path.parent / 'working-runtime.json', d, durable=True)
+        atomic_json(path.parent / 'working-config.json',
+                    private_metadata.read(Path(d['config']), private_metadata.CONFIGURATION_BYTES), durable=True)
 
 def rollback(path):
     require_offline(path.parent)
@@ -2022,7 +2032,7 @@ def rollback(path):
                     input_data=json.dumps(configuration).encode(), env=isolated_environment(),
                     path_fence=fence)
         fence.verify(before)
-        atomic_json(Path(d['config']), configuration)
+        atomic_json(Path(d['config']), configuration, durable=True)
         updated = fence.snapshot()
         verify_settings(d['executable'], configuration, path_fence=fence)
         bounded_run([d['executable'], 'config', 'validate'], timeout=45,
@@ -2030,8 +2040,9 @@ def rollback(path):
         fence.verify(updated)
         if _identity_at(path, 'file') != active_identity:
             raise ConfigurationPathError('Active descriptor changed during runtime rollback.')
-        atomic_json(path.parent / 'rejected-installation.json', {'fingerprint':failed['installation_fingerprint']})
-        atomic_json(path, d)
+        atomic_json(path.parent / 'rejected-installation.json',
+                    {'fingerprint':failed['installation_fingerprint']}, durable=True)
+        atomic_json(path, d, durable=True)
         return d
 
 
@@ -2361,7 +2372,7 @@ def repair(path, resources):
         now = time.time()
         if record.get('fingerprint') == result['fingerprint'] and 0 <= now - record.get('attempted_at',0) < 600:
             raise ManagedRuntimeError('This private runtime defect was already repaired recently; waiting before another attempt.')
-        atomic_json(record_path, {'fingerprint':result['fingerprint'], 'attempted_at':now})
+        atomic_json(record_path, {'fingerprint':result['fingerprint'], 'attempted_at':now}, durable=True)
     if 'private_directory_permissions' in result['causes']:
         from request_policy import configuration_transaction
         with configuration_transaction(), locked(path.parent):
@@ -2399,7 +2410,7 @@ def configuration_hold(root, *, timeout=60, already_drained=False):
         if identity is None: raise ManagedRuntimeError('Cannot establish configuration repair ownership.')
         request = root / 'configuration-request.json'
         token = str(uuid.uuid4())
-        atomic_json(request, {'request_id':token, 'owner':identity})
+        atomic_json(request, {'request_id':token, 'owner':identity}, durable=True)
         try:
             deadline = time.monotonic() + timeout
             while True:
