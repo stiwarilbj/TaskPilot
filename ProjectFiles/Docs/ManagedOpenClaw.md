@@ -496,6 +496,38 @@ Malformed database files are reported as `database_corrupt`; the host leaves
 them unchanged and requires inspection instead of an automatic destructive
 repair. Database health diagnostics contain only fixed states and retry timing.
 
+Each known database also brackets its query with no-follow metadata checks of
+only its exact `-wal` and `-shm` companions. Present companions must be readable,
+single-link regular files owned by the current user. Read-only, nonblocking,
+close-on-exec handles retain their identities until the query finishes; both
+the handles and paths must still identify the same objects afterward. A
+replacement, appearance, disappearance, access/ownership/link change, or failed
+metadata read makes the database check inconclusive, including when SQLite
+reported corruption. A missing main file with orphan companions is inconclusive.
+Missing companions alone are normal. Other database names are never searched.
+
+Metadata admission, SQLite's busy allowance/interrupt, and final companion
+checks share one monotonic deadline per database. Exhausting that allowance
+cannot establish corruption or trigger reconfiguration. This observes changes
+around the query rather than making filesystem and SQLite APIs atomic.
+The companion checks read no contents and write nothing. They add no checkpoint,
+recovery, journal-mode, or immutable-database commands. SQLite's existing
+read-only query can maintain SHM reader-coordination marks (see the
+[WAL-index documentation](https://sqlite.org/wal.html#implementation_of_shared_memory_for_the_wal_index));
+changing timestamps alone therefore do not imply a replaced sidecar or a frozen
+WAL snapshot. Main-file identity and content-metadata checks remain unchanged.
+
+Offline sidecar and shared-budget fixtures (from `ProjectFiles`):
+
+```sh
+python3 -m unittest Tests.Python.test_managed_database_sidecars Tests.Python.test_managed_provisioning
+```
+
+Fixtures use local disposable SQLite databases, real WAL readers, injected
+replacement/access races, and fake clocks. They launch no OpenClaw or desktop
+tasks and assert that healthy checks retain the main database and WAL bytes,
+close all companion handles, and add no generation requests.
+
 Configuration synchronization computes a nested delta from the known local
 configuration and applies only differing TaskPilot-owned leaves through the
 supported `config patch --stdin` interface. The model catalog is replaced as an

@@ -1633,26 +1633,29 @@ def credential_present(state):
 
 
 def read_only_database_health(path, *, timeout=SQLITE_HEALTH_TIMEOUT_SECONDS,
-                              now_monotonic=None):
+                              now_monotonic=None, deadline=None):
     """Bounded SQLite integrity check. It never opens a database for writing."""
     if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 5:
         return 'inconclusive'
+    clock = time.monotonic if now_monotonic is None else now_monotonic
+    if deadline is None: deadline = clock() + timeout
+    if clock() >= deadline: return 'inconclusive'
     database = Path(path)
     try: info = database.lstat()
     except FileNotFoundError: return 'missing'
     if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or
             info.st_uid != os.getuid() or info.st_nlink != 1):
         return 'inconclusive'
-    started = time.monotonic() if now_monotonic is None else now_monotonic()
-    deadline = started + timeout
     connection = None
     interrupter = None
     try:
+        remaining = deadline - clock()
+        if remaining <= 0: return 'inconclusive'
+        busy_milliseconds = min(SQLITE_BUSY_TIMEOUT_MILLISECONDS, int(remaining * 1000))
         uri = database.as_uri() + '?mode=ro'
         connection = sqlite3.connect(uri, uri=True,
-                                     timeout=SQLITE_BUSY_TIMEOUT_MILLISECONDS / 1000)
-        connection.execute(f'PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MILLISECONDS}')
-        clock = time.monotonic if now_monotonic is None else now_monotonic
+                                     timeout=busy_milliseconds / 1000)
+        connection.execute(f'PRAGMA busy_timeout={busy_milliseconds}')
         connection.set_progress_handler(lambda: 1 if clock() >= deadline else 0,
                                         SQLITE_PROGRESS_INTERVAL)
         # Progress handlers run between SQLite VM steps. An independent
@@ -1660,7 +1663,9 @@ def read_only_database_health(path, *, timeout=SQLITE_HEALTH_TIMEOUT_SECONDS,
         # in a database operation. It is cancelled before the connection is
         # closed and never changes the database.
         if now_monotonic is None:
-            interrupter = threading.Timer(max(0.001, timeout), connection.interrupt)
+            remaining = deadline - clock()
+            if remaining <= 0: return 'inconclusive'
+            interrupter = threading.Timer(max(0.001, remaining), connection.interrupt)
             interrupter.daemon = True
             interrupter.start()
         row = connection.execute('PRAGMA quick_check(1)').fetchone()
@@ -1698,9 +1703,63 @@ def read_only_database_health(path, *, timeout=SQLITE_HEALTH_TIMEOUT_SECONDS,
 def known_database_health(state, *, timeout=SQLITE_HEALTH_TIMEOUT_SECONDS,
                           now_monotonic=None):
     root = Path(state)
-    return {name: read_only_database_health(root / name, timeout=timeout,
-                                             now_monotonic=now_monotonic)
+    return {name: _database_health_with_sidecars(root / name, timeout=timeout,
+                                                now_monotonic=now_monotonic)
             for name in SQLITE_HEALTH_FILES}
+
+
+def _sqlite_sidecar_identity(info):
+    # SHM read marks may change during SQLite's read-only query. These are
+    # object/access identities, not a claim that its contents stayed frozen.
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_nlink)
+
+
+def _database_health_with_sidecars(database, *, timeout, now_monotonic):
+    """Fence only this database's WAL/SHM identities within one shared budget."""
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 5:
+        return 'inconclusive'
+    clock = time.monotonic if now_monotonic is None else now_monotonic
+    deadline = clock() + timeout
+    try:
+        with ExitStack() as handles:
+            sidecars = {}
+            for suffix in ('-wal', '-shm'):
+                if clock() >= deadline: return 'inconclusive'
+                path = database.with_name(database.name + suffix)
+                try: before = path.lstat()
+                except FileNotFoundError:
+                    sidecars[path] = None
+                    continue
+                if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_nlink != 1):
+                    return 'inconclusive'
+                # Nonblocking prevents a swapped FIFO from stalling this
+                # metadata-only inspection; no bytes are read from sidecars.
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+                handles.callback(os.close, fd)
+                identity = _sqlite_sidecar_identity(before)
+                if identity != _sqlite_sidecar_identity(os.fstat(fd)):
+                    return 'inconclusive'
+                sidecars[path] = (fd, identity)
+            if clock() >= deadline: return 'inconclusive'
+            result = read_only_database_health(database, timeout=timeout,
+                                                now_monotonic=now_monotonic, deadline=deadline)
+            for path, before in sidecars.items():
+                if clock() >= deadline: return 'inconclusive'
+                try: after = path.lstat()
+                except FileNotFoundError:
+                    if before is None: continue
+                    return 'inconclusive'
+                if before is None: return 'inconclusive'
+                fd, identity = before
+                if (identity != _sqlite_sidecar_identity(after) or
+                        identity != _sqlite_sidecar_identity(os.fstat(fd))):
+                    return 'inconclusive'
+            if clock() >= deadline: return 'inconclusive'
+            if result == 'missing' and any(value is not None for value in sidecars.values()):
+                return 'inconclusive'
+            return result
+    except OSError:
+        return 'inconclusive'
 
 
 def direct_command(descriptor):
