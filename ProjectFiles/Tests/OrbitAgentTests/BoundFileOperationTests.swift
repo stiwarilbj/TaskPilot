@@ -34,6 +34,79 @@ final class BoundFileOperationTests: XCTestCase {
         XCTAssertEqual(second.1["file_identity"] as? String, check.1["file_identity"] as? String)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: file.deletingLastPathComponent().path), ["result"])
     }
+    func testCommittedDigestProofIsReusedWithoutReadingAndHashingAgain() throws {
+        let file = try root().appendingPathComponent("result")
+        var boundaries: [BoundFileOperation.Boundary] = []
+        let operation = try BoundFileOperation(file, hook: { boundaries.append($0) })
+        let written = try operation.replace(with: Data("unchanged".utf8), append: false, mustBeAbsent: true)
+        var proof = written.1
+        proof["task_generation_id"] = "fixture-generation"
+        proof["path"] = file.standardizedFileURL.path
+        proof["file_size"] = written.0
+        boundaries.removeAll()
+
+        let lease = TaskLease(id: "fixture-generation")
+        try TaskOwnership.$current.withValue(lease) {
+            let reused = try XCTUnwrap(operation.reuseVerifiedDigest(kind: "file_contents",
+                expected: Data("unchanged".utf8), generation: lease.id, proof: proof))
+            XCTAssertEqual(reused["file_identity"] as? String, written.1["file_identity"] as? String)
+            XCTAssertEqual(reused["file_sha256"] as? String, written.1["file_sha256"] as? String)
+            XCTAssertEqual((reused["file_size"] as? NSNumber)?.intValue, written.0)
+            XCTAssertTrue(boundaries.contains(.digestProofReused))
+        }
+    }
+
+    func testDigestReusePropagatesTaskRevocationInsteadOfReportingAnUnknownCheck() throws {
+        let file = try root().appendingPathComponent("result")
+        let written = try BoundFileOperation(file).replace(with: Data("unchanged".utf8), append: false, mustBeAbsent: true)
+        let lease = TaskLease(id: "revoked-digest-proof")
+        var proof = written.1
+        proof["task_generation_id"] = lease.id
+        proof["path"] = file.standardizedFileURL.path
+        proof["file_size"] = written.0
+        let check = CommandExecutionPolicy.Check(type: "file_contents", path: file,
+            expected: Data("unchanged".utf8), text: nil, fileDigestProof: proof,
+            taskGenerationID: lease.id)
+
+        try TaskOwnership.$current.withValue(lease) {
+            lease.revoke()
+            XCTAssertThrowsError(try check.evaluate(stdout: "", stdoutTruncated: false)) {
+                XCTAssertTrue($0 is CancellationError)
+            }
+        }
+    }
+
+    func testReplacementAndSameSizeModificationRejectDigestProofAndInspectFreshState() throws {
+        let file = try root().appendingPathComponent("result")
+        let operation = try BoundFileOperation(file)
+        let written = try operation.replace(with: Data("original".utf8), append: false, mustBeAbsent: true)
+        let lease = TaskLease(id: "digest-proof-generation")
+        var proof = written.1
+        proof["task_generation_id"] = lease.id
+        proof["path"] = file.standardizedFileURL.path
+        proof["file_size"] = written.0
+
+        try TaskOwnership.$current.withValue(lease) {
+            try Data("original".utf8).write(to: file, options: .atomic)
+            XCTAssertNil(try operation.reuseVerifiedDigest(kind: "file_contents",
+                expected: Data("original".utf8), generation: lease.id, proof: proof))
+            let replacement = try operation.inspect(kind: "file_contents", expected: Data("original".utf8))
+            XCTAssertTrue(replacement.0)
+            XCTAssertNotEqual(replacement.1["file_identity"] as? String, proof["file_identity"] as? String)
+
+            let handle = try FileHandle(forWritingTo: file)
+            try handle.seek(toOffset: 0)
+            try handle.write(contentsOf: Data("modified".utf8))
+            try handle.truncate(atOffset: UInt64("modified".utf8.count))
+            try handle.synchronize()
+            try handle.close()
+            XCTAssertNil(try operation.reuseVerifiedDigest(kind: "file_contents",
+                expected: Data("original".utf8), generation: lease.id, proof: proof))
+            let changed = try operation.inspect(kind: "file_contents", expected: Data("original".utf8))
+            XCTAssertFalse(changed.0)
+            XCTAssertNotEqual(changed.1["file_version"] as? String, proof["file_version"] as? String)
+        }
+    }
     func testCapturesCompleteUTF8VersionsDuringTheDescriptorBoundWritePass() throws {
         let file = try root().appendingPathComponent("change.txt")
         let created = try BoundFileOperation(file).replaceCapturingText(with: Data("first\n".utf8),

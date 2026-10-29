@@ -134,7 +134,7 @@ final class TaskToolExecutor {
 
     /// Private completion readback. Validates the original payload but never
     /// dispatches it, starts a process, or replays a mutation.
-    func recheck(action input: [String: Any]) async throws -> [String: Any] {
+    func recheck(action input: [String: Any], fileDigestProof: [String: Any]? = nil) async throws -> [String: Any] {
         try await TaskOwnership.checkpoint()
         let action: [String: Any]
         do { action = try ActionContract.validate(input) }
@@ -147,21 +147,21 @@ final class TaskToolExecutor {
         } else if action["type"] as? String == "run_command" {
             requested = (action["checks"] as? [[String: Any]] ?? []).filter { $0["type"] as? String != "stdout_equals" }
         } else { throw TaskToolError.invalidAction("Only native file outcomes can be rechecked") }
-        return try await checkOutcomes(requested)
+        return try await checkOutcomes(requested, fileDigestProof: fileDigestProof)
     }
 
     /// Read-only expected effect check; no action dispatch or command launch.
-    func checkOutcome(_ input: Any) async throws -> [String: Any] {
+    func checkOutcome(_ input: Any, fileDigestProof: [String: Any]? = nil) async throws -> [String: Any] {
         let check: [String: Any]
         do { check = try ActionContract.validateOutcomeCheck(input) }
         catch { throw TaskToolError.invalidAction(error.localizedDescription) }
         guard check["type"] as? String != "stdout_equals" else {
             throw TaskToolError.invalidAction("Standalone checks cannot inspect command output")
         }
-        return try await checkOutcomes([check])
+        return try await checkOutcomes([check], fileDigestProof: fileDigestProof)
     }
 
-    private func checkOutcomes(_ input: [[String: Any]]) async throws -> [String: Any] {
+    private func checkOutcomes(_ input: [[String: Any]], fileDigestProof: [String: Any]? = nil) async throws -> [String: Any] {
         var requested: [[String: Any]] = []
         for check in input {
             do { requested.append(try ActionContract.validateOutcomeCheck(check)) }
@@ -176,9 +176,11 @@ final class TaskToolExecutor {
                 let content = check["content"] as! String
                 expected = check["encoding"] as? String == "base64" ? Data(base64Encoded: content)! : Data(content.utf8)
             }
-            checks.append(CommandExecutionPolicy.Check(type: check["type"] as! String, path: path,
-                                                       expected: expected, text: nil).evaluate(stdout: "", stdoutTruncated: false,
-                                                                                            downloadStatus: fileDownloadStatus))
+            checks.append(try CommandExecutionPolicy.Check(type: check["type"] as! String, path: path,
+                expected: expected, text: nil,
+                fileDigestProof: requested.count == 1 && check["type"] as? String == "file_contents" ? fileDigestProof : nil,
+                taskGenerationID: TaskOwnership.current?.id).evaluate(stdout: "", stdoutTruncated: false,
+                    downloadStatus: fileDownloadStatus))
         }
         try TaskOwnership.check()
         let verified = !checks.isEmpty && checks.allSatisfy { $0["verified"] as? Bool == true }
@@ -490,8 +492,8 @@ final class TaskToolExecutor {
                                            policy: policy, environment: environment,
                                            prefix: "command", timeout: policy.timeout,
                                            validate: { try binding?.validate() })
-        let checks = policy.checks.map { $0.evaluate(stdout: execution.stdout.text, stdoutTruncated: execution.stdout.truncated,
-                                                    downloadStatus: fileDownloadStatus) }
+        let checks = try policy.checks.map { try $0.evaluate(stdout: execution.stdout.text,
+            stdoutTruncated: execution.stdout.truncated, downloadStatus: fileDownloadStatus) }
         let executed = !execution.timedOut && execution.status == 0
         let verified = executed && !checks.isEmpty && checks.allSatisfy { $0["verified"] as? Bool == true }
         var result: [String: Any] = [

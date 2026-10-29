@@ -3,13 +3,15 @@ from copy import deepcopy
 from pathlib import Path
 import sys
 import unittest
+import uuid
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 from action_contract_generated import (validate_action, validate_native_result, validate_native_payload,
                                       ActionContractError, NativeProtocolError)
 from task_evidence import TaskEvidenceLedger
 from expected_effects import ExpectedEffect
-from evidence_fixtures import native_result, native_check
+from evidence_fixtures import native_result, native_check, native_batch
 import openclaw_runtime as runtime
 from prompt_compiler import recovery_condition, decision_rules
 
@@ -66,6 +68,78 @@ class FileIdentityTests(unittest.TestCase):
         reused = ExpectedEffect(expected,{}).reuse_native(self.action,result)
         self.assertEqual(reused['outcome'],'verified')
         self.assertEqual(reused['evidence']['file_identity'],result['file_identity'])
+
+    def test_verified_write_digest_is_cached_for_exact_same_task_contents_only(self):
+        generation = '00000000-0000-4000-8000-000000000123'
+        ledger = TaskEvidenceLedger('Write A to /fixture/a', generation)
+        result = native_result(self.action)
+        ledger.record_action(self.action, result)
+        check = {'type': 'file_contents', 'path': self.action['path'], 'content': 'A'}
+        proof = ledger.file_digest_proof_for(check)
+        self.assertEqual(proof, {
+            'task_generation_id': generation, 'path': self.action['path'],
+            'file_identity': result['file_identity'], 'file_version': result['file_version'],
+            'parent_identity': result['parent_identity'], 'file_size': 1,
+            'file_sha256': result['file_sha256'],
+        })
+        self.assertIsNone(ledger.file_digest_proof_for({**check, 'content': 'B'}))
+        other_task = TaskEvidenceLedger('Write A to /fixture/a', str(uuid.uuid4()))
+        self.assertIsNone(other_task.file_digest_proof_for(check))
+
+    def test_digest_proof_reconciliation_discards_replaced_or_modified_objects(self):
+        generation = str(uuid.uuid4())
+        ledger = TaskEvidenceLedger('Write A to /fixture/a', generation)
+        ledger.record_action(self.action, native_result(self.action))
+        check = {'type': 'file_contents', 'path': self.action['path'], 'content': 'A'}
+        old = ledger.file_digest_proof_for(check)
+        self.assertIsNotNone(old)
+
+        replacement = native_check(check, file_identity='a' * 64, file_version='b' * 64)
+        ledger.reconcile_file_digest_check(check, old,
+            native_batch([check], [replacement]))
+        refreshed = ledger.file_digest_proof_for(check)
+        self.assertNotEqual(refreshed['file_identity'], old['file_identity'])
+        self.assertEqual(refreshed['file_identity'], 'a' * 64)
+
+        current = ledger.file_digest_proof_for(check)
+        changed_contents = native_check(check, verified=False,
+            file_identity='c' * 64, file_version='d' * 64)
+        ledger.reconcile_file_digest_check(check, current,
+            native_batch([check], [changed_contents]))
+        self.assertIsNone(ledger.file_digest_proof_for(check))
+
+    def test_bridge_forwards_and_reconciles_private_digest_proof(self):
+        generation = str(uuid.uuid4())
+        ledger = TaskEvidenceLedger('Write A to /fixture/a', generation)
+        ledger.record_action(self.action, native_result(self.action))
+        context = runtime.TaskContext(ledger.task, 1, generation, ledger=ledger)
+        context.machine.phase = runtime.Phase.VERIFYING
+        check = {'type': 'file_contents', 'path': self.action['path'], 'content': 'A'}
+        token = runtime.current_task.set(context)
+        try:
+            batch = native_batch([check], [native_check(check)])
+            response = {'kind': 'bridge_response', 'request_id': 'fixture', 'ok': True, 'result': batch}
+            with mock.patch.object(runtime, 'bridge_exchange', return_value=response) as exchange:
+                runtime.bridge_call('check_effect', 1, check=check)
+            self.assertEqual(exchange.call_args.args[2]['file_digest_proof'], ledger.file_digest_proof_for(check))
+            proof = exchange.call_args.args[2]['file_digest_proof']
+
+            changed = native_check(check, verified=False, file_identity='e' * 64, file_version='f' * 64)
+            response['result'] = native_batch([check], [changed])
+            with mock.patch.object(runtime, 'bridge_exchange', return_value=response) as exchange:
+                runtime.bridge_call('check_effect', 1, check=check)
+            # The stale candidate is sent so native code can compare the
+            # current descriptor metadata and fall back to a full inspection.
+            self.assertEqual(exchange.call_args.args[2]['file_digest_proof'], proof)
+            self.assertIsNone(ledger.file_digest_proof_for(check))
+
+            # Once the native response established that the old object no
+            # longer matched, later checks cannot reuse that candidate.
+            with mock.patch.object(runtime, 'bridge_exchange', return_value=response) as exchange:
+                runtime.bridge_call('check_effect', 1, check=check)
+            self.assertNotIn('file_digest_proof', exchange.call_args.args[2])
+        finally:
+            runtime.current_task.reset(token)
 
     def test_outcome_checks_preserve_each_checked_object(self):
         check = {'type':'file_contents','path':'/fixture/a','content':'A'}

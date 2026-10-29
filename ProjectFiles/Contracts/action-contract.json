@@ -1854,6 +1854,15 @@
               "type": "string",
               "format": "sha256"
             },
+            "file_size": {
+              "type": "integer",
+              "min": 0,
+              "max": 9007199254740991
+            },
+            "file_sha256": {
+              "type": "string",
+              "format": "sha256"
+            },
             "file_identity": {
               "type": "string",
               "format": "sha256"

@@ -55,6 +55,8 @@ def native_check(check, verified=True, **fields):
     if verified and check['type'] == 'file_contents' and 'content' in check:
         data = base64.b64decode(check['content']) if check.get('encoding') == 'base64' else check['content'].encode()
         result['content_sha256'] = hashlib.sha256(data).hexdigest()
+        result['file_sha256'] = result['content_sha256']
+        result['file_size'] = len(data)
     if verified and check['type'] == 'stdout_equals' and 'text' in check:
         result['text_sha256'] = hashlib.sha256(check['text'].encode()).hexdigest()
     return {**result, **fields}

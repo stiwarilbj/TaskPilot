@@ -301,8 +301,11 @@ final class AgentAutomationBridge {
                 let signal = LocalChangeSignal(lease: lease)
                 let source = await NativeChangeSubscription.file(TaskToolExecutor.expandedFileURL(path), signal: signal)
                 var last: [String: Any] = [:]
+                var digestProof = params["file_digest_proof"] as? [String: Any]
                 let wait = try await LocalChangeWait.run(signal: signal, source: source, deadline: deadline, check: {
-                    last = try await self.taskTools.checkOutcome(check)
+                    let currentProof = digestProof
+                    digestProof = nil
+                    last = try await self.taskTools.checkOutcome(check, fileDigestProof: currentProof)
                     return (last["checks"] as? [[String: Any]])?.first?["verified"] as? Bool == true
                 })
                 try TaskOwnership.check()
@@ -328,7 +331,7 @@ final class AgentAutomationBridge {
             }
             if method == "check_effect" {
                 guard let check = params["check"] else { throw BridgeError.invalidRequest("Missing expected effect check") }
-                let result = try await taskTools.checkOutcome(check)
+                let result = try await taskTools.checkOutcome(check, fileDigestProof: params["file_digest_proof"] as? [String: Any])
                 try TaskOwnership.check()
                 return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
                         "ok": true, "result": result]
@@ -518,7 +521,8 @@ final class AgentAutomationBridge {
                 guard let action = params["action"] as? [String: Any] else {
                     throw BridgeError.invalidRequest("Missing readback payload")
                 }
-                result = try ActionContract.validateNativeReadback(try await taskTools.recheck(action: action), action: action)
+                result = try ActionContract.validateNativeReadback(try await taskTools.recheck(
+                    action: action, fileDigestProof: params["file_digest_proof"] as? [String: Any]), action: action)
 
             case "act":
                 let action = validatedAction!

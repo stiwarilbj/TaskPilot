@@ -557,6 +557,9 @@ class TaskEvidenceLedger:
         self._active_evidence_by_target: dict[tuple[str, str], dict[str, dict]] = {}
         self._evidence_target_keys: dict[str, tuple[tuple[str, str], ...]] = {}
         self._evidence_requirement_memberships: dict[str, dict[str, tuple[str, ...]]] = {}
+        # A task-local reuse hint for descriptor-verified file digests. Native
+        # code rechecks the current descriptor identity/version before reuse.
+        self._file_digest_proofs: dict[str, dict] = {}
         self.coverage_complete = False
         self.local_complete_grammar = False
         self.observation_id: str | None = None
@@ -1442,6 +1445,7 @@ class TaskEvidenceLedger:
     def before_action(self, action: dict) -> None:
         kind = action.get("type")
         if kind in {"none", "wait", "read_file"}: return
+        self._file_digest_proofs.clear()
         # Paths can alias and commands can mutate arbitrary resources. Be
         # conservative; a cheap local recheck is safer than inferring effects.
         self.invalidate(lambda e: e["fact"]["type"] == "observation" or e["mutable"])
@@ -1487,6 +1491,9 @@ class TaskEvidenceLedger:
             self.add_evidence(fact, mutable=result["mode"] != "append", action=action)
             self.add_evidence({"type": "file_exists", "path": result["path"],
                                **({"file_format": deepcopy(result["file_format"])} if "file_format" in result else {}), **identity}, mutable=True, action=action)
+            self._remember_file_digest(
+                result["path"], result, digest=result.get("file_sha256"), size=result.get("file_size"),
+                format_attestation=result.get("file_format"))
         elif kind == "run_command":
             if result.get("timed_out") is not False or type(result.get("exit_code")) is not int or result["exit_code"] != 0: return
             fact = {"type": "command_executed", **{k: action[k] for k in ("argv", "command") if k in action},
@@ -1538,6 +1545,8 @@ class TaskEvidenceLedger:
         kind = check["type"]
         if kind in FILE_CHECKS:
             if actual.get("path") != path_key(check["path"]): return
+            if kind == "file_contents":
+                self._remember_file_digest_from_check(check, actual)
             fact = {"type": kind, "path": actual["path"], **{key: actual[key] for key in
                     ("file_identity", "file_version", "parent_identity", "file_format") if key in actual}}
             if kind == "file_contents":
@@ -1547,6 +1556,101 @@ class TaskEvidenceLedger:
         elif kind == "stdout_equals":
             if actual.get("text_sha256") != hashlib.sha256(check["text"].encode()).hexdigest(): return
             self.add_evidence({"type": kind, "text": check["text"]}, action=action)
+
+    def file_digest_proof_for(self, check: dict) -> dict | None:
+        """Return a same-task digest candidate for an exact file-content check."""
+        if not isinstance(self.generation, str) or not self.generation:
+            return None
+        try:
+            check = validate_outcome_check(check)
+            if check.get("type") != "file_contents": return None
+            expected = content_bytes(check)
+        except (ActionContractError, KeyError, ValueError, UnicodeEncodeError):
+            return None
+        proof = self._file_digest_proofs.get(path_key(check["path"]))
+        if not isinstance(proof, dict): return None
+        if (proof.get("task_generation_id") != self.generation or
+                proof.get("file_size") != len(expected) or
+                proof.get("file_sha256") != hashlib.sha256(expected).hexdigest()):
+            return None
+        return deepcopy(proof)
+
+    def discard_file_digest_proof(self, check: dict, proof: dict | None = None) -> None:
+        try: path = path_key(check["path"])
+        except (KeyError, TypeError): return
+        current = self._file_digest_proofs.get(path)
+        if current is not None and (proof is None or current == proof):
+            self._file_digest_proofs.pop(path, None)
+
+    def reconcile_file_digest_check(self, check: dict, proof: dict | None, response: dict) -> None:
+        """Refresh or evict a candidate after the native check returns."""
+        if not isinstance(check, dict) or check.get("type") != "file_contents": return
+        actual = None
+        if isinstance(response, dict) and response.get("requested_checks") == [check]:
+            checks = response.get("checks")
+            if isinstance(checks, list) and len(checks) == 1 and isinstance(checks[0], dict):
+                actual = checks[0]
+        if actual is not None and actual.get("verified") is True:
+            path = path_key(check["path"])
+            before = deepcopy(self._file_digest_proofs.get(path))
+            self._remember_file_digest_from_check(check, actual)
+            current = self._file_digest_proofs.get(path)
+            # A complete fresh read can replace the proof after an object
+            # replacement. Older native checkers may omit digest metadata;
+            # in that case retain a supplied proof only when its descriptor
+            # identity still matches the readback.
+            if current is not None and current != before:
+                return
+            if (proof is not None and current == proof and
+                    all(actual.get(key) == proof.get(key)
+                        for key in ("file_identity", "file_version", "parent_identity")) and
+                    ("file_size" not in actual or actual.get("file_size") == proof.get("file_size")) and
+                    ("file_sha256" not in actual or actual.get("file_sha256") == proof.get("file_sha256"))):
+                return
+        self.discard_file_digest_proof(check, proof)
+
+    def _remember_file_digest_from_check(self, check: dict, actual: dict) -> None:
+        try:
+            data = content_bytes(check)
+            expected_hash = hashlib.sha256(data).hexdigest()
+            if (check.get("type") != "file_contents" or actual.get("verified") is not True or
+                    actual.get("content_sha256") != expected_hash or
+                    actual.get("file_sha256") != expected_hash or
+                    type(actual.get("file_size")) is not int or actual["file_size"] != len(data)):
+                return
+            self._remember_file_digest(actual.get("path"), actual, digest=expected_hash,
+                                       size=len(data), format_attestation=actual.get("file_format"))
+        except (KeyError, TypeError, ValueError, UnicodeEncodeError):
+            return
+
+    def _remember_file_digest(self, path: Any, source: dict, *, digest: Any, size: Any,
+                              format_attestation: Any = None) -> None:
+        if not isinstance(self.generation, str) or not self.generation or not isinstance(path, str): return
+        normalized = path_key(path)
+        if normalized != path or not normalized.startswith("/"): return
+        if (type(size) is not int or size < 0 or size > 9_007_199_254_740_991 or
+                not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+            return
+        identity = {key: source.get(key) for key in ("file_identity", "file_version", "parent_identity")}
+        if any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+               for value in identity.values()):
+            return
+        if format_attestation is not None:
+            try: validate_native_payload("check_result", {
+                "type": "file_contents", "outcome": "verified", "verified": True,
+                "verification_scope": "file_contents", "path": normalized,
+                "file_identity": identity["file_identity"], "file_version": identity["file_version"],
+                "parent_identity": identity["parent_identity"], "content_sha256": digest,
+                "file_sha256": digest, "file_size": size, "file_format": format_attestation,
+            })
+            except ActionContractError:
+                return
+        self._file_digest_proofs[normalized] = {
+            "task_generation_id": self.generation, "path": normalized,
+            "file_identity": identity["file_identity"], "file_version": identity["file_version"],
+            "parent_identity": identity["parent_identity"], "file_size": size, "file_sha256": digest,
+            **({"file_format": deepcopy(format_attestation)} if format_attestation is not None else {}),
+        }
 
     def record_effect(self, check: dict, actual: dict, action: dict | None = None) -> None:
         """Only validated local checks enter this path; model claims do not."""

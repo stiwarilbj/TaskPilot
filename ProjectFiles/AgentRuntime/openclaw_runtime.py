@@ -1046,6 +1046,11 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
             return bridge_call(method, display_id, **params)
     budget.check(method)
     context = current_task.get()
+    # Digest proofs are private execution metadata. Never accept one from an
+    # action/model payload; derive it solely from the current task ledger.
+    params.pop("file_digest_proof", None)
+    file_digest_check: dict[str, Any] | None = None
+    file_digest_proof: dict[str, Any] | None = None
     if context is not None:
         effect = {"act": "execute", "observe": "observe", "action_receipt": "receipt",
                   "check_effect": "read", "wait_file_effect": "read", "recheck": "read",
@@ -1054,6 +1059,23 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
                   "bind_task_target_choice": "target_choice"}.get(method)
         if effect is None: raise ExecutionStateError("Unknown task bridge operation")
         context.machine.require(effect)
+        if context.ledger is not None:
+            if method in {"check_effect", "wait_file_effect"}:
+                candidate = params.get("check")
+                if isinstance(candidate, dict) and candidate.get("type") == "file_contents":
+                    file_digest_check = candidate
+            elif method == "recheck":
+                action = params.get("action")
+                mode = action.get("mode", "overwrite") if isinstance(action, dict) else None
+                if (isinstance(action, dict) and action.get("type") == "write_file" and
+                        isinstance(mode, str) and mode.lower() == "overwrite"):
+                    file_digest_check = {"type": "file_contents", "path": action.get("path"),
+                                         "content": action.get("content"),
+                                         "encoding": action.get("encoding", "utf-8")}
+            if file_digest_check is not None:
+                file_digest_proof = context.ledger.file_digest_proof_for(file_digest_check)
+                if file_digest_proof is not None:
+                    params["file_digest_proof"] = file_digest_proof
     timeout = params.pop("_reply_timeout", None)
     working_document_revision = params.pop("_working_document_revision", None)
     if method == "observe":
@@ -1128,7 +1150,10 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
             elif response['terminal'] is False:
                 raise BridgeReplyLost('The native action is still dispatched')
     except BridgeReplyLost as error:
-        if method != "act": raise
+        if method != "act":
+            if file_digest_check is not None and context is not None and context.ledger is not None:
+                context.ledger.discard_file_digest_proof(file_digest_check, file_digest_proof)
+            raise
         if context is not None: context.machine.reconcile()
         if not error.connected:
             _task_value('receipt_metrics')["receipt_unresolved"] += 1
@@ -1141,6 +1166,8 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
                 action_id=action_id, _reply_timeout=remaining), _task_value('receipt_metrics'),
             clock=time.monotonic, sleep=time.sleep, action=params['action'])
     if not response['ok']:
+        if file_digest_check is not None and context is not None and context.ledger is not None:
+            context.ledger.discard_file_digest_proof(file_digest_check, file_digest_proof)
         if response['error_code'] == 'protocol_error': raise NativeProtocolError(response['error'])
         if context is not None and method == 'act': context.machine.resolve(params['action_id'])
         raise ActionRejected(response['error'], response['error_code'],
@@ -1153,7 +1180,11 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
         elif method == 'action_receipt': validate_native_receipt(result, params['action_id'])
         elif method in {'check_effect', 'wait_file_effect'}:
             validate_check_batch(result, requested_checks=[params['check']])
+            if file_digest_check is not None and context is not None and context.ledger is not None:
+                context.ledger.reconcile_file_digest_check(file_digest_check, file_digest_proof, result)
         elif method == 'recheck': validate_native_readback(result, params['action'])
+        if method == 'recheck' and file_digest_check is not None and context is not None and context.ledger is not None:
+            context.ledger.reconcile_file_digest_check(file_digest_check, file_digest_proof, result)
         if method == "observe" and isinstance(result, dict):
             if _task_value('generation') is not None and result.get("task_generation_id") != _task_value('generation'):
                 raise ActionRejected("Observation belongs to another task", "cancelled")

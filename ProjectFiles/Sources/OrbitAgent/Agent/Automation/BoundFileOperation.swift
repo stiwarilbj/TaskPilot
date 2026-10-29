@@ -1,4 +1,5 @@
 import CryptoKit
+import CoreFoundation
 import Darwin
 import Foundation
 
@@ -50,7 +51,7 @@ final class BoundFileOperation {
         let parentIdentity: String
         let created: Bool
     }
-    enum Boundary { case bound, staged, beforeCommit, delivering, committed, inspected }
+    enum Boundary { case bound, staged, beforeCommit, delivering, committed, inspected, digestProofReused }
     typealias Hook = (Boundary) throws -> Void
     let input: URL
     let parentURL: URL
@@ -225,7 +226,64 @@ final class BoundFileOperation {
             return (true, Snapshot(data: Data(), identity: identity, parent: parentIdentity).fields)
         }
         let snapshot = try read(limit: kind == "file_contents" ? expected!.count + 1 : 0)
-        return (snapshot.fileFormatValid && (kind != "file_contents" || snapshot.data == expected!), snapshot.fields)
+        let matches = snapshot.fileFormatValid && (kind != "file_contents" || snapshot.data == expected!)
+        var fields = snapshot.fields
+        // An exact, complete read already establishes a full-file digest.
+        // Returning it lets the task ledger reuse it on later checks.
+        if kind == "file_contents", matches, let expected {
+            fields["file_size"] = snapshot.identity.info.st_size
+            fields["file_sha256"] = Self.sha256(expected)
+        }
+        return (matches, fields)
+    }
+
+    /// Reuses a digest established by a descriptor-bound native write. This
+    /// reopens the current target and checks identity/version/size without
+    /// rereading or hashing its contents. A stale or malformed proof returns
+    /// nil so the caller falls back to a normal full inspection.
+    func reuseVerifiedDigest(kind: String, expected: Data?, generation: String?,
+                             proof: [String: Any]) throws -> [String: Any]? {
+        guard kind == "file_contents", let expected,
+              let lease = TaskOwnership.current, lease.id == generation,
+              proof["task_generation_id"] as? String == lease.id,
+              proof["path"] as? String == input.standardizedFileURL.path,
+              let fileIdentity = proof["file_identity"] as? String, Self.isSHA256(fileIdentity),
+              let fileVersion = proof["file_version"] as? String, Self.isSHA256(fileVersion),
+              let provedParent = proof["parent_identity"] as? String, Self.isSHA256(provedParent),
+              let fileSHA256 = proof["file_sha256"] as? String, Self.isSHA256(fileSHA256),
+              let sizeNumber = proof["file_size"] as? NSNumber,
+              CFGetTypeID(sizeNumber) != CFBooleanGetTypeID(),
+              sizeNumber.doubleValue.isFinite, sizeNumber.int64Value >= 0,
+              sizeNumber.doubleValue == Double(sizeNumber.int64Value),
+              sizeNumber.int64Value == Int64(expected.count),
+              fileSHA256 == Self.sha256(expected) else { return nil }
+
+        if let requiredFormat = FileFormatVerifier.expectedFormat(for: name) {
+            guard let format = proof["file_format"] as? [String: Any],
+                  format["format"] as? String == requiredFormat,
+                  format["verified"] as? Bool == true else { return nil }
+        }
+
+        try checkParent()
+        let (fd, current) = try openTarget()
+        defer { close(fd) }
+        guard current.object == fileIdentity,
+              current.version == fileVersion,
+              provedParent == parentIdentity.object,
+              current.info.st_size == sizeNumber.int64Value else { return nil }
+        try hook(.digestProofReused)
+        try TaskOwnership.check()
+        try checkParent()
+        guard try Self.identity(fd) == current, try entry(name) == current else {
+            throw conflict("the file changed while reusing its verified digest")
+        }
+
+        var fields = Snapshot(data: Data(), identity: current, parent: parentIdentity).fields
+        fields["file_size"] = current.info.st_size
+        fields["file_sha256"] = fileSHA256
+        fields["content_sha256"] = fileSHA256
+        if let format = proof["file_format"] as? [String: Any] { fields["file_format"] = format }
+        return fields
     }
     func replace(with data: Data, append: Bool, mustBeAbsent: Bool) throws -> (Int, [String: Any]) {
         let result = try replaceInternal(with: data, append: append, mustBeAbsent: mustBeAbsent,
@@ -378,6 +436,16 @@ final class BoundFileOperation {
             if error is CancellationError { throw error }
             if delivered { throw conflict(error.localizedDescription + (retainDisplaced ? " Displaced data remains at \(parentURL.appendingPathComponent(temporary).path)" : ""), delivered: true) }
             throw error
+        }
+    }
+
+    private static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func isSHA256(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy {
+            ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
         }
     }
 }

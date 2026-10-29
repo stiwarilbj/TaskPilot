@@ -21,9 +21,21 @@ struct CommandExecutionPolicy {
         let path: URL?
         let expected: Data?
         let text: String?
+        let fileDigestProof: [String: Any]?
+        let taskGenerationID: String?
+
+        init(type: String, path: URL?, expected: Data?, text: String?,
+             fileDigestProof: [String: Any]? = nil, taskGenerationID: String? = nil) {
+            self.type = type
+            self.path = path
+            self.expected = expected
+            self.text = text
+            self.fileDigestProof = fileDigestProof
+            self.taskGenerationID = taskGenerationID
+        }
 
         func evaluate(stdout: String, stdoutTruncated: Bool,
-                      downloadStatus: @escaping FileInputAvailability.DownloadStatusReader = FileInputAvailability.downloadStatus) -> [String: Any] {
+                      downloadStatus: @escaping FileInputAvailability.DownloadStatusReader = FileInputAvailability.downloadStatus) throws -> [String: Any] {
             var result: [String: Any] = ["type": type, "verified": false,
                 "outcome": "delivered_unconfirmed", "verification_scope": type]
             if let path { result["path"] = path.path }
@@ -34,9 +46,30 @@ struct CommandExecutionPolicy {
                 case .stdout_equals:
                     matches = !stdoutTruncated && stdout == text
                 case .path_absent, .file_exists, .directory_exists, .file_contents:
-                    let inspection = try BoundFileOperation(path!, downloadStatus: downloadStatus).inspect(kind: type, expected: expected)
+                    let operation = try BoundFileOperation(path!, downloadStatus: downloadStatus)
+                    var reused: [String: Any]?
+                    if let fileDigestProof {
+                        do {
+                            reused = try operation.reuseVerifiedDigest(kind: type, expected: expected,
+                                generation: taskGenerationID, proof: fileDigestProof)
+                        } catch is CancellationError {
+                            throw CancellationError()
+                        } catch {
+                            // A stale or temporarily unbindable proof cannot
+                            // answer the check; fall through to full inspect.
+                            reused = nil
+                        }
+                    }
+                    let inspection: (Bool, [String: Any])
+                    if let reused {
+                        inspection = (true, reused)
+                    } else {
+                        inspection = try operation.inspect(kind: type, expected: expected)
+                    }
                     matches = inspection.0
-                    if matches { result.merge(inspection.1) { _, new in new } }
+                    // Preserve current identity metadata even on a content
+                    // mismatch so the task cache can discard a stale proof.
+                    result.merge(inspection.1) { _, new in new }
                 }
                 result["verified"] = matches
                 result["outcome"] = matches ? "verified" : "delivered_unconfirmed"
@@ -51,6 +84,8 @@ struct CommandExecutionPolicy {
                 result["reason"] = TaskToolError.fileContentsNotLocal.localizedDescription
             } catch is BoundFileOperation.Conflict {
                 result["reason"] = "Filesystem conflict; fresh inspection is required"
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 result["reason"] = "The requested outcome could not be inspected"
             }
