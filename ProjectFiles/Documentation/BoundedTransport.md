@@ -33,6 +33,40 @@ These changes add no model calls or public protocol fields.
   Reconnect readers retain their own pipes, transport, EOF event and stderr tail;
   duplicated read descriptors prevent descriptor reuse across invocations.
 
+## Preparation outside the admission lock
+
+`RequestTransport.put()` captures the registered mailbox under the condition
+lock, then releases it before JSON encoding or status hashing. One compact JSON
+encoding supplies the default byte count and optional SHA-256 status signature.
+The encoder accumulates only up to the transport's byte ceiling; oversized
+preparation returns to normal classified admission failure. Already framed
+native inbox messages supply their wire size and require no re-encoding.
+
+ACP routing also releases its outer condition lock before preparation. A
+received status retains its supplied wire byte count, while its signature uses
+the same compact, ASCII-escaped JSON as before. The temporary encoding ceiling
+allows up to six times the verified wire size for JSON escape expansion, so
+Unicode or whitespace differences cannot incorrectly change admission or status
+coalescing. Temporary encoded bytes are discarded before mailbox admission;
+only the original message, accounting size, and status digest are retained.
+Callers own each message through preparation and must not mutate it concurrently.
+
+Admission reacquires the lock and checks closure, original mailbox object
+identity, terminal state, failure, duplicate status, and current aggregate
+capacity. Unregistering and reusing the same request ID therefore cannot admit
+or fail the replacement mailbox with old prepared work. Close rejects new
+admissions while preserving previously queued chunks and terminals for drainage.
+FIFO follows admission order; production frame readers remain sole producers.
+Terminal reserves, overflow classification and receipt reconciliation are
+unchanged. There are no protocol changes, new workers, or payload diagnostics.
+
+Offline tests pause both serialization and hashing behind barriers and prove
+that other replies, retirement, close, and terminal admission can proceed.
+They cover ID reuse, late oversized preparation, simultaneous duplicate statuses,
+competing capacity admission, per-request FIFO, exact accounting, one encoding
+per prepared message, zero encodings for framed native replies, and bounded
+preparation with unchanged Unicode status fingerprints.
+
 Native writes retain at most 32 MiB/1,056 frames, reserving 8 MiB/32 slots for
 bridge and secure-input replies. A dispatch write source delivers at most
 64 KiB per callback; a five-second per-frame deadline handles a stalled reader.

@@ -1,5 +1,6 @@
 """Offline transport faults only: no providers, desktop actions or browsers."""
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -20,6 +21,219 @@ from evidence_fixtures import native_result
 
 
 class BoundedTransportTests(unittest.TestCase):
+    def during_preparation(self, transport, send, operation, *, block_hash=False):
+        """Barrier-based contention, not a serialization latency threshold."""
+        entered = threading.Event(); release = threading.Event(); completed = threading.Event()
+        results = []; failures = []
+        original = hashlib.sha256 if block_hash else json.JSONEncoder.iterencode
+
+        def blocked(*args, **kwargs):
+            entered.set()
+            if not release.wait(3): raise AssertionError('preparation barrier timed out')
+            return original(*args, **kwargs)
+
+        def sending():
+            try: results.append(send())
+            except BaseException as error: failures.append(error)
+
+        def operating():
+            try: operation()
+            except BaseException as error: failures.append(error)
+            finally: completed.set()
+
+        patch = (mock.patch('bounded_transport.hashlib.sha256', side_effect=blocked) if block_hash else
+                 mock.patch.object(json.JSONEncoder, 'iterencode', autospec=True, side_effect=blocked))
+        with patch:
+            sender = threading.Thread(target=sending)
+            worker = threading.Thread(target=operating)
+            sender.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                worker.start()
+                # Admission/retirement must finish while serialization or hashing
+                # is still deliberately blocked on a different thread.
+                self.assertTrue(completed.wait(2), 'preparation holds the admission lock')
+            finally:
+                release.set(); sender.join(3)
+                if worker.ident is not None: worker.join(3)
+        self.assertFalse(sender.is_alive())
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(failures, [])
+        return results
+
+    def test_one_encoding_supplies_default_size_and_status_digest(self):
+        message = {'text': 'emoji 🧭, combining e\u0301, control\n', 'values': [True, None, 1.25]}
+        encoded = json.dumps(message, separators=(',', ':')).encode()
+        original = json.JSONEncoder.iterencode
+        for status in (False, True):
+            for supplied in (None, len(encoded) + 12):
+                with self.subTest(status=status, supplied=supplied):
+                    transport = RequestTransport(); transport.register(1)
+                    with mock.patch.object(json.JSONEncoder, 'iterencode', autospec=True, side_effect=original) as encode:
+                        self.assertTrue(transport.put(1, message, size=supplied, status=status))
+                    self.assertEqual(encode.call_count, int(status or supplied is None))
+                    self.assertEqual(transport.bytes, len(encoded) if supplied is None else supplied)
+                    self.assertEqual(transport.pending[1].last_status,
+                                     hashlib.sha256(encoded).digest() if status else None)
+                    self.assertEqual(transport.get(1, 0), message)
+                    self.assertEqual((transport.bytes, transport.count), (0, 0))
+
+    def test_prepare_is_bounded_and_does_not_coalesce_overflow_without_a_digest(self):
+        for status in (False, True):
+            transport = RequestTransport(byte_limit=100, reserve_bytes=0); transport.register(1)
+            yielded = []
+            def chunks(*_):
+                for index in range(100):
+                    yielded.append(index)
+                    yield 'x' * 40
+            with mock.patch.object(json.JSONEncoder, 'iterencode', side_effect=chunks):
+                self.assertFalse(transport.put(1, {}, status=status))
+            self.assertEqual(yielded, [0, 1, 2])
+            self.assertEqual((transport.bytes, transport.count), (0, 0))
+            with self.assertRaises(TransportFailure) as caught: transport.get(1, 0)
+            self.assertEqual(caught.exception.code, 'transport_buffer_limit')
+
+    def test_wire_size_survives_json_escape_expansion_and_whitespace(self):
+        transport = ACPTransport(byte_limit=250, reserve_bytes=0)
+        transport.register(1, method='session/prompt', session='s')
+        status = {'method':'session/update', 'params':{'sessionId':'s',
+                  'update':{'sessionUpdate':'tool_call', 'title':'€' * 30}}}
+        wire = json.dumps(status, ensure_ascii=False).encode()
+        canonical = json.dumps(status, separators=(',', ':')).encode()
+        self.assertLess(len(wire), 250)
+        self.assertGreater(len(canonical), 250)
+        transport.route(status, len(wire))
+        self.assertEqual(transport.bytes, len(wire))
+        self.assertEqual(transport.pending[1].last_status, hashlib.sha256(canonical).digest())
+        self.assertEqual(transport.get(1, 0), status)
+        transport.route(status, len(wire) + 2)
+        self.assertEqual((transport.bytes, transport.count), (0, 0))
+
+    def test_retirement_close_and_terminal_fence_preparing_messages(self):
+        for routed in (False, True):
+            for transition in ('unregister', 'replace', 'close', 'terminal', 'failure'):
+                with self.subTest(routed=routed, transition=transition):
+                    transport = ACPTransport(); transport.register(1, method='session/prompt', session='s')
+                    message = {'method':'session/update', 'params':{'sessionId':'s',
+                               'update':{'sessionUpdate':'tool_call', 'title':'old'}}}
+                    def operate():
+                        if transition in ('unregister', 'replace'):
+                            transport.unregister(1)
+                            if transition == 'replace': transport.register(1, method='session/prompt', session='new')
+                        elif transition == 'close': transport.close()
+                        elif transition == 'failure': transport.fail(TransportFailure('transport_closed'))
+                        else: self.assertTrue(transport.put(1, 'terminal', size=8, terminal=True))
+                    send = (lambda: transport.route(message)) if routed else (lambda: transport.put(1, message, status=True))
+                    result = self.during_preparation(transport, send, operate)
+                    self.assertEqual(result, [None] if routed else [False])
+                    self.assertEqual((transport.bytes, transport.count), (8, 1) if transition == 'terminal' else (0, 0))
+                    if transition == 'replace':
+                        self.assertFalse(transport.has_pending(1))
+                        self.assertIsNone(transport.pending[1].last_status)
+
+    def test_other_replies_are_consumable_during_encoding_and_hashing(self):
+        for block_hash in (False, True):
+            transport = ACPTransport()
+            transport.register(1, method='session/prompt', session='s'); transport.register(2)
+            transport.route({'id': 2, 'result': {'ready': True}}, size=40)
+            message = {'method':'session/update', 'params':{'sessionId':'s',
+                       'update':{'sessionUpdate':'tool_call', 'title':'preparing'}}}
+            def consume(): self.assertTrue(transport.get(2, 0)['result']['ready'])
+            self.during_preparation(transport, lambda: transport.route(message), consume, block_hash=block_hash)
+            self.assertEqual(transport.get(1, 0), message)
+            self.assertEqual((transport.bytes, transport.count), (0, 0))
+
+    def test_preparing_terminal_cannot_enter_a_replacement_mailbox(self):
+        transport = ACPTransport(); transport.register(1)
+        def replace():
+            transport.unregister(1); transport.register(1)
+        self.during_preparation(transport, lambda: transport.route({'id':1, 'result':{}}), replace)
+        self.assertFalse(transport.has_pending(1))
+        self.assertFalse(transport.pending[1].ended)
+        self.assertEqual((transport.bytes, transport.count), (0, 0))
+
+    def test_delayed_oversize_preparation_cannot_fail_a_new_mailbox(self):
+        transport = RequestTransport(byte_limit=100, reserve_bytes=0); transport.register(1)
+        def replace():
+            transport.unregister(1); transport.register(1)
+            self.assertTrue(transport.put(1, 'new', size=3, terminal=True))
+        self.assertEqual(self.during_preparation(transport, lambda: transport.put(1, {'old':'x' * 200}), replace), [False])
+        self.assertEqual(transport.get(1, 0), 'new')
+        self.assertEqual((transport.bytes, transport.count), (0, 0))
+
+    def test_parallel_admission_rechecks_aggregate_capacity(self):
+        transport = RequestTransport(byte_limit=100, reserve_bytes=40); transport.register(1); transport.register(2)
+        prepared = threading.Barrier(2)
+        original = transport._prepare
+        def preparing(*args):
+            result = original(*args); prepared.wait(2); return result
+        results = []
+        with mock.patch.object(transport, '_prepare', side_effect=preparing):
+            threads = [threading.Thread(target=lambda key=key: results.append((key, transport.put(key, 'ready', size=40)))) for key in (1, 2)]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join(3)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(sorted(value for _, value in results), [False, True])
+        accepted = next(key for key, value in results if value)
+        rejected = next(key for key, value in results if not value)
+        self.assertEqual((transport.bytes, transport.count), (40, 1))
+        self.assertTrue(transport.put(accepted, 'complete', size=60, terminal=True))
+        self.assertEqual(transport.bytes, 100)
+        self.assertEqual([transport.get(accepted, 0) for _ in range(2)], ['ready', 'complete'])
+        with self.assertRaises(TransportFailure) as caught: transport.get(rejected, 0)
+        self.assertEqual(caught.exception.code, 'transport_buffer_limit')
+        self.assertEqual((transport.bytes, transport.count), (0, 0))
+
+    def test_parallel_request_producers_preserve_each_fifo_and_exact_accounting(self):
+        transport = ACPTransport()
+        for key in range(4): transport.register(key, method='session/prompt', session=str(key))
+        failures = []
+        def produce(key):
+            try:
+                for index in range(30):
+                    transport.route({'method':'session/update', 'params':{'sessionId':str(key),
+                                     'update':{'sessionUpdate':'agent_message_chunk', 'index':index}}})
+                transport.route({'id':key, 'result':{'complete':True}})
+            except BaseException as error: failures.append(error)
+        threads = [threading.Thread(target=produce, args=(key,)) for key in range(4)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(3)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(failures, [])
+        self.assertEqual(transport.count, 124)
+        for key in range(4):
+            self.assertEqual([transport.get(key, 0)['params']['update']['index'] for _ in range(30)], list(range(30)))
+            self.assertTrue(transport.get(key, 0)['result']['complete'])
+        self.assertEqual((transport.bytes, transport.count), (0, 0))
+
+    def test_simultaneously_prepared_duplicate_statuses_admit_once(self):
+        transport = RequestTransport(); transport.register(1)
+        prepared = threading.Barrier(2)
+        original = transport._prepare
+        def preparing(*args):
+            result = original(*args); prepared.wait(2); return result
+        results = []
+        with mock.patch.object(transport, '_prepare', side_effect=preparing):
+            threads = [threading.Thread(target=lambda: results.append(transport.put(1, {'status':'same'}, status=True))) for _ in range(2)]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join(3)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(results, [True, True])
+        self.assertEqual(transport.count, 1)
+        self.assertEqual(transport.get(1, 0), {'status':'same'})
+        self.assertEqual((transport.bytes, transport.count), (0, 0))
+
+    def test_invalid_or_retired_messages_do_not_touch_accounting(self):
+        transport = RequestTransport(); transport.register(1)
+        with self.assertRaises(TypeError): transport.put(1, {'unsupported':object()})
+        self.assertEqual((transport.bytes, transport.count), (0, 0))
+        transport.unregister(1)
+        with mock.patch.object(transport, '_prepare', side_effect=AssertionError('retired preparation')):
+            self.assertFalse(transport.put(1, {}))
+        transport.register(1); transport.close()
+        with mock.patch.object(transport, '_prepare', side_effect=AssertionError('closed preparation')):
+            self.assertFalse(transport.put(1, {}))
+
     def test_fragmented_utf8_and_eof_preserve_complete_frames(self):
         payload = '☃ 🧭'.encode()
         framer = LineFramer(16); frames = []; errors = []

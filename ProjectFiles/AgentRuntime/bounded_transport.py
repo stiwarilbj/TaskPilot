@@ -151,14 +151,40 @@ class RequestTransport:
     def put(self, key, message, *, size=None, terminal=False, status=False):
         with self.condition:
             slot = self.pending.get(key)
-            if slot is None or slot.ended:
+            if self.closed or slot is None or slot.ended:
                 return False  # Unknown, retired, duplicate or post-terminal work.
             if slot.failure and not terminal:
                 return False
-            signature = hashlib.sha256(json.dumps(message, separators=(',', ':')).encode()).digest() if status else None
-            if status and signature == slot.last_status:
+        return self._prepare_and_put(key, slot, message, size=size, terminal=terminal, status=status)
+
+    def _prepare(self, message, size, status):
+        # Native inbox frames already supply their wire size and need no JSON
+        # encoding. ACP statuses still need a canonical digest, independent of
+        # whitespace in the received wire frame. Preserve wire-size accounting.
+        if size is not None and (not status or size > self.byte_limit):
+            return size, None
+        # Default JSON escaping expands a bounded UTF-8 wire frame by at most
+        # six times. Do not reject a valid status merely for that expansion.
+        maximum = self.byte_limit if size is None else max(self.byte_limit, size * 6)
+        encoded = bytearray()
+        for part in json.JSONEncoder(separators=(',', ':')).iterencode(message):
+            chunk = part.encode('utf-8')
+            if len(encoded) + len(chunk) > maximum:
+                return self.byte_limit + 1, None
+            encoded.extend(chunk)
+        return size if size is not None else len(encoded), hashlib.sha256(encoded).digest() if status else None
+
+    def _prepare_and_put(self, key, slot, message, *, size, terminal, status):
+        # Callers must release routing/admission locks before preparation. The
+        # original mailbox identity also fences unregister/register of one ID.
+        size, signature = self._prepare(message, size, status)
+        with self.condition:
+            if self.closed or self.pending.get(key) is not slot or slot.ended:
+                return False
+            if slot.failure and not terminal:
+                return False
+            if status and signature is not None and signature == slot.last_status:
                 return True
-            size = size if size is not None else len(json.dumps(message, separators=(',', ':')).encode())
             limit = self.byte_limit if terminal else self.byte_limit - self.reserve_bytes
             count_limit = self.message_limit + self.request_limit if terminal else self.message_limit
             if self.bytes + size > limit or self.count >= count_limit:
@@ -250,6 +276,8 @@ class ACPTransport(RequestTransport):
 
     def route(self, message, size=None):
         with self.condition:
+            if self.closed:
+                return
             if 'id' in message and type(message['id']) not in (int, str):
                 self.fail(TransportFailure('transport_invalid_request_id'))
                 return
@@ -261,24 +289,29 @@ class ACPTransport(RequestTransport):
                         or not isinstance(message.get('result', message.get('error')), dict)):
                     self.fail(TransportFailure('transport_malformed_envelope'), key)
                     return
-                self.put(key, message, size=size, terminal=True)
-                return
-            params = message.get('params')
-            params = params if isinstance(params, dict) else {}
-            if message.get('method') == 'session/update':
-                keys = [key for key, slot in self.pending.items()
-                        if slot.method == 'session/prompt' and slot.session == params.get('sessionId')
-                        and ('requestId' not in params or type(params['requestId']) is type(key) and params['requestId'] == key)]
+                terminal, status = True, False
             else:
-                keys = list(self.pending) if 'id' in message and isinstance(message.get('method'), str) else []
-            if len(keys) != 1:
+                params = message.get('params')
+                params = params if isinstance(params, dict) else {}
+                if message.get('method') == 'session/update':
+                    keys = [key for key, slot in self.pending.items()
+                            if slot.method == 'session/prompt' and slot.session == params.get('sessionId')
+                            and ('requestId' not in params or type(params['requestId']) is type(key) and params['requestId'] == key)]
+                else:
+                    keys = list(self.pending) if 'id' in message and isinstance(message.get('method'), str) else []
+                if len(keys) != 1:
+                    return
+                key = keys[0]
+                update = params.get('update')
+                if message.get('method') == 'session/update' and not isinstance(update, dict):
+                    self.fail(TransportFailure('transport_malformed_envelope'), key)
+                    return
+                terminal = False
+                status = isinstance(update, dict) and update.get('sessionUpdate') == 'tool_call'
+            slot = self.pending[key]
+            if slot.ended or (slot.failure and not terminal):
                 return
-            update = params.get('update')
-            if message.get('method') == 'session/update' and not isinstance(update, dict):
-                self.fail(TransportFailure('transport_malformed_envelope'), keys[0])
-                return
-            status = isinstance(update, dict) and update.get('sessionUpdate') == 'tool_call'
-            self.put(keys[0], message, size=size, status=status)
+        self._prepare_and_put(key, slot, message, size=size, terminal=terminal, status=status)
 
 
 def write_frame(stream, message, *, timeout=5.0, cancelled=lambda: False):
