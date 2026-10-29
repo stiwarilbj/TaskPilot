@@ -37,16 +37,17 @@ final class CaptureCancellation: @unchecked Sendable {
 /// at most eight waiting evidence requests and one replaceable preview request.
 /// Waiting requests contain metadata/continuations, never acquired pixel buffers.
 actor CaptureAcquisitionQueue {
-    enum Kind { case evidence, preview }
+    enum Kind: Equatable { case evidence, preview }
     struct Statistics { let evidenceFrames: Int; let previewFrames: Int; let waitingEvidence: Int; let waitingPreview: Int; let acquiring: Bool }
     final class Reservation: @unchecked Sendable {
         let id: UUID
+        let kind: Kind
         let cancellation: CaptureCancellation
         let owner: TaskLease?
         let epoch: Int?
         private let queue: CaptureAcquisitionQueue
-        init(id: UUID, cancellation: CaptureCancellation, owner: TaskLease?, epoch: Int?, queue: CaptureAcquisitionQueue) {
-            self.id = id; self.cancellation = cancellation; self.owner = owner
+        init(id: UUID, kind: Kind, cancellation: CaptureCancellation, owner: TaskLease?, epoch: Int?, queue: CaptureAcquisitionQueue) {
+            self.id = id; self.kind = kind; self.cancellation = cancellation; self.owner = owner
             self.epoch = epoch; self.queue = queue
         }
         func checkAuthority() throws {
@@ -157,7 +158,8 @@ actor CaptureAcquisitionQueue {
         } else { return }
         request.waitTicket.start()
         active = request; frames[request.id] = request.kind
-        request.continuation.resume(returning: Reservation(id: request.id, cancellation: request.cancellation, owner: request.owner, epoch: request.epoch, queue: self))
+        request.continuation.resume(returning: Reservation(id: request.id, kind: request.kind,
+            cancellation: request.cancellation, owner: request.owner, epoch: request.epoch, queue: self))
     }
     func acquired(_ reservation: Reservation) {
         guard active?.id == reservation.id else { return }
@@ -308,7 +310,11 @@ actor CapturePNGEncoder {
         activeMemory = job.telemetry.beginMemory(.activeCaptureEncodes, bytes: job.frame.imageStorageBytes)
         active = job
         let writer = writer, directory = job.directory, spaceCheck = spaceCheck
-        worker = Task.detached(priority: .userInitiated) {
+        // Evidence frames participate in planning/action decisions and keep
+        // their existing interactive scheduling. Disposable preview frames
+        // yield to active work; this does not reorder the bounded FIFO queue.
+        let priority: TaskPriority = job.frame.reservation.kind == .preview ? .utility : .userInitiated
+        worker = Task.detached(priority: priority) {
             do {
                 try job.cancellation.check(); try job.frame.check(); try job.budget?.check(phase: "capture_encoding")
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

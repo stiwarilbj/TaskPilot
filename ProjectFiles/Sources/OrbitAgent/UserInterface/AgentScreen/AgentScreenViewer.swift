@@ -58,7 +58,9 @@ final class AgentScreenViewerModel: ObservableObject {
         }
 
         status = "Connecting to \(display.name)…"
-        captureTask = Task { [weak self] in
+        // Live-view pixels are disposable; let capture and refresh work yield
+        // to interactive task evidence and native actions under CPU pressure.
+        captureTask = Task(priority: .utility) { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
                 do {

@@ -45,6 +45,21 @@ final class SubprocessSupervisorTests: XCTestCase {
         }
     }
 
+    func testUtilitySchedulingIsAppliedBeforeTheSuspendedChildCanRun() throws {
+        let capture = try BufferedProcessOutput()
+        defer { capture.close() }
+        let child = process("ps -o ni= -p $$")
+        child.schedulingPriority = .utility
+        child.standardOutput = capture.stdout; child.standardError = capture.stderr
+        let exit = ProcessExitNotification(child)
+        try child.run()
+        capture.closeWriters()
+        XCTAssertEqual(exit.waitForExit(until: .now() + 3), 0)
+        guard case .finished = child.waitForTree(until: .now() + 3) else { return XCTFail("Utility child did not drain") }
+        let output = try capture.finish(); child.markOutputDrained()
+        XCTAssertEqual(output.stdout.text.trimmingCharacters(in: .whitespacesAndNewlines), "5")
+    }
+
     func testAdvisoryApprovalDoesNotReplaceOSLaunchFailure() {
         let process = SubprocessSupervisor(resourceSnapshot: { .init(available: 100, softLimit: 256) })
         process.executableURL = URL(fileURLWithPath: "/nonexistent-taskpilot-fixture")

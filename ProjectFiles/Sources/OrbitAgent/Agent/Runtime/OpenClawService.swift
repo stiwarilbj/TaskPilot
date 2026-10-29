@@ -365,7 +365,8 @@ final class OpenClawService {
         timeout: TimeInterval,
         outputSpillRoot: URL = FileManager.default.temporaryDirectory,
         input: Data? = nil, environment: [String: String]? = nil,
-        cancellation: OpenClawCommandCancellation? = nil
+        cancellation: OpenClawCommandCancellation? = nil,
+        schedulingPriority: SubprocessSupervisor.SchedulingPriority = .inherited
     ) -> CommandResult {
         let process = SubprocessSupervisor()
         do {
@@ -373,6 +374,7 @@ final class OpenClawService {
             process.executableURL = executable
             process.arguments = arguments
             process.environment = environment ?? managedEnvironment().values
+            process.schedulingPriority = schedulingPriority
             let pipe = try input.map { _ in try SubprocessSupervisor.makePrivatePipe() }
             if let pipe { process.standardInput = pipe }
             let exit = ProcessExitNotification(process)

@@ -420,7 +420,8 @@ enum ManagedGatewayHost {
     }
 
     private static func ownedCommand(root: URL, executable: URL, arguments: [String], timeout: TimeInterval,
-                                     environment: [String:String]? = nil) -> OpenClawService.CommandResult {
+                                     environment: [String:String]? = nil,
+                                     schedulingPriority: SubprocessSupervisor.SchedulingPriority = .inherited) -> OpenClawService.CommandResult {
         let cancellation = OpenClawCommandCancellation()
         let timer = DispatchSource.makeTimerSource(queue: .global(qos:.utility))
         timer.schedule(deadline:.now()+0.2, repeating:.milliseconds(200))
@@ -433,7 +434,8 @@ enum ManagedGatewayHost {
         }
         timer.resume(); defer { timer.cancel() }
         return OpenClawService.run(executable:executable, arguments:arguments, timeout:timeout,
-                                  environment:environment, cancellation:cancellation)
+                                  environment:environment, cancellation:cancellation,
+                                  schedulingPriority:schedulingPriority)
     }
 
     static func run(descriptorURL: URL, runtimeURL: URL) -> Int32 {
@@ -579,7 +581,7 @@ enum ManagedGatewayHost {
                     var auditArguments = ["--managed-openclaw", "audit", "--managed-descriptor", descriptorURL.path]
                     if forceFullIntegrityAudit { auditArguments.append("--force-integrity-audit") }
                     let audit = ownedCommand(root:root, executable:runtimeURL,
-                        arguments:auditArguments, timeout:90)
+                        arguments:auditArguments, timeout:90, schedulingPriority:.utility)
                     let auditResult = Self.object(audit.output)
                     fileHints.refresh()
                     if forceFullIntegrityAudit {

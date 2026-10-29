@@ -92,6 +92,34 @@ final class CapturePipelineTests: XCTestCase {
         func set(_ frame: CapturedFrame) { lock.withLock { value = frame } }
         var released: Bool { lock.withLock { value == nil } }
     }
+    private final class PriorityProbe: @unchecked Sendable {
+        private let lock = NSLock()
+        private var recorded: TaskPriority?
+        func record(_ priority: TaskPriority) { lock.withLock { recorded = priority } }
+        var value: TaskPriority? { lock.withLock { recorded } }
+    }
+
+    func testEvidenceCompressionKeepsInteractivePriorityAndPreviewCompressionUsesUtility() async throws {
+        func encodePriority(for kind: CaptureAcquisitionQueue.Kind) async throws -> TaskPriority {
+            let queue = CaptureAcquisitionQueue(), pixels = try image(1)
+            let reservation = try await queue.acquire(kind)
+            let mapping = try ScreenCoordinateMapping(displayID: display.id, displayBounds: display.frame,
+                imageSize: CGSize(width: pixels.width, height: pixels.height))
+            let frame = try CapturedFrame(image: pixels, coordinates: mapping, reservation: reservation)
+            await queue.acquired(reservation)
+            let probe = PriorityProbe()
+            let encoder = CapturePNGEncoder(directory: try directory(), writer: { _, _ in
+                probe.record(Task<Never, Never>.currentPriority)
+            })
+            _ = try await encoder.encode(frame)
+            return try XCTUnwrap(probe.value)
+        }
+
+        let evidencePriority = try await encodePriority(for: .evidence)
+        let previewPriority = try await encodePriority(for: .preview)
+        XCTAssertEqual(evidencePriority, .userInitiated)
+        XCTAssertEqual(previewPriority, .utility)
+    }
 
     func testFramePixelLimitsUseCheckedArithmeticAndInclusiveBounds() throws {
         for (width, height) in [(0, 1), (1, 0), (-1, 1), (1, Int.min)] {

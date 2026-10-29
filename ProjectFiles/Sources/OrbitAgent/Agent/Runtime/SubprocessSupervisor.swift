@@ -5,6 +5,12 @@ import ProcessSupport
 /// Retained by its monitor until the owned tree is empty, independently of the
 /// immediate parent's lifetime. No task text, arguments or output enter metrics.
 final class SubprocessSupervisor: @unchecked Sendable {
+    enum SchedulingPriority: Equatable {
+        case inherited
+        /// Best-effort background maintenance. A positive nice value lowers
+        /// CPU scheduling priority and is inherited by the child’s descendants.
+        case utility
+    }
     enum Failure: LocalizedError {
         case launch(Int32), inspection, localResourceExhausted
         var errorDescription: String? {
@@ -37,6 +43,7 @@ final class SubprocessSupervisor: @unchecked Sendable {
     var executableURL: URL?
     var arguments: [String] = []
     var environment: [String: String]?
+    var schedulingPriority: SchedulingPriority = .inherited
     var currentDirectoryURL: URL?
     var onLaunchAcknowledged: ((TPProcessIdentity) throws -> Void)?
     var standardInput: Any = FileHandle.nullDevice
@@ -167,6 +174,17 @@ final class SubprocessSupervisor: @unchecked Sendable {
             if let onLaunchAcknowledged {
                 guard let rootIdentity else { throw Failure.inspection }
                 try onLaunchAcknowledged(rootIdentity)
+            }
+            if schedulingPriority == .utility {
+                // tp_spawn keeps the child suspended until all ownership and
+                // scheduling policy is installed. Descendants inherit this
+                // lower CPU priority; active task helpers retain inherited
+                // scheduling by default.
+                guard Darwin.setpriority(PRIO_PROCESS, id_t(pid), 5) == 0 else {
+                    let code = errno
+                    _ = Darwin.kill(pid, SIGKILL)
+                    throw Failure.launch(code)
+                }
             }
             // The program cannot fork or mutate before ownership and observers
             // are installed. Launch returns only after explicit release.
