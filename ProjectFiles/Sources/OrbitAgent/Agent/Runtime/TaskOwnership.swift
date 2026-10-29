@@ -814,6 +814,11 @@ enum TaskOwnership {
     @TaskLocal static var allowWorkingSelectionSaveExport = false
     @TaskLocal static var stopBoundaryPreflight: (([String: Any], [StopBoundaryRecord]) throws -> Void)?
     @TaskLocal static var targetChoicePreflight: (([String: Any]) throws -> Void)?
+    @TaskLocal static var documentBindingPreflight: (([String: Any]) throws -> Void)?
+    @TaskLocal static var selectionScopePreflight: (([String: Any]) throws -> Void)?
+    @TaskLocal static var resolvedTargetPreflight: (([String: Any]) throws -> NativeActionBoundaryPolicy.ResolvedTarget?)?
+    @TaskLocal static var targetBindingRevision: UInt64?
+    @TaskLocal static var targetBindings: [[String: Any]] = []
     static func check() throws { try current?.check(); try LocalOperationBudget.check(); try Task.checkCancellation() }
     static func checkpoint() async throws {
         try LocalOperationBudget.check(); try await current?.checkpoint(); try LocalOperationBudget.check()
@@ -822,46 +827,149 @@ enum TaskOwnership {
         let lease = current
         return try await withTaskCancellationHandler(operation: operation, onCancel: { lease?.wakePausedWorkers() })
     }
-    static func commit<T>(_ operation: () throws -> T) throws -> T {
+
+    /// Evaluates the complete task policy without advancing an action receipt.
+    /// This is used at bridge entry for read-only tools (which have no native
+    /// event commit) and is repeated at every mutation boundary below.
+    static func preflightAction() throws {
+        guard let current else { return }
+        try current.commit {
+            try LocalOperationBudget.check()
+            guard let actionReceipt else { return }
+            let evaluation = evaluateActionBoundary(current: current, actionReceipt: actionReceipt)
+            try NativeActionBoundaryPolicy.throwIfRejected(evaluation)
+        }
+    }
+
+    /// Runs one task-scoped read-only policy through the same evaluator when
+    /// the operation has no action receipt (for example, a command capability
+    /// probe). It never marks the original user action as dispatched.
+    static func preflight(action: [String: Any], checks: [NativeActionBoundaryPolicy.Check]) throws {
+        let context: NativeActionBoundaryPolicy.Context
+        if let current {
+            try current.commit {
+                try LocalOperationBudget.check()
+                let constraints = NativeActionBoundaryPolicy.Constraints(
+                    generationID: current.id,
+                    instructionRevision: instructionRevision,
+                    workingDocumentRevision: workingDocumentRevision,
+                    targetBindingRevision: targetBindingRevision,
+                    stopBoundaries: current.activeStopBoundaries,
+                    targetBindings: targetBindings,
+                    allowWorkingSelectionSaveExport: allowWorkingSelectionSaveExport,
+                    alreadyDispatched: false)
+                let context = NativeActionBoundaryPolicy.Context(action: action, constraints: constraints,
+                                                                 resolvedTarget: nil)
+                let evaluation = NativeActionBoundaryPolicy.evaluate(checks, context: context)
+                try NativeActionBoundaryPolicy.throwIfRejected(evaluation)
+            }
+            return
+        }
+        context = NativeActionBoundaryPolicy.Context(action: action,
+            constraints: .init(generationID: nil, instructionRevision: nil,
+                workingDocumentRevision: nil, targetBindingRevision: nil,
+                stopBoundaries: [], targetBindings: [], allowWorkingSelectionSaveExport: false,
+                alreadyDispatched: false), resolvedTarget: nil)
+        try NativeActionBoundaryPolicy.throwIfRejected(NativeActionBoundaryPolicy.evaluate(checks, context: context))
+    }
+
+    static func commit<T>(policyChecks: [NativeActionBoundaryPolicy.Check] = [],
+                          _ operation: () throws -> T) throws -> T {
         if let current {
             return try current.commit {
                 try LocalOperationBudget.check()
-                if let actionReceipt {
-                    guard actionReceipt.generation == current.id else { throw CancellationError() }
-                    let alreadyDispatched = actionReceipt.receipt["state"] as? String == "dispatched"
-                    if let revision = instructionRevision {
-                        try current.validateInstructionRevision(revision,
-                            allowDispatchedReceipt: alreadyDispatched)
-                    }
-                    if let revision = workingDocumentRevision {
-                        try current.validateWorkingDocumentRevision(revision,
-                            allowDispatchedReceipt: alreadyDispatched)
-                    }
-                    // The policy is a dispatch barrier. An operation that has
-                    // already crossed the receipt boundary must finish and be
-                    // reconciled under its originating instruction revision.
-                    if !alreadyDispatched, let stopBoundaryPreflight {
-                        let revision = instructionRevision ?? current.currentInstructionRevision
-                        let boundaries = try current.stopBoundaries(for: revision)
-                        if !boundaries.isEmpty {
-                            guard let action = actionReceipt.action else {
-                                throw StopBoundaryViolation.uncertain(boundaries[0].label)
-                            }
-                            try stopBoundaryPreflight(action, boundaries)
-                        }
-                    }
-                    if !alreadyDispatched, let targetChoicePreflight, let action = actionReceipt.action {
-                        try targetChoicePreflight(action)
-                    }
-                    // Receipt dispatch and delivery share the lease's atomic
-                    // boundary. Failed delivery after this point is uncertain.
-                    try actionReceipt.dispatched()
+                guard let actionReceipt else {
+                    let context = NativeActionBoundaryPolicy.Context(action: nil,
+                        constraints: NativeActionBoundaryPolicy.Constraints(
+                            generationID: current.id, instructionRevision: nil,
+                            workingDocumentRevision: nil, targetBindingRevision: nil,
+                            stopBoundaries: [], targetBindings: [],
+                            allowWorkingSelectionSaveExport: false, alreadyDispatched: false),
+                        resolvedTarget: nil)
+                    let evaluation = NativeActionBoundaryPolicy.evaluate(policyChecks, context: context)
+                    try NativeActionBoundaryPolicy.throwIfRejected(evaluation)
+                    return try operation()
                 }
+
+                let evaluation = evaluateActionBoundary(current: current, actionReceipt: actionReceipt,
+                                                        additionalChecks: policyChecks)
+                try NativeActionBoundaryPolicy.throwIfRejected(evaluation)
+                // Receipt dispatch and delivery share this ordered, atomic
+                // boundary. A failed policy check remains a pre-dispatch error.
+                try actionReceipt.dispatched()
                 return try operation()
             }
         }
         try LocalOperationBudget.check()
+        let context = NativeActionBoundaryPolicy.Context(action: nil,
+            constraints: NativeActionBoundaryPolicy.Constraints(generationID: nil,
+                instructionRevision: nil, workingDocumentRevision: nil, targetBindingRevision: nil,
+                stopBoundaries: [], targetBindings: [], allowWorkingSelectionSaveExport: false,
+                alreadyDispatched: false), resolvedTarget: nil)
+        let evaluation = NativeActionBoundaryPolicy.evaluate(policyChecks, context: context)
+        try NativeActionBoundaryPolicy.throwIfRejected(evaluation)
         return try operation() // Explicit user/manual and teardown paths.
+    }
+
+    private static func evaluateActionBoundary(current: TaskLease, actionReceipt: ActionReceiptStore.Token,
+                                               additionalChecks: [NativeActionBoundaryPolicy.Check] = [])
+        -> NativeActionBoundaryPolicy.Evaluation {
+        let action = actionReceipt.action
+        let alreadyDispatched = actionReceipt.receipt["state"] as? String == "dispatched"
+        let effectiveInstructionRevision = instructionRevision ?? current.currentInstructionRevision
+        let constraints = NativeActionBoundaryPolicy.Constraints(
+            generationID: current.id,
+            instructionRevision: instructionRevision,
+            workingDocumentRevision: workingDocumentRevision,
+            targetBindingRevision: targetBindingRevision,
+            stopBoundaries: current.activeStopBoundaries,
+            targetBindings: targetBindings,
+            allowWorkingSelectionSaveExport: allowWorkingSelectionSaveExport,
+            alreadyDispatched: alreadyDispatched)
+        let context = NativeActionBoundaryPolicy.Context(action: action, constraints: constraints,
+                                                         resolvedTarget: nil)
+        var checks: [NativeActionBoundaryPolicy.Check] = [
+            .init(.ownership) { context in
+                guard actionReceipt.generation == current.id else { throw CancellationError() }
+                context.resolvedTarget = nil
+            }
+        ]
+        if let revision = instructionRevision {
+            checks.append(.init(.instructionRevision) { _ in
+                try current.validateInstructionRevision(revision, allowDispatchedReceipt: alreadyDispatched)
+            })
+        }
+        if let revision = workingDocumentRevision {
+            checks.append(.init(.workingDocumentRevision) { _ in
+                try current.validateWorkingDocumentRevision(revision, allowDispatchedReceipt: alreadyDispatched)
+            })
+        }
+        // An already-dispatched action finishes under its originating policy
+        // and is reconciled before a later decision.
+        if !alreadyDispatched, let stopBoundaryPreflight {
+            checks.append(.init(.stopBefore) { _ in
+                let boundaries = try current.stopBoundaries(for: effectiveInstructionRevision)
+                guard !boundaries.isEmpty else { return }
+                guard let action else { throw StopBoundaryViolation.uncertain(boundaries[0].label) }
+                try stopBoundaryPreflight(action, boundaries)
+            })
+        }
+        if !alreadyDispatched, let targetChoicePreflight, let action {
+            checks.append(.init(.targetChoice) { _ in try targetChoicePreflight(action) })
+        }
+        if let documentBindingPreflight, let action {
+            checks.append(.init(.documentBinding) { _ in try documentBindingPreflight(action) })
+        }
+        if let selectionScopePreflight, let action {
+            checks.append(.init(.selectionScope) { _ in try selectionScopePreflight(action) })
+        }
+        checks.append(contentsOf: additionalChecks)
+        if let resolvedTargetPreflight, let action {
+            checks.append(.init(.resolvedTarget) { context in
+                context.resolvedTarget = try resolvedTargetPreflight(action)
+            })
+        }
+        return NativeActionBoundaryPolicy.evaluate(checks, context: context)
     }
     static func permitted<T>(_ fallback: T, _ operation: () -> T) -> T {
         (try? commit(operation)) ?? fallback

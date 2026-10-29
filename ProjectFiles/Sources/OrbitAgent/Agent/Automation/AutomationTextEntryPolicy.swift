@@ -50,7 +50,7 @@ enum AutomationTextEntryPolicy {
         return value.replacingCharacters(in: lower..<upper, with: text)
     }
 
-    static func deliverChunks(_ chunks: [String], preflight: () throws -> Void,
+    static func deliverChunks(_ chunks: [String], preflight: @escaping () throws -> Void,
                               cancelled: () -> Bool, deliver: (String) throws -> Void) throws {
         var delivered = false
         for chunk in chunks {
@@ -76,7 +76,7 @@ enum AutomationTextEntryPolicy {
         setValue: (String) throws -> TextAttributeDelivery,
         setSelectedText: (String) throws -> TextAttributeDelivery,
         selectRange: (NSRange) throws -> Bool,
-        typeText: (String, () throws -> Void) throws -> Void,
+        typeText: (String, @escaping () throws -> Void) throws -> Void,
         waitForMatch: (() -> Bool) async throws -> Void
     ) async throws -> AutomationTextEntryResult {
         try await focus()

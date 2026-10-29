@@ -82,6 +82,7 @@ from task_inputs import EXACT_INPUT_REFERENCE_VERSION, TASK_INPUT_VERSION, input
 from task_inputs import TaskInputBindings, InputReferenceError
 from task_action_boundaries import (STOP_BOUNDARY_POLICY_VERSION, BoundaryViolation,
                                     detect_stop_boundaries, validate_action_against_boundaries)
+from action_boundary_policy import (NATIVE_ACTION_POLICY_VERSION, evaluate_checks as evaluate_action_policy)
 from command_intents import explicit_operation
 from evidence_consistency import EvidenceConsistency, EVIDENCE_CONSISTENCY_VERSION
 from recovery_cycles import RecoveryCycles, RECOVERY_CYCLE_VERSION
@@ -1082,6 +1083,7 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
     if method == "observe":
         params.setdefault("observation_keywords", _task_value('observation_keywords'))
     if method == "act":
+        params["native_action_policy_version"] = NATIVE_ACTION_POLICY_VERSION
         if _task_value("bridge_observation_revision"):
             params.setdefault("observation_revision", _task_value("bridge_observation_revision"))
         # A UUID represents this logical execution, not a hash of its payload.
@@ -4719,9 +4721,14 @@ class TaskExecution:
         if c.identical_action_count > MAX_IDENTICAL_ACTIONS:
             raise RuntimeError(f"OpenClaw repeated the same desktop action on an unchanged screen; {PRODUCT_NAME} stopped the loop safely")
         if c.stop_boundaries and c.observation is not None:
-            try:
-                validate_action_against_boundaries(c.action, c.observation, c.stop_boundaries)
-            except BoundaryViolation as error:
+            policy_evaluation = evaluate_action_policy({
+                "stop_before": lambda: validate_action_against_boundaries(
+                    c.action, c.observation, c.stop_boundaries),
+            })
+            if not policy_evaluation.decision.allowed:
+                error = policy_evaluation.failure
+                if not isinstance(error, BoundaryViolation):
+                    raise RuntimeError("The action-boundary policy could not validate this action")
                 failure = {"message": str(error), "outcome": "rejected", "error_code": error.code,
                            "recovery": action_failure_recovery(error.code)}
                 c.consecutive_action_failures += 1
@@ -5289,6 +5296,9 @@ def read_runtime_configuration(require_generation: bool = False) -> str:
             raise RuntimeError("TaskPilot task ownership protocol does not match; rebuild the bundled components together")
         if type(configuration.get("stop_boundary_policy_version")) is not int or configuration["stop_boundary_policy_version"] != STOP_BOUNDARY_POLICY_VERSION:
             raise RuntimeError("TaskPilot stop-before boundary policies do not match; rebuild the bundled components together")
+        if (type(configuration.get("native_action_policy_version")) is not int or
+                configuration["native_action_policy_version"] != NATIVE_ACTION_POLICY_VERSION):
+            raise RuntimeError("TaskPilot native action policy versions do not match; rebuild the bundled components together")
         if type(configuration.get("coordinate_mapping_version")) is not int or configuration["coordinate_mapping_version"] != COORDINATE_MAPPING_VERSION:
             raise RuntimeError("TaskPilot screen coordinate mapping versions do not match; rebuild the bundled components together")
         if type(configuration.get("observation_completeness_version")) is not int or configuration["observation_completeness_version"] != OBSERVATION_COMPLETENESS_VERSION:

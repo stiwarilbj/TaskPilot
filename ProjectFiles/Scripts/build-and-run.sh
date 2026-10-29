@@ -50,6 +50,7 @@ if [[ ! -x "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/task_execution.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/task_destination.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/task_action_boundaries.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
+      || "$PROJECT_FILES_DIR/AgentRuntime/action_boundary_policy.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/target_choices.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/bounded_transport.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \
       || "$PROJECT_FILES_DIR/AgentRuntime/observation_context.py" -nt "$RUNTIME_SOURCE/orbit_openclaw_runtime" \

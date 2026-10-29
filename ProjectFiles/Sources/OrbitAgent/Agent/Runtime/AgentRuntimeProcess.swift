@@ -327,6 +327,7 @@ final class AgentRuntimeProcess {
                 "task_generation_id": lease.id,
                 "instruction_revision": lease.currentInstructionRevision,
                 "stop_boundary_policy_version": StopBoundaryPolicy.version,
+                "native_action_policy_version": NativeActionBoundaryPolicy.version,
                 "working_document_protocol_version": WorkingDocumentUpdate.protocolVersion,
                 "target_choice_protocol_version": AgentTargetChoiceProtocol.version,
                 "task_protocol_version": ActionContract.taskProtocolVersion,

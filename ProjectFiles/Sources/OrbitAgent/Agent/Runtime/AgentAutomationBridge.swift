@@ -265,7 +265,11 @@ final class AgentAutomationBridge {
             }
             if method == "inspect_command" {
                 guard let action = params["action"] as? [String: Any] else { throw BridgeError.invalidRequest("Missing command inspection payload") }
-                try accessibility.validateTaskToolWithinWorkingSelection(["type": "inspect_command"])
+                try TaskOwnership.preflight(action: ["type": "inspect_command"], checks: [
+                    .init(.selectionScope) { _ in
+                        try self.accessibility.validateTaskToolWithinWorkingSelection(["type": "inspect_command"])
+                    }
+                ])
                 let result = try await taskTools.inspectCommand(action: action)
                 try TaskOwnership.check()
                 return ["task_generation_id": lease.id, "kind": "bridge_response", "request_id": requestID,
@@ -525,6 +529,9 @@ final class AgentAutomationBridge {
                     action: action, fileDigestProof: params["file_digest_proof"] as? [String: Any]), action: action)
 
             case "act":
+                guard Self.exactRevision(params["native_action_policy_version"]) == UInt64(NativeActionBoundaryPolicy.version) else {
+                    throw BridgeError.invalidRequest("TaskPilot native action policy versions do not match; rebuild the bundled components together")
+                }
                 let action = validatedAction!
                 let kind = ActionKind(rawValue: action["type"] as! String)!
                 let rawSaveExportPermission = params["working_selection_save_export_allowed"]
@@ -556,12 +563,37 @@ final class AgentAutomationBridge {
                         supplied: targetBindings, action: action,
                         requirementIDs: targetRequirementIDs, intendedTarget: intendedTarget)
                 }
+                let documentBindingCheck: ([String: Any]) throws -> Void = { action in
+                    guard kind.owner == .desktop else { return }
+                    try self.accessibility.validateActionDocumentBinding(action, on: display)
+                }
+                let selectionScopeCheck: ([String: Any]) throws -> Void = { action in
+                    if kind.owner == .task_tool {
+                        try self.accessibility.validateTaskToolWithinWorkingSelection(action)
+                    } else if kind.owner == .desktop {
+                        try self.accessibility.validateActionSelectionScope(action, on: display)
+                    }
+                }
+                let resolvedTargetCheck: ([String: Any]) throws -> NativeActionBoundaryPolicy.ResolvedTarget? = { action in
+                    guard kind.owner == .desktop else { return nil }
+                    return try self.accessibility.resolveNativeActionTarget(action, on: display)
+                }
                 result = try await TaskOwnership.$allowWorkingSelectionSaveExport.withValue(allowWorkingSelectionSaveExport) {
                 try await TaskOwnership.$actionReceipt.withValue(receiptToken) {
                     try await TaskOwnership.$stopBoundaryPreflight.withValue(boundaryCheck) {
                     try await TaskOwnership.$targetChoicePreflight.withValue(targetChoiceCheck) {
+                    try await TaskOwnership.$targetBindingRevision.withValue(targetBindingRevision) {
+                    try await TaskOwnership.$targetBindings.withValue(targetBindings) {
+                    try await TaskOwnership.$documentBindingPreflight.withValue(documentBindingCheck) {
+                    try await TaskOwnership.$selectionScopePreflight.withValue(selectionScopeCheck) {
+                    try await TaskOwnership.$resolvedTargetPreflight.withValue(resolvedTargetCheck) {
+                    // read_file is intentionally side-effect free and has no
+                    // native mutation commit. Evaluate its constraints here
+                    // without dispatching the receipt; every mutating route
+                    // evaluates again inside TaskOwnership.commit immediately
+                    // before delivery.
+                    if kind == .read_file { try TaskOwnership.preflightAction() }
                     if kind.owner == .task_tool {
-                        try self.accessibility.validateTaskToolWithinWorkingSelection(action)
                         let result = try await taskTools.perform(action: action,
                             commandBindingID: params["command_inspection_id"] as? String,
                             targetRequirementIDs: targetRequirementIDs)
@@ -584,6 +616,11 @@ final class AgentAutomationBridge {
                     }
                     }
                     }
+                    }
+                    }
+                    }
+                    }
+                }
                 }
                 }
                 try LocalOperationBudget.check()

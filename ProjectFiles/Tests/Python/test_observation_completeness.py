@@ -148,6 +148,7 @@ class ObservationCompletenessTests(unittest.TestCase):
         config = dict(kind='runtime_configuration', gemini_api_key='', action_contract_hash=runtime.CONTRACT_HASH,
                       action_contract_version=runtime.CONTRACT_VERSION, instruction_revision=0, task_protocol_version=runtime.TASK_PROTOCOL_VERSION,
                       stop_boundary_policy_version=runtime.STOP_BOUNDARY_POLICY_VERSION,
+                      native_action_policy_version=runtime.NATIVE_ACTION_POLICY_VERSION,
                       coordinate_mapping_version=runtime.COORDINATE_MAPPING_VERSION,
                       task_generation_id='d0b9c0fc-01af-42f0-b749-1027c907a2cd')
         with mock.patch.object(runtime, '_task_generation_id', None), mock.patch.object(runtime, '_observation_keywords', ['old']), \

@@ -76,8 +76,11 @@ enum AutomationTargetPolicy {
 
     /// One check immediately before delivery. A rejected preflight never calls
     /// the delivery closure; it cannot become a second attempt at a mutation.
-    static func deliver<T>(preflight: () throws -> Void, event: () throws -> T) throws -> T {
-        try preflight()
-        return try event()
+    static func deliver<T>(preflight: @escaping () throws -> Void, event: () throws -> T) throws -> T {
+        try TaskOwnership.commit(policyChecks: [
+            .init(.resolvedTarget) { _ in try preflight() }
+        ]) {
+            try event()
+        }
     }
 }

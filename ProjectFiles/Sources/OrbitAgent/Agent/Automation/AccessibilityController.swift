@@ -3675,13 +3675,14 @@ final class AccessibilityController {
 
     private func validateWorkingDocumentTarget(action: [String: Any], record: ElementRecord?,
                                                pid: pid_t, display: DisplayDescriptor,
-                                               point: CGPoint? = nil) throws {
+                                               point: CGPoint? = nil,
+                                               validateSelection: Bool = true) throws {
         guard let stored = lock.withLock({ workingDocumentBinding }),
               stored.generationID == (TaskOwnership.current?.id ?? taskGenerationID) else { return }
         let refreshed = refreshWorkingDocumentBinding(stored)
         guard let binding = refreshed.binding else { throw AccessibilityActionError.workingDocumentLost }
         if refreshed.changed { installWorkingDocumentBinding(binding, generationID: binding.generationID) }
-        if let scope = binding.selectionScope {
+        if validateSelection, let scope = binding.selectionScope {
             let savePanelTarget = TaskOwnership.allowWorkingSelectionSaveExport
                 && isWorkingSavePanelTarget(action: action, record: record, binding: binding)
             guard validateWorkingSelectionBinding(scope, binding: binding)
@@ -3692,7 +3693,7 @@ final class AccessibilityController {
         // Other applications remain available to the task. The binding only
         // constrains actions routed into the selected document's application.
         guard pid == binding.pid else { return }
-        if let scope = binding.selectionScope {
+        if validateSelection, let scope = binding.selectionScope {
             try validateWorkingSelectionAction(action, record: record, scope: scope, binding: binding,
                                                display: display, point: point,
                                                allowSaveExport: TaskOwnership.allowWorkingSelectionSaveExport)
@@ -3723,6 +3724,97 @@ final class AccessibilityController {
         guard let focused, window(focused, belongsTo: binding.window) else {
             throw AccessibilityActionError.workingDocumentTargetMismatch
         }
+    }
+
+    /// Ordered policy hooks called by TaskOwnership immediately before native
+    /// delivery. These deliberately reuse the live identity rules below;
+    /// observations and target labels never become authority on their own.
+    func validateActionDocumentBinding(_ input: [String: Any], on display: DisplayDescriptor) throws {
+        let action = try validatedDesktopAction(input)
+        let type = action["type"] as? String ?? ""
+        guard !["launch_app", "open_route", "navigate_browser"].contains(type) else { return }
+        let record = action["element_id"] == nil ? nil : try self.record(for: action)
+        let point: CGPoint?
+        if action["x"] != nil, action["y"] != nil { point = try self.point(from: action, display: display) }
+        else { point = nil }
+        let pid = try record?.pid ?? actionPID(action, on: display, fallbackPoint: point)
+        try ensureAllowedOnDisplay(pid, display: display)
+        try validateWorkingDocumentTarget(action: action, record: record, pid: pid, display: display,
+                                          point: point, validateSelection: false)
+    }
+
+    func validateActionSelectionScope(_ input: [String: Any], on display: DisplayDescriptor) throws {
+        let action = try validatedDesktopAction(input)
+        let type = action["type"] as? String ?? ""
+        // Launching an app does not edit or target the bound document. Preserve
+        // the existing rule that a selection limit only constrains document
+        // work, navigation, and task tools.
+        if type == "launch_app" { return }
+        if ["open_route", "navigate_browser"].contains(type) {
+            try validateTaskToolWithinWorkingSelection(action)
+            return
+        }
+        let stored = lock.withLock { workingDocumentBinding }
+        guard let stored,
+              stored.generationID == (TaskOwnership.current?.id ?? taskGenerationID),
+              let scope = stored.selectionScope else { return }
+        let refreshed = refreshWorkingDocumentBinding(stored)
+        guard let binding = refreshed.binding else { throw AccessibilityActionError.workingDocumentLost }
+        if refreshed.changed { installWorkingDocumentBinding(binding, generationID: binding.generationID) }
+        guard validateWorkingSelectionBinding(scope, binding: binding)
+                || (TaskOwnership.allowWorkingSelectionSaveExport &&
+                    workingSelectionAnchorRemains(scope, binding: binding)) else {
+            throw AccessibilityActionError.workingSelectionLost
+        }
+        let record = action["element_id"] == nil ? nil : try self.record(for: action)
+        let point: CGPoint?
+        if action["x"] != nil, action["y"] != nil { point = try self.point(from: action, display: display) }
+        else { point = nil }
+        let pid = try record?.pid ?? actionPID(action, on: display, fallbackPoint: point)
+        // The selected document restricts actions within its own app. Other
+        // apps remain usable, as in the existing working-document policy.
+        guard pid == binding.pid else { return }
+        try validateWorkingSelectionAction(action, record: record, scope: scope, binding: binding,
+                                           display: display, point: point,
+                                           allowSaveExport: TaskOwnership.allowWorkingSelectionSaveExport)
+    }
+
+    func resolveNativeActionTarget(_ input: [String: Any], on display: DisplayDescriptor)
+        throws -> NativeActionBoundaryPolicy.ResolvedTarget? {
+        let action = try validatedDesktopAction(input)
+        let type = action["type"] as? String ?? ""
+        if type == "launch_app" {
+            return .init(kind: .application, processID: nil, role: nil, identity: nil,
+                         reliable: true, ambiguous: false)
+        }
+        if ["open_route", "navigate_browser"].contains(type) { return nil }
+        var record = action["element_id"] == nil ? nil : try self.record(for: action)
+        let point: CGPoint?
+        if action["x"] != nil, action["y"] != nil { point = try self.point(from: action, display: display) }
+        else { point = nil }
+        if record == nil, ["set_value", "type_text"].contains(type) {
+            let pid = try actionPID(action, on: display, fallbackPoint: point)
+            record = try observedFocusedInput(pid: pid)
+        }
+        let pid = try record?.pid ?? actionPID(action, on: display, fallbackPoint: point)
+        try ensureAllowedOnDisplay(pid, display: display)
+        if let record {
+            try validateRecord(record, action: action, on: display)
+            return .init(kind: .accessibility, processID: pid, role: record.role,
+                         identity: "\(pid):\(CFHash(record.element))", reliable: true, ambiguous: false)
+        }
+        if point != nil, ["click", "double_click", "scroll"].contains(type) {
+            try validateCoordinateWindows(pid, on: display)
+            if let point, let resolved = try observedControl(at: point, pid: pid) {
+                try validateRecord(resolved, action: action, on: display)
+                return .init(kind: .coordinate, processID: pid, role: resolved.role,
+                             identity: "\(pid):\(CFHash(resolved.element))", reliable: true, ambiguous: false)
+            }
+            return .init(kind: .coordinate, processID: pid, role: nil, identity: nil,
+                         reliable: false, ambiguous: false)
+        }
+        return .init(kind: .unresolved, processID: pid, role: nil, identity: nil,
+                     reliable: false, ambiguous: false)
     }
 
     private func validateWorkingSelectionAction(_ action: [String: Any], record: ElementRecord?,
@@ -4343,7 +4435,7 @@ final class AccessibilityController {
         point: CGPoint,
         double: Bool,
         on display: DisplayDescriptor,
-        preflight: () throws -> Void = {}
+        preflight: @escaping () throws -> Void = {}
     ) throws {
         let previouslyActiveApp = activateForTargetedInput(pid)
         defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.10, targetPID: pid) }
@@ -4392,12 +4484,12 @@ final class AccessibilityController {
         return (Bundle(url: url)?.object(forInfoDictionaryKey: "LSRequiresIPhoneOS") as? Bool) == true
     }
 
-    private func postHIDClick(at point: CGPoint, double: Bool, preflight: () throws -> Void) throws {
+    private func postHIDClick(at point: CGPoint, double: Bool, preflight: @escaping () throws -> Void) throws {
         try postSessionClick(at: point, double: double, tap: .cghidEventTap, preflight: preflight)
     }
 
     private func postSessionClick(at point: CGPoint, double: Bool, tap: CGEventTapLocation = .cgSessionEventTap,
-                                  preflight: () throws -> Void) throws {
+                                  preflight: @escaping () throws -> Void) throws {
         let originalPointer = CGEvent(source: nil)?.location
         guard let source = CGEventSource(stateID: .hidSystemState),
               let move = CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
@@ -4477,7 +4569,7 @@ final class AccessibilityController {
         agentCursor?.move(to: end, on: display, clicking: false)
     }
 
-    private func postUnicode(_ text: String, to pid: pid_t, preflight: () throws -> Void = {}) throws {
+    private func postUnicode(_ text: String, to pid: pid_t, preflight: @escaping () throws -> Void = {}) throws {
         let previouslyActiveApp = activateForTargetedInput(pid)
         defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.05, targetPID: pid) }
         guard let source = CGEventSource(stateID: .privateState),
@@ -4501,7 +4593,8 @@ final class AccessibilityController {
         Thread.sleep(forTimeInterval: 0.035)
     }
 
-    private func postKey(_ key: String, modifiers: [String], to pid: pid_t, preflight: () throws -> Void = {}) throws {
+    private func postKey(_ key: String, modifiers: [String], to pid: pid_t,
+                         preflight: @escaping () throws -> Void = {}) throws {
         let previouslyActiveApp = activateForTargetedInput(pid)
         defer { restoreFrontmostApplication(previouslyActiveApp, after: 0.05, targetPID: pid) }
         guard let code = Self.supportedKeyCodes[key.lowercased()],

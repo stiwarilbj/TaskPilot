@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "stage_order": [
+    "ownership",
+    "instruction_revision",
+    "working_document_revision",
+    "stop_before",
+    "target_choice",
+    "document_binding",
+    "selection_scope",
+    "destination_identity",
+    "resolved_target"
+  ],
+  "cases": [
+    {
+      "id": "all_policies_allow",
+      "probes": [
+        {"stage": "stop_before", "disposition": "allow", "reason": "none"},
+        {"stage": "selection_scope", "disposition": "allow", "reason": "none"}
+      ],
+      "expected": {"disposition": "allow", "reason": "none"}
+    },
+    {
+      "id": "instruction_supersedes_later_conflicts",
+      "probes": [
+        {"stage": "destination_identity", "disposition": "reject", "reason": "destination_identity_changed"},
+        {"stage": "instruction_revision", "disposition": "refresh_evidence", "reason": "instruction_superseded"}
+      ],
+      "expected": {"disposition": "refresh_evidence", "reason": "instruction_superseded"}
+    },
+    {
+      "id": "stop_before_precedes_document_dispatch",
+      "probes": [
+        {"stage": "document_binding", "disposition": "refresh_evidence", "reason": "working_document_changed"},
+        {"stage": "stop_before", "disposition": "reject", "reason": "stop_boundary_rejected"}
+      ],
+      "expected": {"disposition": "reject", "reason": "stop_boundary_rejected"}
+    },
+    {
+      "id": "selection_limit_precedes_destination_commit",
+      "probes": [
+        {"stage": "destination_identity", "disposition": "reject", "reason": "destination_identity_changed"},
+        {"stage": "selection_scope", "disposition": "refresh_evidence", "reason": "selection_scope_changed"}
+      ],
+      "expected": {"disposition": "refresh_evidence", "reason": "selection_scope_changed"}
+    },
+    {
+      "id": "ambiguous_resolved_target_requests_refresh",
+      "probes": [
+        {"stage": "resolved_target", "disposition": "refresh_evidence", "reason": "ambiguous_target"}
+      ],
+      "expected": {"disposition": "refresh_evidence", "reason": "ambiguous_target"}
+    },
+    {
+      "id": "same_stage_keeps_registration_order",
+      "probes": [
+        {"stage": "selection_scope", "disposition": "reject", "reason": "action_policy_rejected"},
+        {"stage": "selection_scope", "disposition": "refresh_evidence", "reason": "selection_scope_changed"}
+      ],
+      "expected": {"disposition": "reject", "reason": "action_policy_rejected"}
+    },
+    {
+      "id": "malformed_later_probe_cannot_hide_behind_rejection",
+      "probes": [
+        {"stage": "stop_before", "disposition": "reject", "reason": "stop_boundary_rejected"},
+        {"stage": "resolved_target", "disposition": "allow", "reason": "invented"}
+      ],
+      "expected": {"disposition": "reject", "reason": "policy_protocol_error"}
+    },
+    {
+      "id": "unknown_stage_fails_closed",
+      "probes": [
+        {"stage": "invented", "disposition": "allow", "reason": "none"}
+      ],
+      "expected": {"disposition": "reject", "reason": "policy_protocol_error"}
+    },
+    {
+      "id": "allow_cannot_contain_a_failure_reason",
+      "probes": [
+        {"stage": "selection_scope", "disposition": "allow", "reason": "selection_scope_changed"}
+      ],
+      "expected": {"disposition": "reject", "reason": "policy_protocol_error"}
+    }
+  ]
+}

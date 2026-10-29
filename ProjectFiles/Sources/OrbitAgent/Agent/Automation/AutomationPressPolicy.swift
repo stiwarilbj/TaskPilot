@@ -5,7 +5,7 @@ enum AutomationPressPolicy {
     /// action. All other ambiguous errors prohibit a second delivery method.
     static func deliver(preferVerifiedCoordinate: Bool = false, pressAdvertised: Bool = true,
                         recordPress: (AXError) throws -> Void = { _ in },
-                        preflight: () throws -> Void, press: () -> AXError,
+                        preflight: @escaping () throws -> Void, press: () -> AXError,
                         fallback: () throws -> Void) throws -> String {
         // Cached compatibility cannot bypass a currently advertised AXPress.
         // The coordinate route still runs the same current-target preflight.

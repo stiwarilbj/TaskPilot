@@ -447,7 +447,23 @@ final class BoundFileOperation {
         if let original { guard try Self.identity(original) == initial else { throw conflict("the original object changed before commit") } }
         var delivered = false
         do {
-            try TaskOwnership.commit {
+            let destinationIdentityCheck = NativeActionBoundaryPolicy.Check(.destinationIdentity) { _ in
+                // This check runs in the shared ordered evaluator, before the
+                // receipt changes to dispatched. Keep the same descriptor and
+                // entry checks inside the commit below as a final syscall-time
+                // race detector after the test/instrumentation hook.
+                try self.checkParent()
+                guard try self.entry(self.name) == initial, try self.entry(temporary) == stagedIdentity,
+                      try Self.identity(staged) == stagedIdentity else {
+                    throw self.conflict("the destination or staged object changed before delivery")
+                }
+                if let original {
+                    guard try Self.identity(original) == initial else {
+                        throw self.conflict("the original object changed before delivery")
+                    }
+                }
+            }
+            try TaskOwnership.commit(policyChecks: [destinationIdentityCheck]) {
                 // Pause can suspend acquisition of delivery authority after
                 // the outer checks. Recheck both entries under that authority.
                 guard try entry(name) == initial, try entry(temporary) == stagedIdentity,
