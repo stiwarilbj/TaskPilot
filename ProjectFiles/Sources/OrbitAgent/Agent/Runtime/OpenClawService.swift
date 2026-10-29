@@ -21,7 +21,92 @@ enum OpenClawAutomatedSetupEvent: Equatable {
     case failed(String)
 }
 
+/// Stable ordering for independent, read-only checks that make up one local
+/// readiness decision. Ordering is used only when choosing the explanation;
+/// the probes themselves run concurrently.
+enum LocalReadinessProbe: Int, CaseIterable, Hashable {
+    case descriptor
+    case privateDirectories
+    case authenticatedGateway
+}
+
+enum LocalReadinessProbeOutcome: Equatable {
+    case passed
+    case failed(String)
+    case timedOut
+}
+
+struct LocalReadinessSnapshot: Equatable {
+    let outcomes: [LocalReadinessProbe: LocalReadinessProbeOutcome]
+    let exceededDeadline: Bool
+
+    var isReady: Bool {
+        LocalReadinessProbe.allCases.allSatisfy { outcomes[$0] == .passed }
+    }
+
+    var failures: [(probe: LocalReadinessProbe, outcome: LocalReadinessProbeOutcome)] {
+        Array(LocalReadinessProbe.allCases.lazy.compactMap { kind -> (LocalReadinessProbe, LocalReadinessProbeOutcome)? in
+            guard let outcome = outcomes[kind], outcome != .passed else { return nil }
+            return (kind, outcome)
+        })
+    }
+}
+
+/// Runs a fixed set of local read-only checks on utility workers. All workers
+/// share one monotonic deadline. Late results are ignored, and the caller can
+/// cancel cancellable checks (the authenticated health subprocess) once that
+/// deadline expires.
+enum LocalReadinessProbeCoordinator {
+    typealias Probe = (_ remainingSeconds: TimeInterval) -> LocalReadinessProbeOutcome
+
+    static func run(timeout: TimeInterval,
+                    probes: [LocalReadinessProbe: Probe],
+                    onDeadline: () -> Void = {}) -> LocalReadinessSnapshot {
+        let limit = max(0, timeout)
+        let deadline = DispatchTime.now() + limit
+        let lock = NSLock()
+        var outcomes: [LocalReadinessProbe: LocalReadinessProbeOutcome] = [:]
+        var sealed = false
+        let group = DispatchGroup()
+        let queue = DispatchQueue.global(qos: .utility)
+
+        for kind in LocalReadinessProbe.allCases {
+            group.enter()
+            queue.async {
+                defer { group.leave() }
+                let now = DispatchTime.now()
+                let remaining = deadline.uptimeNanoseconds > now.uptimeNanoseconds
+                    ? TimeInterval(deadline.uptimeNanoseconds - now.uptimeNanoseconds) / 1_000_000_000
+                    : 0
+                let outcome: LocalReadinessProbeOutcome
+                if remaining <= 0 {
+                    outcome = .timedOut
+                } else if let probe = probes[kind] {
+                    outcome = probe(remaining)
+                } else {
+                    outcome = .failed("probe_unavailable")
+                }
+                lock.withLock {
+                    guard !sealed, DispatchTime.now().uptimeNanoseconds <= deadline.uptimeNanoseconds else { return }
+                    outcomes[kind] = outcome
+                }
+            }
+        }
+
+        let completed = group.wait(timeout: deadline) == .success
+        lock.withLock {
+            sealed = true
+            for kind in LocalReadinessProbe.allCases where outcomes[kind] == nil {
+                outcomes[kind] = .timedOut
+            }
+        }
+        if !completed { onDeadline() }
+        return LocalReadinessSnapshot(outcomes: outcomes, exceededDeadline: !completed)
+    }
+}
+
 final class OpenClawService {
+    static let localReadinessDeadline: TimeInterval = 5
     static let setupArguments = ["agents", "list", "--json"]
     static let modelReadinessArguments = ["models", "status", "--json"]
     static let primaryModelArguments = ["config", "get", "agents.defaults.model.primary"]
@@ -134,8 +219,32 @@ final class OpenClawService {
             let matchesInstance = health?["instance_id"] as? String == descriptor.instanceID &&
                 health?["configuration_fingerprint"] as? String == descriptor.configurationFingerprint
             let ready = health.map { descriptor.acceptsHealth($0) } ?? false
-            return OpenClawProbe(executableURL: URL(fileURLWithPath: descriptor.executable), version: descriptor.openclawVersion,
-                configured: ready, detail: matchesInstance ? (health?["detail"] as? String ?? "Starting private OpenClaw") : "Starting TaskPilot’s private OpenClaw Gateway")
+            let executableURL = URL(fileURLWithPath: descriptor.executable)
+            guard ready else {
+                return OpenClawProbe(executableURL: executableURL, version: descriptor.openclawVersion,
+                    configured: false, detail: matchesInstance ? (health?["detail"] as? String ?? "Starting private OpenClaw") : "Starting TaskPilot’s private OpenClaw Gateway")
+            }
+
+            // Do not overlap checks with configuration repair or Gateway
+            // restart. The shared permit is nonblocking and remains held for
+            // the entire parallel, read-only readiness decision.
+            let readiness: LocalReadinessSnapshot
+            do {
+                guard let permit = try? ManagedRuntimePermit(root: ManagedOpenClawDescriptor.root,
+                        repairing: false, requireHealth: true) else {
+                    return OpenClawProbe(executableURL: executableURL, version: descriptor.openclawVersion,
+                        configured: false, detail: "TaskPilot’s private runtime is being repaired or restarted. Readiness will be checked again when it finishes.")
+                }
+                readiness = ManagedGatewayHost.checkLocalReadiness(descriptorURL: ManagedOpenClawDescriptor.url,
+                    descriptor: descriptor, permit: permit)
+            }
+            guard readiness.isReady else {
+                Self.requestHealthRefresh()
+                return OpenClawProbe(executableURL: executableURL, version: descriptor.openclawVersion,
+                    configured: false, detail: ManagedGatewayHost.localReadinessDetail(readiness))
+            }
+            return OpenClawProbe(executableURL: executableURL, version: descriptor.openclawVersion,
+                configured: true, detail: matchesInstance ? (health?["detail"] as? String ?? "Private Gateway connected; ACP compatible") : "Private Gateway connected; ACP compatible")
         } catch {
             return OpenClawProbe(executableURL: (try? ManagedOpenClawDescriptor.load()).map { URL(fileURLWithPath:$0.executable) },
                 version:"", configured:false, detail:error.localizedDescription)

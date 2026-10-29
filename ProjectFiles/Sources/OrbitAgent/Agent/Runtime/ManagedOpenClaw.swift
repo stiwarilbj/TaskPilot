@@ -421,8 +421,9 @@ enum ManagedGatewayHost {
 
     private static func ownedCommand(root: URL, executable: URL, arguments: [String], timeout: TimeInterval,
                                      environment: [String:String]? = nil,
-                                     schedulingPriority: SubprocessSupervisor.SchedulingPriority = .inherited) -> OpenClawService.CommandResult {
-        let cancellation = OpenClawCommandCancellation()
+                                     schedulingPriority: SubprocessSupervisor.SchedulingPriority = .inherited,
+                                     cancellation suppliedCancellation: OpenClawCommandCancellation? = nil) -> OpenClawService.CommandResult {
+        let cancellation = suppliedCancellation ?? OpenClawCommandCancellation()
         let timer = DispatchSource.makeTimerSource(queue: .global(qos:.utility))
         timer.schedule(deadline:.now()+0.2, repeating:.milliseconds(200))
         timer.setEventHandler {
@@ -436,6 +437,82 @@ enum ManagedGatewayHost {
         return OpenClawService.run(executable:executable, arguments:arguments, timeout:timeout,
                                   environment:environment, cancellation:cancellation,
                                   schedulingPriority:schedulingPriority)
+    }
+
+    /// Readiness is established from a consistent descriptor snapshot while a
+    /// shared runtime permit excludes offline configuration repair/restarts.
+    /// These checks only read local metadata or query authenticated Gateway
+    /// health; all repairs remain on the serialized host path.
+    static func checkLocalReadiness(descriptorURL: URL, descriptor: ManagedOpenClawDescriptor,
+                                    permit: ManagedRuntimePermit,
+                                    timeout: TimeInterval = OpenClawService.localReadinessDeadline) -> LocalReadinessSnapshot {
+        let root = descriptorURL.deletingLastPathComponent()
+        let healthCancellation = OpenClawCommandCancellation()
+        let probes: [LocalReadinessProbe: LocalReadinessProbeCoordinator.Probe] = [
+            .descriptor: { [permit] _ in
+                withExtendedLifetime(permit) {
+                    do {
+                        return try ManagedOpenClawDescriptor.load(from: descriptorURL) == descriptor
+                            ? .passed : .failed("descriptor_changed")
+                    } catch { return .failed("descriptor_invalid") }
+                }
+            },
+            .privateDirectories: { [permit] _ in
+                withExtendedLifetime(permit) {
+                    do {
+                        try descriptor.checkPrivateDirectories()
+                        return .passed
+                    } catch let failure as PrivateDirectoryPermissions.Failure {
+                        return .failed(failure.rawValue)
+                    } catch {
+                        return .failed("private_directory_unavailable")
+                    }
+                }
+            },
+            .authenticatedGateway: { [permit] remaining in
+                withExtendedLifetime(permit) {
+                    guard remaining > 0 else { return .timedOut }
+                    let milliseconds = max(1, min(4_000, Int(remaining * 1_000)))
+                    let result = ownedCommand(root: root,
+                        executable: URL(fileURLWithPath: descriptor.executable),
+                        arguments: ["health", "--json", "--timeout", String(milliseconds)],
+                        timeout: remaining, environment: descriptor.environment,
+                        cancellation: healthCancellation)
+                    if result.status == -2 { return .timedOut }
+                    guard result.status == 0, object(result.output)?["ok"] as? Bool == true else {
+                        return .failed("gateway_unavailable")
+                    }
+                    return .passed
+                }
+            }
+        ]
+        return LocalReadinessProbeCoordinator.run(timeout: timeout, probes: probes,
+            onDeadline: { healthCancellation.cancel() })
+    }
+
+    static func localReadinessDetail(_ snapshot: LocalReadinessSnapshot) -> String {
+        let details = snapshot.failures.map { failure -> String in
+            switch failure.probe {
+            case .descriptor:
+                if failure.outcome == .timedOut {
+                    return "Private OpenClaw descriptor validation did not finish before the shared readiness deadline."
+                }
+                return "TaskPilot’s private OpenClaw descriptor changed or failed validation."
+            case .privateDirectories:
+                if case .failed(let code) = failure.outcome {
+                    return PrivateDirectoryPermissions.Failure(rawValue: code)?.localizedDescription ??
+                        "TaskPilot could not verify its private runtime directories."
+                }
+                return "Private-directory verification did not finish before the shared readiness deadline."
+            case .authenticatedGateway:
+                if failure.outcome == .timedOut {
+                    return "Authenticated Gateway health did not respond before the shared readiness deadline."
+                }
+                return "TaskPilot could not confirm authenticated Gateway health."
+            }
+        }
+        return details.isEmpty ? "Private Gateway connected; ACP compatible" :
+            details.joined(separator: " ") + " TaskPilot will continue through its normal recovery checks."
     }
 
     static func run(descriptorURL: URL, runtimeURL: URL) -> Int32 {
