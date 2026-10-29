@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "traces": [
+    {
+      "id": "healthy",
+      "fault": "none",
+      "seeds": [
+        1,
+        3
+      ],
+      "events": [
+        {
+          "tick": 0,
+          "event": "model_response"
+        },
+        {
+          "tick": 10,
+          "event": "native_delivery"
+        }
+      ]
+    },
+    {
+      "id": "lost_reply",
+      "fault": "lost_reply",
+      "seeds": [
+        1,
+        3
+      ],
+      "events": [
+        {
+          "tick": 0,
+          "event": "model_response"
+        },
+        {
+          "tick": 10,
+          "event": "native_delivery"
+        }
+      ]
+    },
+    {
+      "id": "stale_observation",
+      "fault": "stale_target",
+      "seeds": [
+        1,
+        3
+      ],
+      "events": [
+        {
+          "tick": 0,
+          "event": "model_response"
+        },
+        {
+          "tick": 10,
+          "event": "native_delivery"
+        }
+      ]
+    },
+    {
+      "id": "stop_at_delivery",
+      "fault": "none",
+      "seeds": [
+        1,
+        3
+      ],
+      "events": [
+        {
+          "tick": 0,
+          "event": "model_response"
+        },
+        {
+          "tick": 10,
+          "event": "native_delivery"
+        },
+        {
+          "tick": 10,
+          "event": "stop"
+        }
+      ]
+    },
+    {
+      "id": "exit_after_dispatch",
+      "fault": "process_exit",
+      "seeds": [
+        1,
+        3
+      ],
+      "events": [
+        {
+          "tick": 0,
+          "event": "model_response"
+        },
+        {
+          "tick": 10,
+          "event": "native_delivery"
+        }
+      ]
+    },
+    {
+      "id": "disconnected_reply",
+      "fault": "disconnected",
+      "seeds": [
+        1,
+        3
+      ],
+      "events": [
+        {
+          "tick": 0,
+          "event": "model_response"
+        },
+        {
+          "tick": 10,
+          "event": "native_delivery"
+        }
+      ]
+    },
+    {
+      "id": "malformed_result",
+      "fault": "malformed_result",
+      "seeds": [
+        1,
+        3
+      ],
+      "events": [
+        {
+          "tick": 0,
+          "event": "model_response"
+        },
+        {
+          "tick": 10,
+          "event": "native_delivery"
+        }
+      ]
+    }
+  ]
+}

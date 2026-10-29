@@ -128,6 +128,7 @@ final class AgentRuntimeProcess {
 
     private let bridge: AgentAutomationBridge
     private let bridgeHandler: (([String: Any]) async -> [String: Any])?
+    private let pipeWriteOperation: RuntimePipeWriter.WriteOperation
     private let drainReportingDelay: TimeInterval
     private let ioQueue = DispatchQueue(label: "com.orbitagent.runtime-io")
     private let ioQueueKey = DispatchSpecificKey<UInt8>()
@@ -188,9 +189,11 @@ final class AgentRuntimeProcess {
     }
     private var invocation: Invocation?
 
-    init(bridge: AgentAutomationBridge, drainReportingDelay: TimeInterval = 5, memoryPressure: MemoryPressureMonitor = .shared, bridgeHandler: (([String: Any]) async -> [String: Any])? = nil) {
+    init(bridge: AgentAutomationBridge, drainReportingDelay: TimeInterval = 5, memoryPressure: MemoryPressureMonitor = .shared, bridgeHandler: (([String: Any]) async -> [String: Any])? = nil,
+         pipeWriteOperation: @escaping RuntimePipeWriter.WriteOperation = { Darwin.write($0, $1, $2) }) {
         self.bridge = bridge
         self.bridgeHandler = bridgeHandler
+        self.pipeWriteOperation = pipeWriteOperation
         self.drainReportingDelay = drainReportingDelay
         ioQueue.setSpecific(key: ioQueueKey, value: 1)
         pressureRegistration = memoryPressure.register { [weak self] in self?.evictRuntimeCaches() }
@@ -269,7 +272,7 @@ final class AgentRuntimeProcess {
         startupTransferred = true
         syncIO {
             invocation = run
-            run.writer = RuntimePipeWriter(handle: input.fileHandleForWriting, queue: ioQueue, descriptorOwner: lease.descriptorOwner, telemetry: telemetry) { [weak self, weak run] code in
+            run.writer = RuntimePipeWriter(handle: input.fileHandleForWriting, queue: ioQueue, descriptorOwner: lease.descriptorOwner, telemetry: telemetry, writeOperation: pipeWriteOperation) { [weak self, weak run] code in
                 guard let self, let run else { return }
                 self.failTransport(code, for: run)
             }

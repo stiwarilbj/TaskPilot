@@ -57,3 +57,7 @@ peers, reject malformed/nonterminal receipts, stop after rejected completion,
 and pause/resume a disposable recovery process with the native signals. The
 fixtures do not perform desktop actions or provider requests. Live accuracy
 validation remains incomplete.
+
+The [offline task replay lab](TaskReplayLab.md) extends these checks across the
+actual Swift/Python subprocess and IPC boundary with seeded synthetic task traces,
+fragmented writes, receipt loss, stale preflight, Stop and process-exit races.
