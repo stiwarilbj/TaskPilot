@@ -95,6 +95,62 @@ from response_validation import (
     normalize_action, validate_response,
 )
 from private_diagnostics import action_record, validate_action_record, validate_request_metrics
+from fault_correlation import failure_cause, validate_event as validate_fault_event, validate_link as validate_fault_link
+
+
+def report_task_failure(error, stage, *, cause=None):
+    try: return _report_task_failure(error, stage, cause=cause)
+    except Exception: return None  # Optional diagnostics never replace a fault.
+
+
+def _report_task_failure(error, stage, *, cause=None):
+    """Project classified facts only. Exception contents never enter reports."""
+    context = current_task.get()
+    if context is None or isinstance(error, (KeyboardInterrupt, SystemExit)) or getattr(error, "superseded_instructions", False):
+        return None
+    context.faults.publish = lambda event: emit("backend_fault", fault=event)
+    context.faults.publish_link = lambda link: emit("backend_fault", fault_link=link)
+    if cause is None:
+        failure = classify_failure(error, time.time())
+        cause = "native_protocol" if isinstance(error, NativeProtocolError) else failure_cause(failure.kind)
+        # The router's conservative catch-all is configuration; diagnostics
+        # must not mistake an unclassified exception for a proven config fault.
+        if (cause == "configuration" and not isinstance(error, ModelAttemptError) and
+                not any((failure.code, failure.codes, failure.provider_status, failure.reason))):
+            cause = "unknown"
+    link = None
+    ancestor = error
+    for _ in range(8):
+        saved = getattr(ancestor, "_taskpilot_fault", None)
+        if isinstance(saved, tuple) and len(saved) == 2 and saved[0] is context.faults:
+            link = saved[1]
+            break
+        ancestor = getattr(ancestor, "__cause__", None)
+        if ancestor is None: break
+    if link is None and cause == "transport": link = context.gateway_fault_link
+    if link is not None and cause == "unknown":
+        existing = context.faults.note(link, stage)
+        if existing is not None:
+            error._taskpilot_fault = (context.faults, existing)
+            return existing
+    link = context.faults.record(cause, stage, link=link)
+    error._taskpilot_fault = (context.faults, link)
+    return link
+
+
+def observe_gateway_fault(event):
+    context = current_task.get()
+    if context is not None:
+        if event is None:
+            if context.gateway_fault_link is not None:
+                context.faults.note(context.gateway_fault_link, "terminal")
+            context.gateway_fault_link = None
+            return
+        context.faults.publish = lambda value: emit("backend_fault", fault=value)
+        context.faults.publish_link = lambda value: emit("backend_fault", fault_link=value)
+        context.gateway_fault_link = context.faults.adopt(event)
+        if context.recovering_fault_link is not None and context.gateway_fault_link is not None:
+            context.faults.attach(context.recovering_fault_link, context.gateway_fault_link)
 
 
 def expected_wait_description(decision: dict[str, Any] | None) -> str:
@@ -428,10 +484,39 @@ def is_model_capacity_failure(error: BaseException | str) -> bool:
 
 class TaskModelRouter(AdaptiveModelRouter):
     def __init__(self, state: RuntimeState | None = None) -> None:
-        super().__init__(emit=emit, state=state)
+        self._fault_link = None
+        super().__init__(emit=self._emit, state=state)
+
+    def _emit(self, kind, **fields):
+        context = current_task.get()
+        if context is not None and self._fault_link is not None:
+            if kind == "wait_phase": context.faults.note(self._fault_link, "waiting")
+            elif kind == "model_health" and fields.get("state") == "verified": self._fault_link = None
+        emit(kind, **fields)
+
+    def execute(self, operation, purpose="planning"):
+        def observed(model):
+            try: return operation(model)
+            except Exception as error:
+                self._fault_link = report_task_failure(error, "model_request")
+                raise
+        try: return super().execute(observed, purpose=purpose)
+        except RecoveryExhaustedError as error:
+            context = current_task.get()
+            if context is not None and self._fault_link is not None:
+                # The router's terminal envelope describes the last failure;
+                # it is not a second provider outage or recovery opportunity.
+                error._taskpilot_fault = (context.faults, self._fault_link)
+            raise
 
 
 def emit(kind: str, **payload: Any) -> None:
+    if kind == "backend_fault":
+        try:
+            if set(payload) == {"fault"}: payload = {"fault": validate_fault_event(payload["fault"])}
+            elif set(payload) == {"fault_link"}: payload = {"fault_link": validate_fault_link(payload["fault_link"])}
+            else: return
+        except (ValueError, TypeError, AttributeError): return
     if kind == "wait_phase":
         context = current_task.get()
         if context is not None:
@@ -1153,6 +1238,7 @@ def bridge_call(method: str, display_id: int, **params: Any) -> dict[str, Any]:
             elif response['terminal'] is False:
                 raise BridgeReplyLost('The native action is still dispatched')
     except BridgeReplyLost as error:
+        report_task_failure(error, "native_action", cause="native_protocol")
         if method != "act":
             if file_digest_check is not None and context is not None and context.ledger is not None:
                 context.ledger.discard_file_digest_proof(file_digest_check, file_digest_proof)
@@ -3350,7 +3436,7 @@ class ACPClient:
             prior = context.machine.phase if context else None
             if context: context.machine.transition(Phase.RECOVERING)
             try:
-                managed_openclaw.wait_for_health(Path(descriptor_path), force=True, status=lambda text: emit("status", message=text))
+                managed_openclaw.wait_for_health(Path(descriptor_path), force=True, status=lambda text: emit("status", message=text), on_fault=observe_gateway_fault)
                 refreshed = refresh_managed_descriptor(readiness_state)
                 path = self.openclaw_path = refreshed['executable']
             except BaseException:
@@ -4127,8 +4213,26 @@ def validated_prompt(client: ACPClient, instruction: str, screenshot_path: Path,
                 raise InstructionSuperseded("A correction arrived while the previous model request was finishing") from error
             if classify_failure(error, time.time()).kind != "transport":
                 raise
+            link = report_task_failure(error, "connection")
+            context = current_task.get()
+            if context is not None and link is not None:
+                if not context.faults.claim(link, "reconnect"):
+                    # Same terminal failure was already handled. Never launch
+                    # another reconnect or another reasoning request for it.
+                    raise
+                context.faults.note(link, "waiting")
             selected = client.selected_model
-            client.reconnect()
+            if context is not None: context.recovering_fault_link = link
+            try: client.reconnect()
+            except Exception as reconnect_error:
+                # Reconnect failure is a consequence unless it establishes a
+                # different classified cause (e.g. rejected credentials).
+                if link is not None and context is not None:
+                    reconnect_error._taskpilot_fault = (context.faults, link)
+                report_task_failure(reconnect_error, "recovery")
+                raise
+            finally:
+                if context is not None: context.recovering_fault_link = None
             if metrics is not None:
                 metrics["reconnects"] += 1
                 metrics[purpose] += 1
@@ -4288,6 +4392,7 @@ class TaskExecution:
 
     def run(self, openclaw_path: str | None, api_key: str) -> None:
         c = self.c
+        ending_fault = None
         try:
             c.ledger = TaskEvidenceLedger(c.task, c.generation,
                                           exact_input_references=c.exact_input_references)
@@ -4320,18 +4425,25 @@ class TaskExecution:
             c.machine.require("connect")
             descriptor_path = os.environ.get("TASKPILOT_MANAGED_DESCRIPTOR")
             if descriptor_path:
-                managed_openclaw.wait_for_health(Path(descriptor_path), status=lambda text: emit("status", message=text))
+                managed_openclaw.wait_for_health(Path(descriptor_path), status=lambda text: emit("status", message=text), on_fault=observe_gateway_fault)
                 resolved = refresh_managed_descriptor()['executable']
             try:
                 try:
                     c.client = ACPClient(resolved)
                 except Exception as error:
                     if not descriptor_path or classify_failure(error,time.time()).kind != 'transport': raise
+                    link = report_task_failure(error, "connection")
+                    if link is not None:
+                        if not c.faults.claim(link, "reconnect"): raise
+                        c.faults.note(link, "waiting")
                     c.machine.transition(Phase.RECOVERING)
                     publish_task_wait('reconciling','Waiting for private Gateway recovery',
                                       operation_key='gateway-startup-recovery',ledger=c.ledger)
-                    managed_openclaw.wait_for_health(Path(descriptor_path),force=True,
-                        status=lambda text: emit('status',message=text))
+                    c.recovering_fault_link = link
+                    try:
+                        managed_openclaw.wait_for_health(Path(descriptor_path),force=True,
+                            status=lambda text: emit('status',message=text), on_fault=observe_gateway_fault)
+                    finally: c.recovering_fault_link = None
                     c.machine.transition(Phase.STARTING,recovered=True)
                     resolved = refresh_managed_descriptor()['executable']
                     c.client = ACPClient(resolved)
@@ -4351,6 +4463,7 @@ class TaskExecution:
             while c.machine.phase != Phase.DRAINING:
                 handlers[c.machine.phase]()
         except BaseException as error:
+            ending_fault = report_task_failure(error, "draining")
             c.machine.drain()  # Includes Stop/SystemExit, not just provider errors.
             stopped = isinstance(error, KeyboardInterrupt) or (isinstance(error, SystemExit) and error.code in {130, 143})
             publish_task_wait("draining", "Finishing the task safely",
@@ -4374,6 +4487,7 @@ class TaskExecution:
             finally:
                 if c.client is not None: c.client.close()
             c.machine.transition(Phase.FINISHED, cleanup=True)
+            if ending_fault is not None: c.faults.note(ending_fault, "terminal")
 
     def local_task(self) -> bool:
         c = self.c
@@ -5039,6 +5153,10 @@ class TaskExecution:
 
     def record_result(self) -> None:
         c = self.c
+        if c.action.get("type") == "run_command" and isinstance(c.result, dict) and c.result.get("timed_out") is True:
+            c.faults.publish = lambda event: emit("backend_fault", fault=event)
+            link = c.faults.record("command_timeout", "native_action")
+            c.faults.note(link, "waiting")  # This is not a Gateway/provider fault.
         if isinstance(c.result, dict):
             expected_effect = c.result.get("expected_effect")
             uncertain_effect = (c.result.get("outcome") == "delivered_unconfirmed" or

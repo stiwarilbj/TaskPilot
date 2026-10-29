@@ -143,6 +143,8 @@ final class AgentRuntimeProcess {
         var outputBuffer = RuntimeLineBuffer()
         var writer: RuntimePipeWriter?
         var transportFailure: String?
+        var transportFault: BackendFaultReports.Link?
+        var faultScope: BackendFaultReports.Scope?
         var receiptIDs: Set<String> = []
         var progressRevision: UInt64 = 0
         var inputRolesRevision: UInt64 = 0
@@ -704,6 +706,19 @@ final class AgentRuntimeProcess {
             if let metrics = try? BackendTelemetry.DiagnosticSchema.decodeRequestMetrics(data, using: run.metricsDecoder) {
                 emit(.diagnostics(metrics), for: run, serializedByteCount: data.count)
             }
+        case "backend_fault":
+            // Already fenced by generation and instruction/document revisions.
+            // Invalid diagnostics are dropped, never a task/protocol failure.
+            let envelope: Set<String> = ["kind", "task_generation_id", "instruction_revision", "working_document_revision"]
+            if Set(message.keys) == envelope.union(["fault"]), let value = message["fault"] as? [String: Any],
+               let event = BackendFaultReports.Event.decode(value) {
+                if run.faultScope == nil { run.faultScope = BackendFaultReports.Scope(telemetry.faults) }
+                run.faultScope?.accept(event)
+            } else if Set(message.keys) == envelope.union(["fault_link"]),
+                      let value = message["fault_link"] as? [String:Any],
+                      let relation = BackendFaultReports.Relation.decode(value) {
+                run.faultScope?.accept(relation)
+            }
         case "bridge_request":
             guard let method = message["method"] as? String,
                   let instructionRevision = exactRevision(message["instruction_revision"]),
@@ -1168,7 +1183,14 @@ final class AgentRuntimeProcess {
     }
 
     private func failTransport(_ code: String, for run: Invocation) {
-        guard invocation === run, run.transportFailure == nil, !run.requestedStop, !run.receivedTerminalEvent else { return }
+        guard invocation === run, !run.requestedStop, !run.receivedTerminalEvent else { return }
+        if let link = run.transportFault {
+            telemetry.faults.note(link, .draining)
+            return // The same invocation is already draining, not a new outage.
+        }
+        let link = telemetry.faults.begin(.transport, at: .connection)
+        run.transportFault = link
+        telemetry.faults.note(link, .draining)
         run.transportFailure = code
         run.pendingTerminalEvent = .failed("TaskPilot transport failure (\(code)). Pending actions are being reconciled and will not be repeated.")
         beginDrain(run)

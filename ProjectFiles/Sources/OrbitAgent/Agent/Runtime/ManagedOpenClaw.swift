@@ -377,11 +377,12 @@ enum ManagedGatewayHost {
         try JSONEncoder().encode(value).write(to: url, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
-    private static func writeHealth(_ descriptor: ManagedOpenClawDescriptor, state: String, detail: String, root: URL, gateway: SubprocessSupervisor? = nil) {
+    private static func writeHealth(_ descriptor: ManagedOpenClawDescriptor, state: String, detail: String, root: URL, gateway: SubprocessSupervisor? = nil, fault: [String: Any]? = nil) {
         var json: [String: Any] = ["version":1, "instance_id":descriptor.instanceID,
             "installation_fingerprint":descriptor.installationFingerprint,
             "configuration_fingerprint":descriptor.configurationFingerprint,
             "state":state, "detail":detail, "checked_at":Date().timeIntervalSince1970]
+        if let fault, BackendFaultReports.Event.decode(fault) != nil { json["fault"] = fault }
         for (key, pid) in [("host_identity", getpid()), ("gateway_identity", gateway?.processIdentifier ?? 0)] {
             if let identity = ManagedProcessIdentity.read(pid),
                let data = try? JSONEncoder().encode(identity),
@@ -540,6 +541,12 @@ enum ManagedGatewayHost {
         let resources = runtimeURL.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("OpenClaw/managed")
         var acpVerified = false
         var repair = false
+        let faults = BackendTelemetry.current.faults
+        var gatewayFault: BackendFaultReports.Link?
+        func fault(_ cause: BackendFaultReports.Cause, _ stage: BackendFaultReports.Stage) -> BackendFaultReports.Link {
+            if let link = gatewayFault, faults.note(link, stage, cause: cause) { return link }
+            let link = faults.begin(cause, at: stage); gatewayFault = link; return link
+        }
         func teardown() {
             gateway?.beginTeardown()
             _ = gateway?.waitForTree(ignoreInterrupt: true)
@@ -607,6 +614,7 @@ enum ManagedGatewayHost {
                     }
                     defer { withExtendedLifetime(permit) {} }
                     teardown(); descriptor = current; nextHealth = 0; nextAudit = 0
+                    gatewayFault = nil
                     integritySchedule.reset(); repair = false
                     writeHealth(current, state:"recovering", detail:"Preparing private Gateway connectivity", root:root)
                 }
@@ -737,7 +745,8 @@ enum ManagedGatewayHost {
                     if gateway == nil && !budget.restartReserved && budget.restarts.count >= 3 {
                         _ = budget.failed()
                         try write(budget, to:root.appendingPathComponent("recovery.json"))
-                        writeHealth(current, state:"recovering", detail:"Private Gateway restart circuit is open; waiting before another local probe", root:root)
+                        if let gatewayFault { faults.note(gatewayFault, .waiting) }
+                        writeHealth(current, state:"recovering", detail:"Private Gateway restart circuit is open; waiting before another local probe", root:root, fault:faults.healthEvent(gatewayFault))
                         continue
                     }
                     if gateway == nil {
@@ -752,8 +761,9 @@ enum ManagedGatewayHost {
                         }
                         let validation = ownedCommand(root:root, executable: URL(fileURLWithPath: current.executable), arguments:["config", "validate"], timeout:15, environment:current.environment)
                         if validation.status != 0 {
+                            _ = fault(.configuration, .healthCheck)
                             nextAudit = 0
-                            writeHealth(current, state:"recovering", detail:"Checking private configuration before repair", root:root); continue
+                            writeHealth(current, state:"recovering", detail:"Checking private configuration before repair", root:root, fault:faults.healthEvent(gatewayFault)); continue
                         }
                         let process = SubprocessSupervisor()
                         let output = try BufferedProcessOutput(maximumBytes:0, merged:true)
@@ -768,7 +778,7 @@ enum ManagedGatewayHost {
                         process.environment = current.environment
                         process.standardOutput = output.stdout; process.standardError = output.stderr
                         try process.run(); output.closeWriters(); gateway = process; capture = output
-                        writeHealth(current, state:"recovering", detail:"Starting TaskPilot’s private Gateway", root:root)
+                        writeHealth(current, state:"recovering", detail:"Starting TaskPilot’s private Gateway", root:root, fault:faults.healthEvent(gatewayFault))
                         // Startup polling does not consume restart attempts until the bounded window ends.
                         let deadline = ProcessInfo.processInfo.systemUptime + 20
                         repeat {
@@ -785,12 +795,14 @@ enum ManagedGatewayHost {
                         acpVerified = acp.status == 0
                         let cause = acp.status == -2 ? "timeout" : Self.object(acp.output)?["cause"] as? String ?? "startup"
                         if !acpVerified && cause == "authentication" {
+                            _ = fault(.credentials, .connection)
                             repair = true
-                            writeHealth(current,state:"needs_repair",detail:"Private Gateway authentication was rejected; checking TaskPilot-owned configuration",root:root)
+                            writeHealth(current,state:"needs_repair",detail:"Private Gateway authentication was rejected; checking TaskPilot-owned configuration",root:root, fault:faults.healthEvent(gatewayFault))
                             nextAudit = now + 300
                             continue
                         }
                         if !acpVerified && cause == "incompatible" {
+                            _ = fault(.configuration, .connection)
                             guard let permit = try? ManagedRuntimePermit(root:root, repairing:true) else { nextAudit = 0; continue }
                             defer { withExtendedLifetime(permit) {} }
                             teardown()
@@ -803,18 +815,30 @@ enum ManagedGatewayHost {
                         }
                     }
                     if healthy && acpVerified {
+                        if let gatewayFault { faults.note(gatewayFault, .terminal) }
+                        gatewayFault = nil
                         budget.healthy(); nextHealth = ProcessInfo.processInfo.systemUptime + 30
                         writeHealth(current, state:"healthy", detail:"Private Gateway connected; ACP compatible", root:root, gateway:gateway)
                     } else {
+                        // A fresh failed health/ACP check establishes this cause;
+                        // slow checks alone never become a provider quota fault.
+                        let link = fault(.gatewayUnavailable, .healthCheck)
                         guard let permit = try? ManagedRuntimePermit(root:root, repairing:true) else {
                             nextAudit = 0; continue
                         }
                         defer { withExtendedLifetime(permit) {} }
+                        // Each due probe gets its existing budgeted attempt.
+                        // Coalesced notifications cannot claim it a second time.
+                        let attempt = min(16, budget.restarts.count + 1)
+                        if faults.claim(link, route:.gatewayRestart, attempt:attempt) {
+                            faults.note(link, .recovery)
+                        }
                         teardown()
                         nextAudit = 0
                         _ = budget.failed()
                         nextHealth = budget.monotonicProbeDeadline
-                        writeHealth(current, state:"recovering", detail:"Private Gateway unavailable; automatic recovery is waiting for its cooldown", root:root)
+                        faults.note(link, .waiting)
+                        writeHealth(current, state:"recovering", detail:"Private Gateway unavailable; automatic recovery is waiting for its cooldown", root:root, fault:faults.healthEvent(gatewayFault))
                     }
                     try write(budget, to:root.appendingPathComponent("recovery.json"))
                 }
@@ -828,6 +852,10 @@ enum ManagedGatewayHost {
                     }
                 }
             } catch {
+                // An unclassified local exception must not acquire a guessed
+                // actionable cause or trigger provider/command recovery.
+                let failure = faults.begin(.unknown, at:.healthCheck)
+                faults.note(failure, .recovery)
                 if let permit = try? ManagedRuntimePermit(root:root, repairing:true) {
                     teardown(); withExtendedLifetime(permit) {}
                 }

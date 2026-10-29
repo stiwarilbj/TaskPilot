@@ -1942,16 +1942,25 @@ def request_recovery(path, *, fault=False):
     # Coalesced signal contains no request/task contents. Host owns the budget.
     atomic_json(path.parent / 'health-request.json', {'requested':time.time(), 'fault':fault})
 
-def wait_for_health(path, *, sleep=time.sleep, now=time.monotonic, status=None, force=False):
+def wait_for_health(path, *, sleep=time.sleep, now=time.monotonic, status=None, force=False, on_fault=None):
     requested_at = time.time() if force else 0
     requested = False
     while True:
         try:
             state = private_metadata.read(path.parent / 'health.json')
             descriptor = load_descriptor(path)
+            if on_fault is not None:
+                event = health_fault(state, descriptor)
+                if event is not None:
+                    try: on_fault(event)
+                    except Exception: pass  # Diagnostics cannot change health.
             if state.get('instance_id') == descriptor['instance_id'] and state.get('configuration_fingerprint') == descriptor['configuration_fingerprint']:
                 if state.get('state') == 'needs_repair': raise ManagedRuntimeError(state.get('detail','Private OpenClaw needs repair in Settings.'))
-                if healthy_record(state, descriptor, requested_at=requested_at): return descriptor
+                if healthy_record(state, descriptor, requested_at=requested_at):
+                    if on_fault is not None:
+                        try: on_fault(None)
+                        except Exception: pass
+                    return descriptor
         except (OSError, ValueError): pass
         if not requested:
             request_recovery(path, fault=force); requested = True
@@ -2084,6 +2093,26 @@ def healthy_record(record, descriptor, *, requested_at=0, wall_time=None):
             type(checked) in (int, float) and requested_at <= checked and
             0 <= (time.time() if wall_time is None else wall_time) - checked < 45 and
             identity_alive(record.get('host_identity')) and identity_alive(record.get('gateway_identity')))
+
+
+def health_fault(record, descriptor, *, wall_time=None):
+    """A causal hint requires the current live host; it never grants readiness."""
+    from fault_correlation import validate_event
+    checked = record.get('checked_at')
+    if not (type(record.get('version')) is int and record['version'] == VERSION and
+            record.get('state') in {'recovering', 'needs_repair'} and
+            all(record.get(key) == descriptor[key] for key in
+                ('instance_id', 'installation_fingerprint', 'configuration_fingerprint')) and
+            type(checked) in (int, float) and
+            0 <= (time.time() if wall_time is None else wall_time) - checked < 45 and
+            identity_alive(record.get('host_identity'))):
+        return None
+    try:
+        event = validate_event(record.get('fault'))
+        if (event['sequence'] == 1 and event['cause'] in {'gateway_unavailable', 'configuration', 'credentials'} and
+                event['stage'] in {'health_check', 'connection'}): return event
+    except (ValueError, TypeError, AttributeError): pass
+    return None
 
 
 def require_offline(root):

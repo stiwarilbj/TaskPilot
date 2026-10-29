@@ -5,6 +5,72 @@ Unrecognized fields, strings outside the declared enums, booleans in numeric
 slots, nested objects, and counters outside `0...1,000,000,000` are rejected.
 Rejection drops the diagnostic record or event and never changes task execution.
 
+## Linked fault reports
+
+`BackendTelemetry.faults` and Python's task-owned `FaultReports` retain at most
+32 episodes (hard maximum 64), for 120 monotonic seconds from the first event.
+Symptoms do not extend expiry; clock regression expires the episode. Each
+report retains a fixed root cause and first stage, up to 15 consequence counts,
+bounded recovery claims, and a bounded duplicate-claim counter. No free-form
+text, exception, payload, file path, credential, model response, task identifier,
+or screenshot is retained. Reports and their opaque UUIDs never enter history,
+decision caches, model prompts, or persisted action diagnostics.
+
+The root is the earliest classified cause established in that explicit chain,
+not a guess about an unobserved underlying failure. A linked Gateway failure
+may explain a later connection failure. Quota, capacity, command timeout,
+configuration, native protocol and unrelated transport failures remain distinct.
+Unclassified exceptions use `unknown`; the router's conservative configuration
+fallback does not independently prove a configuration defect. Temporal proximity
+never merges reports. A later different classified cause starts its own report.
+
+The optional version-1 `backend_fault` IPC record contains exactly `version`,
+`fault_id`, `sequence`, `cause`, and `stage`, inside the normal task/revision
+envelope's `fault` field. Its alternative `fault_link` contains exactly
+`version`, `child_id` and `parent_id`. A live-host Gateway root discovered during
+that specific reconnect may adopt its transport symptom. This explicit link
+preserves spent recovery claims and bounded consequence counts; quota and
+command roots cannot be adopted. Both roots must already belong to the same
+invocation, and unknown, self, stale or incompatible links are ignored. Later
+callbacks to the child resolve to the parent until expiry. Both languages reject
+arbitrary fields and values. The native receiver
+imports roots into an invocation-owned scope, requires consecutive sequences,
+and discards duplicates, expired links, stale generations and stale revisions.
+Malformed diagnostic records are ignored without becoming transport errors or
+UI events. Fixed-name `BackendFault` signposts contain only numeric cause,
+stage, and consequence codes. The in-memory report distinguishes the root from
+its later recovery, waiting, drainage and terminal consequences.
+
+The Gateway host can add the same small root record to existing `health.json`.
+This is a transient causal hint, never connectivity or provider-readiness proof.
+Python accepts it only for a recovering/needs-repair state from a live host
+birth identity, matching instance/installation/configuration, checked within
+45 seconds. Healthy state clears the active hint; normal host expiry limits
+its lifetime. The hint adds no new diagnostic file or background timer.
+
+Recovery claims coalesce one episode/route/attempt. Duplicate handling of the
+same terminal ACP failure cannot reconnect or repeat reasoning again. Existing
+request-terminal acknowledgement, provider policy, three-per-ten-minute local
+budget, action receipts, reconciliation, cancellation and native ownership gates
+remain authoritative. Gateway claims count existing serialized budgeted steps;
+diagnostics cannot grant or reset a restart allowance. A delayed command never
+requests Gateway recovery. Supported recovery routes cannot be claimed for an
+unrelated cause. This does not automatically retry a desktop mutation.
+
+Offline reproduction (no provider or desktop access):
+
+```sh
+swift test --package-path ProjectFiles --filter 'BackendFaultReportsTests|RuntimeTransportTests.testFaultReports'
+cd ProjectFiles
+python3 -m unittest discover -s Tests/Python -p test_fault_correlation.py
+```
+
+The shared `Tests/Fixtures/backend-faults.json` asserts the wire vocabulary and
+strict field types in Swift/Python. Synthetic tests cover concurrent duplicate
+claims, expiry, clock regression, unrelated causes, live-host hints, real native
+IPC import, terminal drainage and unchanged provider/reconnect budgets. No live
+Gateway outage or desktop accuracy validation is claimed by these fixtures.
+
 ## Request metrics
 
 The `request_metrics` event is validated in Python before IPC and again in

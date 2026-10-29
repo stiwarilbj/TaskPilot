@@ -10,6 +10,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+from fault_correlation import FaultReports
 
 
 class Phase(str, Enum):
@@ -168,6 +169,9 @@ class TaskContext:
     target_choice_inspections: set[str] = field(default_factory=set)
     target_choice_fingerprint: str = ""
     machine: ExecutionMachine = field(default_factory=ExecutionMachine)
+    faults: FaultReports = field(default_factory=FaultReports)
+    gateway_fault_link: str | None = None
+    recovering_fault_link: str | None = None
     ledger: Any = None
     runtime_state: Any = None
     client: Any = None

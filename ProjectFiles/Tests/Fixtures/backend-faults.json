@@ -1,0 +1,12 @@
+{
+  "causes": ["unknown", "transport", "gateway_unavailable", "configuration", "credentials", "provider_quota", "provider_capacity", "model_unavailable", "invalid_output", "command_timeout", "native_protocol"],
+  "stages": ["health_check", "connection", "model_request", "native_action", "recovery", "waiting", "draining", "terminal"],
+  "valid": {"version": 1, "fault_id": "00000000-0000-4000-8000-000000000001", "sequence": 1, "cause": "gateway_unavailable", "stage": "health_check"},
+  "invalid_changes": [
+    {"version": true}, {"version": 1.0}, {"version": 2},
+    {"sequence": 0}, {"sequence": 17}, {"sequence": "1"}, {"sequence": 1.0},
+    {"fault_id": "/private/path"}, {"fault_id": "00000000000040008000000000000001"},
+    {"cause": "arbitrary response"}, {"stage": "secret"}, {"detail": "private content"},
+    {"task_generation_id": "not permitted here"}, {"cause": null}
+  ]
+}

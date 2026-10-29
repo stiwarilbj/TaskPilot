@@ -326,12 +326,18 @@ final class BackendTelemetry: @unchecked Sendable {
     private let lock = NSLock()
     private let capacity: Int
     private let now: @Sendable () -> TimeInterval
+    let faults: BackendFaultReports
     private var rings: [Phase: Ring] = [:]
     private var queueCounts: [Queue: QueueCounts] = [:]
     private var memoryUsage: [MemoryStage: MemoryUsage] = [:]
     private static let waitUpperBoundsMilliseconds: [Double] = [0.1, 1, 5, 10, 50, 100, 500, 1_000, 5_000]
     init(capacity: Int = 128, now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.capacity = max(1, min(1024, capacity)); self.now = now
+        let faultSignposter = OSSignposter(subsystem: "com.orbitagent.controller", category: "BackendFaults")
+        faults = BackendFaultReports(now: now) { cause, stage, consequence in
+            // Stable numeric enums only; opaque links remain in memory.
+            faultSignposter.emitEvent("BackendFault", "cause=\(BackendFaultReports.Cause.allCases.firstIndex(of: cause) ?? 0, privacy: .public) stage=\(BackendFaultReports.Stage.allCases.firstIndex(of: stage) ?? 0, privacy: .public) consequence=\(consequence ? 1 : 0, privacy: .public)")
+        }
     }
     func begin(_ phase: Phase, inputBytes: Int? = nil, items: Int? = nil) -> Span {
         Span(self, phase, inputBytes: inputBytes, items: items)

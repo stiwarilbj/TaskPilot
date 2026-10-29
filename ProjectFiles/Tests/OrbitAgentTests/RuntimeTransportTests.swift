@@ -521,6 +521,42 @@ final class RuntimeTransportTests: XCTestCase {
     }
 
     private var display: DisplayDescriptor { DisplayDescriptor(id: 1, name: "fixture", x: 0, y: 0, width: 10, height: 10, isMain: false) }
+    @MainActor func testFaultReportsUseActualTransportWithoutUIEventsOrStaleUpdates() async throws {
+        let executable = try helper("""
+        fault = dict(version=1, fault_id='00000000-0000-4000-8000-000000000001', sequence=1,
+                     cause='transport', stage='connection')
+        emit('backend_fault', fault=fault)
+        emit('backend_fault', fault=fault)
+        emit('backend_fault', fault=dict(fault, sequence=2, stage='waiting'), instruction_revision=9)
+        emit('backend_fault', fault=dict(fault, sequence=2, detail='not allowed'))
+        emit('backend_fault', fault=dict(fault, sequence=2, stage='waiting'))
+        root = dict(fault, fault_id='00000000-0000-4000-8000-000000000002',
+                    cause='gateway_unavailable', stage='health_check')
+        emit('backend_fault', fault=root)
+        relation = dict(version=1, child_id=fault['fault_id'], parent_id=root['fault_id'])
+        emit('backend_fault', fault_link=dict(relation, detail='not allowed'))
+        emit('backend_fault', fault_link=relation)
+        emit('backend_fault', fault_link=relation)
+        emit('backend_fault', fault=dict(fault, sequence=3, stage='draining'))
+        emit('complete', message='finished')
+        """)
+        let telemetry = BackendTelemetry()
+        let runtime = BackendTelemetry.$current.withValue(telemetry) { AgentRuntimeProcess(bridge: bridge()) }
+        let complete = expectation(description:"Normal terminal delivery")
+        var events = 0
+        runtime.onEvent = { event in
+            events += 1
+            if case .completed = event { complete.fulfill() }
+            if case .failed(let message) = event { XCTFail(message) }
+        }
+        try runtime.start(task:"fixture", display:display, runtimeURL:executable, openClawURL:executable, geminiAPIKey:"")
+        await fulfillment(of:[complete], timeout:5)
+        XCTAssertEqual(events, 1)
+        XCTAssertEqual(telemetry.faults.reports().count, 1)
+        XCTAssertEqual(telemetry.faults.reports().first?.cause, .gatewayUnavailable)
+        XCTAssertEqual(telemetry.faults.reports().first?.consequences[.waiting], 1)
+        XCTAssertEqual(telemetry.faults.reports().first?.consequences[.draining], 1)
+    }
     private func bridge() -> AgentAutomationBridge {
         AgentAutomationBridge(displayService: DisplayService(), accessibility: AccessibilityController(), capture: ScreenCaptureService())
     }
