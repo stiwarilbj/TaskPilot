@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+from contextlib import nullcontext
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
 import request_policy as policy
@@ -135,6 +136,58 @@ class ProviderCoordinatorTests(unittest.TestCase):
         self.assertFalse(self.state.verify(SECONDARY, revision))
         self.peer.record_failure(MODEL, policy.Failure('credentials', 'not persisted'))
         self.assertEqual(self.state.health(SECONDARY)['failure_kind'], 'credentials')
+
+    def test_readiness_decision_uses_one_immutable_state_snapshot(self):
+        client = mock.Mock(prompt_calls=1)
+        client.prompt.return_value = '{"status":"done","check":"TASKPILOT_READY"}'
+        snapshot_method = self.state.readiness_snapshot
+        with mock.patch.object(runtime, 'prepare_runtime', return_value=self.state), \
+             mock.patch.object(runtime, 'ACPClient', return_value=client), \
+             mock.patch.object(runtime, 'configuration_transaction', return_value=nullcontext()), \
+             mock.patch.object(runtime, 'validated_prompt', return_value={"status": "done"}), \
+             mock.patch.object(runtime, 'emit'), \
+             mock.patch.object(self.state, 'readiness_snapshot', wraps=snapshot_method) as snapshot, \
+             mock.patch.object(self.state, 'health', side_effect=AssertionError('extra health read')), \
+             mock.patch.object(self.state, 'credential_health', side_effect=AssertionError('extra credential read')), \
+             mock.patch.object(self.state, 'verified_model', side_effect=AssertionError('extra cache read')), \
+             mock.patch.object(self.state, 'attempt_snapshot', side_effect=AssertionError('extra attempt read')):
+            self.assertTrue(runtime._perform_model_check('fixture', self.state))
+        self.assertEqual(snapshot.call_count, 1)
+        client.select_model.assert_called_once_with(MODEL)
+
+        snapshot = self.state.readiness_snapshot()
+        with self.assertRaises(TypeError):
+            snapshot.account_cooldowns['google'] = {'state': 'repair'}
+        with self.assertRaises(TypeError):
+            snapshot.invalidations['*'] = 100
+
+    def test_readiness_snapshot_contains_model_account_and_invalidation_state(self):
+        self.state.record_failure(MODEL, policy.Failure(
+            'temporary', 'model capacity', retry_at=time.time() + 120, scope='model', provider='google'))
+        self.state.record_failure(SECONDARY, quota(time.time() + 240))
+        self.state.invalidate(MODEL)
+
+        snapshot = self.state.readiness_snapshot()
+        self.assertEqual(snapshot.model_failures[MODEL]['failure_kind'], 'temporary')
+        self.assertEqual(snapshot.account_cooldowns['google']['failure_kind'], 'quota')
+        self.assertEqual(snapshot.invalidations[MODEL], snapshot.revision)
+        self.assertEqual(snapshot.invalidated_revision, 0)
+
+    def test_concurrent_failure_after_snapshot_prevents_readiness_success(self):
+        client = mock.Mock(prompt_calls=1)
+
+        def provider_success_racing_with_quota(*_args, **_kwargs):
+            self.peer.record_failure(MODEL, quota(time.time() + 120))
+            return {"status": "done", "check": "TASKPILOT_READY"}
+
+        with mock.patch.object(runtime, 'prepare_runtime', return_value=self.state), \
+             mock.patch.object(runtime, 'ACPClient', return_value=client), \
+             mock.patch.object(runtime, 'configuration_transaction', return_value=nullcontext()), \
+             mock.patch.object(runtime, 'validated_prompt', side_effect=provider_success_racing_with_quota), \
+             mock.patch.object(runtime, 'emit'):
+            self.assertFalse(runtime._perform_model_check('fixture', self.state))
+        self.assertEqual(self.state.health(MODEL)['failure_kind'], 'quota')
+        self.assertIsNone(self.state.verified_model())
 
     def test_stale_invalidation_preserves_other_model_success(self):
         self.state.verify(MODEL)

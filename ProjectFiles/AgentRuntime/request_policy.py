@@ -22,7 +22,8 @@ import re
 import stat
 import sys
 import time
-from typing import Any, Callable
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 from lock_order import LockCategory, reserve
 
 PRIMARY_MODELS = ("google/gemini-3.5-flash-lite", "google/gemini-3.1-flash-lite")
@@ -495,6 +496,50 @@ class ReadinessStateError(RuntimeError):
 
     def __init__(self) -> None:
         super().__init__("TaskPilot local readiness state is invalid or unavailable.")
+
+
+def _freeze_readiness_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_readiness_value(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_readiness_value(item) for item in value)
+    return value
+
+
+def _thaw_readiness_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_readiness_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_readiness_value(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True)
+class ReadinessSnapshot:
+    """Immutable view used for one candidate-selection decision."""
+
+    revision: int
+    verified_model: str | None
+    model_failures: Mapping[str, Any]
+    account_cooldowns: Mapping[str, Any]
+    invalidated_revision: int
+    invalidations: Mapping[str, Any]
+    wall_now: float
+
+    def credential_health(self, model: str) -> dict[str, Any]:
+        provider = model.split('/', 1)[0]
+        value = self.account_cooldowns.get(provider, {})
+        return RuntimeState.current_health(_thaw_readiness_value(value), self.wall_now)
+
+    def health(self, model: str) -> dict[str, Any]:
+        account = self.credential_health(model)
+        if account:
+            return account
+        value = self.model_failures.get(model, {})
+        return RuntimeState.current_health(_thaw_readiness_value(value), self.wall_now)
+
+    def attempt_snapshot(self, model: str) -> tuple[dict[str, Any], int]:
+        return self.health(model), self.revision
 
 
 def _readiness_file_signature(info: os.stat_result) -> tuple[int, ...]:
@@ -1120,39 +1165,62 @@ class RuntimeState:
                     record["verification_clocks"] = {}
                     record.setdefault("invalidations", {})["*"] = document.get("revision", 0) + 1
 
-    def verify(self, model: str, started_revision: int | None = None, *, now: float | None = None,
-               monotonic_now: float | None = None, boot_session: str | None = None) -> bool:
+    def _verify(self, model: str, started_revision: int | None = None, *, now: float | None = None,
+                monotonic_now: float | None = None, boot_session: str | None = None,
+                include_snapshot: bool = False) -> bool | tuple[bool, ReadinessSnapshot]:
         with self.transaction(write=True) as (document, bucket, record):
             wall_now = time.time() if now is None else now
             monotonic_stamp = time.monotonic() if monotonic_now is None else monotonic_now
             boot_stamp = _boot_session_marker() if boot_session is None else boot_session
             # An old success must never erase a failure observed after it began.
             boundary = document.get("revision", 0) if started_revision is None else started_revision
-            if max(bucket.get("invalidated_revision", 0), record.get("invalidations", {}).get("*", 0),
-                   record.get("invalidations", {}).get(model, 0)) > boundary: return False
-            for field, key in (("health", model), ("credential_health", model.split('/', 1)[0])):
-                failure = (self.model_health_records(bucket) if field == "health" else bucket[field]).get(key, {})
-                if failure and (failure.get("revision", 0) > boundary or
-                    (failure.get("state") == "temporary" and failure.get("retry_at") is not None and failure["retry_at"] > wall_now)):
-                    return False
-            self.model_health_records(bucket).pop(model, None)
-            bucket["credential_health"].pop(model.split('/', 1)[0], None)
-            clocks = record.setdefault("verification_clocks", {})
-            if not isinstance(clocks, dict):
-                clocks = record["verification_clocks"] = {}
-            valid_clock = (_finite_number(wall_now) and _finite_number(monotonic_stamp) and
-                           monotonic_stamp >= 0 and isinstance(boot_stamp, str) and
-                           0 < len(boot_stamp) <= 128)
-            if valid_clock:
-                record["verified"][model] = wall_now
-                clocks[model] = {"version": VERIFICATION_CLOCK_VERSION, "boot_session": boot_stamp,
-                                 "wall": wall_now, "monotonic": monotonic_stamp}
-            else:
-                # The provider result is successful, but an uncertain local clock
-                # must not authorize a cache hit on a later readiness request.
-                record["verified"].pop(model, None)
-                clocks.pop(model, None)
-            return True
+            invalidations = record.get("invalidations", {})
+            blocked = max(bucket.get("invalidated_revision", 0), invalidations.get("*", 0),
+                          invalidations.get(model, 0)) > boundary
+            if not blocked:
+                for field, key in (("health", model), ("credential_health", model.split('/', 1)[0])):
+                    failure = (self.model_health_records(bucket) if field == "health" else bucket[field]).get(key, {})
+                    if failure and (failure.get("revision", 0) > boundary or
+                        (failure.get("state") == "temporary" and failure.get("retry_at") is not None and failure["retry_at"] > wall_now)):
+                        blocked = True
+                        break
+            if not blocked:
+                self.model_health_records(bucket).pop(model, None)
+                bucket["credential_health"].pop(model.split('/', 1)[0], None)
+                clocks = record.setdefault("verification_clocks", {})
+                if not isinstance(clocks, dict):
+                    clocks = record["verification_clocks"] = {}
+                valid_clock = (_finite_number(wall_now) and _finite_number(monotonic_stamp) and
+                               monotonic_stamp >= 0 and isinstance(boot_stamp, str) and
+                               0 < len(boot_stamp) <= 128)
+                if valid_clock:
+                    record["verified"][model] = wall_now
+                    clocks[model] = {"version": VERIFICATION_CLOCK_VERSION, "boot_session": boot_stamp,
+                                     "wall": wall_now, "monotonic": monotonic_stamp}
+                else:
+                    # The provider result is successful, but an uncertain local clock
+                    # must not authorize a cache hit on a later readiness request.
+                    record["verified"].pop(model, None)
+                    clocks.pop(model, None)
+            accepted = not blocked
+        if include_snapshot:
+            return accepted, self._snapshot_from_state(
+                document, bucket, record, now=wall_now, monotonic_now=monotonic_stamp,
+                boot_session=boot_stamp)
+        return accepted
+
+    def verify(self, model: str, started_revision: int | None = None, *, now: float | None = None,
+               monotonic_now: float | None = None, boot_session: str | None = None) -> bool:
+        return bool(self._verify(model, started_revision, now=now, monotonic_now=monotonic_now,
+                                 boot_session=boot_session))
+
+    def verify_with_snapshot(self, model: str, started_revision: int | None = None, *, now: float | None = None,
+                             monotonic_now: float | None = None,
+                             boot_session: str | None = None) -> tuple[bool, ReadinessSnapshot]:
+        result = self._verify(model, started_revision, now=now, monotonic_now=monotonic_now,
+                              boot_session=boot_session, include_snapshot=True)
+        assert isinstance(result, tuple)
+        return result
 
     def invalidate(self, model: str | None = None) -> None:
         with self.transaction(write=True) as (document, _, record):
@@ -1168,7 +1236,7 @@ class RuntimeState:
                 record["verified"].clear()
                 record.pop("verification_clocks", None)
 
-    def record_failure(self, model: str, failure: Failure) -> None:
+    def record_failure(self, model: str, failure: Failure) -> dict[str, Any]:
         with self.transaction(write=True) as (document, bucket, record):
             health = {"state": "temporary" if failure.kind in {"quota", "temporary"} else "repair",
                       "detail": failure.summary(), **failure.metadata(), "revision": document.get("revision", 0) + 1}
@@ -1202,6 +1270,7 @@ class RuntimeState:
                         clocks.pop(model, None)
                         if not clocks:
                             other_record.pop("verification_clocks", None)
+            return dict(health_records[key])
 
     @staticmethod
     def current_health(result: Any, now: float | None = None) -> dict[str, Any]:
@@ -1227,23 +1296,63 @@ class RuntimeState:
     def health(self, model: str, *, now: float | None = None) -> dict[str, Any]:
         return self.attempt_snapshot(model, now=now)[0]
 
-    def verified_model(self, *, now: float | None = None, monotonic_now: float | None = None,
-                       boot_session: str | None = None) -> str | None:
-        with self.transaction():
+    def _snapshot_from_state(self, document: dict[str, Any], bucket: dict[str, Any], record: dict[str, Any], *,
+                             now: float, monotonic_now: float, boot_session: str | None) -> ReadinessSnapshot:
+        models = self.model_health_records(bucket)
+        account = bucket.get("credential_health", {})
+        verified = record.get("verified", {})
+        clocks = record.get("verification_clocks", {})
+        model_failures = {model: models.get(model, {}) for model in ALL_MODELS}
+        providers = {model.split('/', 1)[0] for model in ALL_MODELS}
+        account_cooldowns = {provider: account.get(provider, {}) for provider in providers}
+
+        cached_model = None
+        if isinstance(verified, dict):
+            for model in ALL_MODELS:
+                provider = model.split('/', 1)[0]
+                if (self.current_health(account_cooldowns.get(provider, {}), now) or
+                        self.current_health(model_failures.get(model, {}), now)):
+                    continue
+                clock = clocks.get(model) if isinstance(clocks, dict) else None
+                if _verification_cache_status(
+                        verified.get(model), clock, wall_now=now,
+                        monotonic_now=monotonic_now, boot_session=boot_session) == "fresh":
+                    cached_model = model
+                    break
+
+        revision = document.get("revision", 0)
+        invalidated_revision = bucket.get("invalidated_revision", 0)
+        if type(revision) is not int:
+            revision = 0
+        if type(invalidated_revision) is not int:
+            invalidated_revision = -1
+        invalidations = record.get("invalidations", {})
+        if not isinstance(invalidations, dict):
+            invalidations = {"malformed": True}
+        return ReadinessSnapshot(
+            revision=revision,
+            verified_model=cached_model,
+            model_failures=_freeze_readiness_value(model_failures),
+            account_cooldowns=_freeze_readiness_value(account_cooldowns),
+            invalidated_revision=invalidated_revision,
+            invalidations=_freeze_readiness_value(invalidations),
+            wall_now=now,
+        )
+
+    def readiness_snapshot(self, *, now: float | None = None, monotonic_now: float | None = None,
+                           boot_session: str | None = None) -> ReadinessSnapshot:
+        """Read cache and failure policy once for a consistent readiness decision."""
+        with self.transaction() as (document, bucket, record):
             wall_now = time.time() if now is None else now
             monotonic_stamp = time.monotonic() if monotonic_now is None else monotonic_now
             boot_stamp = _boot_session_marker() if boot_session is None else boot_session
-            clocks = self.value.get("verification_clocks", {})
-            for model in ALL_MODELS:
-                if (self.current_health(self.value["credential_health"].get(model.split('/', 1)[0], {})) or
-                        self.current_health(self.value["health"].get(model, {}))):
-                    continue
-                clock = clocks.get(model) if isinstance(clocks, dict) else None
-                if _verification_cache_status(self.value["verified"].get(model), clock,
-                                              wall_now=wall_now, monotonic_now=monotonic_stamp,
-                                              boot_session=boot_stamp) == "fresh":
-                    return model
-            return None
+            return self._snapshot_from_state(document, bucket, record, now=wall_now,
+                                             monotonic_now=monotonic_stamp, boot_session=boot_stamp)
+
+    def verified_model(self, *, now: float | None = None, monotonic_now: float | None = None,
+                       boot_session: str | None = None) -> str | None:
+        return self.readiness_snapshot(now=now, monotonic_now=monotonic_now,
+                                       boot_session=boot_session).verified_model
 
     def check_revision(self) -> int:
         with self.transaction():

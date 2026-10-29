@@ -855,10 +855,11 @@ def _check_models(path: str, key: str, read_only: bool = False) -> bool:
 
 
 def _perform_model_check(path: str, state: RuntimeState, read_only: bool = False, key: str = "") -> bool:
+    snapshot = state.readiness_snapshot()
     checks = {m: {"model": m, "state": "configured", "detail": "Configured; not verified through TaskPilot"} for m in ALL_MODELS}
     for model in ALL_MODELS:
-        checks[model].update(state.health(model))
-    cached = state.verified_model()
+        checks[model].update(snapshot.health(model))
+    cached = snapshot.verified_model
     if cached:
         checks[cached].update(state="verified", detail="Verified through TaskPilot within the last ten minutes")
         emit("model_checks", checks=list(checks.values()), cached=True)
@@ -868,14 +869,17 @@ def _perform_model_check(path: str, state: RuntimeState, read_only: bool = False
         return False
     # A reported reset suppresses premature checks. With no reset, an explicit
     # Check may probe the owning model once to detect repaired billing/quota.
-    unresolved = next((m for m in ALL_MODELS if state.credential_health(m).get("state") == "temporary" and
-                       state.credential_health(m).get("retry_at") is None), None)
-    probes = {m for m in ALL_MODELS if state.health(m).get("state") == "temporary" and state.health(m).get("retry_at") is None}
+    credential_health = {m: snapshot.credential_health(m) for m in ALL_MODELS}
+    model_health = {m: snapshot.health(m) for m in ALL_MODELS}
+    unresolved = next((m for m in ALL_MODELS if credential_health[m].get("state") == "temporary" and
+                       credential_health[m].get("retry_at") is None), None)
+    probes = {m for m in ALL_MODELS if model_health[m].get("state") == "temporary" and
+              model_health[m].get("retry_at") is None}
     if unresolved:
-        owner = model_route(Failure.from_health(state.credential_health(unresolved)), unresolved)
+        owner = model_route(Failure.from_health(credential_health[unresolved]), unresolved)
         unresolved = owner if owner in ALL_MODELS else unresolved
         probes = {unresolved}
-    if all(state.health(m).get("state") == "temporary" for m in ALL_MODELS) and not probes:
+    if all(model_health[m].get("state") == "temporary" for m in ALL_MODELS) and not probes:
         emit("model_checks", checks=list(checks.values()), cached=False, prompt_calls=0, repairs=0)
         return False
     try:
@@ -889,8 +893,9 @@ def _perform_model_check(path: str, state: RuntimeState, read_only: bool = False
             client = ACPClient(path)
             client.readiness_state = state
     except Exception as error:
-        state.record_failure(PRIMARY_MODELS[0], classify_failure(error, time.time(), PRIMARY_MODELS[0]))
-        checks[PRIMARY_MODELS[0]].update(state.health(PRIMARY_MODELS[0]))
+        failure = classify_failure(error, time.time(), PRIMARY_MODELS[0])
+        applied = state.record_failure(PRIMARY_MODELS[0], failure)
+        checks[PRIMARY_MODELS[0]].update(applied)
         emit("model_checks", checks=list(checks.values()), cached=False, prompt_calls=0)
         return False
     try:
@@ -899,17 +904,31 @@ def _perform_model_check(path: str, state: RuntimeState, read_only: bool = False
             synthetic_check_image(image)
             budget = ResponseRepairBudget()
             exhausted: set[str] = set()
+
+            def apply_failure_status(model: str, health: dict[str, Any]) -> None:
+                shared = (health.get("failure_kind") == "credentials" or
+                          (health.get("failure_scope") == "credential" and
+                           health.get("failure_kind") in {"quota", "temporary"}))
+                provider = health.get("provider") or model.split('/', 1)[0]
+                targets = (item for item in ALL_MODELS if item.startswith(provider + '/')) if shared else (model,)
+                for target in targets:
+                    checks[target].update(health)
+                    # Fold failures observed during this decision into its local
+                    # working set; do not re-read disk or try siblings that the
+                    # just-recorded account cooldown now blocks.
+                    model_health[target] = health
+
             for model in ALL_MODELS:
-                if model in exhausted or (model not in probes and state.health(model).get("state") == "temporary"):
+                if model in exhausted or (model not in probes and model_health[model].get("state") == "temporary"):
                     continue
                 try:
-                    health, started_revision = state.attempt_snapshot(model)
+                    health, started_revision = snapshot.attempt_snapshot(model)
                     if model not in probes and health.get("state") == "temporary": continue
                     client.select_model(model)
                     validated_prompt(client, 'Do not call tools. Inspect this synthetic image and return exactly {"status":"done","check":"TASKPILOT_READY"}.', image, "readiness", budget)
                 except Exception as error:
                     failure = classify_failure(error, time.time(), model)
-                    state.record_failure(model, failure)
+                    apply_failure_status(model, state.record_failure(model, failure))
                     probes.discard(model)
                     if failure.scope == "credential":
                         probes.difference_update(m for m in ALL_MODELS if m.startswith((failure.provider or model.split('/', 1)[0]) + '/'))
@@ -921,21 +940,27 @@ def _perform_model_check(path: str, state: RuntimeState, read_only: bool = False
                             continue
                         route = model_route(prior, model)
                         if route in ALL_MODELS:
-                            state.record_failure(route, prior)
+                            apply_failure_status(route, state.record_failure(route, prior))
                             if prior.scope == "credential":
                                 probes.difference_update(m for m in ALL_MODELS if m.startswith((prior.provider or model.split('/', 1)[0]) + '/'))
                             exhausted.add(route)
                             stop = stop or prior.kind in {"credentials", "transport", "configuration", "cancelled"}
-                    for other in ALL_MODELS:
-                        checks[other].update(state.health(other))
                     if stop:
                         break
                     continue
-                verified = state.verify(model, started_revision)
+                verified, result_snapshot = state.verify_with_snapshot(model, started_revision)
                 for other in ALL_MODELS:
-                    checks[other] = {"model": other, "state": "configured", "detail": "Configured; not verified through TaskPilot", **state.health(other)}
+                    checks[other] = {
+                        "model": other,
+                        "state": "configured",
+                        "detail": "Configured; not verified through TaskPilot",
+                        **result_snapshot.health(other),
+                    }
                 if verified:
                     checks[model].update(state="verified", detail="Verified through TaskPilot with image input and structured output")
+                # The transactional commit guard may have observed a newer
+                # failure. Its state view is also the status source, without an
+                # extra readiness transaction or a stale snapshot claim.
                 break
     finally:
         client.close()

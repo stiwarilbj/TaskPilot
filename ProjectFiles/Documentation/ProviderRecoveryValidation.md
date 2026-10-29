@@ -55,6 +55,13 @@ a fixed local-state error before any write transaction can replace it; the
 runtime never resets such a document to an empty cache, which could erase a
 quota cooldown. The document limit is 8 MiB.
 
+Each provider-readiness decision captures one immutable snapshot containing its
+revision, cache result, per-model failures, account cooldowns, and invalidation
+markers. Candidate selection and displayed local status reuse that view. When a
+provider result is ready to commit, the runtime checks the newest revision and
+cooldowns inside the write transaction; if a newer failure wins, its status is
+returned from that same transaction without another state-file read.
+
 Regression coverage includes healthy execution, model-specific fallback,
 shared quota exhaustion, reported resets, cancelled/interrupted waits, cached
 shared limits, credential changes, upstream attempt exhaustion, anonymous
