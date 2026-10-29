@@ -229,6 +229,78 @@ final class BoundFileOperationTests: XCTestCase {
             }
         }
     }
+    func testBatchInspectionSharesOneDescriptorSnapshotForRepeatedTargetChecks() throws {
+        let file = try root().appendingPathComponent("result")
+        try put("same", file)
+        var boundaries: [BoundFileOperation.Boundary] = []
+        let operation = try BoundFileOperation(file, hook: { boundaries.append($0) })
+        let snapshots = try operation.inspectBatch([
+            .init(kind: "file_exists", expected: nil),
+            .init(kind: "file_contents", expected: Data("same".utf8)),
+            .init(kind: "file_contents", expected: Data("other".utf8)),
+            .init(kind: "path_absent", expected: nil)
+        ])
+
+        XCTAssertEqual(snapshots.map(\.matches), [true, true, false, false])
+        XCTAssertEqual(boundaries.filter { $0 == .bound }.count, 1,
+                       "All checks for one target should use one opened descriptor")
+        XCTAssertEqual(boundaries.filter { $0 == .inspected }.count, 1,
+                       "The shared snapshot should be validated once")
+        let identity = try XCTUnwrap(snapshots[0].fields["file_identity"] as? String)
+        let version = try XCTUnwrap(snapshots[0].fields["file_version"] as? String)
+        XCTAssertEqual(snapshots[1].fields["file_identity"] as? String, identity)
+        XCTAssertEqual(snapshots[2].fields["file_identity"] as? String, identity)
+        XCTAssertEqual(snapshots[1].fields["file_version"] as? String, version)
+        XCTAssertEqual(snapshots[2].fields["file_version"] as? String, version)
+    }
+
+    func testASeparateInspectionObservesReplacementIdentity() throws {
+        let file = try root().appendingPathComponent("result")
+        try put("before", file)
+        let operation = try BoundFileOperation(file)
+        let first = try operation.inspectBatch([.init(kind: "file_exists", expected: nil)]).first!
+        try Data("after".utf8).write(to: file, options: .atomic)
+        let second = try operation.inspectBatch([.init(kind: "file_exists", expected: nil)]).first!
+
+        XCTAssertTrue(first.matches)
+        XCTAssertTrue(second.matches)
+        XCTAssertNotEqual(first.fields["file_identity"] as? String, second.fields["file_identity"] as? String)
+        XCTAssertNotEqual(first.fields["file_version"] as? String, second.fields["file_version"] as? String)
+    }
+
+    func testDirectoryTypeAndExistenceChecksShareOneDescriptor() throws {
+        let directory = try root().appendingPathComponent("Reports", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        var boundaries: [BoundFileOperation.Boundary] = []
+        let operation = try BoundFileOperation(directory, hook: { boundaries.append($0) })
+        let snapshots = try operation.inspectBatch([
+            .init(kind: "directory_exists", expected: nil),
+            .init(kind: "file_exists", expected: nil),
+            .init(kind: "file_contents", expected: Data("unexpected".utf8)),
+            .init(kind: "path_absent", expected: nil)
+        ])
+        XCTAssertEqual(snapshots.map(\.matches), [true, false, false, false])
+        XCTAssertEqual(boundaries.filter { $0 == .bound }.count, 1)
+        XCTAssertEqual(boundaries.filter { $0 == .inspected }.count, 1)
+        XCTAssertNotNil(snapshots[0].fields["file_identity"])
+    }
+
+    func testCommandCheckBatchPreservesPerCheckResultsFromOneTargetSnapshot() throws {
+        let file = try root().appendingPathComponent("result")
+        try put("same", file)
+        let checks = [
+            CommandExecutionPolicy.Check(type: "file_exists", path: file, expected: nil, text: nil),
+            CommandExecutionPolicy.Check(type: "file_contents", path: file, expected: Data("same".utf8), text: nil),
+            CommandExecutionPolicy.Check(type: "file_contents", path: file, expected: Data("wrong".utf8), text: nil)
+        ]
+        let result = try CommandExecutionPolicy.Check.evaluateBatch(checks, stdout: "", stdoutTruncated: false)
+        XCTAssertEqual(result.map { $0["verified"] as? Bool }, [true, true, false])
+        XCTAssertEqual(result[0]["file_identity"] as? String, result[1]["file_identity"] as? String)
+        XCTAssertEqual(result[1]["file_identity"] as? String, result[2]["file_identity"] as? String)
+        XCTAssertEqual(result[1]["content_sha256"] as? String,
+                       SHA256.hash(data: Data("same".utf8)).map { String(format: "%02x", $0) }.joined())
+        XCTAssertNil(result[2]["content_sha256"])
+    }
     func testCancellationBeforeCommitDeletesStageWithoutChangingDestination() throws {
         let file = try root().appendingPathComponent("result")
         try put("old", file)

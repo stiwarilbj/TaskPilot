@@ -34,6 +34,62 @@ struct CommandExecutionPolicy {
             self.taskGenerationID = taskGenerationID
         }
 
+        static func groups(for checks: [Check]) -> [[Int]] {
+            var groups: [String: [Int]] = [:]
+            for (index, check) in checks.enumerated() {
+                let key = check.path.map { "file:\($0.standardizedFileURL.path)" } ?? "standalone:\(index)"
+                groups[key, default: []].append(index)
+            }
+            return groups.values.sorted { ($0.first ?? 0) < ($1.first ?? 0) }
+        }
+
+        static func evaluateAll(_ checks: [Check], stdout: String, stdoutTruncated: Bool,
+                                downloadStatus: @escaping FileInputAvailability.DownloadStatusReader = FileInputAvailability.downloadStatus) throws -> [[String: Any]] {
+            var checkedByIndex = Array<[String: Any]?>(repeating: nil, count: checks.count)
+            for indexes in groups(for: checks) {
+                let results = try evaluateBatch(indexes.map { checks[$0] }, stdout: stdout,
+                    stdoutTruncated: stdoutTruncated, downloadStatus: downloadStatus)
+                for (index, result) in zip(indexes, results) { checkedByIndex[index] = result }
+            }
+            return try checkedByIndex.map { result in
+                guard let result else { throw TaskToolError.operationFailed("A local file check did not produce a result") }
+                return result
+            }
+        }
+
+        static func evaluateBatch(_ checks: [Check], stdout: String, stdoutTruncated: Bool,
+                                  downloadStatus: @escaping FileInputAvailability.DownloadStatusReader = FileInputAvailability.downloadStatus) throws -> [[String: Any]] {
+            guard !checks.isEmpty else { return [] }
+            if checks.count == 1 {
+                return [try checks[0].evaluate(stdout: stdout, stdoutTruncated: stdoutTruncated,
+                                                downloadStatus: downloadStatus)]
+            }
+            guard let path = checks[0].path,
+                  checks.allSatisfy({ $0.path?.standardizedFileURL.path == path.standardizedFileURL.path }),
+                  checks.allSatisfy({ OutcomeCheckKind(rawValue: $0.type) != .stdout_equals }) else {
+                return try checks.map { try $0.evaluate(stdout: stdout, stdoutTruncated: stdoutTruncated,
+                                                        downloadStatus: downloadStatus) }
+            }
+
+            do {
+                let operation = try BoundFileOperation(path, downloadStatus: downloadStatus)
+                let snapshots = try operation.inspectBatch(checks.map {
+                    BoundFileOperation.InspectionRequest(kind: $0.type, expected: $0.expected)
+                })
+                return zip(checks, snapshots).map { check, snapshot in
+                    check.result(matches: snapshot.matches, fields: snapshot.fields)
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch TaskToolError.fileContentsNotLocal {
+                return checks.map { $0.result(reason: TaskToolError.fileContentsNotLocal.localizedDescription) }
+            } catch is BoundFileOperation.Conflict {
+                return checks.map { $0.result(reason: "Filesystem conflict; fresh inspection is required") }
+            } catch {
+                return checks.map { $0.result(reason: "The requested outcome could not be inspected") }
+            }
+        }
+
         func evaluate(stdout: String, stdoutTruncated: Bool,
                       downloadStatus: @escaping FileInputAvailability.DownloadStatusReader = FileInputAvailability.downloadStatus) throws -> [String: Any] {
             var result: [String: Any] = ["type": type, "verified": false,
@@ -71,6 +127,24 @@ struct CommandExecutionPolicy {
                     // mismatch so the task cache can discard a stale proof.
                     result.merge(inspection.1) { _, new in new }
                 }
+                return self.result(matches: matches, fields: result)
+            } catch TaskToolError.fileContentsNotLocal {
+                return self.result(reason: TaskToolError.fileContentsNotLocal.localizedDescription)
+            } catch is BoundFileOperation.Conflict {
+                return self.result(reason: "Filesystem conflict; fresh inspection is required")
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                return self.result(reason: "The requested outcome could not be inspected")
+            }
+        }
+
+        private func result(matches: Bool? = nil, fields: [String: Any] = [:], reason: String? = nil) -> [String: Any] {
+            var result: [String: Any] = ["type": type, "verified": false,
+                "outcome": "delivered_unconfirmed", "verification_scope": type]
+            if let path { result["path"] = path.path }
+            result.merge(fields) { _, new in new }
+            if let matches {
                 result["verified"] = matches
                 result["outcome"] = matches ? "verified" : "delivered_unconfirmed"
                 if matches, let expected {
@@ -80,14 +154,8 @@ struct CommandExecutionPolicy {
                     result["text_sha256"] = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
                 }
                 if !matches { result["reason"] = "The requested outcome did not match" }
-            } catch TaskToolError.fileContentsNotLocal {
-                result["reason"] = TaskToolError.fileContentsNotLocal.localizedDescription
-            } catch is BoundFileOperation.Conflict {
-                result["reason"] = "Filesystem conflict; fresh inspection is required"
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                result["reason"] = "The requested outcome could not be inspected"
+            } else if let reason {
+                result["reason"] = reason
             }
             return result
         }

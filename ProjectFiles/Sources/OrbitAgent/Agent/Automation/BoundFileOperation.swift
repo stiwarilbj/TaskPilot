@@ -41,6 +41,14 @@ final class BoundFileOperation {
             return result
         }
     }
+    struct InspectionRequest {
+        let kind: String
+        let expected: Data?
+    }
+    struct InspectionResult {
+        let matches: Bool
+        let fields: [String: Any]
+    }
     struct TextEditSnapshot {
         let beforeData: Data?
         let afterData: Data
@@ -127,22 +135,24 @@ final class BoundFileOperation {
             throw conflict("the parent directory changed", delivered: delivered)
         }
     }
-    private func openTarget() throws -> (Int32, Identity) {
+    private func openTarget(requireLocal: Bool = true) throws -> (Int32, Identity) {
         guard let expected = try entry(name), expected.regular else {
             throw conflict("the target is missing, a symbolic link, or not a regular file")
         }
-        try FileInputAvailability.requireLocal(flags: expected.info.st_flags)
-        let cloudStatus = try? downloadStatus(parentURL.appendingPathComponent(name))
-        // Provider metadata is pathname-based; don't apply another object's
-        // cloud state if the entry changed while it was collected.
-        try checkParent()
-        guard try entry(name) == expected else { throw conflict("the target changed during availability inspection") }
-        try FileInputAvailability.requireLocal(flags: expected.info.st_flags, downloadStatus: cloudStatus)
+        if requireLocal {
+            try FileInputAvailability.requireLocal(flags: expected.info.st_flags)
+            let cloudStatus = try? downloadStatus(parentURL.appendingPathComponent(name))
+            // Provider metadata is pathname-based; don't apply another object's
+            // cloud state if the entry changed while it was collected.
+            try checkParent()
+            guard try entry(name) == expected else { throw conflict("the target changed during availability inspection") }
+            try FileInputAvailability.requireLocal(flags: expected.info.st_flags, downloadStatus: cloudStatus)
+        }
         let fd = openat(parent, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { throw conflict("the target could not be bound") }
         do {
             let actual = try Self.identity(fd)
-            try FileInputAvailability.requireLocal(flags: actual.info.st_flags)
+            if requireLocal { try FileInputAvailability.requireLocal(flags: actual.info.st_flags) }
             guard actual == expected, actual.regular else { throw conflict("the target changed while opening") }
             return (fd, actual)
         } catch { close(fd); throw error }
@@ -209,32 +219,115 @@ final class BoundFileOperation {
                         fileFormatValid: formatValid)
     }
     func inspect(kind: String, expected: Data?) throws -> (Bool, [String: Any]) {
+        guard let result = try inspectBatch([InspectionRequest(kind: kind, expected: expected)]).first else {
+            throw TaskToolError.invalidAction("A file inspection requires at least one check")
+        }
+        return (result.matches, result.fields)
+    }
+
+    /// Evaluates all checks for this bound path against one descriptor-derived
+    /// snapshot. The descriptor and snapshot are discarded on return; callers
+    /// must create a new inspection after any mutation or later verification.
+    func inspectBatch(_ requests: [InspectionRequest]) throws -> [InspectionResult] {
+        guard !requests.isEmpty else { return [] }
+        for request in requests {
+            guard ["path_absent", "file_exists", "directory_exists", "file_contents"].contains(request.kind),
+                  request.kind != "file_contents" || request.expected != nil else {
+                throw TaskToolError.invalidAction("A file inspection contains an unsupported check")
+            }
+        }
+
         try checkParent()
-        if kind == "path_absent" {
-            let absent = try entry(name) == nil
-            try hook(.inspected); try checkParent()
-            let stillAbsent = try entry(name) == nil
-            return (absent && stillAbsent, ["parent_identity": parentIdentity.object])
+        guard let initial = try entry(name) else {
+            try hook(.inspected)
+            try checkParent()
+            guard try entry(name) == nil else { throw conflict("the target appeared during inspection") }
+            return requests.map { request in
+                InspectionResult(matches: request.kind == "path_absent",
+                    fields: request.kind == "path_absent" ? ["parent_identity": parentIdentity.object] : [:])
+            }
         }
-        if kind == "directory_exists" {
-            let fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-            guard fd >= 0 else { return (false, [:]) }
-            defer { close(fd) }
-            let identity = try Self.identity(fd)
-            try hook(.inspected); try checkParent()
-            guard try entry(name) == identity else { throw conflict("the directory changed during inspection") }
-            return (true, Snapshot(data: Data(), identity: identity, parent: parentIdentity).fields)
+
+        let mode = initial.info.st_mode & S_IFMT
+        let needsReadableFile = requests.contains { $0.kind == "file_exists" || $0.kind == "file_contents" }
+        let fd: Int32
+        let identity: Identity
+        if mode == S_IFREG {
+            let opened = try openTarget(requireLocal: needsReadableFile)
+            fd = opened.0; identity = opened.1
+        } else if mode == S_IFDIR {
+            fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard fd >= 0 else { throw conflict("the directory could not be bound") }
+            do {
+                identity = try Self.identity(fd)
+                guard identity == initial else { throw conflict("the directory changed while opening") }
+            } catch { close(fd); throw error }
+        } else {
+            // Never follow symlinks or open special files as a side effect of
+            // checking whether a destination is absent.
+            try hook(.inspected)
+            try checkParent()
+            guard try entry(name) == initial else { throw conflict("the target changed during inspection") }
+            return requests.map { request in
+                InspectionResult(matches: false,
+                    fields: request.kind == "path_absent" ? ["parent_identity": parentIdentity.object] : [:])
+            }
         }
-        let snapshot = try read(limit: kind == "file_contents" ? expected!.count + 1 : 0)
-        let matches = snapshot.fileFormatValid && (kind != "file_contents" || snapshot.data == expected!)
-        var fields = snapshot.fields
-        // An exact, complete read already establishes a full-file digest.
-        // Returning it lets the task ledger reuse it on later checks.
-        if kind == "file_contents", matches, let expected {
-            fields["file_size"] = snapshot.identity.info.st_size
-            fields["file_sha256"] = Self.sha256(expected)
+        defer { close(fd) }
+        try hook(.bound)
+        let isDirectory = identity.info.st_mode & S_IFMT == S_IFDIR
+
+        var requestedReadLimit = 0
+        for request in requests where request.kind == "file_contents" {
+            let (limit, overflow) = request.expected!.count.addingReportingOverflow(1)
+            guard !overflow else { throw TaskToolError.invalidAction("The requested file contents are too large to inspect") }
+            requestedReadLimit = max(requestedReadLimit, limit)
         }
-        return (matches, fields)
+        var data = Data()
+        while !isDirectory && data.count < requestedReadLimit {
+            try TaskOwnership.check()
+            let part = try Self.read(fd, offset: Int64(data.count), count: min(65_536, requestedReadLimit - data.count))
+            if part.isEmpty { break }
+            data.append(part)
+        }
+        if needsReadableFile && !isDirectory {
+            try FileInputAvailability.requireLocal(flags: Self.identity(fd).info.st_flags)
+        }
+        let format = needsReadableFile && !isDirectory
+            ? try FileFormatVerifier.attestation(fileDescriptor: fd, size: identity.info.st_size, filename: name) : nil
+        let formatValid = FileFormatVerifier.expectedFormat(for: name) == nil || format != nil
+        try hook(.inspected)
+        try checkParent()
+        guard try Self.identity(fd) == identity, try entry(name) == identity else {
+            throw conflict(isDirectory ? "the directory changed during inspection" : "the file changed during inspection")
+        }
+
+        let snapshot = Snapshot(data: data, identity: identity, parent: parentIdentity,
+                                fileFormat: format, fileFormatValid: formatValid)
+        return requests.map { request in
+            switch request.kind {
+            case "path_absent":
+                return InspectionResult(matches: false, fields: ["parent_identity": parentIdentity.object])
+            case "directory_exists":
+                return isDirectory
+                    ? InspectionResult(matches: true, fields: snapshot.fields)
+                    : InspectionResult(matches: false, fields: [:])
+            case "file_exists":
+                return !isDirectory && identity.regular
+                    ? InspectionResult(matches: snapshot.fileFormatValid, fields: snapshot.fields)
+                    : InspectionResult(matches: false, fields: [:])
+            case "file_contents":
+                let matches = !isDirectory && identity.regular && snapshot.fileFormatValid && snapshot.data == request.expected!
+                var fields = !isDirectory && identity.regular ? snapshot.fields : [:]
+                if matches, let expected = request.expected {
+                    fields["file_size"] = identity.info.st_size
+                    fields["file_sha256"] = Self.sha256(expected)
+                }
+                return InspectionResult(matches: matches, fields: fields)
+            default:
+                return InspectionResult(matches: false, fields: [:])
+            }
+        }
     }
 
     /// Reuses a digest established by a descriptor-bound native write. This

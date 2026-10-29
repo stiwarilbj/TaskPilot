@@ -81,6 +81,25 @@ final class EvidenceReadbackTests: XCTestCase {
         XCTAssertEqual(checks[2]["text_sha256"] as? String, hash(Data("A".utf8)))
     }
 
+    func testRepeatedCommandChecksShareOneTargetSnapshotAndKeepRequestOrder() async throws {
+        let root = try fixture(), file = root.appendingPathComponent("result")
+        try Data("A".utf8).write(to: file)
+        let result = try await TaskToolExecutor().perform(action: ["type": "run_command",
+            "argv": ["/usr/bin/true"], "working_directory": root.path,
+            "checks": [
+                ["type": "file_exists", "path": file.path],
+                ["type": "file_contents", "path": file.path, "content": "A"],
+                ["type": "path_absent", "path": file.path]
+            ]])
+
+        let checks = try XCTUnwrap(result["checks"] as? [[String: Any]])
+        XCTAssertEqual(checks.map { $0["type"] as? String }, ["file_exists", "file_contents", "path_absent"])
+        XCTAssertEqual(checks.map { $0["verified"] as? Bool }, [true, true, false])
+        XCTAssertEqual(checks[0]["file_identity"] as? String, checks[1]["file_identity"] as? String)
+        XCTAssertEqual(checks[0]["file_version"] as? String, checks[1]["file_version"] as? String)
+        XCTAssertNil(checks[2]["file_identity"])
+    }
+
     func testReadbackRejectsInvalidPayloadAndHistoricalAppendWithoutEffects() async throws {
         let file = try fixture().appendingPathComponent("a"), tools = TaskToolExecutor()
         let invalid: [[String: Any]] = [

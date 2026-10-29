@@ -167,7 +167,7 @@ final class TaskToolExecutor {
             do { requested.append(try ActionContract.validateOutcomeCheck(check)) }
             catch { throw TaskToolError.invalidAction(error.localizedDescription) }
         }
-        var checks: [[String: Any]] = []
+        var prepared: [CommandExecutionPolicy.Check] = []
         for check in requested {
             try await TaskOwnership.checkpoint()
             let path = Self.expandedFileURL(check["path"] as! String)
@@ -176,11 +176,25 @@ final class TaskToolExecutor {
                 let content = check["content"] as! String
                 expected = check["encoding"] as? String == "base64" ? Data(base64Encoded: content)! : Data(content.utf8)
             }
-            checks.append(try CommandExecutionPolicy.Check(type: check["type"] as! String, path: path,
+            prepared.append(CommandExecutionPolicy.Check(type: check["type"] as! String, path: path,
                 expected: expected, text: nil,
                 fileDigestProof: requested.count == 1 && check["type"] as? String == "file_contents" ? fileDigestProof : nil,
-                taskGenerationID: TaskOwnership.current?.id).evaluate(stdout: "", stdoutTruncated: false,
-                    downloadStatus: fileDownloadStatus))
+                taskGenerationID: TaskOwnership.current?.id))
+        }
+
+        // Checks for the same standardized target share one descriptor-bound
+        // inspection. Results are written back by original index so each
+        // requested check retains its own scope and ordering.
+        var checkedByIndex = Array<[String: Any]?>(repeating: nil, count: prepared.count)
+        for indexes in CommandExecutionPolicy.Check.groups(for: prepared) {
+            try await TaskOwnership.checkpoint()
+            let results = try CommandExecutionPolicy.Check.evaluateBatch(indexes.map { prepared[$0] },
+                stdout: "", stdoutTruncated: false, downloadStatus: fileDownloadStatus)
+            for (index, result) in zip(indexes, results) { checkedByIndex[index] = result }
+        }
+        let checks = try checkedByIndex.map { result -> [String: Any] in
+            guard let result else { throw TaskToolError.operationFailed("A local file check did not produce a result") }
+            return result
         }
         try TaskOwnership.check()
         let verified = !checks.isEmpty && checks.allSatisfy { $0["verified"] as? Bool == true }
@@ -492,8 +506,8 @@ final class TaskToolExecutor {
                                            policy: policy, environment: environment,
                                            prefix: "command", timeout: policy.timeout,
                                            validate: { try binding?.validate() })
-        let checks = try policy.checks.map { try $0.evaluate(stdout: execution.stdout.text,
-            stdoutTruncated: execution.stdout.truncated, downloadStatus: fileDownloadStatus) }
+        let checks = try CommandExecutionPolicy.Check.evaluateAll(policy.checks, stdout: execution.stdout.text,
+            stdoutTruncated: execution.stdout.truncated, downloadStatus: fileDownloadStatus)
         let executed = !execution.timedOut && execution.status == 0
         let verified = executed && !checks.isEmpty && checks.allSatisfy { $0["verified"] as? Bool == true }
         var result: [String: Any] = [
