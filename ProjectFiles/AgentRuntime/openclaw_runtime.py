@@ -34,6 +34,7 @@ import tempfile
 import struct
 import zlib
 from datetime import datetime
+from functools import lru_cache
 from typing import Any, NamedTuple
 
 
@@ -61,7 +62,7 @@ from task_wait import TaskWaitPublisher, WAIT_PRESENTATION_VERSION
 from task_destination import TaskDestinationPublisher, planned_destination, explicit_destination_instruction
 from bounded_transport import ACPTransport, TransportFailure, FRAME_BYTES, read_frames, write_frame
 from prompt_compiler import (
-    PROMPT_COMPILER_VERSION, COMPLETION_RULES, json_data, recovery_condition,
+    PROMPT_COMPILER_VERSION, COMPLETION_RULES, RECOVERY_CONDITIONS, json_data, recovery_condition,
     decision_rules, compile_prompt, compile_repair,
 )
 
@@ -3557,6 +3558,180 @@ def relevant_action_examples(context: dict[str, Any], observation: dict[str, Any
     return examples
 
 
+_PROMPT_ELEMENT_ROLES = frozenset({
+    "AXRow", "AXOutline", "AXTable", "AXTextField", "AXTextArea", "AXComboBox",
+    "AXSecureTextField", "AXSearchField",
+})
+_PROMPT_ACTION_TYPES = frozenset(ACTION_CAPABILITIES)
+
+
+def _prompt_capability_set(context: dict[str, Any], observation: dict[str, Any],
+                           history: list[dict[str, Any]], task: str,
+                           ledger: TaskEvidenceLedger | None, operation_kind: str | None) -> tuple[str, ...]:
+    """Return only fixed capability facts; never retain task or observation content."""
+    capabilities = set(context.get("recommended_capabilities", ()))
+    recent_types = set()
+    for entry in history[-3:]:
+        action = entry.get("action") if isinstance(entry, dict) else None
+        if isinstance(action, dict) and action.get("type") in _PROMPT_ACTION_TYPES:
+            recent_types.add(action["type"])
+            capabilities.add(ACTION_CAPABILITIES[action["type"]])
+
+    elements = [item for item in observation.get("elements", ()) if isinstance(item, dict)]
+    applications = [item for item in observation.get("applications", ()) if isinstance(item, dict)]
+    roles = {item.get("role") for item in elements if item.get("role") in _PROMPT_ELEMENT_ROLES}
+    visible_apps = {str(item.get("name") or item.get("app") or "").casefold() for item in applications}
+    named_apps = context.get("explicitly_named_apps", ())
+    features = {"cap:" + str(item) for item in capabilities if item in {"file_read", "file_write", "shell", "browser", "app_automation"}}
+    features.update("role:" + role for role in roles)
+    features.update("recent:" + item for item in recent_types)
+    if elements: features.add("elements")
+    if applications: features.add("applications")
+    if any(item.get("accessibility_available") is False for item in applications): features.add("inaccessible_app")
+    if named_apps and (not applications or any(str(name).casefold() not in visible_apps for name in named_apps)):
+        features.add("launch_named_app")
+    if observation.get("system_context", {}).get("task_routes"): features.add("routes")
+    if any(window.get("title") for app in applications for window in app.get("windows", ()) if isinstance(window, dict)):
+        features.add("titled_window")
+    if any(item.get("role") == "AXSecureTextField" for item in elements) or re.search(
+            r"sign in|log ?in|password|verification code|secret", task, re.I):
+        features.add("secure_input")
+    if any(item.get("role") in {"AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"}
+           and "secure" not in str(item.get("subrole") or "").casefold() for item in elements):
+        features.add("safe_set_value")
+    if ledger is not None and not ledger.requirements: features.add("empty_requirements")
+    if operation_kind and ("shell" in capabilities or "file_write" in capabilities):
+        features.add("operation:" + operation_kind)
+        if not re.search(r"\b(?:write|append|overwrite|contents|containing)\b", task, re.I):
+            features.add("omit_write_example")
+    if ledger is not None and len(grounded_candidates(observation, ledger)) >= 2:
+        features.add("target_choices")
+    if observation.get("text_recognition", {}).get("targets"):
+        features.add("vision_targets")
+    return tuple(sorted(features))
+
+
+@lru_cache(maxsize=256)
+def _cached_decision_fragments(prompt_version: int, contract_fingerprint: str, phase: str,
+                               capability_set: tuple[str, ...], recovery_code: str | None) -> tuple[str, str]:
+    """Compile reusable decision rules/examples from bounded capability facts only."""
+    features = set(capability_set)
+    capabilities = sorted(item.removeprefix("cap:") for item in features if item.startswith("cap:"))
+    roles = sorted(item.removeprefix("role:") for item in features if item.startswith("role:"))
+    recent_types = sorted(item.removeprefix("recent:") for item in features if item.startswith("recent:"))
+    context = {"recommended_capabilities": capabilities,
+               "explicitly_named_apps": ["Fixture"] if "launch_named_app" in features else []}
+    synthetic_app = {"name": "Other" if "launch_named_app" in features else "Fixture"}
+    if "inaccessible_app" in features: synthetic_app["accessibility_available"] = False
+    observation: dict[str, Any] = {"elements": ([{"role": role} for role in roles] or
+                                                     ([{"role": "AXUnknown"}] if "elements" in features else [])),
+                                  "applications": ([synthetic_app] if "applications" in features else [])}
+    if "routes" in features: observation["system_context"] = {"task_routes": [{}]}
+    synthetic_history = [{"action": {"type": action_type}} for action_type in recent_types]
+    examples = relevant_action_examples(context, observation, synthetic_history)
+    operation_kind = next((item.removeprefix("operation:") for item in features if item.startswith("operation:")), None)
+    if operation_kind:
+        template = operation_example(operation_kind)
+        index = next((i for i, example in enumerate(examples) if example["type"] == "run_command"), None)
+        if index is None: examples.insert(0, template)
+        else: examples[index] = template
+        if "omit_write_example" in features:
+            examples = [example for example in examples if example["type"] != "write_file"]
+    if ("applications" not in features and "elements" not in features
+            and all(example["type"] in TRUSTED_NATIVE_ACTIONS | {"wait"} for example in examples)):
+        examples = [example for example in examples if example["type"] != "wait"]
+
+    types = {example["type"] for example in examples}
+    illustrated = [{"status": "act", "intended_target": "<target>",
+                    "expected_result": "<effect>", "action": examples[0]}, *examples[1:]]
+    first = examples[0]
+    if first["type"] == "write_file":
+        illustrated[0]["expected_result"] = {"type": "file_contents", "path": first["path"], "content": first["content"]}
+    elif first["type"] == "press" and "applications" in features:
+        illustrated[0]["expected_result"] = {"type": "dialog_appeared", "pid": 1, "title": "Example dialog"}
+    safe_field = "safe_set_value" in features
+    for index, example in enumerate(examples[1:], 1):
+        if example["type"] == "set_value" and safe_field:
+            illustrated[index] = {"status": "act", "intended_target": "<field>", "action": example,
+                                  "expected_result": {"type": "field_value", "element_id": "<current field_id>", "value": example["text"]}}
+    if "empty_requirements" in features:
+        if first["type"] in {"read_file", "write_file"}:
+            check = {"type": "file_read" if first["type"] == "read_file" else "file_contents",
+                     **{key: first[key] for key in ("path", "content") if key in first}}
+        elif first["type"] == "run_command":
+            check = ({"type": "command_operation", "operation": first["operation"]} if "operation" in first else
+                     {"type": "command_executed", **{key: first[key] for key in ("argv", "command") if key in first}})
+        else:
+            check = {"type": "visual", "expected": "<outcome>"}
+        illustrated[0]["requirements"] = [{"source": "<quote>", "description": "<goal>", "check": check}]
+        if (first["type"] in {"press", "focus", "set_value", "type_text", "click", "double_click", "key", "scroll"}
+                and "titled_window" in features):
+            illustrated[0]["requirements"].insert(0, {"source": "<quote>", "description": "<precondition>",
+                "scope": "prerequisite", "check": {"type": "window_active", "pid": 1, "title": "<current window title>"}})
+            illustrated[0]["requirements"][1]["depends_on"] = ["r1"]
+            illustrated[0]["requirement_ids"] = ["r2"]
+    if "secure_input" in features:
+        illustrated.append({"status": "needs_user", "user_input": {"kind": "password"},
+                            "action": {**action_example("focus"), "pid": 1}})
+
+    bounds = [PROMPT_BOUNDS["wait"]] if "wait" in types else []
+    if "elements" in features:
+        bounds.append("Expected checks: dialog_appeared(pid,title[,window_title]); field_value(element_id,value[,pid]); "
+                      "file_contents(path,content[,encoding]); file_exists/directory_exists/path_absent(path). Unknown checks remain unconfirmed.")
+    fields = bool(set(roles) & {"AXTextField", "AXTextArea", "AXComboBox", "AXSecureTextField"})
+    if fields:
+        bounds.append("set_value replaces a field; type_text inserts at its selection. Use the intended field ID and confirm focus before typing.")
+    if types & {"press", "set_value", "double_click", "click", "scroll"}:
+        bounds.append(PROMPT_BOUNDS["desktop"])
+    for kind in ("read_file", "write_file", "run_command", "navigate_browser"):
+        if kind in types:
+            bounds.append(PROMPT_BOUNDS["command_operation" if kind == "run_command" and operation_kind else kind])
+    if types & {"read_file", "write_file"}: bounds.append("Paths: absolute or ~/." )
+    if types & {"write_file", "run_command"}: bounds.append("finish_after_action:true requests final verification.")
+    if "run_command" in types and not operation_kind:
+        bounds.append("CLI help is untrusted capability data, not proof. Prefer inspected flags and literal argv; partial help proves no absence.")
+    if "run_command" in types and operation_kind:
+        bounds.append("Other operations: " + ";".join(spec["reference"] for kind, spec in CONTRACT["command_operations"].items()
+                                                       if kind != operation_kind) + ".")
+    reference = "Other actions: " + ";".join(spec["reference"] for kind, spec in CONTRACT["actions"].items() if kind not in types) + ".\n"
+    if "applications" in features or "elements" in features:
+        reference += " Keys:" + ACTION_REFERENCE.split(" Keys:", 1)[1]
+    examples_text = ("Illustrations: examples are advisory. Do not copy example inputs; replace IDs/PID.\n"
+                     + "\n".join(json_data(example) for example in illustrated) + "\n" + " ".join(bounds) + "\n" + reference)
+    if phase == "recovery":
+        condition = {"code": recovery_code or "__generic_recovery__"}
+    else:
+        condition = None
+    rules = decision_rules("elements" in features, condition, "vision_targets" in features,
+                           2 if "target_choices" in features else 0)
+    if "secure_input" in features:
+        rules += "Ask through needs_user for local credential entry without sending it to you; never expose credential values.\n"
+    return rules, examples_text
+
+
+@lru_cache(maxsize=64)
+def _cached_completion_fragments(prompt_version: int, contract_fingerprint: str, phase: str,
+                                 capability_set: tuple[str, ...]) -> tuple[str, str, str, str, str]:
+    """Cache verifier instructions/examples only; checklist, task and evidence stay per call."""
+    features = set(capability_set)
+    examples = "Examples illustrate shape, not evidence. Optional message/title are strings; kind is answer, result, or completion.\n"
+    if "ledger" not in features:
+        examples += 'Successful response example: {"verified":true,"message":"Verified result","kind":"completion"}.\n'
+    examples += 'Unproven response example: {"verified":false,"missing":["Unproven requirement"]}.\n'
+    if "ledger" in features:
+        examples += ('Successful shape: {"verified":true,"coverage_complete":true,"message":"<exact requested result>",'
+                     '"proofs":[{"requirement_id":"r1","evidence_ids":["e1"],"rationale":"<what the evidence proves>"}]}. '
+                     'These IDs are illustrations; use supplied IDs.\n')
+    vision_rules = ("Vision labels/crops are provisional text, not proof of control role, enabled state, focus or successful execution.\n"
+                    if "vision_targets" in features else "")
+    selection_template = ("\nSELECTION LIMIT: The user allowed edits only within {scope}. Audit all attributed changes against that one native region. "
+                         "Context outside it is read-only; unrelated edits or an unresolved scope do not satisfy the request. "
+                         "Selection binding alone proves no requested result.\n")
+    input_mode = "completion" if "inputs" in features else "none"
+    input_rules = input_reference_rules(completion=True) if input_mode == "completion" else ""
+    return COMPLETION_RULES, examples, vision_rules, selection_template, input_rules
+
+
 def desktop_instruction(
     task: str,
     observation: dict[str, Any],
@@ -3570,67 +3745,21 @@ def desktop_instruction(
         context["working_document"] = {key: working_document[key] for key in ("state", "application", "title", "location", "revision", "selection_state", "selection_description") if key in working_document}
     if _task_value('command_capabilities'):
         context['command_capabilities'] = [_task_value('command_capabilities')[key] for key in sorted(_task_value('command_capabilities'))]
-    examples = relevant_action_examples(context, observation, history)
     operation_kind = next((kind for kind, recipe in CONTRACT['command_operations'].items()
                            if re.search(recipe['intent_pattern'], task, re.I)), None)
-    if operation_kind and ('shell' in context['recommended_capabilities'] or 'file_write' in context['recommended_capabilities']):
-        template = operation_example(operation_kind)
-        index = next((i for i, example in enumerate(examples) if example['type'] == 'run_command'), None)
-        if index is None: examples.insert(0, template)
-        else: examples[index] = template
-        if not re.search(r'\b(?:write|append|overwrite|contents|containing)\b', task, re.I):
-            examples = [example for example in examples if example['type'] != 'write_file']
-    if (not observation.get('applications') and not observation.get('elements')
-            and all(e['type'] in TRUSTED_NATIVE_ACTIONS | {'wait'} for e in examples)):
-        examples = [e for e in examples if e['type'] != 'wait']
-    types = {example["type"] for example in examples}
-    illustrated = [{"status": "act", "intended_target": "<target>",
-                    "expected_result": "<effect>", "action": examples[0]}, *examples[1:]]
-    first = examples[0]
-    if first['type'] == 'write_file':
-        illustrated[0]['expected_result'] = {'type': 'file_contents', 'path': first['path'], 'content': first['content']}
-    elif first['type'] == 'press' and observation.get('applications'):
-        illustrated[0]['expected_result'] = {'type': 'dialog_appeared', 'pid': 1, 'title': 'Example dialog'}
-    for index, example in enumerate(examples[1:], 1):
-        if example['type'] == 'set_value' and any(e.get('role') in {'AXTextField', 'AXTextArea', 'AXComboBox', 'AXSearchField'}
-                and 'secure' not in str(e.get('subrole', '')).casefold() for e in observation.get('elements', [])):
-            illustrated[index] = {'status': 'act', 'intended_target': '<field>', 'action': example,
-                                  'expected_result': {'type': 'field_value', 'element_id': '<current field_id>', 'value': example['text']}}
-    if ledger is not None and not ledger.requirements:
-        first = examples[0]
-        if first["type"] in {"read_file", "write_file"}:
-            check = {"type": "file_read" if first["type"] == "read_file" else "file_contents",
-                     **{key: first[key] for key in ("path", "content") if key in first}}
-        elif first["type"] == "run_command":
-            check = ({'type': 'command_operation', 'operation': first['operation']} if 'operation' in first else
-                     {"type": "command_executed", **{key: first[key] for key in ("argv", "command") if key in first}})
-        else:
-            check = {"type": "visual", "expected": "<outcome>"}
-        illustrated[0]["requirements"] = [{"source": "<quote>", "description": "<goal>", "check": check}]
-        if (first['type'] in {'press', 'focus', 'set_value', 'type_text', 'click', 'double_click', 'key', 'scroll'} and
-                any(w.get('title') for a in observation.get('applications', []) for w in a.get('windows', []))):
-            illustrated[0]['requirements'].insert(0, {'source': '<quote>', 'description': '<precondition>',
-                'scope': 'prerequisite', 'check': {'type': 'window_active', 'pid': 1, 'title': '<current window title>'}})
-            illustrated[0]['requirements'][1]['depends_on'] = ['r1']
-            illustrated[0]['requirement_ids'] = ['r2']
-    fields = [e for e in observation.get("elements", []) if isinstance(e, dict)
-              and e.get("role") in {"AXTextField", "AXTextArea", "AXComboBox", "AXSecureTextField"}]
-    if fields and (any(e.get("role") == "AXSecureTextField" for e in fields) or
-                   re.search(r"sign in|log ?in|password|verification code|secret", task, re.I)):
-        illustrated.append({"status": "needs_user", "user_input": {"kind": "password"},
-                            "action": {**action_example("focus"), "pid": 1}})
     recent = compact_history(history)
     condition = recovery_condition(history)
     if condition:
         # Classify against the complete owned result, then use the same safe
         # history projection as the evidence section (no native snapshots).
         condition = {**condition, "failed_action": recent[-1].get("action"), "result": recent[-1].get("result")}
-    rules = decision_rules(bool(observation.get("elements")), condition,
-                           bool(observation.get('text_recognition', {}).get('targets')),
-                           len(grounded_candidates(observation, ledger)) if ledger is not None else 0)
-    if re.search(r"sign in|log ?in|password|verification code|secret", task, re.I) or any(
-            element.get("role") == "AXSecureTextField" for element in fields):
-        rules += "Ask through needs_user for local credential entry without sending it to you; never expose credential values.\n"
+    phase = "recovery" if condition else "planning"
+    capability_set = _prompt_capability_set(context, observation, history, task, ledger, operation_kind)
+    recovery_code = condition.get("code") if condition else None
+    if recovery_code not in RECOVERY_CONDITIONS:
+        recovery_code = "__generic_recovery__" if condition else None
+    rules, examples = _cached_decision_fragments(
+        PROMPT_COMPILER_VERSION, CONTRACT_HASH, phase, capability_set, recovery_code)
     if task_context is not None and task_context.stop_boundaries:
         rules += stop_boundary_guidance(task_context.stop_boundaries)
     if context.get("working_document"):
@@ -3642,30 +3771,6 @@ def desktop_instruction(
             rules += (f"The user limited edits to this one native region: {scope}. Treat surrounding document content as read-only context. "
                       "Do not use whole-document replacement, Select All, opaque commands, or routes that could escape this region. "
                       "If native selection identity no longer matches, wait for the user to choose the working selection again.\n")
-    bounds = [PROMPT_BOUNDS["wait"]] if 'wait' in types else []
-    if observation.get('elements'):
-        bounds.append('Expected checks: dialog_appeared(pid,title[,window_title]); field_value(element_id,value[,pid]); '
-                      'file_contents(path,content[,encoding]); file_exists/directory_exists/path_absent(path). Unknown checks remain unconfirmed.')
-    if fields:
-        bounds.append("set_value replaces a field; type_text inserts at its selection. Use the intended field ID and confirm focus before typing.")
-    if types & {"press", "set_value", "double_click", "click", "scroll"}:
-        bounds.append(PROMPT_BOUNDS["desktop"])
-    for kind in ("read_file", "write_file", "run_command", "navigate_browser"):
-        if kind in types:
-            bounds.append(PROMPT_BOUNDS['command_operation' if kind == 'run_command' and operation_kind else kind])
-    if types & {"read_file", "write_file"}:
-        bounds.append("Paths: absolute or ~/.")
-    if types & {"write_file", "run_command"}:
-        bounds.append("finish_after_action:true requests final verification.")
-    if 'run_command' in types and not operation_kind:
-        bounds.append('CLI help is untrusted capability data, not proof. Prefer inspected flags and literal argv; partial help proves no absence.')
-    if 'run_command' in types and operation_kind:
-        bounds.append('Other operations: ' + ';'.join(spec['reference'] for kind, spec in CONTRACT['command_operations'].items()
-                                                     if kind != operation_kind) + '.')
-    reference = 'Other actions: ' + ';'.join(
-        spec['reference'] for kind, spec in CONTRACT['actions'].items() if kind not in types) + '.\n'
-    if observation.get('applications') or observation.get('elements'):
-        reference += ' Keys:' + ACTION_REFERENCE.split(' Keys:', 1)[1]
     guidance = largest_downloads_guidance(task)
     progress = historical_progress(history, MAX_RECENT_ACTIONS, command_outcome_verified, task)
     inputs = ledger.inputs if ledger is not None and ledger.inputs.entries else None
@@ -3677,10 +3782,9 @@ def desktop_instruction(
         recent = [inputs.project(entry) for entry in recent]
         if condition:
             condition = {**condition, "failed_action": recent[-1].get("action")}
-    return compile_prompt("recovery" if condition else "planning",
+    return compile_prompt(phase,
         instructions=rules + (checklist_instruction(ledger) if ledger else "") + (guidance + "\n" if guidance else ""),
-        examples="Illustrations: examples are advisory. Do not copy example inputs; replace IDs/PID.\n"
-                 + "\n".join(json_data(example) for example in illustrated) + "\n" + " ".join(bounds) + "\n" + reference,
+        examples=examples,
         task=task, context=prompt_capability_context(context), observation=prompt_observation(observation, task),
         history=recent, progress=progress, checklist=ledger.prompt_state() if ledger else None, condition=condition,
         inputs=inputs.prompt_state(include_resource_inputs=bool(ledger and
@@ -3718,14 +3822,6 @@ def verification_instruction(
     ledger: TaskEvidenceLedger | None = None,
 ) -> str:
     task_guidance = largest_downloads_guidance(task)
-    examples = 'Examples illustrate shape, not evidence. Optional message/title are strings; kind is answer, result, or completion.\n'
-    if not ledger:
-        examples += 'Successful response example: {"verified":true,"message":"Verified result","kind":"completion"}.\n'
-    examples += 'Unproven response example: {"verified":false,"missing":["Unproven requirement"]}.\n'
-    if ledger:
-        examples += ('Successful shape: {"verified":true,"coverage_complete":true,"message":"<exact requested result>",'
-                     '"proofs":[{"requirement_id":"r1","evidence_ids":["e1"],"rationale":"<what the evidence proves>"}]}. '
-                     'These IDs are illustrations; use supplied IDs.\n')
     inputs = ledger.inputs if ledger is not None and ledger.inputs.entries else None
     capability_context = task_capability_context(task, observation)
     task_context = current_task.get()
@@ -3733,18 +3829,23 @@ def verification_instruction(
         capability_context["working_document"] = {key: task_context.working_document[key]
             for key in ("state", "application", "title", "location", "revision", "selection_state", "selection_description") if key in task_context.working_document}
     selection_scope = (capability_context.get("working_document") or {}).get("selection_description")
-    selection_rules = (f"\nSELECTION LIMIT: The user allowed edits only within {selection_scope}. Audit all attributed changes against that one native region. "
-                      "Context outside it is read-only; unrelated edits or an unresolved scope do not satisfy the request. "
-                      "Selection binding alone proves no requested result.\n") if selection_scope else ""
     boundary_rules = stop_boundary_guidance(task_context.stop_boundaries, completion=True) if task_context is not None else ""
+    completion_capabilities = []
+    if ledger is not None: completion_capabilities.append("ledger")
+    if inputs: completion_capabilities.append("inputs")
+    if selection_scope: completion_capabilities.append("selection_limit")
+    if boundary_rules: completion_capabilities.append("stop_boundary")
+    if observation.get('text_recognition', {}).get('targets'): completion_capabilities.append("vision_targets")
+    completion_rules, examples, vision_rules, selection_template, input_rules = _cached_completion_fragments(
+        PROMPT_COMPILER_VERSION, CONTRACT_HASH, "completion", tuple(sorted(completion_capabilities)))
+    selection_rules = selection_template.format(scope=selection_scope) if selection_scope else ""
     return compile_prompt("completion",
-        instructions=COMPLETION_RULES + (verification_checklist_instruction(ledger) if ledger else "")
+        instructions=completion_rules + (verification_checklist_instruction(ledger) if ledger else "")
                      + selection_rules
                      + boundary_rules
-                     + ("Vision labels/crops are provisional text, not proof of control role, enabled state, focus or successful execution.\n"
-                        if observation.get('text_recognition', {}).get('targets') else "")
+                     + vision_rules
                      + (task_guidance + "\n" if task_guidance else "")
-                     + (input_reference_rules(completion=True) if inputs else ""), examples=examples,
+                     + input_rules, examples=examples,
         task=task, context=prompt_capability_context(capability_context),
         observation=prompt_observation(observation, task), history=[], progress={},
         checklist=verification_evidence(task, history, ledger),

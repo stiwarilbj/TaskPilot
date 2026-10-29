@@ -1,4 +1,5 @@
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -145,6 +146,96 @@ class PromptCompilerTests(unittest.TestCase):
         candidate = {'status': 'done', 'output': 'Complete', 'output_kind': 'result'}
         self.assertEqual(runtime.verification_instruction('Click Save', candidate, OBSERVATION, history),
                          runtime.verification_instruction('Click Save', reordered(candidate), reordered(OBSERVATION), reordered(history)))
+
+    def test_static_fragment_cache_preserves_pre_cache_prompt_bytes(self):
+        runtime._cached_decision_fragments.cache_clear()
+        runtime._cached_completion_fragments.cache_clear()
+        observation = {'elements': [], 'applications': []}
+        failure = [{'action': {'type': 'press', 'element_id': 'old:save'},
+                    'result': {'outcome': 'rejected', 'error_code': 'stale_target', 'message': 'moved'}}]
+        with mock.patch.object(runtime.Path, 'home', return_value=Path('/fixture/home')):
+            prompts = [
+                runtime.desktop_instruction('Click Save', observation, []),
+                runtime.desktop_instruction('Click Save', observation, failure),
+                runtime.verification_instruction('Click Save', {'status': 'done'}, observation, []),
+            ]
+        # Digests captured from the original uncached prompt builders. These
+        # assert the complete UTF-8 prompt bytes, not just selected fragments.
+        self.assertEqual([hashlib.sha256(prompt.encode('utf-8')).hexdigest() for prompt in prompts], [
+            'e0dfcacfddd6db04c3679da4dc5858637405751946dfff571fbcc639e92e60dd',
+            'fad15b5b8562cdb618b823323aa0d035da7d69d75ce82372b46ca157b70853cd',
+            '868e94c8b8bd2a09428939ce59edc8e6f5d9172e3d0065cd407f976fad0dddcc',
+        ])
+
+    def test_cached_static_fragments_never_reuse_observation_or_evidence(self):
+        runtime._cached_decision_fragments.cache_clear()
+        first_observation = deepcopy(OBSERVATION)
+        first_observation['observation_revision'] = 'fresh-observation-one'
+        first_observation['elements'][0]['id'] = 'fresh-one:save'
+        first_history = [self.failure(message='evidence from decision one')]
+        first = self.prompt(first_history, observation=first_observation)
+        misses_after_first = runtime._cached_decision_fragments.cache_info().misses
+
+        second_observation = deepcopy(OBSERVATION)
+        second_observation['observation_revision'] = 'fresh-observation-two'
+        second_observation['elements'][0]['id'] = 'fresh-two:save'
+        second_history = [self.failure(message='evidence from decision two')]
+        second = self.prompt(second_history, observation=second_observation)
+
+        cache = runtime._cached_decision_fragments.cache_info()
+        self.assertEqual(cache.misses, misses_after_first)
+        self.assertGreaterEqual(cache.hits, 1)
+        self.assertIn('fresh-one:save', first)
+        self.assertIn('evidence from decision one', first)
+        self.assertNotIn('evidence from decision two', first)
+        self.assertIn('fresh-two:save', second)
+        self.assertIn('evidence from decision two', second)
+        self.assertNotIn('fresh-one:save', second)
+        self.assertNotIn('evidence from decision one', second)
+
+        first_ledger = TaskEvidenceLedger('Click Save')
+        first_ledger.add_evidence({'type': 'file_exists', 'path': '/fixture/evidence-one'})
+        second_ledger = TaskEvidenceLedger('Click Save')
+        second_ledger.add_evidence({'type': 'file_exists', 'path': '/fixture/evidence-two'})
+        first_with_ledger = self.prompt(task='Click Save', ledger=first_ledger)
+        misses_after_ledger_one = runtime._cached_decision_fragments.cache_info().misses
+        second_with_ledger = self.prompt(task='Click Save', ledger=second_ledger)
+        self.assertEqual(runtime._cached_decision_fragments.cache_info().misses, misses_after_ledger_one)
+        self.assertIn('/fixture/evidence-one', first_with_ledger)
+        self.assertNotIn('/fixture/evidence-two', first_with_ledger)
+        self.assertIn('/fixture/evidence-two', second_with_ledger)
+        self.assertNotIn('/fixture/evidence-one', second_with_ledger)
+
+        runtime._cached_completion_fragments.cache_clear()
+        first_verification = runtime.verification_instruction('Click Save', {}, OBSERVATION, [], first_ledger)
+        completion_misses = runtime._cached_completion_fragments.cache_info().misses
+        second_verification = runtime.verification_instruction('Click Save', {}, OBSERVATION, [], second_ledger)
+        self.assertEqual(runtime._cached_completion_fragments.cache_info().misses, completion_misses)
+        self.assertIn('/fixture/evidence-one', first_verification)
+        self.assertNotIn('/fixture/evidence-two', first_verification)
+        self.assertIn('/fixture/evidence-two', second_verification)
+        self.assertNotIn('/fixture/evidence-one', second_verification)
+
+    def test_prompt_cache_identity_includes_version_contract_phase_and_capabilities(self):
+        runtime._cached_decision_fragments.cache_clear()
+        task = 'Click Save'
+        observation = {'elements': [], 'applications': []}
+        context = runtime.task_capability_context(task, observation)
+        capability_set = runtime._prompt_capability_set(context, observation, [], task, None, None)
+        runtime._cached_decision_fragments(runtime.PROMPT_COMPILER_VERSION, runtime.CONTRACT_HASH,
+                                           'planning', capability_set, None)
+        before = runtime._cached_decision_fragments.cache_info()
+        runtime._cached_decision_fragments(runtime.PROMPT_COMPILER_VERSION + 1, runtime.CONTRACT_HASH,
+                                           'planning', capability_set, None)
+        runtime._cached_decision_fragments(runtime.PROMPT_COMPILER_VERSION, runtime.CONTRACT_HASH + 'x',
+                                           'planning', capability_set, None)
+        runtime._cached_decision_fragments(runtime.PROMPT_COMPILER_VERSION, runtime.CONTRACT_HASH,
+                                           'recovery', capability_set, 'stale_target')
+        changed_capabilities = tuple(sorted((*capability_set, 'vision_targets')))
+        runtime._cached_decision_fragments(runtime.PROMPT_COMPILER_VERSION, runtime.CONTRACT_HASH,
+                                           'planning', changed_capabilities, None)
+        after = runtime._cached_decision_fragments.cache_info()
+        self.assertEqual(after.misses - before.misses, 4)
 
     def test_complete_evidence_and_task_text_are_preserved_outside_rules(self):
         task = 'Save draft “Résumé” and return its contents'
