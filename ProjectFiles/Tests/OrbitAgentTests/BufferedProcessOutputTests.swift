@@ -45,6 +45,30 @@ final class BufferedProcessOutputTests: XCTestCase {
         return try capture.finish()
     }
 
+    private func captureSplitBytes(_ bytes: Data, limit: Int) throws -> BufferedProcessOutput.StreamResult {
+        let capture = try BufferedProcessOutput(maximumBytes: limit, spillRoot: fixture())
+        defer { capture.close() }
+        for byte in bytes {
+            try capture.stdout.write(contentsOf: Data([byte]))
+            // Ensure the asynchronous reader can observe separate writes,
+            // including cuts between bytes of a single Unicode scalar.
+            Thread.sleep(forTimeInterval: 0.001)
+        }
+        return try capture.finish().stdout
+    }
+
+    private func completeTextPrefix(_ text: String, byteLimit: Int) -> String {
+        var result = ""
+        var used = 0
+        for scalar in text.unicodeScalars {
+            let size = scalar.utf8.count
+            guard used + size <= byteLimit else { break }
+            result.unicodeScalars.append(scalar)
+            used += size
+        }
+        return result
+    }
+
     func testDrainBudgetBoundsBytesAndInterruptedOrShortReads() {
         var full = BufferedProcessOutput.DrainBudget()
         while full.nextReadSize > 0 {
@@ -219,8 +243,22 @@ final class BufferedProcessOutputTests: XCTestCase {
             // Pass the literal path as a positional argument to the shell.
             let output = try run(capture, "/bin/cat \"$1\"", arguments: [input.path])
             XCTAssertEqual(output.stdout.data, Data(text.utf8.prefix(cap)))
-            XCTAssertEqual(output.stdout.text, String(decoding: text.utf8.prefix(cap), as: UTF8.self))
+            XCTAssertEqual(output.stdout.text, completeTextPrefix(text, byteLimit: cap))
             XCTAssertEqual(output.stdout.truncated, text.utf8.count > cap)
+        }
+    }
+
+    func testTruncationAtEveryAccentAndEmojiByteKeepsOnlyCompleteTextScalars() throws {
+        let text = "AéB🙂ñC"
+        let raw = Data(text.utf8)
+        // These limits stop after the first byte of é, at each interior byte
+        // of the four-byte emoji, and after the first byte of ñ.
+        for limit in [2, 5, 6, 7, 9, raw.count] {
+            let output = try captureSplitBytes(raw, limit: limit)
+            XCTAssertEqual(output.data, Data(raw.prefix(limit)))
+            XCTAssertEqual(output.text, completeTextPrefix(text, byteLimit: limit))
+            XCTAssertEqual(output.truncated, limit < raw.count)
+            if limit < raw.count { XCTAssertFalse(output.text.contains("\u{FFFD}")) }
         }
     }
 
