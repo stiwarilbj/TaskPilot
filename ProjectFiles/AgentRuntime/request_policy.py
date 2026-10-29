@@ -7,6 +7,7 @@ from provider_errors import ProviderRequestError, facts, retry_time
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import ctypes
 import hashlib
 import errno
 import fcntl
@@ -19,6 +20,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import time
 from typing import Any, Callable
 from lock_order import LockCategory, reserve
@@ -32,12 +34,55 @@ ALL_MODELS = PRIMARY_MODELS + FALLBACK_MODELS
 CONFIG_VERSION = 5
 ERROR_POLICY_VERSION = 1
 VERIFICATION_CACHE_SECONDS = 600
+VERIFICATION_CLOCK_VERSION = 1
 READINESS_PRUNE_MAX_CREDENTIALS = 64
 READINESS_PRUNE_MAX_IDENTITIES = 128
 READINESS_PRUNE_MAX_HEALTH_RECORDS = 128
 READINESS_PRUNE_MAX_LEASE_SCAN = 64
 READINESS_PRUNE_MAX_DIRECTORY_ENTRIES = 256
 _READINESS_IDENTITY = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _read_boot_session_marker() -> str | None:
+    """Return a stable operating-system boot identity, or fail closed."""
+    try:
+        if sys.platform == "darwin":
+            libc = ctypes.CDLL(None, use_errno=True)
+            sysctlbyname = libc.sysctlbyname
+            sysctlbyname.argtypes = (ctypes.c_char_p, ctypes.c_void_p,
+                                     ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p,
+                                     ctypes.c_size_t)
+            sysctlbyname.restype = ctypes.c_int
+            size = ctypes.c_size_t(0)
+            if sysctlbyname(b"kern.bootsessionuuid", None, ctypes.byref(size), None, 0) != 0:
+                return None
+            if size.value < 2 or size.value > 128:
+                return None
+            buffer = ctypes.create_string_buffer(size.value)
+            if sysctlbyname(b"kern.bootsessionuuid", buffer, ctypes.byref(size), None, 0) != 0:
+                return None
+            value = buffer.value.decode("ascii")
+            return value.lower() if re.fullmatch(r"[0-9a-fA-F-]{36}", value) else None
+        if sys.platform.startswith("linux"):
+            value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+            return value.lower() if re.fullmatch(r"[0-9a-fA-F-]{36}", value) else None
+    except Exception:
+        return None
+    return None
+
+
+_BOOT_SESSION_MARKER = _read_boot_session_marker()
+
+
+def _boot_session_marker() -> str | None:
+    return _BOOT_SESSION_MARKER
+
+
+def _finite_number(value: Any) -> bool:
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except (OverflowError, ValueError):
+        return False
 
 
 @dataclass
@@ -602,6 +647,36 @@ def _expired_verification(value: Any, now: float) -> bool:
         return False
 
 
+def _verification_cache_status(value: Any, clock: Any, *, wall_now: float,
+                               monotonic_now: float, boot_session: str | None) -> str:
+    """Classify a success stamp without letting wall-clock changes extend it.
+
+    Wall time is retained for compatibility and diagnostics. A cache hit is
+    authorized only when the stamp is complete, belongs to this boot session,
+    and its monotonic age is within the cache TTL. Unknown or discontinuous
+    clocks require a fresh verification but are retained by pruning.
+    """
+    if not all(_finite_number(item) for item in (value, wall_now, monotonic_now)):
+        return "uncertain"
+    if (not isinstance(clock, dict) or type(clock.get("version")) is not int or
+            clock.get("version") != VERIFICATION_CLOCK_VERSION):
+        return "uncertain"
+    stamp_boot = clock.get("boot_session")
+    stamp_wall = clock.get("wall")
+    stamp_monotonic = clock.get("monotonic")
+    if (not isinstance(boot_session, str) or not boot_session or len(boot_session) > 128 or
+            stamp_boot != boot_session or type(stamp_wall) not in (int, float) or
+            not _finite_number(stamp_wall) or not _finite_number(stamp_monotonic) or
+            stamp_monotonic < 0 or stamp_wall != value):
+        return "uncertain"
+    elapsed = monotonic_now - stamp_monotonic
+    if not math.isfinite(elapsed) or elapsed < 0:
+        return "uncertain"
+    if elapsed >= VERIFICATION_CACHE_SECONDS:
+        return "expired"
+    return "fresh"
+
+
 def _expired_temporary_failure(value: Any, now: float) -> bool:
     if not isinstance(value, dict) or value.get("state") != "temporary":
         return False
@@ -634,7 +709,8 @@ def _rotate_items(mapping: dict, items: list[tuple[Any, Any]]) -> None:
             mapping[key] = value
 
 
-def _prune_readiness_document(document: dict[str, Any], state: "RuntimeState", now: float) -> None:
+def _prune_readiness_document(document: dict[str, Any], state: "RuntimeState", now: float,
+                             monotonic_now: float, boot_session: str | None) -> None:
     """Bounded, conservative cleanup performed only while the state write lock is held."""
     credentials = document.get("credentials")
     if not isinstance(credentials, dict):
@@ -671,12 +747,29 @@ def _prune_readiness_document(document: dict[str, Any], state: "RuntimeState", n
                 verified = record.get("verified")
                 if isinstance(verified, dict) and examined_verification < READINESS_PRUNE_MAX_HEALTH_RECORDS:
                     remaining_health = READINESS_PRUNE_MAX_HEALTH_RECORDS - examined_verification
-                    for model, timestamp in _bounded_items(verified, remaining_health):
+                    verification_slice = _bounded_items(verified, remaining_health)
+                    clocks = record.get("verification_clocks")
+                    for model, timestamp in verification_slice:
                         examined_verification += 1
-                        if _expired_verification(timestamp, now):
+                        if isinstance(clocks, dict) and model in clocks:
+                            expired = _verification_cache_status(
+                                timestamp, clocks[model], wall_now=now,
+                                monotonic_now=monotonic_now, boot_session=boot_session) == "expired"
+                        elif "verification_clocks" not in record or isinstance(clocks, dict):
+                            # Legacy entries are never accepted as cache hits;
+                            # their wall time is used only to reclaim clearly old data.
+                            expired = _expired_verification(timestamp, now)
+                        else:
+                            expired = False
+                        if expired:
                             verified.pop(model, None)
+                            if isinstance(clocks, dict):
+                                clocks.pop(model, None)
+                    _rotate_items(verified, verification_slice)
                     if not verified:
                         record.pop("verified", None)
+                    if isinstance(clocks, dict) and not clocks:
+                        record.pop("verification_clocks", None)
                 # Keep invalidation markers, single-flight results, and any
                 # unknown future fields. Delete only a cache-only empty shell.
                 if not record:
@@ -835,7 +928,8 @@ class RuntimeState:
             if write:
                 # Best-effort and strictly bounded. Any uncertain descriptor,
                 # lease, timestamp, or quota state is retained by the pruner.
-                _prune_readiness_document(document, self, time.time())
+                _prune_readiness_document(document, self, time.time(), time.monotonic(),
+                                          _boot_session_marker())
                 document["revision"] = int(document.get("revision", 0)) + 1
                 self.value["revision"] = document["revision"]
                 fd, name = tempfile.mkstemp(prefix=".runtime-readiness-", dir=self.root)
@@ -863,11 +957,15 @@ class RuntimeState:
             for bucket in document["credentials"].values():
                 for record in bucket.get("records", {}).values():
                     record["verified"] = {}
+                    record["verification_clocks"] = {}
                     record.setdefault("invalidations", {})["*"] = document.get("revision", 0) + 1
 
-    def verify(self, model: str, started_revision: int | None = None, *, now: float | None = None) -> bool:
-        now = time.time() if now is None else now
+    def verify(self, model: str, started_revision: int | None = None, *, now: float | None = None,
+               monotonic_now: float | None = None, boot_session: str | None = None) -> bool:
         with self.transaction(write=True) as (document, bucket, record):
+            wall_now = time.time() if now is None else now
+            monotonic_stamp = time.monotonic() if monotonic_now is None else monotonic_now
+            boot_stamp = _boot_session_marker() if boot_session is None else boot_session
             # An old success must never erase a failure observed after it began.
             boundary = document.get("revision", 0) if started_revision is None else started_revision
             if max(bucket.get("invalidated_revision", 0), record.get("invalidations", {}).get("*", 0),
@@ -875,18 +973,40 @@ class RuntimeState:
             for field, key in (("health", model), ("credential_health", model.split('/', 1)[0])):
                 failure = (self.model_health_records(bucket) if field == "health" else bucket[field]).get(key, {})
                 if failure and (failure.get("revision", 0) > boundary or
-                    (failure.get("state") == "temporary" and failure.get("retry_at") is not None and failure["retry_at"] > now)):
+                    (failure.get("state") == "temporary" and failure.get("retry_at") is not None and failure["retry_at"] > wall_now)):
                     return False
             self.model_health_records(bucket).pop(model, None)
             bucket["credential_health"].pop(model.split('/', 1)[0], None)
-            record["verified"][model] = now
+            clocks = record.setdefault("verification_clocks", {})
+            if not isinstance(clocks, dict):
+                clocks = record["verification_clocks"] = {}
+            valid_clock = (_finite_number(wall_now) and _finite_number(monotonic_stamp) and
+                           monotonic_stamp >= 0 and isinstance(boot_stamp, str) and
+                           0 < len(boot_stamp) <= 128)
+            if valid_clock:
+                record["verified"][model] = wall_now
+                clocks[model] = {"version": VERIFICATION_CLOCK_VERSION, "boot_session": boot_stamp,
+                                 "wall": wall_now, "monotonic": monotonic_stamp}
+            else:
+                # The provider result is successful, but an uncertain local clock
+                # must not authorize a cache hit on a later readiness request.
+                record["verified"].pop(model, None)
+                clocks.pop(model, None)
             return True
 
     def invalidate(self, model: str | None = None) -> None:
         with self.transaction(write=True) as (document, _, record):
             record.setdefault("invalidations", {})[model or "*"] = document.get("revision", 0) + 1
-            if model: record["verified"].pop(model, None)
-            else: record["verified"].clear()
+            if model:
+                record["verified"].pop(model, None)
+                clocks = record.get("verification_clocks")
+                if isinstance(clocks, dict):
+                    clocks.pop(model, None)
+                    if not clocks:
+                        record.pop("verification_clocks", None)
+            else:
+                record["verified"].clear()
+                record.pop("verification_clocks", None)
 
     def record_failure(self, model: str, failure: Failure) -> None:
         with self.transaction(write=True) as (document, bucket, record):
@@ -904,11 +1024,24 @@ class RuntimeState:
             health_records[key] = health
             for other_record in bucket["records"].values():
                 verified = other_record.setdefault("verified", {})
-                if failure.kind in {"credentials", "transport", "configuration"}: verified.clear()
+                clocks = other_record.get("verification_clocks")
+                if failure.kind in {"credentials", "transport", "configuration"}:
+                    verified.clear()
+                    other_record.pop("verification_clocks", None)
                 elif shared:
                     for other in list(verified):
-                        if other.startswith(key + '/'): verified.pop(other, None)
-                else: verified.pop(model, None)
+                        if other.startswith(key + '/'):
+                            verified.pop(other, None)
+                            if isinstance(clocks, dict):
+                                clocks.pop(other, None)
+                    if isinstance(clocks, dict) and not clocks:
+                        other_record.pop("verification_clocks", None)
+                else:
+                    verified.pop(model, None)
+                    if isinstance(clocks, dict):
+                        clocks.pop(model, None)
+                        if not clocks:
+                            other_record.pop("verification_clocks", None)
 
     @staticmethod
     def current_health(result: Any, now: float | None = None) -> dict[str, Any]:
@@ -934,10 +1067,23 @@ class RuntimeState:
     def health(self, model: str, *, now: float | None = None) -> dict[str, Any]:
         return self.attempt_snapshot(model, now=now)[0]
 
-    def verified_model(self) -> str | None:
+    def verified_model(self, *, now: float | None = None, monotonic_now: float | None = None,
+                       boot_session: str | None = None) -> str | None:
         with self.transaction():
-            now = time.time()
-            return next((m for m in ALL_MODELS if not self.current_health(self.value["credential_health"].get(m.split('/', 1)[0], {})) and not self.current_health(self.value["health"].get(m, {})) and type(self.value["verified"].get(m)) in (int, float) and 0 <= now - self.value["verified"][m] < VERIFICATION_CACHE_SECONDS), None)
+            wall_now = time.time() if now is None else now
+            monotonic_stamp = time.monotonic() if monotonic_now is None else monotonic_now
+            boot_stamp = _boot_session_marker() if boot_session is None else boot_session
+            clocks = self.value.get("verification_clocks", {})
+            for model in ALL_MODELS:
+                if (self.current_health(self.value["credential_health"].get(model.split('/', 1)[0], {})) or
+                        self.current_health(self.value["health"].get(model, {}))):
+                    continue
+                clock = clocks.get(model) if isinstance(clocks, dict) else None
+                if _verification_cache_status(self.value["verified"].get(model), clock,
+                                              wall_now=wall_now, monotonic_now=monotonic_stamp,
+                                              boot_session=boot_stamp) == "fresh":
+                    return model
+            return None
 
     def check_revision(self) -> int:
         with self.transaction():

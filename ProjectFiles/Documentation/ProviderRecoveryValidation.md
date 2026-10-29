@@ -39,6 +39,15 @@ repair failures and malformed or indefinite cooldowns remain. Managed-health
 namespaces for the current and validated rollback installations are retained.
 Pruning runs only as part of an existing write and adds no provider checks.
 
+Successful provider verifications retain their wall-clock timestamp and a
+versioned monotonic timestamp paired with the operating-system boot-session
+identifier. A cached success is usable only on the same boot with a valid,
+non-regressing monotonic clock and an age under ten minutes. Wall-clock jumps
+within that boot do not expire or extend the cache. A reboot, unavailable boot
+identity, legacy timestamp-only entry, malformed stamp, or monotonic regression
+requires a fresh verification. Model and credential cooldown records are not
+modified by clock-cache validation.
+
 Regression coverage includes healthy execution, model-specific fallback,
 shared quota exhaustion, reported resets, cancelled/interrupted waits, cached
 shared limits, credential changes, upstream attempt exhaustion, anonymous

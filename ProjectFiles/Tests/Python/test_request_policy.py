@@ -176,16 +176,128 @@ class RequestPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(policy.time, 'time', return_value=1000):
             root = Path(directory)
             state = policy.RuntimeState('fingerprint', 'v1', root)
-            state.verify(policy.PRIMARY_MODELS[0])
-            self.assertEqual(state.verified_model(), policy.PRIMARY_MODELS[0])
+            state.verify(policy.PRIMARY_MODELS[0], now=1000, monotonic_now=100, boot_session='boot-a')
+            self.assertEqual(state.verified_model(now=1000, monotonic_now=100, boot_session='boot-a'),
+                             policy.PRIMARY_MODELS[0])
             self.assertIsNone(policy.RuntimeState('changed', 'v1', root).verified_model())
             self.assertIsNone(policy.RuntimeState('fingerprint', 'v2', root).verified_model())
             with mock.patch.object(policy.time, 'time', return_value=1600):
-                self.assertIsNone(state.verified_model())
+                self.assertIsNone(state.verified_model(now=1600, monotonic_now=700, boot_session='boot-a'))
             state.record_failure(policy.PRIMARY_MODELS[0], policy.Failure('temporary', 'overloaded', 1100))
             self.assertIsNone(state.verified_model())
             self.assertEqual(policy.RuntimeState('fingerprint', 'v1', root).health(policy.PRIMARY_MODELS[0])['state'], 'temporary')
             self.assertEqual(state.path.stat().st_mode & 0o777, 0o600)
+
+    def test_readiness_success_cache_uses_monotonic_age_and_rejects_reboot_or_uncertain_clock(self):
+        model = policy.PRIMARY_MODELS[0]
+        with tempfile.TemporaryDirectory() as directory:
+            state = policy.RuntimeState('fingerprint', 'v1', Path(directory))
+            state.verify(model, now=10_000, monotonic_now=100, boot_session='boot-a')
+
+            # Large forward and backward wall-clock corrections do not alter
+            # the ten-minute age while the boot marker and monotonic clock agree.
+            self.assertEqual(state.verified_model(now=99_000, monotonic_now=110, boot_session='boot-a'), model)
+            self.assertEqual(state.verified_model(now=1_000, monotonic_now=110, boot_session='boot-a'), model)
+
+            # Monotonic expiry, a reboot, or a monotonic regression all require
+            # a fresh readiness check even when wall time appears recent.
+            self.assertIsNone(state.verified_model(now=10_010, monotonic_now=700, boot_session='boot-a'))
+            self.assertIsNone(state.verified_model(now=10_010, monotonic_now=101, boot_session='boot-b'))
+            self.assertIsNone(state.verified_model(now=10_010, monotonic_now=99, boot_session='boot-a'))
+
+            record = json.loads(state.path.read_text())['credentials'][state.credential]['records'][state.identity]
+            self.assertEqual(record['verified'][model], 10_000)
+            self.assertEqual(record['verification_clocks'][model], {
+                'version': policy.VERIFICATION_CLOCK_VERSION, 'boot_session': 'boot-a',
+                'wall': 10_000, 'monotonic': 100,
+            })
+
+    def test_readiness_clock_correction_cannot_authorize_a_stale_cached_check(self):
+        model = policy.PRIMARY_MODELS[0]
+        with tempfile.TemporaryDirectory() as directory:
+            state = policy.RuntimeState('fingerprint', 'v1', Path(directory))
+            state.verify(model, now=10_000, monotonic_now=100, boot_session='boot-a')
+            with mock.patch.object(policy, '_boot_session_marker', return_value='boot-a'), \
+                 mock.patch.object(policy.time, 'time', return_value=99_000), \
+                 mock.patch.object(policy.time, 'monotonic', return_value=110), \
+                 mock.patch.object(runtime, 'emit'):
+                self.assertTrue(runtime._perform_model_check('fixture', state, read_only=True))
+
+            # A wall-clock jump alone cannot make a 10-second success stale.
+            # A genuinely old monotonic success is not accepted as verified.
+            with mock.patch.object(policy, '_boot_session_marker', return_value='boot-a'), \
+                 mock.patch.object(policy.time, 'time', return_value=10_010), \
+                 mock.patch.object(policy.time, 'monotonic', return_value=700), \
+                 mock.patch.object(runtime, 'emit'), mock.patch.object(runtime, 'ACPClient') as client:
+                self.assertFalse(runtime._perform_model_check('fixture', state, read_only=True))
+                client.assert_not_called()
+
+            with mock.patch.object(policy, '_boot_session_marker', return_value='boot-b'), \
+                 mock.patch.object(policy.time, 'time', return_value=10_010), \
+                 mock.patch.object(policy.time, 'monotonic', return_value=101), \
+                 mock.patch.object(runtime, 'emit'), mock.patch.object(runtime, 'ACPClient') as client:
+                self.assertFalse(runtime._perform_model_check('fixture', state, read_only=True))
+                client.assert_not_called()
+
+    def test_legacy_or_malformed_verification_clock_never_authorizes_cache_hit(self):
+        model = policy.PRIMARY_MODELS[0]
+        with tempfile.TemporaryDirectory() as directory:
+            state = policy.RuntimeState('fingerprint', 'v1', Path(directory))
+            with state.transaction(write=True) as (_document, _bucket, record):
+                record['verified'][model] = 10_000
+            self.assertIsNone(state.verified_model(now=10_001, monotonic_now=101, boot_session='boot-a'))
+
+            state.verify(model, now=10_001, monotonic_now=101, boot_session='boot-a')
+            with state.transaction(write=True) as (_document, _bucket, record):
+                record['verification_clocks'][model]['monotonic'] = 'invalid'
+            self.assertIsNone(state.verified_model(now=10_002, monotonic_now=102, boot_session='boot-a'))
+
+            state.verify(model, now=10_003, monotonic_now=103, boot_session='boot-a')
+            state.invalidate(model)
+            record = json.loads(state.path.read_text())['credentials'][state.credential]['records'][state.identity]
+            self.assertNotIn(model, record['verified'])
+            self.assertNotIn('verification_clocks', record)
+
+    def test_pruning_uses_monotonic_expiry_despite_wall_clock_jumps(self):
+        model = policy.PRIMARY_MODELS[0]
+        old_identity = 'b' * 64
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(policy, '_rollback_readiness_protection', return_value=(set(), set(), set(), False)), \
+             mock.patch.object(policy, '_any_active_check_lease', return_value=False), \
+             mock.patch.object(policy, '_check_lease_state', return_value=False):
+            root = Path(directory)
+            state = policy.RuntimeState('fingerprint', 'v1', root)
+            old_record = {
+                'verified': {model: 10_000},
+                'verification_clocks': {model: {
+                    'version': policy.VERIFICATION_CLOCK_VERSION,
+                    'boot_session': 'boot-a', 'wall': 10_000, 'monotonic': 100,
+                }},
+            }
+            document = {'revision': 0, 'credentials': {state.credential: {
+                'records': {old_identity: old_record}, 'health': {}, 'credential_health': {},
+            }}}
+            state.path.write_text(json.dumps(document)); state.path.chmod(0o600)
+
+            with mock.patch.object(policy, '_boot_session_marker', return_value='boot-a'), \
+                 mock.patch.object(policy.time, 'time', return_value=99_000), \
+                 mock.patch.object(policy.time, 'monotonic', return_value=110):
+                state.finish_check(True)
+                retained = json.loads(state.path.read_text())['credentials'][state.credential]['records']
+                self.assertIn(old_identity, retained)
+
+            with mock.patch.object(policy, '_boot_session_marker', return_value='boot-a'), \
+                 mock.patch.object(policy.time, 'time', return_value=10_600), \
+                 mock.patch.object(policy.time, 'monotonic', return_value=700):
+                state.finish_check(True)
+                pruned = json.loads(state.path.read_text())['credentials'][state.credential]['records']
+                self.assertNotIn(old_identity, pruned)
+
+            state.verify(model, now=10_004, monotonic_now=104, boot_session='boot-a')
+            state.record_failure(model, policy.Failure('temporary', 'fixture', retry_at=20_000))
+            record = json.loads(state.path.read_text())['credentials'][state.credential]['records'][state.identity]
+            self.assertNotIn(model, record['verified'])
+            self.assertNotIn('verification_clocks', record)
 
     def test_readiness_pruning_is_bounded_and_preserves_current_rollback_and_cooldowns(self):
         now = 50_000.0
@@ -208,9 +320,16 @@ class RequestPolicyTests(unittest.TestCase):
                 "credential_health": {"google": {"state": "temporary", "retry_at": None,
                                                      "failure_kind": "quota", "revision": 8}},
             }
+            current_verification_clock = {
+                "version": policy.VERIFICATION_CLOCK_VERSION,
+                "boot_session": policy._boot_session_marker(),
+                "wall": now - 20,
+                "monotonic": policy.time.monotonic(),
+            }
             bucket = {
                 "records": {
-                    state.identity: {"verified": {model: now - 20}},
+                    state.identity: {"verified": {model: now - 20},
+                                     "verification_clocks": {model: current_verification_clock}},
                     old_id: {"verified": {model: now - 601}},
                     rollback_id: {"verified": {model: now - 601}},
                     active_id: {"verified": {model: now - 601}},
@@ -309,7 +428,15 @@ class RequestPolicyTests(unittest.TestCase):
             root = Path(directory)
             state = policy.RuntimeState("key", "version", root)
             records = {f"{index + 1000:064x}": {"verified": {model: now - 601}} for index in range(200)}
-            records[state.identity] = {"verified": {model: now - 10}}
+            records[state.identity] = {
+                "verified": {model: now - 10},
+                "verification_clocks": {model: {
+                    "version": policy.VERIFICATION_CLOCK_VERSION,
+                    "boot_session": policy._boot_session_marker(),
+                    "wall": now - 10,
+                    "monotonic": policy.time.monotonic(),
+                }},
+            }
             document = {"revision": 0, "credentials": {state.credential: {
                 "records": records, "health": {}, "credential_health": {}, "managed_health": {},
             }}}
