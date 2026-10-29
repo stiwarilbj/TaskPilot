@@ -1,6 +1,7 @@
 """Bounded decoding of provider error envelopes; no provider calls or raw-error persistence."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 import json
@@ -31,7 +32,19 @@ def error_object(value: Any) -> dict[str, Any] | None:
     return result if isinstance(result, dict) else None
 
 
+@dataclass(frozen=True)
+class ErrorView:
+    """One local traversal, preserving bounded node order and string fallback.
+
+    Nodes reference the received envelope; callers must not mutate it during
+    classification. Nothing is cached globally or persisted.
+    """
+    nodes: tuple[dict[str, Any], ...]
+    fallback_text: str | None
+
+
 def error_nodes(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, ErrorView): return list(payload.nodes)
     nodes: list[dict[str, Any]] = []
     seen: set[int] = set()
     def visit(value, depth=0):
@@ -49,8 +62,13 @@ def error_nodes(payload: Any) -> list[dict[str, Any]]:
     return nodes
 
 
+def normalize_error(payload: Any) -> ErrorView:
+    if isinstance(payload, ErrorView): return payload
+    return ErrorView(tuple(error_nodes(payload)), payload[:262144] if isinstance(payload, str) else None)
+
+
 def facts(payload: Any, model: str | None = None) -> dict[str, Any]:
-    nodes = error_nodes(payload)
+    nodes = normalize_error(payload).nodes
     result: dict[str, Any] = {}
     for node in nodes:
         code = node.get('code')
@@ -120,7 +138,7 @@ def retry_time(payload: Any, message: str, now: float) -> float | None:
         elif isinstance(value, str):
             try: deadlines.append(datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp())
             except (ValueError, TypeError, OverflowError): pass
-    for node in error_nodes(payload):
+    for node in normalize_error(payload).nodes:
         for key in ('retryAfter', 'retry_after', 'retryAfterSeconds', 'retryDelay'):
             if key in node: delay(node[key])
         for key in ('retryAfterMs', 'retry_after_ms'):
@@ -144,9 +162,10 @@ def retry_time(payload: Any, message: str, now: float) -> float | None:
 
 
 def message_text(payload: Any, default: str = 'OpenClaw provider request failed') -> str:
-    messages = [n[key] for n in error_nodes(payload) for key in ('message', 'errorMessage', 'rawError')
+    view = normalize_error(payload)
+    messages = [n[key] for n in view.nodes for key in ('message', 'errorMessage', 'rawError')
                 if isinstance(n.get(key), str)]
-    text = messages[-1] if messages else payload if isinstance(payload, str) else default
+    text = messages[-1] if messages else view.fallback_text if view.fallback_text is not None else default
     return str(text)[:262144]
 
 
@@ -154,7 +173,17 @@ class ProviderRequestError(RuntimeError):
     """Keep the envelope in memory until it has been classified, never stringify its data."""
     def __init__(self, payload: Any, model: str | None = None, default: str = 'OpenClaw provider request failed') -> None:
         self.payload, self.model = payload, model
-        super().__init__(message_text(payload, default))
+        self._error_view = normalize_error(payload)
+        super().__init__(message_text(self._error_view, default))
+
+    def take_error_view(self) -> ErrorView:
+        """Hand classification the constructor's traversal, then release it.
+
+        Reclassification deliberately builds a fresh view rather than keeping
+        raw parsed errors alive as a cache on an already classified exception.
+        """
+        view, self._error_view = self._error_view, None
+        return view if view is not None else normalize_error(self.payload)
 
 
 def response_error(response: str | dict[str, Any]) -> dict[str, Any] | None:

@@ -7,6 +7,26 @@ transcripts, Gateway transcript recovery, and provider error JSON returned as
 text. Raw envelopes remain in memory; the readiness file contains only
 normalized identifiers and policy facts.
 
+Provider-error classification shares one request-local normalized view between
+message selection, structured facts, retry accounting, and cooldown extraction.
+It preserves the existing traversal order and limits: depth eight, 64 nodes,
+32 entries per traversed list, and 262,144 characters per embedded JSON string.
+Equal embedded strings remain separate occurrences; native object aliases and
+cycles retain their existing handling. No process-wide error cache is created.
+`ProviderRequestError` hands its message-selection view to classification once
+and releases it there. A later classification builds a fresh view, including
+fresh relative retry deadlines. Failed upstream attempts each get their own view.
+
+Precedence remains field-specific: later codes and statuses can replace earlier
+ones, the first valid provider retry count wins, and explicit credential scope
+dominates model scope. An individual envelope uses the latest valid cooldown
+hint; the existing generic failed-attempt wrapper still uses the earliest
+applicable attempt deadline. Upstream exhaustion never grants a new local retry.
+Offline tests assert these rules and count traversals/embedded JSON decodes,
+including conflicting fields, bounds, aliases, and release after classification.
+Run the focused fixtures with
+`python3 -m unittest discover -s ProjectFiles/Tests/Python -p 'test_provider_error*.py'`.
+
 Recovery distinguishes explicit account/project limits from limits containing
 a model dimension. A quota code or the word “daily” alone does not establish
 account-wide scope. Shared cooldowns invalidate sibling verification and block

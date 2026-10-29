@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from response_validation import VALIDATION_VERSION
 from action_contract_generated import CONTRACT_HASH
-from provider_errors import ProviderRequestError, facts, retry_time
+from provider_errors import ProviderRequestError, facts, normalize_error, retry_time
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -187,8 +187,8 @@ def classify_failure(error: BaseException, now: float, model: str | None = None,
                        model=error.failure.model or (model.split('/', 1)[-1] if model else None))
     message = str(error)
     lowered = message.lower()
-    payload = error.payload if isinstance(error, ProviderRequestError) else message
-    fields = facts(payload, getattr(error, "model", None) or model)
+    view = error.take_error_view() if isinstance(error, ProviderRequestError) else normalize_error(message)
+    fields = facts(view, getattr(error, "model", None) or model)
     if str(getattr(error, 'code', '')).startswith(('transport_', 'local_resource_')):
         fields['code'] = error.code
     code, status, reason = fields.get("code"), fields.get("status"), fields.get("reason")
@@ -199,7 +199,8 @@ def classify_failure(error: BaseException, now: float, model: str | None = None,
         if match:
             http = int(match.group(1))
     upstream = fields["recovered_upstream"] or any(s in lowered for s in ("all models failed", "recovery exhausted", "retry budget exhausted"))
-    reset = retry_time(payload, message, now)
+    reset = retry_time(view, message, now)
+    del view
     scope = fields["scope"]
 
     if str(code).startswith('local_resource_'):
