@@ -12,11 +12,13 @@ final class RuntimePipeWriter {
         let completion: (Bool) -> Void
         let waitTicket: BackendTelemetry.QueueTicket
         let budget: LocalOperationBudget?
+        let workload: LocalWorkloadGovernor.Reservation
     }
     private let descriptor: Int32
     private let queue: DispatchQueue
     private let failure: (String) -> Void
     private let telemetry: BackendTelemetry
+    private let governor: LocalWorkloadGovernor
     // Injectable only so tests can force partial POSIX writes; production uses Darwin.write.
     private let writeOperation: WriteOperation
     // A consumed slot is cleared as soon as its completion callback is taken.
@@ -36,11 +38,13 @@ final class RuntimePipeWriter {
     init(handle: FileHandle, queue: DispatchQueue, byteLimit: Int = 32 * 1024 * 1024,
          reserve: Int = 8 * 1024 * 1024, timeout: TimeInterval = 5,
          descriptorOwner: BackendDescriptors.Owner? = TaskOwnership.current?.descriptorOwner, telemetry: BackendTelemetry = .current,
+         governor: LocalWorkloadGovernor = .shared,
          writeOperation: @escaping WriteOperation = { descriptor, bytes, count in Darwin.write(descriptor, bytes, count) },
          failure: @escaping (String) -> Void) {
         BackendDescriptors.shared.track(handle, subsystem: .runtimeWritePipe, owner: descriptorOwner)
         descriptor = handle.fileDescriptor; self.queue = queue; self.failure = failure; self.telemetry = telemetry
         self.writeOperation = writeOperation
+        self.governor = governor
         self.byteLimit = byteLimit; self.reserve = reserve; self.timeout = timeout
         let flags = fcntl(descriptor, F_GETFL)
         // Darwin.write otherwise raises SIGPIPE before it can return EPIPE.
@@ -59,6 +63,13 @@ final class RuntimePipeWriter {
         guard !closed else { waitTicket.discard(.rejected); completion(false); return }
         do { try budget?.check(phase: "pipe_queue") }
         catch { rejectExpired(waitTicket, completion: completion, error: error); return }
+        let workload: LocalWorkloadGovernor.Reservation
+        do { workload = try governor.reserve(priority ? .terminalIPC : .ipc, budget: budget) }
+        catch {
+            waitTicket.discard(.rejected); completion(false); fail("transport_local_resource"); return
+        }
+        var transferred = false
+        defer { if !transferred { workload.finish() } }
         let data = payload()
         do { try budget?.check(phase: "pipe_queue") }
         catch { rejectExpired(waitTicket, completion: completion, error: error); return }
@@ -71,7 +82,12 @@ final class RuntimePipeWriter {
             waitTicket.discard(.rejected)
             completion(false); fail("transport_buffer_limit"); return
         }
-        frames.append(Frame(data: data, completion: completion, waitTicket: waitTicket, budget: budget)); bytes += data.count
+        do { try workload.update(.init(memoryBytes: data.count)) }
+        catch {
+            waitTicket.discard(.rejected); completion(false); fail("transport_local_resource"); return
+        }
+        frames.append(Frame(data: data, completion: completion, waitTicket: waitTicket, budget: budget, workload: workload))
+        transferred = true; bytes += data.count
         if source == nil {
             let source = DispatchSource.makeWriteSource(fileDescriptor: descriptor, queue: queue)
             source.setEventHandler { [weak self] in self?.pump() }
@@ -103,12 +119,16 @@ final class RuntimePipeWriter {
             // existing transport timeout. Dropping its suffix corrupts framing
             // and cannot establish that an associated action failed.
             if frames[frameHead]!.offset == 0 {
-                do { try frames[frameHead]!.budget?.check(phase: "pipe_queue") }
+                do {
+                    try frames[frameHead]!.budget?.check(phase: "pipe_queue")
+                    try frames[frameHead]!.workload.start()
+                }
                 catch {
                     let index = frameHead
                     let frameBytes = frames[index]!.data.count
                     let ticket = frames[index]!.waitTicket
                     let completion = frames[index]!.completion
+                    frames[index]!.workload.finish()
                     frameHead += 1; bytes -= frameBytes
                     frames[index] = nil
                     compactConsumedPrefixIfNeeded()
@@ -132,6 +152,7 @@ final class RuntimePipeWriter {
                 let index = frameHead
                 let frameBytes = frames[index]!.data.count
                 let completion = frames[index]!.completion
+                frames[index]!.workload.finish()
                 frameHead += 1
                 bytes -= frameBytes
                 frames[index] = nil
@@ -166,6 +187,7 @@ final class RuntimePipeWriter {
         frames.removeAll(keepingCapacity: true); frameHead = 0; bytes = 0
         for frame in pending {
             frame.waitTicket.discard(.cancelled)
+            frame.workload.finish()
             frame.completion(false)
         }
     }

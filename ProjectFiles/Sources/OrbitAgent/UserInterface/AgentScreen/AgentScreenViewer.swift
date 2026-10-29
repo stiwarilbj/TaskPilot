@@ -71,6 +71,10 @@ final class AgentScreenViewerModel: ObservableObject {
                     try await Task.sleep(for: .milliseconds(100))
                 } catch is CancellationError {
                     return
+                } catch let refusal as LocalWorkloadGovernor.Refused where refusal.deferred {
+                    // Keep the last disposable preview. Resource pressure is
+                    // a skipped refresh, not a lost display connection.
+                    try? await Task.sleep(for: .seconds(1))
                 } catch {
                     image = nil
                     status = error.localizedDescription

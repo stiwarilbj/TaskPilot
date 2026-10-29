@@ -74,11 +74,15 @@ final class SubprocessSupervisor: @unchecked Sendable {
     private let inspectionCheck: () -> Bool
     let descriptorOwner: BackendDescriptors.Owner?
     private let resourceSnapshot: () -> DescriptorHeadroom?
+    private let governor: LocalWorkloadGovernor
+    private var workload: LocalWorkloadGovernor.Reservation?
 
     init(descriptorOwner: BackendDescriptors.Owner? = TaskOwnership.current?.descriptorOwner, launchCheck: @escaping () throws -> Void = {}, inspectionCheck: @escaping () -> Bool = { true },
-         resourceSnapshot: @escaping () -> DescriptorHeadroom? = { DescriptorHeadroom.read() }) {
+         resourceSnapshot: @escaping () -> DescriptorHeadroom? = { DescriptorHeadroom.read() },
+         governor: LocalWorkloadGovernor = .shared) {
         self.descriptorOwner = descriptorOwner
         self.launchCheck = launchCheck; self.inspectionCheck = inspectionCheck; self.resourceSnapshot = resourceSnapshot
+        self.governor = governor
     }
     var snapshot: Snapshot { condition.withLock { state } }
     var isRunning: Bool { condition.withLock { state.launched && !state.parentExited } }
@@ -115,6 +119,7 @@ final class SubprocessSupervisor: @unchecked Sendable {
     }
 
     func run() throws {
+        let budget = LocalOperationBudget.current
         do { try queue.sync {
             try launchCheck()
             guard !snapshot.launched, let executableURL else { throw Failure.launch(EINVAL) }
@@ -122,6 +127,13 @@ final class SubprocessSupervisor: @unchecked Sendable {
             // concurrent launch can consume headroom after this read; retain
             // all existing OS launch errors and partial-launch drainage.
             if let resources = resourceSnapshot(), !resources.permitsLaunch { throw Failure.localResourceExhausted }
+            // Account for controller-side launch/monitoring work through the
+            // entire owned tree, not just the immediate parent's lifetime.
+            let reservation = try governor.reserve(.helper, demand: .init(memoryBytes: 256 * 1024,
+                descriptors: DescriptorHeadroom.launchReserve), budget: budget)
+            try reservation.start()
+            var transferred = false
+            defer { if !transferred { reservation.finish() } }
             let argv = ([executableURL.path] + arguments).map { strdup($0) } + [nil]
             let env = (environment ?? ProcessInfo.processInfo.environment).sorted { $0.key < $1.key }.map { strdup("\($0.key)=\($0.value)") } + [nil]
             defer { argv.forEach { free($0) }; env.forEach { free($0) } }
@@ -143,6 +155,7 @@ final class SubprocessSupervisor: @unchecked Sendable {
             guard code == 0 else { throw Failure.launch(code) }
             processIdentifier = pid
             condition.withLock { state.launched = true; state.groupAcknowledged = true }
+            workload = reservation; transferred = true
             var identity = TPProcessIdentity()
             if tp_process_identity(pid, &identity) == 1 { identities[pid] = identity; rootIdentity = identity }
             let source = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: queue)
@@ -285,6 +298,7 @@ final class SubprocessSupervisor: @unchecked Sendable {
             return state.treeFinished
         }
         if finished {
+            workload?.finish(); workload = nil
             monitor?.cancel(); monitor = nil
             for (_, source) in watchers.values { source.cancel() }
             watchers.removeAll()

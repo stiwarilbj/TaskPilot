@@ -3,6 +3,32 @@ import XCTest
 
 final class MemoryPressureTests: XCTestCase {
     private final class Payload {}
+    func testPressureCallbackCanReleaseItsRegistrationWithoutLockReentry() {
+        let monitor = MemoryPressureMonitor(listen: false)
+        var registration: MemoryPressureMonitor.Registration?
+        var revisions: [UInt64] = []
+        registration = monitor.registerPressure { flags, revision in
+            revisions.append(revision)
+            if flags.contains(.warning) { registration = nil }
+        }
+        monitor.receive(.warning)
+        XCTAssertNil(registration)
+        monitor.receive(.normal)
+        XCTAssertEqual(revisions, [0, 1])
+    }
+
+    func testLatestPressureLevelWinsAfterConcurrentCallbacks() throws {
+        let monitor = MemoryPressureMonitor(listen: false)
+        let governor = LocalWorkloadGovernor(monitor: monitor)
+        DispatchQueue.concurrentPerform(iterations: 1000) { index in
+            monitor.receive(index.isMultiple(of: 2) ? .warning : .normal)
+        }
+        monitor.receive(.normal)
+        let ticket = try governor.reserve(.previewCapture)
+        ticket.finish()
+        XCTAssertEqual(governor.snapshot.reservations, 0)
+    }
+
     func testWarningAndCriticalReleaseCacheOwnershipButNormalDoesNot() {
         let monitor = MemoryPressureMonitor(listen: false)
         let cache = PressureSensitiveCache<Payload>(monitor: monitor)

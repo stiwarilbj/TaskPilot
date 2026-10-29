@@ -650,6 +650,20 @@ enum ManagedGatewayHost {
                 let forceFullIntegrityAudit = integritySchedule.shouldRun(
                     at:monotonicNow, forced:faultRequested || repair || dirtyMetadata.contains(.installation) || dirtyMetadata.contains(.rescanRequired))
                 if now >= nextAudit || faultRequested || requested && repair || fullIntegrityAuditDue || !dirtyMetadata.isEmpty {
+                    // Only a routine audit is disposable. Startup/full audits,
+                    // fault diagnosis and repairs retain their existing required
+                    // path. Deferral is not an integrity failure or restart.
+                    var maintenance: LocalWorkloadGovernor.Reservation?
+                    if !forceFullIntegrityAudit && !repair && !faultRequested && !requested && dirtyMetadata.isEmpty {
+                        do {
+                            maintenance = try LocalWorkloadGovernor.shared.reserve(.maintenance)
+                            try maintenance?.start()
+                        } catch is LocalWorkloadGovernor.Refused {
+                            maintenance?.finish(); nextAudit = now + 30
+                            continue
+                        }
+                    }
+                    defer { maintenance?.finish() }
                     if !dirtyMetadata.isEmpty {
                         writeHealth(current, state:"recovering", detail:"Checking private runtime changes", root:root)
                         nextHealth = 0

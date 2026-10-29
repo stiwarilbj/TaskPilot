@@ -46,15 +46,18 @@ actor CaptureAcquisitionQueue {
         let owner: TaskLease?
         let epoch: Int?
         private let queue: CaptureAcquisitionQueue
-        init(id: UUID, kind: Kind, cancellation: CaptureCancellation, owner: TaskLease?, epoch: Int?, queue: CaptureAcquisitionQueue) {
+        private let workload: LocalWorkloadGovernor.Reservation
+        init(id: UUID, kind: Kind, cancellation: CaptureCancellation, owner: TaskLease?, epoch: Int?, queue: CaptureAcquisitionQueue,
+             workload: LocalWorkloadGovernor.Reservation) {
             self.id = id; self.kind = kind; self.cancellation = cancellation; self.owner = owner
-            self.epoch = epoch; self.queue = queue
+            self.epoch = epoch; self.queue = queue; self.workload = workload
         }
         func checkAuthority() throws {
             try cancellation.check()
             if let owner { guard owner.state == .running, owner.suspensionRevision == epoch else { throw CancellationError() } }
         }
         func check() throws { try Task.checkCancellation(); try checkAuthority() }
+        func retainPixels(bytes: Int) throws { try workload.update(.init(memoryBytes: bytes)) }
         deinit { let id = id, queue = queue; Task { await queue.release(id) } }
     }
     private struct Request {
@@ -66,6 +69,7 @@ actor CaptureAcquisitionQueue {
         let observer: UUID?
         let waitTicket: BackendTelemetry.QueueTicket
         let budget: LocalOperationBudget?
+        let workload: LocalWorkloadGovernor.Reservation
         let continuation: CheckedContinuation<Reservation, Error>
         func rejection() -> Error? {
             do {
@@ -82,17 +86,26 @@ actor CaptureAcquisitionQueue {
     private var active: Request?
     private var frames: [UUID: Kind] = [:]
     private let maximumWaitingEvidence: Int
-    init(maximumWaitingEvidence: Int = 8) { self.maximumWaitingEvidence = max(1, maximumWaitingEvidence) }
+    private let governor: LocalWorkloadGovernor
+    init(maximumWaitingEvidence: Int = 8, governor: LocalWorkloadGovernor = .shared) {
+        self.maximumWaitingEvidence = max(1, maximumWaitingEvidence); self.governor = governor
+    }
     var statistics: Statistics {
         .init(evidenceFrames: frames.values.filter { $0 == .evidence }.count,
               previewFrames: frames.values.filter { $0 == .preview }.count,
               waitingEvidence: evidence.count, waitingPreview: preview == nil ? 0 : 1, acquiring: active != nil)
     }
     func acquire(_ kind: Kind, owner: TaskLease? = nil,
+                 estimatedBytes: Int = 0,
                  waitTicket suppliedTicket: BackendTelemetry.QueueTicket? = nil) async throws -> Reservation {
         let waitTicket = suppliedTicket ?? BackendTelemetry.current.beginQueueWait(kind == .evidence ? .captureEvidence : .capturePreview)
         let budget = LocalOperationBudget.current
-        do { try LocalOperationBudget.check("capture_queue") }
+        let workload: LocalWorkloadGovernor.Reservation
+        do {
+            try LocalOperationBudget.check("capture_queue")
+            workload = try governor.reserve(kind == .evidence ? .evidenceCapture : .previewCapture,
+                demand: .init(memoryBytes: estimatedBytes, descriptors: 2), budget: budget)
+        }
         catch { waitTicket.discard(error is CancellationError ? .cancelled : .rejected); throw error }
         let id = UUID(), cancellation = CaptureCancellation(), epoch = owner?.suspensionRevision
         return try await withTaskCancellationHandler {
@@ -101,15 +114,15 @@ actor CaptureAcquisitionQueue {
                     cancellation.cancel(); Task { await self?.cancel(id) }
                 }
                 let request = Request(id: id, kind: kind, cancellation: cancellation, owner: owner,
-                    epoch: epoch, observer: observer, waitTicket: waitTicket, budget: budget, continuation: continuation)
+                    epoch: epoch, observer: observer, waitTicket: waitTicket, budget: budget, workload: workload, continuation: continuation)
                 if let error = Task.isCancelled ? CancellationError() : request.rejection() {
                     waitTicket.discard(error is CancellationError ? .cancelled : .rejected)
-                    request.removeObserver(); continuation.resume(throwing: error); return
+                    request.removeObserver(); workload.finish(); continuation.resume(throwing: error); return
                 }
                 if kind == .evidence {
                     guard evidence.count < maximumWaitingEvidence else {
                         waitTicket.discard(.rejected)
-                        request.removeObserver(); continuation.resume(throwing: ScreenCaptureError.pipelineBusy); return
+                        request.removeObserver(); workload.finish(); continuation.resume(throwing: ScreenCaptureError.pipelineBusy); return
                     }
                     evidence.append(request)
                 } else {
@@ -117,6 +130,7 @@ actor CaptureAcquisitionQueue {
                     if let previous = preview {
                         previous.waitTicket.discard(.coalesced)
                         previous.cancellation.cancel(); previous.removeObserver()
+                        previous.workload.finish()
                         previous.continuation.resume(throwing: CancellationError())
                     }
                     if active?.kind == .preview { active?.cancellation.cancel() }
@@ -129,9 +143,11 @@ actor CaptureAcquisitionQueue {
     private func cancel(_ id: UUID) {
         if let index = evidence.firstIndex(where: { $0.id == id }) {
             let request = evidence.remove(at: index); request.waitTicket.discard(.cancelled); request.removeObserver()
+            request.workload.finish()
             request.continuation.resume(throwing: CancellationError())
         } else if preview?.id == id, let request = preview {
-            preview = nil; request.waitTicket.discard(.cancelled); request.removeObserver(); request.continuation.resume(throwing: CancellationError())
+            preview = nil; request.waitTicket.discard(.cancelled); request.removeObserver(); request.workload.finish()
+            request.continuation.resume(throwing: CancellationError())
         }
         // An active native acquisition must drain before another starts.
         if active?.id == id { active?.cancellation.cancel() }
@@ -143,11 +159,11 @@ actor CaptureAcquisitionQueue {
         // not reached this actor. Every continuation settles exactly once.
         while let first = evidence.first, let error = first.rejection() {
             evidence.removeFirst(); first.waitTicket.discard(error is CancellationError ? .cancelled : .rejected)
-            first.removeObserver(); first.continuation.resume(throwing: error)
+            first.removeObserver(); first.workload.finish(); first.continuation.resume(throwing: error)
         }
         if let request = preview, let error = request.rejection() {
             preview = nil; request.waitTicket.discard(error is CancellationError ? .cancelled : .rejected)
-            request.removeObserver(); request.continuation.resume(throwing: error)
+            request.removeObserver(); request.workload.finish(); request.continuation.resume(throwing: error)
         }
         let request: Request
         if !evidence.isEmpty, frames.values.filter({ $0 == .evidence }).count < 2 {
@@ -156,10 +172,16 @@ actor CaptureAcquisitionQueue {
             guard !frames.values.contains(.preview) else { return }
             request = next; preview = nil
         } else { return }
+        do { try request.workload.start() }
+        catch {
+            request.waitTicket.discard(error is CancellationError ? .cancelled : .rejected)
+            request.removeObserver(); request.workload.finish(); request.continuation.resume(throwing: error)
+            pump(); return
+        }
         request.waitTicket.start()
         active = request; frames[request.id] = request.kind
         request.continuation.resume(returning: Reservation(id: request.id, kind: request.kind,
-            cancellation: request.cancellation, owner: request.owner, epoch: request.epoch, queue: self))
+            cancellation: request.cancellation, owner: request.owner, epoch: request.epoch, queue: self, workload: request.workload))
     }
     func acquired(_ reservation: Reservation) {
         guard active?.id == reservation.id else { return }
@@ -184,6 +206,7 @@ final class CapturedFrame: @unchecked Sendable {
          reservation: CaptureAcquisitionQueue.Reservation) throws {
         // Validate before retaining the pixels or recording their memory size.
         self.imageStorageBytes = try CaptureFrameLimits.storageBytes(for: image)
+        try reservation.retainPixels(bytes: imageStorageBytes)
         self.image = image
         self.coordinates = coordinates; self.reservation = reservation
     }
@@ -211,6 +234,7 @@ actor CapturePNGEncoder {
         let queuedMemory: BackendTelemetry.MemoryTicket
         let budget: LocalOperationBudget?
         let requiredDiskBytes: UInt64
+        let workload: LocalWorkloadGovernor.Reservation
         let continuation: CheckedContinuation<URL, Error>
         func checkAdmission() throws {
             try cancellation.check(); try frame.reservation.checkAuthority()
@@ -221,6 +245,8 @@ actor CapturePNGEncoder {
     private let writer: Writer
     private let directory: URL
     private let spaceCheck: SpaceCheck
+    private let governor: LocalWorkloadGovernor
+    private let diskSnapshot: @Sendable (URL) throws -> LocalWorkloadGovernor.DiskSpace
     private var waiting: [Job] = []
     private var active: Job?
     private var activeMemory: BackendTelemetry.MemoryTicket?
@@ -231,8 +257,11 @@ actor CapturePNGEncoder {
              if let owner { try owner.requireCaptureDiskHeadroom(required) }
              else { try CaptureDiskHeadroom.check(directory: directory, requiredBytes: required) }
          },
+         governor: LocalWorkloadGovernor = .shared,
+         diskSnapshot: @escaping @Sendable (URL) throws -> LocalWorkloadGovernor.DiskSpace = { try .read(directory: $0) },
          writer: @escaping Writer = { try ScreenCaptureService.writePNG($0, to: $1) }) {
         self.directory = directory; self.writer = writer; self.spaceCheck = spaceCheck
+        self.governor = governor; self.diskSnapshot = diskSnapshot
     }
     var pendingCount: Int { waiting.count }
     var activeCount: Int { active == nil ? 0 : 1 }
@@ -247,6 +276,7 @@ actor CapturePNGEncoder {
         catch { waitTicket.discard(error is CancellationError ? .cancelled : .rejected); throw error }
         let outputDirectory: URL
         let requiredDiskBytes: UInt64
+        let workload: LocalWorkloadGovernor.Reservation
         var encodingHold: CaptureArtifactHold?
         defer { withExtendedLifetime(encodingHold) {} }
         do {
@@ -257,6 +287,9 @@ actor CapturePNGEncoder {
             guard !overflow else { throw CaptureDiskHeadroom.Failure.unavailable }
             requiredDiskBytes = try CaptureDiskHeadroom.requiredBytes(pixelBytes: UInt64(max(frame.imageStorageBytes, pixelBytes)))
             try spaceCheck(frame.reservation.owner, outputDirectory, requiredDiskBytes)
+            workload = try governor.reserve(frame.reservation.kind == .preview ? .previewEncoding : .evidenceEncoding,
+                demand: .init(memoryBytes: frame.imageStorageBytes, descriptors: 2, diskBytes: requiredDiskBytes,
+                              disk: try diskSnapshot(outputDirectory)), budget: budget)
         } catch {
             waitTicket.discard(error is CancellationError ? .cancelled : .rejected)
             throw error
@@ -278,7 +311,7 @@ actor CapturePNGEncoder {
                     url: outputDirectory.appendingPathComponent("screen-\(UUID().uuidString).png"),
                     cancellation: cancellation, observer: observer, telemetry: telemetry, waitTicket: waitTicket,
                     queuedMemory: telemetry.beginMemory(.queuedCaptureFrames, bytes: frame.imageStorageBytes),
-                    budget: budget, requiredDiskBytes: requiredDiskBytes, continuation: continuation)
+                    budget: budget, requiredDiskBytes: requiredDiskBytes, workload: workload, continuation: continuation)
                 frameIDs.insert(frame.id); waiting.append(job); pump()
             }
         } onCancel: { cancellation.cancel(); Task { await self.cancel(id) } }
@@ -290,6 +323,7 @@ actor CapturePNGEncoder {
         if let index = waiting.firstIndex(where: { $0.id == id }) {
             let job = waiting.remove(at: index); job.waitTicket.discard(.cancelled)
             job.queuedMemory.finish(); frameIDs.remove(job.frame.id); job.removeObserver()
+            job.workload.finish()
             job.continuation.resume(throwing: CancellationError())
         }
         if active?.id == id {
@@ -301,15 +335,15 @@ actor CapturePNGEncoder {
         guard active == nil, !waiting.isEmpty else { return }
         let job = waiting.removeFirst()
         job.queuedMemory.finish()
-        do { try job.checkAdmission() }
+        do { try job.checkAdmission(); try job.workload.start() }
         catch {
             job.waitTicket.discard(error is CancellationError ? .cancelled : .rejected)
-            frameIDs.remove(job.frame.id); job.removeObserver(); job.continuation.resume(throwing: error)
+            frameIDs.remove(job.frame.id); job.removeObserver(); job.workload.finish(); job.continuation.resume(throwing: error)
             pump(); return
         }
         activeMemory = job.telemetry.beginMemory(.activeCaptureEncodes, bytes: job.frame.imageStorageBytes)
         active = job
-        let writer = writer, directory = job.directory, spaceCheck = spaceCheck
+        let writer = writer, directory = job.directory, spaceCheck = spaceCheck, diskSnapshot = diskSnapshot
         // Evidence frames participate in planning/action decisions and keep
         // their existing interactive scheduling. Disposable preview frames
         // yield to active work; this does not reorder the bounded FIFO queue.
@@ -321,6 +355,8 @@ actor CapturePNGEncoder {
                 // Admission can precede this worker by an arbitrarily slow
                 // encode. Recheck the actual destination before ImageIO starts.
                 try spaceCheck(job.frame.reservation.owner, directory, job.requiredDiskBytes)
+                try job.workload.update(.init(memoryBytes: job.frame.imageStorageBytes, descriptors: 2,
+                    diskBytes: job.requiredDiskBytes, disk: try diskSnapshot(directory)))
                 try job.cancellation.check(); try job.frame.check(); try job.budget?.check(phase: "capture_encoding")
             }
             catch {
@@ -359,6 +395,7 @@ actor CapturePNGEncoder {
         guard active?.id == job.id else { return }
         active = nil; activeMemory?.finish(); activeMemory = nil
         worker = nil; frameIDs.remove(job.frame.id); job.removeObserver()
+        job.workload.finish()
         do {
             try job.cancellation.check(); try job.frame.check(); try job.budget?.check(phase: "capture_encoding")
             let url = try result.get(); job.continuation.resume(returning: url)

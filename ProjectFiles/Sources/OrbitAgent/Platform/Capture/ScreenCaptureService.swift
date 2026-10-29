@@ -57,9 +57,11 @@ actor ScreenCaptureService {
     private let encoder: CapturePNGEncoder
     private let acquirer: Acquirer?
 
-    init(acquisitionQueue: CaptureAcquisitionQueue = CaptureAcquisitionQueue(),
-         encoder: CapturePNGEncoder = CapturePNGEncoder(), acquirer: Acquirer? = nil) {
-        self.acquisitionQueue = acquisitionQueue; self.encoder = encoder; self.acquirer = acquirer
+    init(acquisitionQueue: CaptureAcquisitionQueue? = nil,
+         encoder: CapturePNGEncoder? = nil, acquirer: Acquirer? = nil,
+         governor: LocalWorkloadGovernor = .shared) {
+        self.acquisitionQueue = acquisitionQueue ?? CaptureAcquisitionQueue(governor: governor)
+        self.encoder = encoder ?? CapturePNGEncoder(governor: governor); self.acquirer = acquirer
     }
 
     /// Reads macOS' existing TCC decision without invoking ScreenCaptureKit.
@@ -90,7 +92,7 @@ actor ScreenCaptureService {
         do {
             let waitTicket = BackendTelemetry.current.beginQueueWait(.captureEvidence)
             let reservation: CaptureAcquisitionQueue.Reservation
-            do { reservation = try await acquisitionQueue.acquire(.evidence, waitTicket: waitTicket) }
+            do { reservation = try await acquisitionQueue.acquire(.evidence, estimatedBytes: 16, waitTicket: waitTicket) }
             catch { waitTicket.discard(error is CancellationError ? .cancelled : .rejected); throw error }
             do {
                 try reservation.check(); try LocalOperationBudget.check("capture_acquisition")
@@ -144,7 +146,8 @@ actor ScreenCaptureService {
         let reservation: CaptureAcquisitionQueue.Reservation
         do {
             reservation = try await LocalOperationBudget.bounded(phase: "capture_queue") {
-                try await queue.acquire(.evidence, owner: owner, waitTicket: waitTicket)
+                try await queue.acquire(.evidence, owner: owner,
+                    estimatedBytes: Int(Self.maximumVisionWidth * Self.maximumVisionHeight) * 4, waitTicket: waitTicket)
             }
         } catch {
             waitTicket.discard(error is CancellationError ? .cancelled : .rejected)
@@ -276,7 +279,10 @@ actor ScreenCaptureService {
     func capturePreview(display: DisplayDescriptor) async throws -> CGImage {
         let waitTicket = BackendTelemetry.current.beginQueueWait(.capturePreview)
         let reservation: CaptureAcquisitionQueue.Reservation
-        do { reservation = try await acquisitionQueue.acquire(.preview, waitTicket: waitTicket) }
+        do {
+            reservation = try await acquisitionQueue.acquire(.preview,
+                estimatedBytes: Int(Self.maximumPreviewWidth * Self.maximumPreviewHeight) * 4, waitTicket: waitTicket)
+        }
         catch { waitTicket.discard(error is CancellationError ? .cancelled : .rejected); throw error }
         do {
             try reservation.check(); try LocalOperationBudget.check("capture_acquisition")
@@ -284,6 +290,7 @@ actor ScreenCaptureService {
             if let acquirer { image = try await acquirer(display, false, true) }
             else { image = try await acquirePreviewImage(display: display) }
             try CaptureFrameLimits.validate(width: image.width, height: image.height)
+            try reservation.retainPixels(bytes: CaptureFrameLimits.storageBytes(for: image))
             await acquisitionQueue.acquired(reservation)
             try reservation.check()
             return image

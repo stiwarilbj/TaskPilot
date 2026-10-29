@@ -1,6 +1,6 @@
 import Foundation
 
-/// Background eviction only: registrations must never deliver actions or UI.
+/// Background cache eviction and admission hints only: never actions or UI.
 final class MemoryPressureMonitor {
     static let shared = MemoryPressureMonitor()
     final class Registration {
@@ -11,11 +11,14 @@ final class MemoryPressureMonitor {
     }
     private let lock = NSLock()
     private var handlers: [UUID: () -> Void] = [:]
+    private var pressureHandlers: [UUID: (DispatchSource.MemoryPressureEvent, UInt64) -> Void] = [:]
+    private var pressure: DispatchSource.MemoryPressureEvent = .normal
+    private var pressureRevision: UInt64 = 0
     private var source: DispatchSourceMemoryPressure?
 
     init(listen: Bool = true) {
         guard listen else { return }
-        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical],
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.normal, .warning, .critical],
             queue: DispatchQueue(label: "com.orbitagent.memory-pressure", qos: .utility))
         self.source = source
         source.setEventHandler { [weak self] in
@@ -31,13 +34,30 @@ final class MemoryPressureMonitor {
         lock.withLock { handlers[id] = handler }
         return Registration(self, id)
     }
-    private func remove(_ id: UUID) { _ = lock.withLock { handlers.removeValue(forKey: id) } }
+    /// Capture the latest level atomically. Revisions let consumers reject an
+    /// older callback racing a new notification. Never call an owner under the
+    /// monitor lock: releasing its last reference can remove its registration.
+    func registerPressure(_ handler: @escaping (DispatchSource.MemoryPressureEvent, UInt64) -> Void) -> Registration {
+        let id = UUID()
+        let state = lock.withLock { pressureHandlers[id] = handler; return (pressure, pressureRevision) }
+        handler(state.0, state.1)
+        return Registration(self, id)
+    }
+    private func remove(_ id: UUID) {
+        lock.withLock { handlers.removeValue(forKey: id); pressureHandlers.removeValue(forKey: id) }
+    }
 
     // Synthetic flags let tests exercise eviction without pressuring macOS.
     func receive(_ flags: DispatchSource.MemoryPressureEvent) {
-        guard !flags.intersection([.warning, .critical]).isEmpty else { return }
-        let callbacks = lock.withLock { Array(handlers.values) }
-        for callback in callbacks { callback() }
+        guard !flags.intersection([.normal, .warning, .critical]).isEmpty else { return }
+        let state = lock.withLock {
+            pressure = flags
+            pressureRevision &+= 1
+            return (Array(pressureHandlers.values), pressureRevision,
+                    flags.intersection([.warning, .critical]).isEmpty ? [] : Array(handlers.values))
+        }
+        for callback in state.0 { callback(flags, state.1) }
+        for callback in state.2 { callback() }
     }
 }
 

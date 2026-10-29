@@ -44,6 +44,7 @@ final class ObservationCollection<Node> {
     let deadline: TimeInterval
     let now: () -> TimeInterval
     let limits: Limits
+    private let governor: LocalWorkloadGovernor
     private var pending: [Pending] = []
     private var readIssues: [[String: Any]] = []
     private var readIssueCounts: [String: Int] = [:]
@@ -58,8 +59,9 @@ final class ObservationCollection<Node> {
     var scope = Scope(pid: 0)
     var hasTime: Bool { now() < deadline }
 
-    init(budget: TimeInterval, limits: Limits = Limits(), now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
-        self.now = now; self.deadline = now() + max(0, budget); self.limits = limits
+    init(budget: TimeInterval, limits: Limits = Limits(), now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         governor: LocalWorkloadGovernor = .shared) {
+        self.now = now; self.deadline = now() + max(0, budget); self.limits = limits; self.governor = governor
     }
 
     func issue(_ reason: String, attribute: String? = nil, code: Int? = nil) {
@@ -81,6 +83,14 @@ final class ObservationCollection<Node> {
         let before = collected
         try BackendTelemetry.current.measure(.axCollection) { span in
             defer { span.record(items: collected - before) }
+            try check()
+            // Traversal is synchronous bridge work, not another queue. Account
+            // for bounded graph storage; capture and Pause waits stay outside.
+            let nodes = max(0, max(limits.initialElements, limits.expandedElements))
+            let (bytes, overflow) = nodes.multipliedReportingOverflow(by: 1024)
+            let workload = try governor.reserve(.accessibility, demand: .init(memoryBytes: overflow ? Int.max : bytes))
+            defer { workload.finish() }
+            try workload.start()
             try collectNodes(roots: roots, revision: revision, expand: expand, check: check,
                              equal: equal, identityHash: identityHash, inspect: inspect, children: children,
                              shouldDefer: shouldDefer)

@@ -5,6 +5,9 @@ import XCTest
 @testable import OrbitAgent
 
 final class CapturePipelineTests: XCTestCase {
+    // Synthetic pipeline tests must not depend on ambient macOS pressure.
+    // Shared admission and pressure transitions have separate injected fixtures.
+    private let governor = LocalWorkloadGovernor()
     private final class Clock: @unchecked Sendable {
         private let lock = NSLock()
         private var value = 0.0
@@ -101,14 +104,14 @@ final class CapturePipelineTests: XCTestCase {
 
     func testEvidenceCompressionKeepsInteractivePriorityAndPreviewCompressionUsesUtility() async throws {
         func encodePriority(for kind: CaptureAcquisitionQueue.Kind) async throws -> TaskPriority {
-            let queue = CaptureAcquisitionQueue(), pixels = try image(1)
+            let queue = CaptureAcquisitionQueue(governor: governor), pixels = try image(1)
             let reservation = try await queue.acquire(kind)
             let mapping = try ScreenCoordinateMapping(displayID: display.id, displayBounds: display.frame,
                 imageSize: CGSize(width: pixels.width, height: pixels.height))
             let frame = try CapturedFrame(image: pixels, coordinates: mapping, reservation: reservation)
             await queue.acquired(reservation)
             let probe = PriorityProbe()
-            let encoder = CapturePNGEncoder(directory: try directory(), writer: { _, _ in
+            let encoder = CapturePNGEncoder(directory: try directory(), governor: governor, writer: { _, _ in
                 probe.record(Task<Never, Never>.currentPriority)
             })
             _ = try await encoder.encode(frame)
@@ -153,8 +156,8 @@ final class CapturePipelineTests: XCTestCase {
 
     func testOversizedTaskAndPreviewFramesReleaseAcquisitionSlots() async throws {
         let large = try overWideImage(), small = try image(1), images = Images([large, small, large, small])
-        let queue = CaptureAcquisitionQueue(), root = try directory(), lease = TaskLease(scratchRoot: root)
-        let service = ScreenCaptureService(acquisitionQueue: queue, acquirer: { _, _, preview in try await images.acquire(preview: preview) })
+        let queue = CaptureAcquisitionQueue(governor: governor), root = try directory(), lease = TaskLease(scratchRoot: root)
+        let service = ScreenCaptureService(acquisitionQueue: queue, acquirer: { _, _, preview in try await images.acquire(preview: preview) }, governor: governor)
         do {
             _ = try await TaskOwnership.$current.withValue(lease) { try await service.acquire(display: display) }
             XCTFail("Oversized task frame retained")
@@ -172,7 +175,7 @@ final class CapturePipelineTests: XCTestCase {
     }
 
     func testFrameConstructionAndDirectPNGWritingRejectBeforeRetentionOrOutput() async throws {
-        let large = try overWideImage(), queue = CaptureAcquisitionQueue()
+        let large = try overWideImage(), queue = CaptureAcquisitionQueue(governor: governor)
         let reservation = try await queue.acquire(.evidence)
         let mapping = try ScreenCoordinateMapping(displayID: display.id, displayBounds: display.frame,
             imageSize: CGSize(width: large.width, height: large.height))
@@ -189,8 +192,8 @@ final class CapturePipelineTests: XCTestCase {
         let root = try directory(), lease = TaskLease(scratchRoot: root), disk = DiskSpace()
         disk.setAvailable(0)
         let encoder = CapturePNGEncoder(spaceCheck: { try disk.check(owner: $0, directory: $1, required: $2) },
-            writer: { _, _ in XCTFail("Low-space capture reached compression") })
-        let pixels = try image(1), service = ScreenCaptureService(acquirer: { _, _, _ in pixels })
+            governor: governor, writer: { _, _ in XCTFail("Low-space capture reached compression") })
+        let pixels = try image(1), service = ScreenCaptureService(acquirer: { _, _, _ in pixels }, governor: governor)
         let frame = try await TaskOwnership.$current.withValue(lease) { try await service.acquire(display: display) }
         let telemetry = BackendTelemetry(), ticket = telemetry.beginQueueWait(.pngCompression)
         do { _ = try await encoder.encode(frame, telemetry: telemetry, waitTicket: ticket); XCTFail("Low-space capture accepted") }
@@ -212,8 +215,8 @@ final class CapturePipelineTests: XCTestCase {
         defer { writer.release.signal() }
         let lease = TaskLease(scratchRoot: try directory())
         let encoder = CapturePNGEncoder(spaceCheck: { try disk.check(owner: $0, directory: $1, required: $2) },
-            writer: { try writer.write($0, to: $1) })
-        let pixels = try image(1), service = ScreenCaptureService(acquirer: { _, _, _ in pixels })
+            governor: governor, writer: { try writer.write($0, to: $1) })
+        let pixels = try image(1), service = ScreenCaptureService(acquirer: { _, _, _ in pixels }, governor: governor)
         let first = try await TaskOwnership.$current.withValue(lease) { try await service.acquire(display: display) }
         let second = try await TaskOwnership.$current.withValue(lease) { try await service.acquire(display: display) }
         let running = Task { try await encoder.encode(first) }
@@ -242,7 +245,7 @@ final class CapturePipelineTests: XCTestCase {
     }
 
     func testExpiredAcquisitionDoesNotReservePixelsOrReplacePreview() async throws {
-        let queue = CaptureAcquisitionQueue(), clock = Clock()
+        let queue = CaptureAcquisitionQueue(governor: governor), clock = Clock()
         var blocker: CaptureAcquisitionQueue.Reservation? = try await queue.acquire(.evidence)
         let preview = Task { try await queue.acquire(.preview) }
         await eventually { await queue.statistics.waitingPreview == 1 }
@@ -262,8 +265,8 @@ final class CapturePipelineTests: XCTestCase {
         let clock = Clock(), budget = LocalOperationBudget(seconds: 1, phase: "preflight", now: { clock.now() })
         let telemetry = BackendTelemetry(now: { clock.now() }), ticket = telemetry.beginQueueWait(.pngCompression)
         let root = try directory().appendingPathComponent("not-created")
-        let encoder = CapturePNGEncoder(directory: root, writer: { _, _ in XCTFail("Expired compression invoked") })
-        let pixels = try image(1), service = ScreenCaptureService(acquirer: { _, _, _ in pixels })
+        let encoder = CapturePNGEncoder(directory: root, governor: governor, writer: { _, _ in XCTFail("Expired compression invoked") })
+        let pixels = try image(1), service = ScreenCaptureService(acquirer: { _, _, _ in pixels }, governor: governor)
         let frame = try await service.acquire(display: display)
         clock.advance(1)
         do {
@@ -284,8 +287,8 @@ final class CapturePipelineTests: XCTestCase {
     func testQueuedEncodingExpiresBeforeWorkerAllocationAndCanBeRetriedFresh() async throws {
         let started = expectation(description: "First encode running"), writer = BlockedWriter(started)
         defer { writer.release.signal() }
-        let root = try directory(), encoder = CapturePNGEncoder(directory: root, writer: { try writer.write($0, to: $1) })
-        let pixels = try image(1), service = ScreenCaptureService(acquirer: { _, _, _ in pixels })
+        let root = try directory(), encoder = CapturePNGEncoder(directory: root, governor: governor, writer: { try writer.write($0, to: $1) })
+        let pixels = try image(1), service = ScreenCaptureService(acquirer: { _, _, _ in pixels }, governor: governor)
         let first = try await service.acquire(display: display), second = try await service.acquire(display: display)
         let running = Task { try await encoder.encode(first) }
         await fulfillment(of: [started], timeout: 2)
@@ -307,7 +310,7 @@ final class CapturePipelineTests: XCTestCase {
     }
 
     func testEvidencePrecedesLatestPreviewAndOldPreviewsAreCoalesced() async throws {
-        let queue = CaptureAcquisitionQueue()
+        let queue = CaptureAcquisitionQueue(governor: governor)
         var blocker: CaptureAcquisitionQueue.Reservation? = try await queue.acquire(.preview)
         let old = Task { try await queue.acquire(.preview) }
         await eventually { await queue.statistics.waitingPreview == 1 }
@@ -324,7 +327,7 @@ final class CapturePipelineTests: XCTestCase {
         await queue.acquired(preview)
     }
     func testCaptureQueueMeasuresWaitAndPreviewCoalescing() async throws {
-        let clock = Clock(), telemetry = BackendTelemetry(now: { clock.now() }), queue = CaptureAcquisitionQueue()
+        let clock = Clock(), telemetry = BackendTelemetry(now: { clock.now() }), queue = CaptureAcquisitionQueue(governor: governor)
         let blockerTicket = telemetry.beginQueueWait(.capturePreview)
         var blocker: CaptureAcquisitionQueue.Reservation? = try await queue.acquire(.preview, waitTicket: blockerTicket)
         let oldTicket = telemetry.beginQueueWait(.capturePreview)
@@ -348,7 +351,7 @@ final class CapturePipelineTests: XCTestCase {
         await queue.acquired(reservation)
     }
     func testPreviewFloodRetainsOnlyOnePendingRequest() async throws {
-        let queue = CaptureAcquisitionQueue(), counter = Counter()
+        let queue = CaptureAcquisitionQueue(governor: governor), counter = Counter()
         var blocker: CaptureAcquisitionQueue.Reservation? = try await queue.acquire(.preview)
         let requests = (0..<100).map { _ in Task {
             do { return try await queue.acquire(.preview) }
@@ -366,7 +369,7 @@ final class CapturePipelineTests: XCTestCase {
         XCTAssertEqual(successes, 1)
     }
     func testWaitingEvidenceIsBoundedAndCancellationRemovesQueueEntries() async throws {
-        let queue = CaptureAcquisitionQueue(maximumWaitingEvidence: 2)
+        let queue = CaptureAcquisitionQueue(maximumWaitingEvidence: 2, governor: governor)
         let active = try await queue.acquire(.evidence)
         let first = Task { try await queue.acquire(.evidence) }
         let second = Task { try await queue.acquire(.evidence) }
@@ -378,7 +381,7 @@ final class CapturePipelineTests: XCTestCase {
         await queue.acquired(active)
     }
     func testRawEvidenceLimitStillAllowsPreviewAndPreservesOwnedFrames() async throws {
-        let queue = CaptureAcquisitionQueue()
+        let queue = CaptureAcquisitionQueue(governor: governor)
         var first: CaptureAcquisitionQueue.Reservation? = try await queue.acquire(.evidence)
         await queue.acquired(first!)
         let second = try await queue.acquire(.evidence); await queue.acquired(second)
@@ -393,7 +396,7 @@ final class CapturePipelineTests: XCTestCase {
         let nextStats = await queue.statistics; XCTAssertEqual(nextStats.evidenceFrames, 2)
     }
     func testRevocationRemovesQueuedWorkBeforeAnyAcquisition() async throws {
-        let queue = CaptureAcquisitionQueue(), lease = TaskLease()
+        let queue = CaptureAcquisitionQueue(governor: governor), lease = TaskLease()
         let active = try await queue.acquire(.preview)
         let waiting = Task { try await queue.acquire(.evidence, owner: lease) }
         await eventually { await queue.statistics.waitingEvidence == 1 }
@@ -408,10 +411,10 @@ final class CapturePipelineTests: XCTestCase {
     func testSlowEncodingDoesNotBlockAcquisitionOrPreviewAndUsesExactPixels() async throws {
         let started = expectation(description: "Compression running"), writer = BlockedWriter(started)
         defer { writer.release.signal() }
-        let root = try directory(), queue = CaptureAcquisitionQueue()
-        let encoder = CapturePNGEncoder(directory: root, writer: { try writer.write($0, to: $1) })
+        let root = try directory(), queue = CaptureAcquisitionQueue(governor: governor)
+        let encoder = CapturePNGEncoder(directory: root, governor: governor, writer: { try writer.write($0, to: $1) })
         let images = Images([try image(1), try image(0, 0, 1), try image(0, 1)])
-        let capture = ScreenCaptureService(acquisitionQueue: queue, encoder: encoder, acquirer: { _, _, preview in try await images.acquire(preview: preview) })
+        let capture = ScreenCaptureService(acquisitionQueue: queue, encoder: encoder, acquirer: { _, _, preview in try await images.acquire(preview: preview) }, governor: governor)
         let telemetry = BackendTelemetry()
         let accepted = try await BackendTelemetry.$current.withValue(telemetry) { try await capture.acquire(display: display) }
         let compression = Task {
@@ -435,10 +438,10 @@ final class CapturePipelineTests: XCTestCase {
     func testCancelledQueuedCompressionReleasesItsBufferWhileFirstEncodeIsBlocked() async throws {
         let started = expectation(description: "First encode running"), writer = BlockedWriter(started)
         defer { writer.release.signal() }
-        let root = try directory(), queue = CaptureAcquisitionQueue(), weakFrame = WeakFrame()
-        let encoder = CapturePNGEncoder(directory: root, writer: { try writer.write($0, to: $1) })
+        let root = try directory(), queue = CaptureAcquisitionQueue(governor: governor), weakFrame = WeakFrame()
+        let encoder = CapturePNGEncoder(directory: root, governor: governor, writer: { try writer.write($0, to: $1) })
         let pixels = try image(1)
-        let service = ScreenCaptureService(acquisitionQueue: queue, encoder: encoder, acquirer: { _, _, _ in pixels })
+        let service = ScreenCaptureService(acquisitionQueue: queue, encoder: encoder, acquirer: { _, _, _ in pixels }, governor: governor)
         let first = try await service.acquire(display: display)
         let running = Task { try await service.encode(first) }
         await fulfillment(of: [started], timeout: 2)
@@ -458,7 +461,7 @@ final class CapturePipelineTests: XCTestCase {
     func testOwnerRetentionLimitRejectsPNGAndCleansOnlyNewArtifact() async throws {
         let lease = TaskLease(scratchRoot: try directory(), captureFileLimit: 1, captureByteLimit: 1_000_000)
         let pixels = try image(1)
-        let service = ScreenCaptureService(acquirer: { _, _, _ in pixels })
+        let service = ScreenCaptureService(acquirer: { _, _, _ in pixels }, governor: governor)
         let first = try await TaskOwnership.$current.withValue(lease) { try await service.acquire(display: display) }
         let accepted = try await service.encode(first)
         let usage = lease.captureArtifactUsage
@@ -478,9 +481,9 @@ final class CapturePipelineTests: XCTestCase {
         let started = expectation(description: "Owned writer running"), writer = BlockedWriter(started)
         defer { writer.release.signal() }
         let lease = TaskLease(scratchRoot: try directory())
-        let encoder = CapturePNGEncoder(writer: { try writer.write($0, to: $1) })
+        let encoder = CapturePNGEncoder(governor: governor, writer: { try writer.write($0, to: $1) })
         let pixels = try image(1)
-        let service = ScreenCaptureService(encoder: encoder, acquirer: { _, _, _ in pixels })
+        let service = ScreenCaptureService(encoder: encoder, acquirer: { _, _, _ in pixels }, governor: governor)
         let frame = try await TaskOwnership.$current.withValue(lease) { try await service.acquire(display: display) }
         let pending = Task { try await service.encode(frame) }
         await fulfillment(of: [started], timeout: 2)
@@ -494,9 +497,9 @@ final class CapturePipelineTests: XCTestCase {
     func testStoppedEncodingDrainsBeforeNextJobAndRemovesLateArtifact() async throws {
         let started = expectation(description: "Old encode running"), writer = BlockedWriter(started)
         defer { writer.release.signal() }
-        let encoder = CapturePNGEncoder(directory: try directory(), writer: { try writer.write($0, to: $1) })
+        let encoder = CapturePNGEncoder(directory: try directory(), governor: governor, writer: { try writer.write($0, to: $1) })
         let pixels = try image(1), lease = TaskLease()
-        let service = ScreenCaptureService(encoder: encoder, acquirer: { _, _, _ in pixels })
+        let service = ScreenCaptureService(encoder: encoder, acquirer: { _, _, _ in pixels }, governor: governor)
         let frame = try await TaskOwnership.$current.withValue(lease) { try await service.acquire(display: display) }
         let old = Task { try await service.encode(frame) }
         await fulfillment(of: [started], timeout: 2)
@@ -513,8 +516,8 @@ final class CapturePipelineTests: XCTestCase {
     }
     func testFailedWriterRemovesPartialFileAndNextEncodingSucceeds() async throws {
         let root = try directory(), pixels = try image(1), writer = FailOnceWriter()
-        let encoder = CapturePNGEncoder(directory: root, writer: { try writer.write($0, to: $1) })
-        let service = ScreenCaptureService(encoder: encoder, acquirer: { _, _, _ in pixels })
+        let encoder = CapturePNGEncoder(directory: root, governor: governor, writer: { try writer.write($0, to: $1) })
+        let service = ScreenCaptureService(encoder: encoder, acquirer: { _, _, _ in pixels }, governor: governor)
         let frame = try await service.acquire(display: display)
         do { _ = try await service.encode(frame); XCTFail("Failed writer accepted") }
         catch { XCTAssertTrue(error is ScreenCaptureError) }
@@ -526,8 +529,8 @@ final class CapturePipelineTests: XCTestCase {
     func testDuplicateCompressionAndOverflowAreRejectedWithoutMoreWorkers() async throws {
         let started = expectation(description: "Encode running"), writer = BlockedWriter(started)
         defer { writer.release.signal() }
-        let encoder = CapturePNGEncoder(directory: try directory(), writer: { try writer.write($0, to: $1) })
-        let pixels = try image(1), service = ScreenCaptureService(acquirer: { _, _, _ in pixels })
+        let encoder = CapturePNGEncoder(directory: try directory(), governor: governor, writer: { try writer.write($0, to: $1) })
+        let pixels = try image(1), service = ScreenCaptureService(acquirer: { _, _, _ in pixels }, governor: governor)
         let first = try await service.acquire(display: display), second = try await service.acquire(display: display)
         let clock = Clock(), telemetry = BackendTelemetry(now: { clock.now() })
         let firstTicket = telemetry.beginQueueWait(.pngCompression)
@@ -539,7 +542,7 @@ final class CapturePipelineTests: XCTestCase {
         let queued = Task { try await encoder.encode(second, telemetry: telemetry, waitTicket: queuedTicket) }
         await eventually { await encoder.pendingCount == 1 }
         clock.advance(0.020)
-        let otherService = ScreenCaptureService(acquirer: { _, _, _ in pixels })
+        let otherService = ScreenCaptureService(acquirer: { _, _, _ in pixels }, governor: governor)
         let third = try await otherService.acquire(display: display)
         let rejectedTicket = telemetry.beginQueueWait(.pngCompression)
         do { _ = try await encoder.encode(third, telemetry: telemetry, waitTicket: rejectedTicket); XCTFail("Compression queue overflowed") }
