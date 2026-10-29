@@ -15,6 +15,7 @@ import openclaw_runtime as runtime
 from evidence_fixtures import VerificationSessions, native_result, native_failure
 from coordinate_fixtures import fixture_coordinates
 from action_receipts import BridgeReplyLost, RuntimeInbox
+from bounded_transport import TransportFailure
 
 
 class ActionReceiptTests(unittest.TestCase):
@@ -68,6 +69,39 @@ class ActionReceiptTests(unittest.TestCase):
         self.assert_once()
         self.assertEqual(self.metrics['receipt_queries'], 1)
         self.assertEqual(self.metrics['receipt_recoveries'], 1)
+
+    def test_no_progress_fault_preserves_receipt_reconciliation_and_unknown_effects(self):
+        for state in ['confirmed', 'unconfirmed', 'unknown']:
+            with self.subTest(state=state), mock.patch.object(runtime, 'emit'):
+                self.calls.clear()
+                self.metrics.update(receipt_queries=0, receipt_recoveries=0, receipt_unresolved=0)
+                self.action = ({'type': 'write_file', 'path': '/fixture/note', 'content': 'X', 'mode': 'append'}
+                               if state == 'confirmed' else {'type': 'press', 'element_id': 'current:save'})
+                inbox = RuntimeInbox(io.StringIO(''))
+                key = inbox.register('bridge_response', 'fixture', self.generation)
+                inbox.transport.fail(TransportFailure('transport_write_no_progress'), key)
+                with mock.patch.object(inbox, 'start'), self.assertRaises(BridgeReplyLost) as caught:
+                    inbox.read(0, key=key)
+                failure = caught.exception
+                self.assertEqual(failure.code, 'transport_write_no_progress')
+                self.assertTrue(failure.connected)
+                inbox.transport.unregister(key)
+                receipt = self.receipt(state)
+                if state != 'unknown':
+                    receipt.update(result=native_result(self.action))
+                def exchange(method, display, params, timeout):
+                    self.calls.append((method, dict(params), timeout))
+                    if method == 'act': raise failure
+                    return {'ok': True, 'result': receipt}
+                if state == 'unknown':
+                    with self.assertRaises(RuntimeError): self.execute(exchange)
+                    self.assertEqual(self.metrics['receipt_unresolved'], 1)
+                else:
+                    result = self.execute(exchange)
+                    self.assertEqual(result['verified'], state == 'confirmed')
+                    self.assertEqual(self.metrics['receipt_recoveries'], 1)
+                self.assert_once()
+                self.assertEqual(self.metrics['receipt_queries'], 1)
 
     def test_pending_work_is_polled_until_its_terminal_reply(self):
         result = native_result({'type':'run_command','argv':['fixture'],'timeout_seconds':120})

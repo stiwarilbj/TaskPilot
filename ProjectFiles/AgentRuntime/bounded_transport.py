@@ -330,7 +330,11 @@ def write_frame(stream, message, *, timeout=5.0, cancelled=lambda: False):
         if remaining <= 0:
             raise TransportFailure('transport_write_timeout')
         try:
-            offset += os.write(descriptor, memoryview(data)[offset:offset + 65536])
+            written = os.write(descriptor, memoryview(data)[offset:offset + 65536])
+            if written == 0:
+                # Any earlier prefix remains uncertain; never restart the frame.
+                raise TransportFailure('transport_write_no_progress')
+            offset += written
         except BlockingIOError:
             select.select([], [descriptor], [], min(0.1, remaining))
         except OSError as error:

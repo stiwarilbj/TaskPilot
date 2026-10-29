@@ -419,10 +419,68 @@ class BoundedTransportTests(unittest.TestCase):
             stream.close(); os.close(read_fd)
 
     def test_transport_failure_is_never_classified_as_format_repair(self):
-        for code in ['transport_frame_limit', 'transport_buffer_limit', 'transport_write_timeout']:
+        for code in ['transport_frame_limit', 'transport_buffer_limit', 'transport_write_timeout',
+                     'transport_write_no_progress']:
             failure = runtime.classify_failure(TransportFailure(code), 0)
             self.assertEqual(failure.kind, 'transport')
             self.assertEqual(failure.code, code)
+
+    def test_zero_byte_write_fails_without_waiting_or_retrying_a_partial_frame(self):
+        message = {'fixture': 'unchanged'}
+        expected = (json.dumps(message, separators=(',', ':')) + '\n').encode()
+        real_write = os.write
+        for prefix in [0, 7]:
+            with self.subTest(prefix=prefix):
+                read_fd, write_fd = os.pipe()
+                stream = os.fdopen(write_fd, 'wb', buffering=0)
+                attempts = []
+                def write(descriptor, data):
+                    attempts.append(bytes(data))
+                    if prefix and len(attempts) == 1:
+                        return real_write(descriptor, data[:prefix])
+                    if len(attempts) == (2 if prefix else 1):
+                        return 0
+                    self.fail('retried a zero-progress write')
+                try:
+                    with mock.patch('bounded_transport.os.write', side_effect=write), \
+                         mock.patch('bounded_transport.time.monotonic', return_value=10), \
+                         mock.patch('bounded_transport.select.select') as wait:
+                        with self.assertRaises(TransportFailure) as caught:
+                            write_frame(stream, message, timeout=300)
+                    self.assertEqual(caught.exception.code, 'transport_write_no_progress')
+                    self.assertTrue(caught.exception.connected)  # No claim that an associated effect failed.
+                    self.assertEqual(attempts, [expected, expected[prefix:]] if prefix else [expected])
+                    wait.assert_not_called()
+                    self.assertFalse(stream.closed)  # The caller owns teardown.
+                    stream.close()
+                    self.assertEqual(os.read(read_fd, len(expected)), expected[:prefix])
+                finally:
+                    stream.close(); os.close(read_fd)
+
+    def test_temporary_backpressure_still_resumes_the_same_partial_frame(self):
+        message = {'fixture': 'backpressure'}
+        expected = (json.dumps(message, separators=(',', ':')) + '\n').encode()
+        read_fd, write_fd = os.pipe()
+        stream = os.fdopen(write_fd, 'wb', buffering=0)
+        real_write = os.write
+        attempts = []
+        def write(descriptor, data):
+            attempts.append(bytes(data))
+            if len(attempts) == 1:
+                return real_write(descriptor, data[:7])
+            if len(attempts) == 2:
+                raise BlockingIOError()
+            return real_write(descriptor, data)
+        try:
+            with mock.patch('bounded_transport.os.write', side_effect=write), \
+                 mock.patch('bounded_transport.select.select', return_value=([], [write_fd], [])) as wait:
+                write_frame(stream, message)
+            self.assertEqual(attempts, [expected, expected[7:], expected[7:]])
+            wait.assert_called_once()
+            stream.close()
+            self.assertEqual(os.read(read_fd, len(expected) + 1), expected)
+        finally:
+            stream.close(); os.close(read_fd)
 
     def test_malformed_request_id_cannot_escape_reader_or_alias_an_integer(self):
         for key in [True, [], {}]:
@@ -503,6 +561,56 @@ for line in sys.stdin:
                     self.assertEqual(client.transport.bytes, 0)
                     self.assertEqual(emit.call_count, 1)
                 finally: client.close()
+
+    def test_zero_progress_acp_write_drains_child_and_retains_abort_requirement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / 'fake-acp'
+            executable.write_text('#!' + sys.executable + '\n' + '''import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get('method') == 'initialize': result = {'protocolVersion': 1}
+    elif request.get('method') == 'session/new': result = {'sessionId': 'fixture', 'configOptions': []}
+    else: continue
+    print(json.dumps({'id':request['id'],'result':result}), flush=True)
+''')
+            executable.chmod(0o700)
+            image = Path(directory) / 'fixture.png'; image.write_bytes(b'offline')
+            real_write = os.write
+            for prefix in [0, 7]:
+                with self.subTest(prefix=prefix), \
+                     mock.patch.object(runtime, 'session_transcript_cursor', return_value=None):
+                    client = runtime.ACPClient(str(executable))
+                    descriptor = client.process.stdin.fileno()
+                    attempts = []
+                    def write(fd, data):
+                        if fd != descriptor: return real_write(fd, data)
+                        attempts.append(bytes(data))
+                        if prefix and len(attempts) == 1:
+                            return real_write(fd, data[:prefix])
+                        return 0  # The best-effort cancellation also cannot use this pipe.
+                    try:
+                        with mock.patch('bounded_transport.os.write', side_effect=write):
+                            with self.assertRaises(TransportFailure) as caught:
+                                client.prompt('fixture', image)
+                        self.assertEqual(caught.exception.code, 'transport_write_no_progress')
+                        self.assertEqual(len(attempts), 3 if prefix else 2)
+                        self.assertIsNotNone(client.process.poll())
+                        self.assertTrue(all(stream.closed for stream in
+                                            (client.process.stdin, client.process.stdout, client.process.stderr)))
+                        self.assertTrue(client.stdout_finished.wait(1))
+                        self.assertEqual(client.transport.pending, {})
+                        self.assertEqual(client.transport.bytes, 0)
+                        self.assertEqual(client.prompt_calls, 1)
+                        self.assertEqual(client.pending_prompt_session_id, 'fixture')
+                        with mock.patch.object(client, 'gateway_configuration', return_value={'ok': False}) as abort, \
+                             mock.patch.object(client, '_initialize') as restart:
+                            with self.assertRaisesRegex(RuntimeError, 'confirm the previous OpenClaw request ended'):
+                                client.reconnect()
+                        abort.assert_called_once_with('sessions.abort', {'key': client.session_key})
+                        restart.assert_not_called()
+                        self.assertEqual(client.prompt_calls, 1)
+                    finally:
+                        client.close()
 
     def test_oversized_real_acp_frame_stops_child_before_reporting_failure(self):
         with tempfile.TemporaryDirectory() as directory:

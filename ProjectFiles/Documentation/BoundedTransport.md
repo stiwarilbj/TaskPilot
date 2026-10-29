@@ -83,6 +83,15 @@ ACP faults close and wait for the originating child. The existing one-reconnect
 path still requires an acknowledged Gateway abort before replaying reasoning.
 Neither partial text nor silence triggers another request.
 
+A zero-byte Python pipe write fails immediately with
+`transport_write_no_progress`, even after a partial frame. It does not wait for
+the timeout, retry the suffix, or restart the frame. Temporary backpressure
+(`BlockingIOError`) retains the existing writable wait and deadline. The caller
+still owns teardown; ACP closes and reaps its child and retires the request.
+This failure does not establish whether an associated mutation happened or
+clear the pending inference's Gateway-abort requirement. Receipt reconciliation
+and unknown-effect handling remain authoritative before further execution.
+
 A native action whose reply is lost retains its logical ID. A connected inbox
 fault enters the existing bounded, read-only receipt lookup; the action is never
 redispatched. If the native transport itself fails, ownership is revoked, native
