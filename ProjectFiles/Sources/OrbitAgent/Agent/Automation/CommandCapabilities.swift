@@ -199,18 +199,19 @@ enum CommandCapabilities {
         return nil
     }
 
+    private static let longOptionPattern = try! NSRegularExpression(pattern: "(?<![A-Za-z0-9_-])--[A-Za-z][A-Za-z0-9-]*")
+    private static let shortOptionPattern = try! NSRegularExpression(pattern: "(?<![A-Za-z0-9_-])-[A-Za-z0-9](?![A-Za-z0-9_-])")
+    private static let valueOptionPattern = try! NSRegularExpression(pattern: "(--[A-Za-z][A-Za-z0-9-]*)[ =]+((?:<[^>\\r\\n]+>[ ]*)+|(?:name|filename)[ ]+(?:value|JSON|text)|(?:name|filename)(?=[ ;]))")
+
     static func longOptions(_ help: String) -> Set<String> {
-        let pattern = try! NSRegularExpression(pattern: "(?<![A-Za-z0-9_-])--[A-Za-z][A-Za-z0-9-]*")
-        return Set(pattern.matches(in: help, range: NSRange(help.startIndex..., in: help)).compactMap { Range($0.range, in: help).map { String(help[$0]) } })
+        return Set(longOptionPattern.matches(in: help, range: NSRange(help.startIndex..., in: help)).compactMap { Range($0.range, in: help).map { String(help[$0]) } })
     }
     static func shortOptions(_ help: String) -> Set<String> {
-        let pattern = try! NSRegularExpression(pattern: "(?<![A-Za-z0-9_-])-[A-Za-z0-9](?![A-Za-z0-9_-])")
-        return Set(pattern.matches(in: help, range: NSRange(help.startIndex..., in: help)).compactMap { Range($0.range, in: help).map { String(help[$0]) } })
+        return Set(shortOptionPattern.matches(in: help, range: NSRange(help.startIndex..., in: help)).compactMap { Range($0.range, in: help).map { String(help[$0]) } })
     }
     static func valueOptions(_ help: String) -> [String: Int] {
         var values: [String: Int] = [:]
-        let pattern = try! NSRegularExpression(pattern: "(--[A-Za-z][A-Za-z0-9-]*)[ =]+((?:<[^>\\r\\n]+>[ ]*)+|(?:name|filename)[ ]+(?:value|JSON|text)|(?:name|filename)(?=[ ;]))")
-        for match in pattern.matches(in: help, range: NSRange(help.startIndex..., in: help)) {
+        for match in valueOptionPattern.matches(in: help, range: NSRange(help.startIndex..., in: help)) {
             guard let flagRange = Range(match.range(at: 1), in: help), let valueRange = Range(match.range(at: 2), in: help) else { continue }
             let flag = String(help[flagRange]), placeholders = String(help[valueRange])
             let count = placeholders.contains("<") ? placeholders.filter { $0 == "<" }.count : placeholders.split(separator: " ").count

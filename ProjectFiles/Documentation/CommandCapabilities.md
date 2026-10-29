@@ -30,6 +30,18 @@ observed option operands and the `--` separator. Short-option listings are
 informational. In particular, curl documents implicit boolean negations in its
 [official command reference](https://curl.se/docs/manpage.html).
 
+The three fixed help-extraction regular expressions are private, immutable
+static properties, initialized once and shared across inspections. Matches,
+flag sets, and value-argument counts are computed afresh from each help text;
+this does not extend executable bindings or capability-cache validity.
+`CommandHelpParsingTests` compares extraction against the previous per-call
+compilation path, including Unicode, unusual whitespace, misleading examples,
+alias operands, repeated options, and independent concurrent inspections.
+An optimized local seven-trial benchmark of 1,000 extractions measured median
+time of 36.5 ms with per-call compilation and 6.7 ms with static expressions,
+with identical result counts. This measures parsing only, not command latency;
+regressions assert exact extraction results rather than timing thresholds.
+
 Literal argument arrays execute the inspected canonical executable directly.
 For fully recognized static shell pipelines/sequences, syntax is checked
 without running the source, and the actual shell classifies literal command
