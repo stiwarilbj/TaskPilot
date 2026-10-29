@@ -1,0 +1,612 @@
+{
+  "baseline": "ea537b2",
+  "cases": [
+    {
+      "after": "same\nparagraph\n",
+      "before": "same\nparagraph\n",
+      "hunks": [],
+      "name": "unchanged",
+      "outside": [],
+      "request": "Change only the introduction.",
+      "scope": "imprecise"
+    },
+    {
+      "after": "one\ntwo\n",
+      "before": "one\r\ntwo\r\n",
+      "hunks": [],
+      "name": "normalized-line-endings",
+      "outside": [],
+      "request": "Improve the document.",
+      "scope": "unrestricted"
+    },
+    {
+      "after": "one\ntwo\n",
+      "before": null,
+      "hunks": [
+        {
+          "affectedEnd": 1,
+          "affectedStart": 1,
+          "after": [
+            {"changed": true, "number": 1, "text": "one"},
+            {"changed": true, "number": 2, "text": "two"},
+            {"changed": true, "number": 3, "text": ""}
+          ],
+          "before": []
+        }
+      ],
+      "name": "new-file",
+      "outside": [],
+      "request": "Create the document.",
+      "scope": "imprecise"
+    },
+    {
+      "after": "",
+      "before": "",
+      "hunks": [],
+      "name": "empty",
+      "outside": [],
+      "request": "Improve the document.",
+      "scope": "unrestricted"
+    },
+    {
+      "after": "# Introduction\nnew intro\n# Body\nold body\n# Ending\nfooter",
+      "before": "# Introduction\nold intro\n# Body\nold body\n# Ending\nfooter",
+      "hunks": [
+        {
+          "affectedEnd": 3,
+          "affectedStart": 2,
+          "after": [
+            {"changed": false, "number": 1, "text": "# Introduction"},
+            {"changed": true, "number": 2, "text": "new intro"},
+            {"changed": false, "number": 3, "text": "# Body"},
+            {"changed": false, "number": 4, "text": "old body"},
+            {"changed": false, "number": 5, "text": "# Ending"}
+          ],
+          "before": [
+            {"changed": false, "number": 1, "text": "# Introduction"},
+            {"changed": true, "number": 2, "text": "old intro"},
+            {"changed": false, "number": 3, "text": "# Body"},
+            {"changed": false, "number": 4, "text": "old body"},
+            {"changed": false, "number": 5, "text": "# Ending"}
+          ]
+        }
+      ],
+      "name": "localized-paragraph",
+      "outside": [false],
+      "request": "Change only the introduction.",
+      "scope": "checked"
+    },
+    {
+      "after": "# Introduction\nnew intro\n# Body\nnew body\n# Ending\nfooter",
+      "before": "# Introduction\nold intro\n# Body\nold body\n# Ending\nfooter",
+      "hunks": [
+        {
+          "affectedEnd": 5,
+          "affectedStart": 2,
+          "after": [
+            {"changed": false, "number": 1, "text": "# Introduction"},
+            {"changed": true, "number": 2, "text": "new intro"},
+            {"changed": false, "number": 3, "text": "# Body"},
+            {"changed": true, "number": 4, "text": "new body"}
+          ],
+          "before": [
+            {"changed": false, "number": 1, "text": "# Introduction"},
+            {"changed": true, "number": 2, "text": "old intro"},
+            {"changed": false, "number": 3, "text": "# Body"},
+            {"changed": true, "number": 4, "text": "old body"}
+          ]
+        },
+        {
+          "affectedEnd": 5,
+          "affectedStart": 2,
+          "after": [
+            {"changed": true, "number": 2, "text": "new intro"},
+            {"changed": false, "number": 3, "text": "# Body"},
+            {"changed": true, "number": 4, "text": "new body"},
+            {"changed": false, "number": 5, "text": "# Ending"},
+            {"changed": false, "number": 6, "text": "footer"}
+          ],
+          "before": [
+            {"changed": true, "number": 2, "text": "old intro"},
+            {"changed": false, "number": 3, "text": "# Body"},
+            {"changed": true, "number": 4, "text": "old body"},
+            {"changed": false, "number": 5, "text": "# Ending"},
+            {"changed": false, "number": 6, "text": "footer"}
+          ]
+        }
+      ],
+      "name": "outside-heading",
+      "outside": [true, true],
+      "request": "Change only the introduction.",
+      "scope": "potentialMismatch"
+    },
+    {
+      "after": "opening\n# Introduction\nold intro\n# Body\nold body\n# Ending\nfooter",
+      "before": "# Introduction\nold intro\n# Body\nold body\n# Ending\nfooter",
+      "hunks": [
+        {
+          "affectedEnd": 2,
+          "affectedStart": 1,
+          "after": [
+            {"changed": true, "number": 1, "text": "opening"},
+            {"changed": false, "number": 2, "text": "# Introduction"},
+            {"changed": false, "number": 3, "text": "old intro"},
+            {"changed": false, "number": 4, "text": "# Body"}
+          ],
+          "before": [
+            {"changed": false, "number": 1, "text": "# Introduction"},
+            {"changed": false, "number": 2, "text": "old intro"},
+            {"changed": false, "number": 3, "text": "# Body"}
+          ]
+        }
+      ],
+      "name": "insert-at-start",
+      "outside": [true],
+      "request": "Change only the introduction.",
+      "scope": "potentialMismatch"
+    },
+    {
+      "after": "# Introduction\nold intro\n# Body\nold body\n# Ending\nfooter\nclosing",
+      "before": "# Introduction\nold intro\n# Body\nold body\n# Ending\nfooter",
+      "hunks": [
+        {
+          "affectedEnd": 7,
+          "affectedStart": 6,
+          "after": [
+            {"changed": false, "number": 4, "text": "old body"},
+            {"changed": false, "number": 5, "text": "# Ending"},
+            {"changed": false, "number": 6, "text": "footer"},
+            {"changed": true, "number": 7, "text": "closing"}
+          ],
+          "before": [
+            {"changed": false, "number": 4, "text": "old body"},
+            {"changed": false, "number": 5, "text": "# Ending"},
+            {"changed": false, "number": 6, "text": "footer"}
+          ]
+        }
+      ],
+      "name": "insert-at-end",
+      "outside": [true],
+      "request": "Change only the introduction.",
+      "scope": "potentialMismatch"
+    },
+    {
+      "after": "# Introduction\nold intro\nextra\n# Body\nold body\n# Ending\nfooter",
+      "before": "# Introduction\nold intro\n# Body\nold body\n# Ending\nfooter",
+      "hunks": [
+        {
+          "affectedEnd": 4,
+          "affectedStart": 2,
+          "after": [
+            {"changed": false, "number": 1, "text": "# Introduction"},
+            {"changed": false, "number": 2, "text": "old intro"},
+            {"changed": true, "number": 3, "text": "extra"},
+            {"changed": false, "number": 4, "text": "# Body"},
+            {"changed": false, "number": 5, "text": "old body"},
+            {"changed": false, "number": 6, "text": "# Ending"}
+          ],
+          "before": [
+            {"changed": false, "number": 1, "text": "# Introduction"},
+            {"changed": false, "number": 2, "text": "old intro"},
+            {"changed": false, "number": 3, "text": "# Body"},
+            {"changed": false, "number": 4, "text": "old body"},
+            {"changed": false, "number": 5, "text": "# Ending"}
+          ]
+        }
+      ],
+      "name": "insert-at-scope-boundary",
+      "outside": [true],
+      "request": "Change only the introduction.",
+      "scope": "potentialMismatch"
+    },
+    {
+      "after": "old intro\n# Body\nold body\n# Ending\nfooter",
+      "before": "# Introduction\nold intro\n# Body\nold body\n# Ending\nfooter",
+      "hunks": [
+        {
+          "affectedEnd": 2,
+          "affectedStart": 1,
+          "after": [
+            {"changed": false, "number": 1, "text": "old intro"},
+            {"changed": false, "number": 2, "text": "# Body"},
+            {"changed": false, "number": 3, "text": "old body"}
+          ],
+          "before": [
+            {"changed": true, "number": 1, "text": "# Introduction"},
+            {"changed": false, "number": 2, "text": "old intro"},
+            {"changed": false, "number": 3, "text": "# Body"},
+            {"changed": false, "number": 4, "text": "old body"}
+          ]
+        }
+      ],
+      "name": "remove-at-start",
+      "outside": [true],
+      "request": "Change only the introduction.",
+      "scope": "potentialMismatch"
+    },
+    {
+      "after": "# Introduction\nold intro\n# Body\nold body\n# Ending",
+      "before": "# Introduction\nold intro\n# Body\nold body\n# Ending\nfooter",
+      "hunks": [
+        {
+          "affectedEnd": 7,
+          "affectedStart": 6,
+          "after": [
+            {"changed": false, "number": 3, "text": "# Body"},
+            {"changed": false, "number": 4, "text": "old body"},
+            {"changed": false, "number": 5, "text": "# Ending"}
+          ],
+          "before": [
+            {"changed": false, "number": 3, "text": "# Body"},
+            {"changed": false, "number": 4, "text": "old body"},
+            {"changed": false, "number": 5, "text": "# Ending"},
+            {"changed": true, "number": 6, "text": "footer"}
+          ]
+        }
+      ],
+      "name": "remove-at-end",
+      "outside": [true],
+      "request": "Change only the introduction.",
+      "scope": "potentialMismatch"
+    },
+    {
+      "after": "B\nA\nA",
+      "before": "A\nB\nA",
+      "hunks": [
+        {
+          "affectedEnd": 2,
+          "affectedStart": 1,
+          "after": [
+            {"changed": false, "number": 1, "text": "B"},
+            {"changed": false, "number": 2, "text": "A"},
+            {"changed": true, "number": 3, "text": "A"}
+          ],
+          "before": [
+            {"changed": true, "number": 1, "text": "A"},
+            {"changed": false, "number": 2, "text": "B"},
+            {"changed": false, "number": 3, "text": "A"}
+          ]
+        },
+        {
+          "affectedEnd": 2,
+          "affectedStart": 1,
+          "after": [
+            {"changed": false, "number": 1, "text": "B"},
+            {"changed": false, "number": 2, "text": "A"},
+            {"changed": true, "number": 3, "text": "A"}
+          ],
+          "before": [
+            {"changed": true, "number": 1, "text": "A"},
+            {"changed": false, "number": 2, "text": "B"},
+            {"changed": false, "number": 3, "text": "A"}
+          ]
+        }
+      ],
+      "name": "repeated-suffix-tie",
+      "outside": [true, true],
+      "request": "Only change \"B\".",
+      "scope": "potentialMismatch"
+    },
+    {
+      "after": "A\nB\nA",
+      "before": "B\nA\nA",
+      "hunks": [
+        {
+          "affectedEnd": 2,
+          "affectedStart": 1,
+          "after": [
+            {"changed": false, "number": 1, "text": "A"},
+            {"changed": true, "number": 2, "text": "B"},
+            {"changed": false, "number": 3, "text": "A"}
+          ],
+          "before": [
+            {"changed": true, "number": 1, "text": "B"},
+            {"changed": false, "number": 2, "text": "A"},
+            {"changed": false, "number": 3, "text": "A"}
+          ]
+        },
+        {
+          "affectedEnd": 2,
+          "affectedStart": 1,
+          "after": [
+            {"changed": false, "number": 1, "text": "A"},
+            {"changed": true, "number": 2, "text": "B"},
+            {"changed": false, "number": 3, "text": "A"}
+          ],
+          "before": [
+            {"changed": true, "number": 1, "text": "B"},
+            {"changed": false, "number": 2, "text": "A"},
+            {"changed": false, "number": 3, "text": "A"}
+          ]
+        }
+      ],
+      "name": "repeated-suffix-reverse",
+      "outside": [false, false],
+      "request": "Only change \"B\".",
+      "scope": "checked"
+    },
+    {
+      "after": "# Introduction\n\n# Body\nshared paragraph\nshared paragraph\n\n# Ending\nfooter",
+      "before": "# Introduction\nshared paragraph\n\n# Body\nshared paragraph\n\n# Ending\nfooter",
+      "hunks": [
+        {
+          "affectedEnd": 3,
+          "affectedStart": 2,
+          "after": [
+            {"changed": false, "number": 1, "text": "# Introduction"},
+            {"changed": false, "number": 2, "text": ""},
+            {"changed": false, "number": 3, "text": "# Body"},
+            {"changed": false, "number": 4, "text": "shared paragraph"}
+          ],
+          "before": [
+            {"changed": false, "number": 1, "text": "# Introduction"},
+            {"changed": true, "number": 2, "text": "shared paragraph"},
+            {"changed": false, "number": 3, "text": ""},
+            {"changed": false, "number": 4, "text": "# Body"},
+            {"changed": false, "number": 5, "text": "shared paragraph"}
+          ]
+        },
+        {
+          "affectedEnd": 7,
+          "affectedStart": 5,
+          "after": [
+            {"changed": false, "number": 2, "text": ""},
+            {"changed": false, "number": 3, "text": "# Body"},
+            {"changed": false, "number": 4, "text": "shared paragraph"},
+            {"changed": true, "number": 5, "text": "shared paragraph"},
+            {"changed": false, "number": 6, "text": ""},
+            {"changed": false, "number": 7, "text": "# Ending"},
+            {"changed": false, "number": 8, "text": "footer"}
+          ],
+          "before": [
+            {"changed": false, "number": 3, "text": ""},
+            {"changed": false, "number": 4, "text": "# Body"},
+            {"changed": false, "number": 5, "text": "shared paragraph"},
+            {"changed": false, "number": 6, "text": ""},
+            {"changed": false, "number": 7, "text": "# Ending"},
+            {"changed": false, "number": 8, "text": "footer"}
+          ]
+        }
+      ],
+      "name": "repeated-paragraphs",
+      "outside": [false, true],
+      "request": "Change only the introduction.",
+      "scope": "potentialMismatch"
+    },
+    {
+      "after": "# Introduction\nnew\n# Introduction\nold",
+      "before": "# Introduction\nold\n# Introduction\nold",
+      "hunks": [
+        {
+          "affectedEnd": 3,
+          "affectedStart": 2,
+          "after": [
+            {"changed": false, "number": 1, "text": "# Introduction"},
+            {"changed": true, "number": 2, "text": "new"},
+            {"changed": false, "number": 3, "text": "# Introduction"},
+            {"changed": false, "number": 4, "text": "old"}
+          ],
+          "before": [
+            {"changed": false, "number": 1, "text": "# Introduction"},
+            {"changed": true, "number": 2, "text": "old"},
+            {"changed": false, "number": 3, "text": "# Introduction"},
+            {"changed": false, "number": 4, "text": "old"}
+          ]
+        }
+      ],
+      "name": "repeated-heading",
+      "outside": [null],
+      "request": "Change only the introduction.",
+      "scope": "imprecise"
+    },
+    {
+      "after": "top\nb\na\nb\na\nend",
+      "before": "top\na\nb\na\nb\nend",
+      "hunks": [
+        {
+          "affectedEnd": 3,
+          "affectedStart": 2,
+          "after": [
+            {"changed": false, "number": 1, "text": "top"},
+            {"changed": false, "number": 2, "text": "b"},
+            {"changed": false, "number": 3, "text": "a"},
+            {"changed": false, "number": 4, "text": "b"}
+          ],
+          "before": [
+            {"changed": false, "number": 1, "text": "top"},
+            {"changed": true, "number": 2, "text": "a"},
+            {"changed": false, "number": 3, "text": "b"},
+            {"changed": false, "number": 4, "text": "a"},
+            {"changed": false, "number": 5, "text": "b"}
+          ]
+        },
+        {
+          "affectedEnd": 7,
+          "affectedStart": 5,
+          "after": [
+            {"changed": false, "number": 2, "text": "b"},
+            {"changed": false, "number": 3, "text": "a"},
+            {"changed": false, "number": 4, "text": "b"},
+            {"changed": true, "number": 5, "text": "a"},
+            {"changed": false, "number": 6, "text": "end"}
+          ],
+          "before": [
+            {"changed": false, "number": 3, "text": "b"},
+            {"changed": false, "number": 4, "text": "a"},
+            {"changed": false, "number": 5, "text": "b"},
+            {"changed": false, "number": 6, "text": "end"}
+          ]
+        }
+      ],
+      "name": "duplicate-block-movement",
+      "outside": [null, null],
+      "request": "Improve the document.",
+      "scope": "unrestricted"
+    },
+    {
+      "after": "start\na\n\n\nfooter\n",
+      "before": "start\n\na\n\nfooter\n",
+      "hunks": [
+        {
+          "affectedEnd": 3,
+          "affectedStart": 2,
+          "after": [
+            {"changed": false, "number": 1, "text": "start"},
+            {"changed": false, "number": 2, "text": "a"},
+            {"changed": false, "number": 3, "text": ""},
+            {"changed": true, "number": 4, "text": ""}
+          ],
+          "before": [
+            {"changed": false, "number": 1, "text": "start"},
+            {"changed": true, "number": 2, "text": ""},
+            {"changed": false, "number": 3, "text": "a"},
+            {"changed": false, "number": 4, "text": ""}
+          ]
+        },
+        {
+          "affectedEnd": 3,
+          "affectedStart": 2,
+          "after": [
+            {"changed": false, "number": 2, "text": "a"},
+            {"changed": false, "number": 3, "text": ""},
+            {"changed": true, "number": 4, "text": ""},
+            {"changed": false, "number": 5, "text": "footer"},
+            {"changed": false, "number": 6, "text": ""}
+          ],
+          "before": [
+            {"changed": true, "number": 2, "text": ""},
+            {"changed": false, "number": 3, "text": "a"},
+            {"changed": false, "number": 4, "text": ""},
+            {"changed": false, "number": 5, "text": "footer"},
+            {"changed": false, "number": 6, "text": ""}
+          ]
+        }
+      ],
+      "name": "repeated-blank-tail",
+      "outside": [null, null],
+      "request": "Only change \"a\".",
+      "scope": "imprecise"
+    },
+    {
+      "after": "same\nnew\nsame\ntail",
+      "before": "same\nsame\ntail",
+      "hunks": [
+        {
+          "affectedEnd": 3,
+          "affectedStart": 1,
+          "after": [
+            {"changed": false, "number": 1, "text": "same"},
+            {"changed": true, "number": 2, "text": "new"},
+            {"changed": false, "number": 3, "text": "same"},
+            {"changed": false, "number": 4, "text": "tail"}
+          ],
+          "before": [
+            {"changed": false, "number": 1, "text": "same"},
+            {"changed": false, "number": 2, "text": "same"},
+            {"changed": false, "number": 3, "text": "tail"}
+          ]
+        }
+      ],
+      "name": "unequal-leading-insertion",
+      "outside": [true],
+      "request": "Only change \"tail\".",
+      "scope": "potentialMismatch"
+    },
+    {
+      "after": "same\nsame\ntail",
+      "before": "same\nnew\nsame\ntail",
+      "hunks": [
+        {
+          "affectedEnd": 3,
+          "affectedStart": 2,
+          "after": [
+            {"changed": false, "number": 1, "text": "same"},
+            {"changed": false, "number": 2, "text": "same"},
+            {"changed": false, "number": 3, "text": "tail"}
+          ],
+          "before": [
+            {"changed": false, "number": 1, "text": "same"},
+            {"changed": true, "number": 2, "text": "new"},
+            {"changed": false, "number": 3, "text": "same"},
+            {"changed": false, "number": 4, "text": "tail"}
+          ]
+        }
+      ],
+      "name": "unequal-leading-deletion",
+      "outside": [true],
+      "request": "Only change \"tail\".",
+      "scope": "potentialMismatch"
+    },
+    {
+      "after": "😀\ncafé\n新文\nend\n",
+      "before": "😀\r\ncafé\r\n旧文\r\nend\r\n",
+      "hunks": [
+        {
+          "affectedEnd": 4,
+          "affectedStart": 3,
+          "after": [
+            {"changed": false, "number": 1, "text": "😀"},
+            {"changed": false, "number": 2, "text": "café"},
+            {"changed": true, "number": 3, "text": "新文"},
+            {"changed": false, "number": 4, "text": "end"},
+            {"changed": false, "number": 5, "text": ""}
+          ],
+          "before": [
+            {"changed": false, "number": 1, "text": "😀"},
+            {"changed": false, "number": 2, "text": "café"},
+            {"changed": true, "number": 3, "text": "旧文"},
+            {"changed": false, "number": 4, "text": "end"},
+            {"changed": false, "number": 5, "text": ""}
+          ]
+        }
+      ],
+      "name": "unicode-and-crlf",
+      "outside": [true],
+      "request": "Only change \"旧文\".",
+      "scope": "potentialMismatch"
+    },
+    {
+      "after": "",
+      "before": "old\n",
+      "hunks": [
+        {
+          "affectedEnd": 2,
+          "affectedStart": 1,
+          "after": [
+            {"changed": false, "number": 1, "text": ""}
+          ],
+          "before": [
+            {"changed": true, "number": 1, "text": "old"},
+            {"changed": false, "number": 2, "text": ""}
+          ]
+        }
+      ],
+      "name": "to-empty",
+      "outside": [null],
+      "request": "Improve the document.",
+      "scope": "unrestricted"
+    },
+    {
+      "after": "new\n",
+      "before": "",
+      "hunks": [
+        {
+          "affectedEnd": 2,
+          "affectedStart": 1,
+          "after": [
+            {"changed": true, "number": 1, "text": "new"},
+            {"changed": false, "number": 2, "text": ""}
+          ],
+          "before": [
+            {"changed": false, "number": 1, "text": ""}
+          ]
+        }
+      ],
+      "name": "from-empty",
+      "outside": [null],
+      "request": "Improve the document.",
+      "scope": "unrestricted"
+    }
+  ],
+  "version": 1
+}

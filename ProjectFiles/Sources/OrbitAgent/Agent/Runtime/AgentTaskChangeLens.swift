@@ -236,34 +236,59 @@ enum AgentTaskChangeLensDiff {
         guard old.count <= 1_000, new.count <= 1_000 else {
             return .unavailable("This text has too many lines for a bounded comparison.")
         }
-        let columns = new.count + 1
-        var common = [UInt16](repeating: 0, count: (old.count + 1) * columns)
-        if !old.isEmpty && !new.isEmpty {
-            for oldIndex in old.indices.reversed() {
+        if Task.isCancelled { return .unavailable("Comparison cancelled.") }
+        if old == new { return .hunks([]) }
+
+        // Traceback always consumes equal leading lines before consulting the
+        // matrix, so those rows and columns cannot affect later choices.
+        var prefix = 0
+        while prefix < min(old.count, new.count), old[prefix] == new[prefix] { prefix += 1 }
+        var oldEnd = old.count, newEnd = new.count
+        while oldEnd > prefix, newEnd > prefix, old[oldEnd - 1] == new[newEnd - 1] {
+            oldEnd -= 1; newEnd -= 1
+        }
+        if oldEnd < old.count {
+            // A suffix disjoint from both middles adds the same LCS length
+            // to every middle choice. Otherwise retain it in the matrix:
+            // repeated lines can change the established removal-first ties.
+            let suffix = Set(old[oldEnd...])
+            if old[prefix..<oldEnd].contains(where: suffix.contains) ||
+                new[prefix..<newEnd].contains(where: suffix.contains) {
+                oldEnd = old.count; newEnd = new.count
+            }
+        }
+        let columns = newEnd - prefix + 1
+        var common = [UInt16](repeating: 0, count: (oldEnd - prefix + 1) * columns)
+        if oldEnd > prefix && newEnd > prefix {
+            for oldIndex in (prefix..<oldEnd).reversed() {
                 if Task.isCancelled { return .unavailable("Comparison cancelled.") }
-                for newIndex in new.indices.reversed() {
-                    let cell = oldIndex * columns + newIndex
+                for newIndex in (prefix..<newEnd).reversed() {
+                    let cell = (oldIndex - prefix) * columns + newIndex - prefix
                     if old[oldIndex] == new[newIndex] {
-                        common[cell] = common[(oldIndex + 1) * columns + newIndex + 1] &+ 1
+                        common[cell] = common[cell + columns + 1] &+ 1
                     } else {
-                        common[cell] = max(common[(oldIndex + 1) * columns + newIndex], common[oldIndex * columns + newIndex + 1])
+                        common[cell] = max(common[cell + columns], common[cell + 1])
                     }
                 }
             }
         }
 
         enum Operation { case same(Int, Int); case remove(Int); case insert(Int, Int) }
-        var operations: [Operation] = []
-        var i = 0, j = 0
-        while i < old.count || j < new.count {
-            if i < old.count, j < new.count, old[i] == new[j] {
+        var operations: [Operation] = (0..<prefix).map { .same($0, $0) }
+        var i = prefix, j = prefix
+        while i < oldEnd || j < newEnd {
+            if i < oldEnd, j < newEnd, old[i] == new[j] {
                 operations.append(.same(i, j)); i += 1; j += 1; continue
             }
-            if i < old.count, (j == new.count || common[(i + 1) * columns + j] >= common[i * columns + j + 1]) {
+            let cell = (i - prefix) * columns + j - prefix
+            if i < oldEnd, (j == newEnd || common[cell + columns] >= common[cell + 1]) {
                 operations.append(.remove(i)); i += 1
-            } else if j < new.count {
+            } else if j < newEnd {
                 operations.append(.insert(i, j)); j += 1
             }
+        }
+        for offset in 0..<(old.count - oldEnd) {
+            operations.append(.same(oldEnd + offset, newEnd + offset))
         }
         let changedIndices = operations.indices.filter {
             switch operations[$0] { case .same: false; case .remove, .insert: true }
