@@ -1,10 +1,10 @@
 import Darwin
 import Foundation
 import Compression
+import CoreGraphics
 
-/// Small, descriptor-based checks for common document formats. This verifies
-/// signatures and essential container structure; it does not parse document
-/// content or claim that every optional format feature is valid.
+/// Staged, bounded descriptor-based artifact acceptance. Facts cover readable
+/// structure and required relationships, never semantic content or rendering.
 enum FileFormatVerifier {
     static let maximumCentralDirectoryBytes = 4 * 1024 * 1024
     static let maximumEntries = 16_384
@@ -21,18 +21,53 @@ enum FileFormatVerifier {
         }
     }
 
-    /// Returns a private attestation for valid supported formats. A nil result
-    /// means the extension is unsupported or the bytes do not match it.
-    static func attestation(fileDescriptor fd: Int32, size: Int64, filename: String) throws -> [String: Any]? {
-        guard let format = expectedFormat(for: filename) else { return nil }
-        let valid: Bool
-        switch format {
-        case "pdf": valid = try verifyPDF(fd, size: size)
-        case "docx": valid = try verifyOOXML(fd, size: size, kind: .docx)
-        case "xlsx": valid = try verifyOOXML(fd, size: size, kind: .xlsx)
-        default: valid = false
+    /// The attestation is deliberately narrower than semantic correctness or a
+    /// full standards validator. Unsupported and over-budget inputs have no proof.
+    static func attestation(fileDescriptor fd: Int32, size: Int64, filename: String,
+                            clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) throws -> [String: Any]? {
+        guard let format = expectedFormat(for: filename), size > 0, size <= 64 * 1024 * 1024 else { return nil }
+        let budget = ArtifactInspectionBudget(clock: clock)
+        do {
+            try budget.check()
+            let count: Int
+            switch format {
+            case "pdf":
+                guard try verifyPDF(fd, size: size), let pages = try readablePDF(fd, size: size, budget: budget) else { return nil }
+                count = pages
+            case "docx":
+                guard let parts = try verifyOOXML(fd, size: size, kind: .docx, budget: budget) else { return nil }
+                count = parts
+            case "xlsx":
+                guard let parts = try verifyOOXML(fd, size: size, kind: .xlsx, budget: budget) else { return nil }
+                count = parts
+            default: return nil
+            }
+            try budget.check()
+            return ArtifactStructureProof(format: format, count: count).fields
+        } catch ArtifactInspectionBudget.Exhausted.limit { return nil }
+    }
+
+    private static func readablePDF(_ fd: Int32, size: Int64, budget: ArtifactInspectionBudget) throws -> Int? {
+        // Never render, run JavaScript, follow URLs, or open a pathname. Quartz
+        // sees only this bounded descriptor snapshot; the caller rechecks identity.
+        let bytes = try read(fd, offset: 0, count: Int(size))
+        try budget.check()
+        guard bytes.count == Int(size), let provider = CGDataProvider(data: bytes as CFData),
+              let document = CGPDFDocument(provider), document.isUnlocked,
+              let catalog = document.catalog else { return nil }
+        var pages: CGPDFDictionaryRef?
+        guard CGPDFDictionaryGetDictionary(catalog, "Pages", &pages), pages != nil else { return nil }
+        let count = document.numberOfPages
+        guard count > 0, count <= 2_048 else { return nil }
+        for index in 1...count {
+            try budget.check()
+            guard let page = document.page(at: index) else { return nil }
+            let rect = page.getBoxRect(.mediaBox)
+            guard !rect.isNull, rect.width.isFinite, rect.height.isFinite,
+                  rect.width > 0, rect.height > 0 else { return nil }
         }
-        return valid ? ["format": format, "verified": true] : nil
+        try budget.check()
+        return count
     }
 
     private static func read(_ fd: Int32, offset: Int64, count: Int) throws -> Data {
@@ -103,15 +138,15 @@ enum FileFormatVerifier {
         let dataOffset: Int64
     }
 
-    private static func verifyOOXML(_ fd: Int32, size: Int64, kind: OOXMLKind) throws -> Bool {
+    private static func verifyOOXML(_ fd: Int32, size: Int64, kind: OOXMLKind, budget: ArtifactInspectionBudget) throws -> Int? {
         // ZIP EOCD has a 22-byte fixed header and a maximum 65,535-byte comment.
-        guard size >= 22 else { return false }
+        guard size >= 22 else { return nil }
         let signature = try read(fd, offset: 0, count: 4)
-        guard signature == Data([0x50, 0x4b, 0x03, 0x04]) else { return false }
+        guard signature == Data([0x50, 0x4b, 0x03, 0x04]) else { return nil }
         let tailCount = Int(min(size, 65_557))
         let tailOffset = size - Int64(tailCount)
         let tail = try read(fd, offset: tailOffset, count: tailCount)
-        guard let eocd = findEOCD(in: tail), tail.count - eocd >= 22 else { return false }
+        guard let eocd = findEOCD(in: tail), tail.count - eocd >= 22 else { return nil }
 
         let disk = u16(tail, eocd + 4), centralDisk = u16(tail, eocd + 6)
         let diskEntries = u16(tail, eocd + 8), totalEntries = u16(tail, eocd + 10)
@@ -121,22 +156,22 @@ enum FileFormatVerifier {
               totalEntries > 0, Int(totalEntries) <= maximumEntries,
               directorySize != UInt32.max, directoryOffset != UInt32.max,
               Int64(directorySize) <= Int64(maximumCentralDirectoryBytes),
-              eocd + 22 + commentLength == tail.count else { return false }
+              eocd + 22 + commentLength == tail.count else { return nil }
 
         let eocdAbsolute = tailOffset + Int64(eocd)
         let directoryStart = Int64(directoryOffset), directoryEnd = directoryStart + Int64(directorySize)
         guard directoryEnd == eocdAbsolute, directoryStart >= 0, directoryEnd >= directoryStart,
-              directoryEnd <= size else { return false }
+              directoryEnd <= size else { return nil }
         let directory = try read(fd, offset: directoryStart, count: Int(directorySize))
-        guard directory.count == Int(directorySize) else { return false }
+        guard directory.count == Int(directorySize) else { return nil }
 
         var cursor = 0
         var requiredEntries: [String: ZIPEntry] = [:]
-        var worksheetEntries: [ZIPEntry] = []
-        var worksheetNames = Set<String>()
+        var names = Set<String>()
+        var occupied: [Range<Int64>] = []
         for _ in 0..<Int(totalEntries) {
-            try TaskOwnership.check()
-            guard cursor <= directory.count - 46, u32(directory, cursor) == 0x02014b50 else { return false }
+            try budget.check()
+            guard cursor <= directory.count - 46, u32(directory, cursor) == 0x02014b50 else { return nil }
             let flags = u16(directory, cursor + 8), method = u16(directory, cursor + 10)
             let crc = u32(directory, cursor + 16), compressed = u32(directory, cursor + 20)
             let uncompressed = u32(directory, cursor + 24)
@@ -145,7 +180,7 @@ enum FileFormatVerifier {
             let startDisk = u16(directory, cursor + 34), localOffset = u32(directory, cursor + 42)
             let totalLength = 46 + nameLength + extraLength + entryCommentLength
             guard nameLength > 0, nameLength <= maximumNameBytes,
-                  totalLength <= directory.count - cursor else { return false }
+                  totalLength <= directory.count - cursor else { return nil }
             let rawNameStart = cursor + 46
             let rawName = directory[rawNameStart..<(rawNameStart + nameLength)]
             let decodedName: String?
@@ -159,75 +194,49 @@ enum FileFormatVerifier {
                   compressed != UInt32.max, uncompressed != UInt32.max,
                   localOffset != UInt32.max,
                   let name = decodedName,
-                  !name.contains("\\"), !name.hasPrefix("/") else { return false }
+                  ArtifactPackage.safeMember(name), names.insert(name).inserted else { return nil }
             // Reject ZIP64 extra fields, whose sentinels would otherwise evade
             // the bounded offsets and sizes enforced by this reader.
             let extraStart = cursor + 46 + nameLength
-            if containsZIP64Extra(directory, start: extraStart, length: extraLength) { return false }
+            if containsZIP64Extra(directory, start: extraStart, length: extraLength) { return nil }
 
             let local = Int64(localOffset)
-            guard local >= 0, local + 30 <= directoryStart else { return false }
+            guard local >= 0, local + 30 <= directoryStart else { return nil }
             let localHeader = try read(fd, offset: local, count: 30)
             guard localHeader.count == 30, u32(localHeader, 0) == 0x04034b50,
-                  u16(localHeader, 6) == flags, u16(localHeader, 8) == method else { return false }
+                  u16(localHeader, 6) == flags, u16(localHeader, 8) == method else { return nil }
             if flags & 0x0008 == 0 {
                 guard u32(localHeader, 14) == crc, u32(localHeader, 18) == compressed,
-                      u32(localHeader, 22) == uncompressed else { return false }
+                      u32(localHeader, 22) == uncompressed else { return nil }
             }
             let localNameLength = Int(u16(localHeader, 26)), localExtraLength = Int(u16(localHeader, 28))
-            guard localNameLength == nameLength else { return false }
+            guard localNameLength == nameLength else { return nil }
             let localName = try read(fd, offset: local + 30, count: localNameLength)
-            guard localName == Data(rawName) else { return false }
+            guard localName == Data(rawName) else { return nil }
             let dataStart = local + 30 + Int64(localNameLength + localExtraLength)
             let dataEnd = dataStart + Int64(compressed)
-            guard dataStart >= local, dataEnd >= dataStart, dataEnd <= directoryStart else { return false }
-            if isRequiredEntry(name, kind: kind) {
-                guard compressed > 0, uncompressed > 0,
-                      compressed <= UInt32(maximumRequiredPartBytes),
-                      uncompressed <= UInt32(maximumRequiredPartBytes) else { return false }
-                let entry = ZIPEntry(name: name, method: method, crc32: crc, compressedSize: compressed,
-                                     uncompressedSize: uncompressed, dataOffset: dataStart)
-                if isWorksheet(name) {
-                    guard worksheetNames.insert(name).inserted else { return false }
-                    worksheetEntries.append(entry)
-                } else {
-                    guard requiredEntries[name] == nil else { return false }
-                    requiredEntries[name] = entry
-                }
-            }
+            guard dataStart >= local, dataEnd >= dataStart, dataEnd <= directoryStart else { return nil }
+            occupied.append(local..<dataEnd)
+            let entry = ZIPEntry(name: name, method: method, crc32: crc, compressedSize: compressed,
+                                 uncompressedSize: uncompressed, dataOffset: dataStart)
+            requiredEntries[name] = entry
             cursor += totalLength
         }
-        guard cursor == directory.count else { return false }
-        switch kind {
-        case .docx:
-            guard let contentTypes = requiredEntries["[Content_Types].xml"],
-                  let document = requiredEntries["word/document.xml"],
-                  let typesXML = try inflate(contentTypes, fd: fd),
-                  hasXMLRoot(typesXML, "Types"),
-                  contains(typesXML, "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"),
-                  let documentXML = try inflate(document, fd: fd),
-                  hasXMLRoot(documentXML, "document") else { return false }
-            return true
-        case .xlsx:
-            guard let contentTypes = requiredEntries["[Content_Types].xml"],
-                  let workbook = requiredEntries["xl/workbook.xml"],
-                  let typesXML = try inflate(contentTypes, fd: fd),
-                  hasXMLRoot(typesXML, "Types"),
-                  contains(typesXML, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"),
-                  let workbookXML = try inflate(workbook, fd: fd),
-                  hasXMLRoot(workbookXML, "workbook") else { return false }
-            var inflatedBytes = typesXML.count + workbookXML.count
-            for worksheet in worksheetEntries {
-                try TaskOwnership.check()
-                let remaining = maximumInflatedBytes - inflatedBytes
-                guard remaining > 0 else { break }
-                guard Int(worksheet.uncompressedSize) <= remaining else { continue }
-                let sheetXML = try inflate(worksheet, fd: fd, maximumOutput: remaining)
-                inflatedBytes += Int(worksheet.uncompressedSize)
-                if let sheetXML, hasXMLRoot(sheetXML, "worksheet") { return true }
-            }
-            return false
+        guard cursor == directory.count else { return nil }
+        let ordered = occupied.sorted { $0.lowerBound < $1.lowerBound }
+        for index in ordered.indices.dropFirst() where ordered[index - 1].upperBound > ordered[index].lowerBound { return nil }
+        var remaining = maximumInflatedBytes
+        var cache: [String: Data] = [:]
+        let package = ArtifactPackage(names: names, budget: budget) { name in
+            if let bytes = cache[name] { return bytes }
+            guard let entry = requiredEntries[name], Int(entry.uncompressedSize) <= remaining,
+                  let bytes = try inflate(entry, fd: fd, maximumOutput: remaining) else { return nil }
+            try budget.check()
+            remaining -= bytes.count
+            cache[name] = bytes
+            return bytes
         }
+        return try package.validate(kind: kind == .docx ? "docx" : "xlsx")
     }
 
     private static func inflate(_ entry: ZIPEntry, fd: Int32,
@@ -259,42 +268,14 @@ enum FileFormatVerifier {
         return output
     }
 
-    private static func hasXMLRoot(_ data: Data, _ expected: String) -> Bool {
-        guard let xml = String(data: data, encoding: .utf8) else { return false }
-        var index = xml.startIndex
-        while index < xml.endIndex {
-            guard let opening = xml[index...].firstIndex(of: "<") else { return false }
-            let next = xml.index(after: opening)
-            guard next < xml.endIndex else { return false }
-            let marker = xml[next]
-            if marker == "!", xml[opening...].hasPrefix("<!--") {
-                guard let close = xml[opening...].range(of: "-->")?.upperBound else { return false }
-                index = close
-                continue
-            }
-            if marker == "?" || marker == "!" || marker == "/" {
-                guard let close = xml[next...].firstIndex(of: ">") else { return false }
-                index = xml.index(after: close)
-                continue
-            }
-            var end = next
-            while end < xml.endIndex, !xml[end].isWhitespace, xml[end] != ">", xml[end] != "/" { end = xml.index(after: end) }
-            let qualifiedName = String(xml[next..<end])
-            return qualifiedName.split(separator: ":").last.map(String.init) == expected
-        }
-        return false
+    private static let crcTable: [UInt32] = (0..<256).map { value in
+        var crc = UInt32(value)
+        for _ in 0..<8 { crc = (crc & 1) == 1 ? (crc >> 1) ^ 0xedb8_8320 : crc >> 1 }
+        return crc
     }
-
-    private static func contains(_ data: Data, _ marker: String) -> Bool {
-        data.range(of: Data(marker.utf8)) != nil
-    }
-
     private static func crc32(_ data: Data) -> UInt32 {
         var crc: UInt32 = 0xffff_ffff
-        for byte in data {
-            crc ^= UInt32(byte)
-            for _ in 0..<8 { crc = (crc & 1) == 1 ? (crc >> 1) ^ 0xedb8_8320 : crc >> 1 }
-        }
+        for byte in data { crc = (crc >> 8) ^ crcTable[Int((crc ^ UInt32(byte)) & 0xff)] }
         return ~crc
     }
 
@@ -321,19 +302,6 @@ enum FileFormatVerifier {
             cursor += 4 + size
         }
         return false
-    }
-
-    private static func isRequiredEntry(_ name: String, kind: OOXMLKind) -> Bool {
-        switch kind {
-        case .docx: return name == "[Content_Types].xml" || name == "word/document.xml"
-        case .xlsx: return name == "[Content_Types].xml" || name == "xl/workbook.xml" || isWorksheet(name)
-        }
-    }
-
-    private static func isWorksheet(_ name: String) -> Bool {
-        guard name.hasPrefix("xl/worksheets/sheet"), name.hasSuffix(".xml") else { return false }
-        let number = name.dropFirst("xl/worksheets/sheet".count).dropLast(".xml".count)
-        return !number.isEmpty && number.allSatisfy(\.isNumber)
     }
 
     private static func u16(_ data: Data, _ offset: Int) -> UInt16 {

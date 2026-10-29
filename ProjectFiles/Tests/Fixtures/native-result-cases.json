@@ -3636,7 +3636,14 @@
         "parent_identity": "3333333333333333333333333333333333333333333333333333333333333333",
         "file_format": {
           "format": "pdf",
-          "verified": true
+          "verified": true,
+          "validation_version": 1,
+          "scope": "document_structure",
+          "structure_count": 1,
+          "facts": [
+            "pdf_catalog",
+            "pdf_pages"
+          ]
         }
       },
       "action": {
@@ -3689,7 +3696,16 @@
         "parent_identity": "3333333333333333333333333333333333333333333333333333333333333333",
         "file_format": {
           "format": "xlsx",
-          "verified": true
+          "verified": true,
+          "validation_version": 1,
+          "scope": "document_structure",
+          "structure_count": 1,
+          "facts": [
+            "zip_directory",
+            "content_types",
+            "package_relationships",
+            "workbook_sheets"
+          ]
         }
       },
       "action": {
@@ -3725,6 +3741,147 @@
         "path": "/example/missing.pdf",
         "parent_identity": "3333333333333333333333333333333333333333333333333333333333333333"
       }
+    },
+    {
+      "name": "pdf staged structural proof",
+      "schema": "artifact_format",
+      "value": {
+        "format": "pdf",
+        "verified": true,
+        "validation_version": 1,
+        "scope": "document_structure",
+        "structure_count": 1,
+        "facts": [
+          "pdf_catalog",
+          "pdf_pages"
+        ]
+      }
+    },
+    {
+      "name": "docx staged structural proof",
+      "schema": "artifact_format",
+      "value": {
+        "format": "docx",
+        "verified": true,
+        "validation_version": 1,
+        "scope": "document_structure",
+        "structure_count": 1,
+        "facts": [
+          "zip_directory",
+          "content_types",
+          "package_relationships",
+          "word_body"
+        ]
+      }
+    },
+    {
+      "name": "xlsx staged structural proof",
+      "schema": "artifact_format",
+      "value": {
+        "format": "xlsx",
+        "verified": true,
+        "validation_version": 1,
+        "scope": "document_structure",
+        "structure_count": 1,
+        "facts": [
+          "zip_directory",
+          "content_types",
+          "package_relationships",
+          "workbook_sheets"
+        ]
+      }
+    },
+    {
+      "name": "old shallow proof",
+      "schema": "artifact_format",
+      "value": {
+        "format": "pdf",
+        "verified": true
+      },
+      "error": "artifact_format.validation_version is required"
+    },
+    {
+      "name": "wrong structural stage",
+      "schema": "artifact_format",
+      "value": {
+        "format": "pdf",
+        "verified": true,
+        "validation_version": 1,
+        "scope": "document_structure",
+        "structure_count": 1,
+        "facts": [
+          "pdf_catalog",
+          "word_body"
+        ]
+      },
+      "error": "artifact_format.facts must name the verified structural stages"
+    },
+    {
+      "name": "docx count is bounded",
+      "schema": "artifact_format",
+      "value": {
+        "format": "docx",
+        "verified": true,
+        "validation_version": 1,
+        "scope": "document_structure",
+        "structure_count": 2,
+        "facts": [
+          "zip_directory",
+          "content_types",
+          "package_relationships",
+          "word_body"
+        ]
+      },
+      "error": "artifact_format.structure_count exceeds the format limit"
+    },
+    {
+      "name": "strict proof version",
+      "schema": "artifact_format",
+      "value": {
+        "format": "pdf",
+        "verified": true,
+        "validation_version": true,
+        "scope": "document_structure",
+        "structure_count": 1,
+        "facts": [
+          "pdf_catalog",
+          "pdf_pages"
+        ]
+      },
+      "error": "artifact_format.validation_version must be an integer"
+    },
+    {
+      "name": "structure cannot imply semantic proof",
+      "schema": "artifact_format",
+      "value": {
+        "format": "pdf",
+        "verified": true,
+        "validation_version": 1,
+        "scope": "usable",
+        "structure_count": 1,
+        "facts": [
+          "pdf_catalog",
+          "pdf_pages"
+        ]
+      },
+      "error": "artifact_format.scope must be a supported value"
+    },
+    {
+      "name": "no arbitrary proof payload",
+      "schema": "artifact_format",
+      "value": {
+        "format": "pdf",
+        "verified": true,
+        "validation_version": 1,
+        "scope": "document_structure",
+        "structure_count": 1,
+        "facts": [
+          "pdf_catalog",
+          "pdf_pages"
+        ],
+        "text": "not allowed"
+      },
+      "error": "artifact_format contains unsupported parameters"
     }
   ]
 }

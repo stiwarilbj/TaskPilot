@@ -279,15 +279,25 @@
             }
             return
         }
+        try validateNativePayload("artifact_format", attestation, path: path + ".file_format")
         guard attestation["format"] as? String == expected, attestation["verified"] as? Bool == true else {
             throw NativeProtocolError(message: path + ".file_format must verify the requested \(expected.uppercased()) format")
         }
     }
     private static func validateFileFormatPayload(_ schema: String, _ value: [String: Any], path: String) throws {
         switch schema {
+        case "artifact_format":
+            let profile = (definition["artifact_formats"] as! [String: [String: Any]])[value["format"] as! String]!
+            guard value["facts"] as? [String] == profile["facts"] as? [String] else {
+                throw NativeProtocolError(message: path + ".facts must name the verified structural stages")
+            }
+            guard (value["structure_count"] as! NSNumber).intValue <= profile["maximum_count"] as! Int else {
+                throw NativeProtocolError(message: path + ".structure_count exceeds the format limit")
+            }
         case "action_result":
-            if value["action_type"] as? String == "write_file", value["verified"] as? Bool == true {
-                try validateFileFormatAttestation(schema, value, path: path, required: true)
+            if ["read_file", "write_file"].contains(value["action_type"] as? String ?? "") {
+                try validateFileFormatAttestation(schema, value, path: path,
+                    required: value["action_type"] as? String == "write_file" && value["verified"] as? Bool == true)
             }
             for (index, checked) in (value["checks"] as? [[String: Any]] ?? []).enumerated() {
                 try validateFileFormatAttestation("check_result", checked, path: "\(path).checks[\(index)]")

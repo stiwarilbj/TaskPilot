@@ -161,10 +161,12 @@ class PromptCompilerTests(unittest.TestCase):
             ]
         # Digests captured from the original uncached prompt builders. These
         # assert the complete UTF-8 prompt bytes, not just selected fragments.
+        # The verifier fixture advances only its checklist version to 12 for
+        # typed artifact acceptance; cached and uncached instructions match.
         self.assertEqual([hashlib.sha256(prompt.encode('utf-8')).hexdigest() for prompt in prompts], [
             'e0dfcacfddd6db04c3679da4dc5858637405751946dfff571fbcc639e92e60dd',
             'fad15b5b8562cdb618b823323aa0d035da7d69d75ce82372b46ca157b70853cd',
-            '868e94c8b8bd2a09428939ce59edc8e6f5d9172e3d0065cd407f976fad0dddcc',
+            'b4d4c78a39f596a6783020d04c1a8ba74cc837e3ffc18f6ed9b9333034805cee',
         ])
 
     def test_cached_static_fragments_never_reuse_observation_or_evidence(self):

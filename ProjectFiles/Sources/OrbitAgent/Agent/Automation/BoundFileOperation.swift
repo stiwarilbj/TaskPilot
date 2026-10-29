@@ -354,7 +354,7 @@ final class BoundFileOperation {
         if let requiredFormat = FileFormatVerifier.expectedFormat(for: name) {
             guard let format = proof["file_format"] as? [String: Any],
                   format["format"] as? String == requiredFormat,
-                  format["verified"] as? Bool == true else { return nil }
+                  (try? ActionContract.validateNativePayload("artifact_format", format)) != nil else { return nil }
         }
 
         try checkParent()
@@ -431,14 +431,16 @@ final class BoundFileOperation {
         }
         try Self.write(staged, data)
         guard fsync(staged) == 0 else { throw Self.systemError("flush staged file") }
-        let stagedSize = try Self.identity(staged).info.st_size
+        let beforeFormat = try Self.identity(staged)
+        let stagedSize = beforeFormat.info.st_size
         let stagedFormat = try FileFormatVerifier.attestation(fileDescriptor: staged, size: stagedSize, filename: name)
         if FileFormatVerifier.expectedFormat(for: name) != nil, stagedFormat == nil {
             let format = FileFormatVerifier.expectedFormat(for: name)!.uppercased()
-            throw TaskToolError.invalidAction("The staged contents do not match the requested \(format) format")
+            throw TaskToolError.invalidAction("The staged \(format) structure could not be verified within supported format and inspection limits")
         }
         let stagedHash = try Self.copyAndHash(staged)
         let stagedIdentity = try Self.identity(staged)
+        guard stagedIdentity == beforeFormat else { throw conflict("the staged object changed during artifact validation") }
         try hook(.staged)
         try hook(.beforeCommit)
         try checkParent()

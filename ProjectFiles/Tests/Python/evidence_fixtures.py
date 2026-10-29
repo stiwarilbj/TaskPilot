@@ -49,7 +49,7 @@ def native_check(check, verified=True, **fields):
         result.update(filesystem_identity(result['path']))
         suffix = os.path.splitext(result['path'])[1].lower()
         format_name = {'.pdf': 'pdf', '.docx': 'docx', '.xlsx': 'xlsx'}.get(suffix)
-        if format_name: result['file_format'] = {'format': format_name, 'verified': True}
+        if format_name: result['file_format'] = format_proof(format_name)
         if check['type'] == 'path_absent':
             result.pop('file_identity'); result.pop('file_version')
     if verified and check['type'] == 'file_contents' and 'content' in check:
@@ -108,7 +108,7 @@ def native_result(action, **fields):
     if result.get('verified') is True and kind in {'read_file', 'write_file'}:
         suffix = os.path.splitext(result['path'])[1].lower()
         format_name = {'.pdf': 'pdf', '.docx': 'docx', '.xlsx': 'xlsx'}.get(suffix)
-        if format_name: result['file_format'] = {'format': format_name, 'verified': True}
+        if format_name: result['file_format'] = format_proof(format_name)
     return {**result, **fields}
 
 
@@ -125,3 +125,10 @@ def native_delivery(action, fields):
     elif action['type'] in {'set_value','type_text'} and fields.get('outcome') == 'delivered_unconfirmed':
         fields.update(verified=False, text_verification=fields.get('text_verification','unavailable'))
     return native_result(action, **fields)
+
+
+def format_proof(kind):
+    from action_contract_generated import CONTRACT
+    return {'format': kind, 'verified': True, 'validation_version': 1,
+            'scope': 'document_structure', 'structure_count': 1,
+            'facts': list(CONTRACT['artifact_formats'][kind]['facts'])}

@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'AgentRuntime'))
-from evidence_fixtures import native_result, native_check, native_batch
+from evidence_fixtures import native_result, native_check, native_batch, format_proof
 import openclaw_runtime as runtime
 from evidence_fixtures import VerificationSessions
 from response_validation import ResponseValidationError, validate_response
@@ -121,15 +121,15 @@ class EvidenceLedgerTests(unittest.TestCase):
             ledger.record_action(action, missing)
         self.assertFalse(ledger.evidence)
 
-        mismatched = native_result(action, file_format={'format': 'xlsx', 'verified': True})
+        mismatched = native_result(action, file_format=format_proof('xlsx'))
         with self.assertRaisesRegex(runtime.NativeProtocolError, 'must verify the requested PDF format'):
             ledger.record_action(action, mismatched)
         self.assertFalse(ledger.evidence)
 
-        valid = native_result(action, file_format={'format': 'pdf', 'verified': True})
+        valid = native_result(action, file_format=format_proof('pdf'))
         ledger.record_action(action, valid)
         self.assertEqual(ledger.requirements['r1']['state'], 'proven')
-        self.assertTrue(all(record['fact'].get('file_format') == {'format': 'pdf', 'verified': True}
+        self.assertTrue(all(record['fact'].get('file_format') == format_proof('pdf')
                             for record in ledger.evidence.values()
                             if record['fact'].get('path') == action['path']))
 
@@ -142,7 +142,7 @@ class EvidenceLedgerTests(unittest.TestCase):
 
     def test_file_format_attestations_are_rejected_for_unrelated_extensions(self):
         action = write('/fixture/result.txt', 'plain text')
-        result = native_result(action, file_format={'format': 'pdf', 'verified': True})
+        result = native_result(action, file_format=format_proof('pdf'))
         with self.assertRaisesRegex(runtime.NativeProtocolError, 'not valid for this destination'):
             runtime.validate_native_result(result, action)
 

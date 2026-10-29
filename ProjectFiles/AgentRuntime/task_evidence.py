@@ -17,14 +17,15 @@ import unicodedata
 from copy import deepcopy
 from typing import Any
 
-from action_contract_generated import (CONTRACT, ActionContractError, _field, validate_action, validate_outcome_check,
+from action_contract_generated import (CONTRACT, ActionContractError, NativeProtocolError, _field, validate_action, validate_outcome_check,
     validate_native_result, validate_check_batch, validate_native_readback, validate_native_payload, validate_native_evidence,
     expected_file_format)
 from task_inputs import TaskInputBindings
 from expected_effects import ExpectedEffect, ExpectedEffectError, validate_expectation
 from observation_context import coordinate_targets, observation_indexes
+from artifact_acceptance import inspect_output_set, structure_matches
 
-CHECKLIST_VERSION = 11
+CHECKLIST_VERSION = 12
 BATCH_PROGRESS_VERSION = 1
 CONTINUATION_CHECKPOINT_VERSION = 1
 RESULT_BROWSER_BUNDLE_IDS = frozenset({
@@ -1533,7 +1534,7 @@ class TaskEvidenceLedger:
         if check['type'] in FILE_CHECKS:
             expected_format = expected_file_format(check.get('path'))
             if (check['type'] in {'file_exists', 'file_contents'} and expected_format and
-                    actual.get('file_format') != {"format": expected_format, "verified": True}): return False
+                    not structure_matches(actual.get('file_format'), check.get('path'))): return False
             return (actual.get('path') == path_key(check['path']) and
                     (check['type'] != 'file_contents' or actual.get('content_sha256') == content_hash(check)))
         return check['type'] == 'stdout_equals' and actual.get('text_sha256') == hashlib.sha256(check['text'].encode()).hexdigest()
@@ -1643,7 +1644,7 @@ class TaskEvidenceLedger:
                 "parent_identity": identity["parent_identity"], "content_sha256": digest,
                 "file_sha256": digest, "file_size": size, "file_format": format_attestation,
             })
-            except ActionContractError:
+            except (ActionContractError, NativeProtocolError):
                 return
         self._file_digest_proofs[normalized] = {
             "task_generation_id": self.generation, "path": normalized,
@@ -1689,7 +1690,7 @@ class TaskEvidenceLedger:
             return fact["type"] == "requirement_observed" and fact.get("check_fingerprint") == digest(check)
         expected_format = expected_file_format(check.get("path")) if kind in {
             "file_exists", "file_contents", "file_written", "file_append"} else None
-        if expected_format and fact.get("file_format") != {"format": expected_format, "verified": True}: return False
+        if expected_format and not structure_matches(fact.get("file_format"), check.get("path")): return False
         if kind == "file_contents" and fact["type"] == "file_read":
             return path_key(check["path"]) == fact["path"] and content_hash(check) == fact["content_sha256"]
         if kind == "file_exists" and fact["type"] == "file_contents":
@@ -1751,6 +1752,7 @@ class TaskEvidenceLedger:
         if not active or not (self.coverage_complete or self.local_complete_grammar): return False
         if any(r["state"] != "proven" for r in active): return False
         if not self.batch_complete(): return False
+        if not inspect_output_set(self).complete: return False
         if output is not None:
             for r in active:
                 if r["check"]["type"] in {"file_read", "stdout_equals"}:
@@ -1811,6 +1813,9 @@ class TaskEvidenceLedger:
                               for key, e in self.evidence.items() if e["valid"]}}
         if self.inputs.reference_occurrences:
             state["input_roles"] = self.input_role_state()
+        artifacts = inspect_output_set(self)
+        if artifacts.members or not artifacts.bounded:
+            state["artifact_acceptance"] = artifacts.prompt_state()
         if batch_prompt is not None:
             state["batch"] = batch_prompt
         if self.continuation_checkpoint is not None:

@@ -239,12 +239,19 @@ def expected_file_format(path):
 
 
 def _validate_file_format_payload(schema, value, path):
-    if schema == 'check_batch':
+    if schema == 'artifact_format':
+        profile = CONTRACT['artifact_formats'][value['format']]
+        if value['facts'] != profile['facts']:
+            raise NativeProtocolError(path + '.facts must name the verified structural stages')
+        if value['structure_count'] > profile['maximum_count']:
+            raise NativeProtocolError(path + '.structure_count exceeds the format limit')
+    elif schema == 'check_batch':
         for index, checked in enumerate(value.get('checks', [])):
             _validate_file_format_attestation('check_result', checked, f'{path}.checks[{index}]')
     elif schema == 'action_result':
-        if value.get('action_type') == 'write_file' and value.get('verified') is True:
-            _validate_file_format_attestation(schema, value, path, required=True)
+        if value.get('action_type') in {'read_file', 'write_file'}:
+            _validate_file_format_attestation(schema, value, path,
+                required=value.get('action_type') == 'write_file' and value.get('verified') is True)
         for index, checked in enumerate(value.get('checks', [])):
             _validate_file_format_attestation('check_result', checked, f'{path}.checks[{index}]')
     elif schema == 'check_result':
@@ -271,6 +278,7 @@ def _validate_file_format_attestation(schema, value, path, required=False):
         if required or (schema == 'check_result' and value.get('type') in {'file_exists', 'file_contents'} and value.get('verified') is True):
             raise NativeProtocolError(path + '.file_format is required for a verified ' + expected.upper() + ' result')
         return
+    validate_native_payload('artifact_format', attestation, path + '.file_format')
     if attestation.get('format') != expected or attestation.get('verified') is not True:
         raise NativeProtocolError(path + '.file_format must verify the requested ' + expected.upper() + ' format')
 

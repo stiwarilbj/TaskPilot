@@ -43,6 +43,11 @@ verified object at inspection time; existing task freshness and completion gates
 still apply. Arbitrary shell commands remain outside this native write layer;
 their file outcome checks use bound inspection, and exit zero alone is not proof.
 
+Supported document outputs additionally pass the staged structural checks in
+[Artifact acceptance](../Documentation/ArtifactAcceptance.md). Their typed proof
+and digest refer to the same inspected object/version; unsupported structure
+never inherits meaning from a successful byte write.
+
 Validation uses disposable local files and injected boundary changes, plus the
 Python, Swift, setup, generated-contract, and offline scripted regression suites.
 No fixer, live-control tester, browser interaction, provider request, or live
