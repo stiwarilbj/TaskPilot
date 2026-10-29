@@ -42,6 +42,12 @@ class LineFramer:
                     self.pending.clear()
                     self.discarding = True
                     on_failure(TransportFailure('transport_frame_limit'))
+                elif not self.pending and end >= 0:
+                    # Own only this complete line, without copying via pending.
+                    if length:
+                        on_frame(bytes(memoryview(data)[start:stop]))
+                    start = end + 1
+                    continue
                 else:
                     self.pending.extend(memoryview(data)[start:stop])
             if end < 0:

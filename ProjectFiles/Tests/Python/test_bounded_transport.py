@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import random
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,24 @@ import openclaw_runtime as runtime
 from action_receipts import RuntimeInbox, BridgeReplyLost
 from bounded_transport import ACPTransport, RequestTransport, LineFramer, TransportFailure, read_frames, write_frame
 from evidence_fixtures import native_result
+
+
+class CountingFrameBuffer(bytearray):
+    """Test-only copy accounting; production framing retains no metrics."""
+    def __init__(self):
+        super().__init__()
+        self.extend_calls = self.extended_bytes = 0
+        self.materializations = self.materialized_bytes = 0
+
+    def extend(self, value):
+        self.extend_calls += 1
+        self.extended_bytes += len(value)
+        super().extend(value)
+
+    def __bytes__(self):
+        self.materializations += 1
+        self.materialized_bytes += len(self)
+        return bytes(memoryview(self))
 
 
 class BoundedTransportTests(unittest.TestCase):
@@ -243,6 +262,89 @@ class BoundedTransportTests(unittest.TestCase):
         self.assertEqual(frames, [payload, b'last'])
         self.assertEqual(errors, [])
         self.assertEqual(len(framer.pending), 0)
+
+    def test_complete_lines_bypass_pending_copies(self):
+        expected = [json.dumps({'index': index, 'value': 'x' * 24}).encode() for index in range(1000)]
+        framer = LineFramer(128); framer.pending = CountingFrameBuffer()
+        frames = []; errors = []
+        framer.feed(b'\n'.join(expected) + b'\n', frames.append, errors.append, flush=True)
+        self.assertEqual(frames, expected)
+        self.assertTrue(all(type(frame) is bytes for frame in frames))
+        self.assertEqual(errors, [])
+        self.assertEqual((framer.pending.extend_calls, framer.pending.extended_bytes,
+                          framer.pending.materializations, framer.pending.materialized_bytes), (0, 0, 0, 0))
+        self.assertEqual(framer.pending, b'')
+
+    def test_only_fragmented_lines_use_the_accumulation_buffer(self):
+        framer = LineFramer(16); framer.pending = CountingFrameBuffer()
+        frames = []; errors = []
+        framer.feed(b'alpha\nbe', frames.append, errors.append)
+        self.assertEqual((frames, bytes(memoryview(framer.pending))), ([b'alpha'], b'be'))
+        framer.feed(b'ta\ngamma\nlast', frames.append, errors.append)
+        framer.feed(b'', frames.append, errors.append, flush=True)
+        self.assertEqual(frames, [b'alpha', b'beta', b'gamma', b'last'])
+        self.assertEqual(errors, [])
+        self.assertEqual((framer.pending.extend_calls, framer.pending.extended_bytes,
+                          framer.pending.materializations, framer.pending.materialized_bytes), (3, 8, 2, 8))
+
+    def test_random_fragmentation_matches_wire_frames_errors_and_eof_byte_for_byte(self):
+        for seed in range(80):
+            rng = random.Random(seed)
+            limit = rng.choice([0, 1, 16, 64])
+            lines = [b'', b'\r', 'emoji 🧭 e\u0301'.encode(), b'\x00\xff\xfe',
+                     b'x' * limit, b'y' * (limit + 1), b'z' * (limit * 3 + 1)]
+            lines += [bytes(rng.choice([0, 13, 32, 65, 127, 255]) for _ in range(rng.randrange(130)))
+                      for _ in range(30)]
+            wire = b'\n'.join(lines) + (b'\n' if seed % 2 else b'')
+            expected = [('failure', 'transport_frame_limit') if len(line) > limit else ('frame', line)
+                        for line in wire.split(b'\n') if line]
+            framer = LineFramer(limit); events = []
+            def frame(value):
+                self.assertIs(type(value), bytes)
+                events.append(('frame', value))
+            def failure(error): events.append(('failure', error.code))
+            position = 0
+            with self.subTest(seed=seed, limit=limit):
+                while position < len(wire):
+                    stop = min(len(wire), position + rng.randrange(1, 257))
+                    framer.feed(wire[position:stop], frame, failure,
+                                flush=stop == len(wire) and seed % 3 == 0)
+                    self.assertLessEqual(len(framer.pending), limit)
+                    if rng.randrange(4) == 0: framer.feed(b'', frame, failure)
+                    position = stop
+                framer.feed(b'', frame, failure, flush=True)
+                framer.feed(b'', frame, failure, flush=True)
+                self.assertEqual(events, expected)
+                self.assertEqual(framer.pending, b'')
+                self.assertFalse(framer.discarding)
+
+    def test_direct_frames_own_bytes_independently_of_source_and_later_feeds(self):
+        source = bytearray(b'alpha\nbeta\n')
+        framer = LineFramer(16); frames = []; errors = []
+        framer.feed(source, frames.append, errors.append)
+        source[:] = b'changed'
+        framer.feed(b'fragment', frames.append, errors.append)
+        framer.feed(b'ed\nnext\n', frames.append, errors.append)
+        self.assertEqual(frames, [b'alpha', b'beta', b'fragmented', b'next'])
+        self.assertTrue(all(type(frame) is bytes for frame in frames))
+        self.assertEqual(errors, [])
+
+    def test_oversized_and_empty_lines_resynchronize_into_direct_frames(self):
+        framer = LineFramer(4); framer.pending = CountingFrameBuffer()
+        events = []
+        frame = lambda value: events.append(('frame', value))
+        failure = lambda error: events.append(('failure', error.code))
+        framer.feed(b'\n\nxxxx\n12345\n\r\nokay\nlast', frame, failure)
+        self.assertEqual(events, [('frame', b'xxxx'), ('failure', 'transport_frame_limit'),
+                                  ('frame', b'\r'), ('frame', b'okay')])
+        self.assertEqual((framer.pending.extend_calls, framer.pending.extended_bytes), (1, 4))
+        framer.feed(b'x', frame, failure)  # Oversized final fragment fails before EOF.
+        self.assertEqual(events[-1], ('failure', 'transport_frame_limit'))
+        framer.feed(b'', frame, failure, flush=True)
+        self.assertFalse(framer.discarding)
+        framer.feed(b'new\n', frame, failure)
+        self.assertEqual(events[-1], ('frame', b'new'))
+        self.assertEqual(framer.pending.materializations, 0)
 
     def test_exact_limit_then_oversized_unterminated_flood_is_bounded(self):
         framer = LineFramer(64); frames = []; errors = []

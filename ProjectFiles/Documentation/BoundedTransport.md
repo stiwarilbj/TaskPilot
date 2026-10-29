@@ -33,6 +33,33 @@ These changes add no model calls or public protocol fields.
   Reconnect readers retain their own pipes, transport, EOF event and stderr tail;
   duplicated read descriptors prevent descriptor reuse across invocations.
 
+## Direct Python line framing
+
+When no fragment is pending, `LineFramer.feed()` dispatches a complete bounded
+line as owned immutable bytes directly from the read chunk. It does not copy
+that line through the accumulation buffer. A mutable input chunk cannot change
+a retained frame, and a frame does not retain the larger input chunk.
+Split lines and unterminated EOF tails still accumulate normally. The size
+check precedes either path; oversized lines fail once and drain through LF
+before framing resumes. Empty lines remain skipped, LF is excluded, CR and all
+other bytes remain unchanged, and EOF still emits a bounded nonempty tail.
+
+Offline reproduction: `/opt/homebrew/bin/python3.11 -m unittest discover -s
+ProjectFiles/Tests/Python -p test_bounded_transport.py`. Test-only accumulation
+buffers count extension calls/bytes and immutable materializations; no counters
+or payload diagnostics are added to production. A 1,000-line, 51,890-byte
+fixture previously copied 50,890 payload bytes into pending storage and another
+50,890 into dispatch frames. It now performs zero pending writes or pending
+materializations, with one owned dispatch copy per line (50,890 bytes total).
+Mixed-fragment fixtures verify that only split lines use pending storage.
+Eighty seeded fragmentations compare frame bytes, failure ordering, bounds,
+delimiter handling, and EOF behavior against the original wire records.
+
+A local nine-trial benchmark of 100 batches (100,000 frames) measured median
+framing time of 27.3 ms before and 24.1 ms after the change. These illustrative
+timings are not regression thresholds; copy counts and byte equality are the
+deterministic checks.
+
 ## Preparation outside the admission lock
 
 `RequestTransport.put()` captures the registered mailbox under the condition
