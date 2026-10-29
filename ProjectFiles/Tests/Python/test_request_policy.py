@@ -78,6 +78,103 @@ class RequestPolicyTests(unittest.TestCase):
                 else:
                     self.assertEqual(recovered.path.read_bytes(), previous)
 
+    def test_malformed_readiness_state_fails_closed_without_replacing_original_bytes(self):
+        model = policy.PRIMARY_MODELS[0]
+        corruptions = {
+            "oversized": lambda state: state.path.write_bytes(b" " * (policy.READINESS_STATE_MAX_BYTES + 1)),
+            "duplicate_credentials": lambda state: state.path.write_text(
+                '{"revision":0,"credentials":{"preserved":{"credential_health":'
+                '{"google":{"state":"temporary","retry_at":999999999999}}}},"credentials":{}}'),
+            "truncated": lambda state: state.path.write_bytes(state.path.read_bytes()[:-1]),
+        }
+        for label, corrupt in corruptions.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                state = policy.RuntimeState("fingerprint", "v1", Path(directory))
+                state.record_failure(model, policy.Failure(
+                    "quota", "fixture cooldown", retry_at=999999999999, scope="credential", provider="google"))
+                corrupt(state)
+                damaged = state.path.read_bytes()
+                with self.assertRaises(policy.ReadinessStateError) as raised:
+                    state.record_failure(model, policy.Failure("temporary", "new failure", retry_at=999999999999))
+                self.assertEqual(str(raised.exception), "TaskPilot local readiness state is invalid or unavailable.")
+                self.assertEqual(raised.exception.code, "local_resource_readiness_state")
+                self.assertEqual(state.path.read_bytes(), damaged)
+
+    def test_readiness_state_rejects_symlinks_without_touching_the_cooldown_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = policy.RuntimeState("fingerprint", "v1", root)
+            state.record_failure(policy.PRIMARY_MODELS[0], policy.Failure(
+                "quota", "fixture cooldown", retry_at=999999999999, scope="credential", provider="google"))
+            preserved = state.path.read_bytes()
+            victim = root / "preserved-readiness.json"
+            victim.write_bytes(preserved)
+            victim.chmod(0o600)
+            state.path.unlink()
+            state.path.symlink_to(victim)
+
+            with self.assertRaises(policy.ReadinessStateError):
+                state.record_failure(policy.PRIMARY_MODELS[0], policy.Failure(
+                    "temporary", "new failure", retry_at=999999999999))
+            self.assertTrue(state.path.is_symlink())
+            self.assertEqual(victim.read_bytes(), preserved)
+
+    def test_readiness_state_rejects_symlink_replacement_during_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = policy.RuntimeState("fingerprint", "v1", root)
+            state.record_failure(policy.PRIMARY_MODELS[0], policy.Failure(
+                "quota", "fixture cooldown", retry_at=999999999999, scope="credential", provider="google"))
+            preserved = state.path.read_bytes()
+            victim = root / "preserved-readiness.json"
+            victim.write_bytes(preserved)
+            victim.chmod(0o600)
+            real_read = os.read
+            replaced = False
+
+            def replace_after_open(descriptor, size):
+                nonlocal replaced
+                if not replaced:
+                    replaced = True
+                    state.path.unlink()
+                    state.path.symlink_to(victim)
+                return real_read(descriptor, size)
+
+            with mock.patch.object(policy.os, "read", side_effect=replace_after_open), \
+                 self.assertRaises(policy.ReadinessStateError):
+                state.record_failure(policy.PRIMARY_MODELS[0], policy.Failure(
+                    "temporary", "new failure", retry_at=999999999999))
+            self.assertTrue(state.path.is_symlink())
+            self.assertEqual(victim.read_bytes(), preserved)
+
+    def test_readiness_state_identity_is_rechecked_before_atomic_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = policy.RuntimeState("fingerprint", "v1", root)
+            state.record_failure(policy.PRIMARY_MODELS[0], policy.Failure(
+                "quota", "fixture cooldown", retry_at=999999999999, scope="credential", provider="google"))
+            preserved = state.path.read_bytes()
+            victim = root / "preserved-readiness.json"
+            victim.write_bytes(preserved)
+            victim.chmod(0o600)
+            real_dump = json.dump
+            replaced = False
+
+            def replace_before_commit(document, output, **kwargs):
+                nonlocal replaced
+                real_dump(document, output, **kwargs)
+                if not replaced:
+                    replaced = True
+                    state.path.unlink()
+                    state.path.symlink_to(victim)
+
+            with mock.patch.object(policy.json, "dump", side_effect=replace_before_commit), \
+                 self.assertRaises(policy.ReadinessStateError):
+                state.record_failure(policy.PRIMARY_MODELS[0], policy.Failure(
+                    "temporary", "new failure", retry_at=999999999999))
+            self.assertTrue(state.path.is_symlink())
+            self.assertEqual(victim.read_bytes(), preserved)
+
     def test_healthy_sticky_one_call_per_decision(self):
         router = self.router()
         for _ in range(3):

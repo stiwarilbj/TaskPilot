@@ -40,6 +40,7 @@ READINESS_PRUNE_MAX_IDENTITIES = 128
 READINESS_PRUNE_MAX_HEALTH_RECORDS = 128
 READINESS_PRUNE_MAX_LEASE_SCAN = 64
 READINESS_PRUNE_MAX_DIRECTORY_ENTRIES = 256
+READINESS_STATE_MAX_BYTES = 8 * 1024 * 1024
 _READINESS_IDENTITY = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -487,6 +488,168 @@ def sync_state_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+class ReadinessStateError(RuntimeError):
+    """Fixed, payload-free failure for damaged or replaced private cache state."""
+
+    code = "local_resource_readiness_state"
+
+    def __init__(self) -> None:
+        super().__init__("TaskPilot local readiness state is invalid or unavailable.")
+
+
+def _readiness_file_signature(info: os.stat_result) -> tuple[int, ...]:
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite JSON number")
+    return parsed
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError("non-standard JSON constant")
+
+
+def _validate_readiness_shape(document: Any) -> dict[str, Any]:
+    """Reject malformed cache structure rather than normalizing away cooldowns."""
+    if not isinstance(document, dict):
+        raise ValueError("readiness root must be an object")
+    revision = document.get("revision")
+    if "revision" in document and (type(revision) is not int or revision < 0):
+        raise ValueError("invalid readiness revision")
+    configurations = document.get("configurations")
+    if "configurations" in document and not isinstance(configurations, dict):
+        raise ValueError("invalid configuration versions")
+
+    if "credentials" not in document:
+        # Legacy top-level state remains readable, but its structures must be
+        # intact before a migration can preserve them.
+        for field in ("health", "credential_health", "verified"):
+            value = document.get(field)
+            if field in document and not isinstance(value, dict):
+                raise ValueError("invalid legacy readiness structure")
+        return document
+    credentials = document["credentials"]
+    if not isinstance(credentials, dict):
+        raise ValueError("invalid credential namespaces")
+
+    def require_mapping(owner: dict[str, Any], field: str) -> dict[str, Any] | None:
+        value = owner.get(field)
+        if field in owner and not isinstance(value, dict):
+            raise ValueError("invalid readiness mapping")
+        return value
+
+    for bucket in credentials.values():
+        if not isinstance(bucket, dict):
+            raise ValueError("invalid credential record")
+        for field in ("health", "credential_health", "records", "managed_health"):
+            require_mapping(bucket, field)
+        for field in ("health", "credential_health"):
+            entries = bucket.get(field, {})
+            if isinstance(entries, dict) and any(not isinstance(item, dict) for item in entries.values()):
+                raise ValueError("invalid cooldown record")
+        managed = bucket.get("managed_health", {})
+        if isinstance(managed, dict):
+            for health in managed.values():
+                if not isinstance(health, dict) or any(not isinstance(item, dict) for item in health.values()):
+                    raise ValueError("invalid managed cooldown record")
+        records = bucket.get("records", {})
+        if isinstance(records, dict):
+            for record in records.values():
+                if not isinstance(record, dict):
+                    raise ValueError("invalid verification record")
+                for field in ("verified", "verification_clocks", "invalidations"):
+                    require_mapping(record, field)
+    return document
+
+
+def _read_readiness_state(path: Path) -> tuple[dict[str, Any], tuple[int, ...] | None]:
+    """Read one stable, bounded regular file without following a replacement symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        try:
+            os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            return {}, None
+        except OSError:
+            raise ReadinessStateError() from None
+        raise ReadinessStateError() from None
+    except OSError:
+        raise ReadinessStateError() from None
+
+    try:
+        before = os.fstat(descriptor)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or
+                before.st_nlink != 1 or before.st_size < 0 or
+                before.st_size > READINESS_STATE_MAX_BYTES):
+            raise ReadinessStateError()
+
+        chunks: list[bytes] = []
+        total = 0
+        while total <= READINESS_STATE_MAX_BYTES:
+            chunk = os.read(descriptor, min(64 * 1024, READINESS_STATE_MAX_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > READINESS_STATE_MAX_BYTES:
+            raise ReadinessStateError()
+
+        after = os.fstat(descriptor)
+        try:
+            named = os.stat(path, follow_symlinks=False)
+        except OSError:
+            raise ReadinessStateError() from None
+        signature = _readiness_file_signature(before)
+        if (_readiness_file_signature(after) != signature or
+                _readiness_file_signature(named) != signature or total != after.st_size or
+                not stat.S_ISREG(named.st_mode)):
+            raise ReadinessStateError()
+
+        try:
+            raw = b"".join(chunks).decode("utf-8")
+            document = json.loads(raw, object_pairs_hook=_unique_json_object,
+                                  parse_float=_finite_json_float, parse_constant=_reject_json_constant)
+            return _validate_readiness_shape(document), signature
+        except (UnicodeError, ValueError, TypeError, RecursionError, OverflowError):
+            raise ReadinessStateError() from None
+    except ReadinessStateError:
+        raise
+    except (OSError, ValueError, TypeError, OverflowError):
+        raise ReadinessStateError() from None
+    finally:
+        os.close(descriptor)
+
+
+def _verify_readiness_path(path: Path, expected: tuple[int, ...] | None) -> None:
+    """Ensure a transaction has not been redirected to a different state file."""
+    try:
+        named = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        if expected is None:
+            return
+        raise ReadinessStateError() from None
+    except OSError:
+        raise ReadinessStateError() from None
+    if (expected is None or not stat.S_ISREG(named.st_mode) or named.st_uid != os.getuid() or
+            named.st_nlink != 1 or _readiness_file_signature(named) != expected):
+        raise ReadinessStateError()
+
+
 def _check_lease_state(root: Path, identity: str) -> bool | None:
     """Return False only when no active lease is established; uncertainty retains state."""
     if not isinstance(identity, str) or not _READINESS_IDENTITY.fullmatch(identity):
@@ -903,11 +1066,7 @@ class RuntimeState:
     @contextmanager
     def transaction(self, *, write: bool = False):
         with private_lock(self.root / "runtime-readiness.lock"):
-            try:
-                document = json.loads(self.path.read_text())
-                if not isinstance(document, dict): document = {}
-            except (OSError, ValueError):
-                document = {}
+            document, state_identity = _read_readiness_state(self.path)
             # Migrate only the matching old verification identity. Old cooldowns
             # had no credential namespace and cannot safely transfer to a new key.
             if "credentials" not in document:
@@ -938,6 +1097,7 @@ class RuntimeState:
                         json.dump(document, output, allow_nan=False)
                         output.flush()
                         os.fsync(output.fileno())
+                    _verify_readiness_path(self.path, state_identity)
                     os.replace(name, self.path)
                     sync_state_directory(self.root)
                 finally:

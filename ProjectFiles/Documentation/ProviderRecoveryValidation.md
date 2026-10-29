@@ -48,6 +48,13 @@ identity, legacy timestamp-only entry, malformed stamp, or monotonic regression
 requires a fresh verification. Model and credential cooldown records are not
 modified by clock-cache validation.
 
+The shared readiness-state document is read through a no-follow descriptor,
+with regular-file and size checks, stable file identity checks, and duplicate
+JSON-key rejection. Malformed, truncated, oversized, or replaced state raises
+a fixed local-state error before any write transaction can replace it; the
+runtime never resets such a document to an empty cache, which could erase a
+quota cooldown. The document limit is 8 MiB.
+
 Regression coverage includes healthy execution, model-specific fallback,
 shared quota exhaustion, reported resets, cancelled/interrupted waits, cached
 shared limits, credential changes, upstream attempt exhaustion, anonymous
