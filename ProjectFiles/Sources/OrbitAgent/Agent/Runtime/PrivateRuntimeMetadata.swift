@@ -46,6 +46,13 @@ enum PrivateRuntimeMetadata {
     }
     static func document(_ url: URL, maximum: Int = recordBytes,
                          read: (Int32, Int) throws -> Data = readChunk) throws -> Document {
+        let data = try checkedData(url, maximum: maximum, read: read)
+        return Document(data: data, value: try parse(data))
+    }
+    /// Retains the same descriptor checks for callers with a configured codec
+    /// and separate parsing telemetry. They must validate JSON before decoding.
+    static func checkedData(_ url: URL, maximum: Int = recordBytes,
+                            read: (Int32, Int) throws -> Data = readChunk) throws -> Data {
         guard maximum > 0, maximum <= integrityBytes else { throw Failure.size }
         let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else {
@@ -74,7 +81,7 @@ enum PrivateRuntimeMetadata {
               Identity(before) == Identity(after), Identity(after) == Identity(named), data.count == after.st_size else {
             throw Failure.changed
         }
-        return Document(data: data, value: try parse(data))
+        return data
     }
     static func object(_ url: URL, maximum: Int = recordBytes) throws -> [String: Any] {
         guard let value = try document(url, maximum: maximum).value as? [String: Any] else { throw Failure.invalidJSON }

@@ -248,12 +248,16 @@ struct AgentTaskLedgerStore: Sendable {
     static let fileName = "task-ledger.json"
     static let directoryPermissions = 0o700
     static let filePermissions = 0o600
+    // Byte ceiling, not an entry-count limit. Saves must remain loadable.
+    static let maximumFileBytes = 64 * 1024 * 1024
 
     let fileURL: URL
 
-    // Copies of this Sendable store share the queue as well as its codecs.
-    // Configuration is fixed before publication; all coding uses this queue.
-    private let codingQueue = DispatchQueue(label: "com.orbitagent.task-ledger-json")
+    // Copies share one FIFO operation queue and its codecs. Queue admission
+    // orders submitted snapshots, including overlapping callers; a later save
+    // cannot replace an earlier one until its replacement and permissions finish.
+    private let operationQueue = DispatchQueue(label: "com.orbitagent.task-ledger-json")
+    private let replaceAndFinalize: @Sendable (Data, URL) throws -> Void
     private let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .millisecondsSince1970
@@ -265,8 +269,18 @@ struct AgentTaskLedgerStore: Sendable {
         return encoder
     }()
 
-    init(fileURL: URL? = nil) {
+    init(
+        fileURL: URL? = nil,
+        replaceAndFinalize: @escaping @Sendable (Data, URL) throws -> Void = { data, url in
+            try PrivateDurableFile.replace(data, at: url)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: AgentTaskLedgerStore.filePermissions],
+                ofItemAtPath: url.path
+            )
+        }
+    ) {
         self.fileURL = fileURL ?? Self.defaultFileURL()
+        self.replaceAndFinalize = replaceAndFinalize
     }
 
     static func defaultFileURL(
@@ -286,18 +300,23 @@ struct AgentTaskLedgerStore: Sendable {
         _ = TaskTemporaryResourceLedger.reclaimAbandoned(root: scratchRoot)
     }
 
-    func load() throws -> AgentTaskLedgerSnapshot {
-        try BackendTelemetry.current.measure(.persistenceRead) { span in
-            guard FileManager.default.fileExists(atPath: fileURL.path) else {
-                span.record(inputBytes: 0)
-                return AgentTaskLedgerSnapshot()
-            }
-            let data = try Data(contentsOf: fileURL)
-            span.record(inputBytes: data.count)
-            let telemetry = BackendTelemetry.current
-            return try codingQueue.sync {
-                try telemetry.measure(.jsonDecoding, inputBytes: data.count) { _ in
-                    try decoder.decode(AgentTaskLedgerSnapshot.self, from: data)
+    func load(
+        read: (Int32, Int) throws -> Data = PrivateRuntimeMetadata.readChunk
+    ) throws -> AgentTaskLedgerSnapshot {
+        let telemetry = BackendTelemetry.current
+        return try telemetry.measure(.persistenceRead) { span in
+            try operationQueue.sync {
+                let data: Data
+                do {
+                    data = try PrivateRuntimeMetadata.checkedData(fileURL, maximum: Self.maximumFileBytes, read: read)
+                } catch PrivateRuntimeMetadata.Failure.missing {
+                    span.record(inputBytes: 0)
+                    return AgentTaskLedgerSnapshot()
+                }
+                span.record(inputBytes: data.count)
+                return try telemetry.measure(.jsonDecoding, inputBytes: data.count) { _ in
+                    _ = try PrivateRuntimeMetadata.parse(data)
+                    return try decoder.decode(AgentTaskLedgerSnapshot.self, from: data)
                 }
             }
         }
@@ -308,22 +327,22 @@ struct AgentTaskLedgerStore: Sendable {
         history: [AgentTaskHistoryEntry],
         activeTask: AgentTaskAuthorization? = nil
     ) throws {
-        try BackendTelemetry.current.measure(.persistenceWrite, items: queue.count + history.count) { span in
-            let fileManager = FileManager.default
-            let directory = fileURL.deletingLastPathComponent()
-            try fileManager.createDirectory(
-                at: directory,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: Self.directoryPermissions]
-            )
-            try fileManager.setAttributes(
-                [.posixPermissions: Self.directoryPermissions],
-                ofItemAtPath: directory.path
-            )
+        let telemetry = BackendTelemetry.current
+        try telemetry.measure(.persistenceWrite, items: queue.count + history.count) { span in
+            try operationQueue.sync {
+                let fileManager = FileManager.default
+                let directory = fileURL.deletingLastPathComponent()
+                try fileManager.createDirectory(
+                    at: directory,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: Self.directoryPermissions]
+                )
+                try fileManager.setAttributes(
+                    [.posixPermissions: Self.directoryPermissions],
+                    ofItemAtPath: directory.path
+                )
 
-            let telemetry = BackendTelemetry.current
-            let data = try codingQueue.sync {
-                try telemetry.measure(.jsonEncoding) { encoding in
+                let data = try telemetry.measure(.jsonEncoding) { encoding in
                     for entry in history {
                         if let metrics = entry.requestMetrics {
                             try BackendTelemetry.DiagnosticSchema.validateRequestMetrics(metrics)
@@ -333,13 +352,10 @@ struct AgentTaskLedgerStore: Sendable {
                     encoding.record(outputBytes: data.count)
                     return data
                 }
+                guard data.count <= Self.maximumFileBytes else { throw PrivateRuntimeMetadata.Failure.size }
+                try replaceAndFinalize(data, fileURL)
+                span.record(outputBytes: data.count)
             }
-            try PrivateDurableFile.replace(data, at: fileURL)
-            try fileManager.setAttributes(
-                [.posixPermissions: Self.filePermissions],
-                ofItemAtPath: fileURL.path
-            )
-            span.record(outputBytes: data.count)
         }
     }
 }
@@ -367,40 +383,135 @@ struct AgentTaskHistoryYearGroup: Equatable, Identifiable {
 }
 
 enum AgentTaskHistoryGrouping {
+    struct WorkCounts: Equatable {
+        var sourceEntriesSorted = 0
+        var sourceSorts = 0
+        var dateComponentReads = 0
+        var dayBoundaryReads = 0
+        var groupedEntryAppends = 0
+        var dayEntryBucketArraysCreated = 0
+        var perDaySorts = 0
+        var perDaySortedEntries = 0
+    }
+
+    private final class DayBuilder {
+        let dayStart: Date
+        var entries: [AgentTaskHistoryEntry] = []
+        init(dayStart: Date) { self.dayStart = dayStart }
+    }
+
+    private final class MonthBuilder {
+        let month: Int
+        var dayBuilders: [Date: DayBuilder] = [:]
+        var days: [DayBuilder] = []
+        init(month: Int) { self.month = month }
+    }
+
+    private final class YearBuilder {
+        let year: Int
+        var monthBuilders: [Int: MonthBuilder] = [:]
+        var months: [MonthBuilder] = []
+        init(year: Int) { self.year = year }
+    }
+
     static func years(
         from entries: [AgentTaskHistoryEntry],
         calendar: Calendar = .current
     ) -> [AgentTaskHistoryYearGroup] {
-        let sorted = entries.sorted { $0.finishedAt > $1.finishedAt }
-        let yearBuckets = Dictionary(grouping: sorted) {
-            calendar.component(.year, from: $0.finishedAt)
+        var workCounts: WorkCounts?
+        return buildYears(from: entries, calendar: calendar, workCounts: &workCounts)
+    }
+
+    /// Operation counts support deterministic allocation/work comparisons in
+    /// offline tests. The normal history view passes no counter and stores none.
+    static func measuredYears(
+        from entries: [AgentTaskHistoryEntry],
+        calendar: Calendar = .current
+    ) -> (groups: [AgentTaskHistoryYearGroup], work: WorkCounts) {
+        var work: WorkCounts? = WorkCounts()
+        let groups = buildYears(from: entries, calendar: calendar, workCounts: &work)
+        return (groups, work ?? WorkCounts())
+    }
+
+    private static func buildYears(
+        from entries: [AgentTaskHistoryEntry],
+        calendar: Calendar,
+        workCounts: inout WorkCounts?
+    ) -> [AgentTaskHistoryYearGroup] {
+        let sorted = entries.enumerated().sorted { lhs, rhs in
+            if lhs.element.finishedAt == rhs.element.finishedAt { return lhs.offset < rhs.offset }
+            return lhs.element.finishedAt > rhs.element.finishedAt
+        }
+        workCounts?.sourceEntriesSorted = sorted.count
+        workCounts?.sourceSorts = sorted.isEmpty ? 0 : 1
+
+        var years: [YearBuilder] = []
+        var yearBuilders: [Int: YearBuilder] = [:]
+        for (_, entry) in sorted {
+            let finishedAt = entry.finishedAt
+            let components = calendar.dateComponents([.year, .month, .day], from: finishedAt)
+            guard let year = components.year, let month = components.month else { continue }
+            let dayStart = calendar.startOfDay(for: finishedAt)
+            workCounts?.dateComponentReads += 1
+            workCounts?.dayBoundaryReads += 1
+
+            let yearBuilder: YearBuilder
+            if let existing = yearBuilders[year] {
+                yearBuilder = existing
+            } else {
+                let inserted = YearBuilder(year: year)
+                let index = insertionIndex(in: years) { $0.year > year }
+                years.insert(inserted, at: index)
+                yearBuilders[year] = inserted
+                yearBuilder = inserted
+            }
+
+            let monthBuilder: MonthBuilder
+            if let existing = yearBuilder.monthBuilders[month] {
+                monthBuilder = existing
+            } else {
+                let inserted = MonthBuilder(month: month)
+                let index = insertionIndex(in: yearBuilder.months) { $0.month > month }
+                yearBuilder.months.insert(inserted, at: index)
+                yearBuilder.monthBuilders[month] = inserted
+                monthBuilder = inserted
+            }
+
+            let dayBuilder: DayBuilder
+            if let existing = monthBuilder.dayBuilders[dayStart] {
+                dayBuilder = existing
+            } else {
+                let inserted = DayBuilder(dayStart: dayStart)
+                let index = insertionIndex(in: monthBuilder.days) { $0.dayStart > dayStart }
+                monthBuilder.days.insert(inserted, at: index)
+                monthBuilder.dayBuilders[dayStart] = inserted
+                dayBuilder = inserted
+                workCounts?.dayEntryBucketArraysCreated += 1
+            }
+            dayBuilder.entries.append(entry)
+            workCounts?.groupedEntryAppends += 1
         }
 
-        return yearBuckets.keys.sorted(by: >).map { year in
-            let yearEntries = yearBuckets[year] ?? []
-            let monthBuckets = Dictionary(grouping: yearEntries) {
-                calendar.component(.month, from: $0.finishedAt)
-            }
-            let months = monthBuckets.keys.sorted(by: >).map { month in
-                let monthEntries = monthBuckets[month] ?? []
-                let dayBuckets = Dictionary(grouping: monthEntries) {
-                    calendar.startOfDay(for: $0.finishedAt)
-                }
-                let days = dayBuckets.keys.sorted(by: >).map { dayStart in
-                    AgentTaskHistoryDayGroup(
-                        dayStart: dayStart,
-                        entries: (dayBuckets[dayStart] ?? []).sorted {
-                            $0.finishedAt > $1.finishedAt
-                        }
-                    )
-                }
-                return AgentTaskHistoryMonthGroup(
-                    year: year,
-                    month: month,
-                    days: days
-                )
-            }
-            return AgentTaskHistoryYearGroup(year: year, months: months)
+        return years.map { year in
+            AgentTaskHistoryYearGroup(year: year.year, months: year.months.map { month in
+                AgentTaskHistoryMonthGroup(year: year.year, month: month.month,
+                    days: month.days.map { day in
+                    AgentTaskHistoryDayGroup(dayStart: day.dayStart, entries: day.entries)
+                })
+            })
         }
+    }
+
+    /// Finds where a new descending key belongs. Existing groups are reused
+    /// through their lookup dictionaries, so insertion is only done once per key.
+    private static func insertionIndex<Element>(in values: [Element], before: (Element) -> Bool) -> Int {
+        var lower = 0
+        var upper = values.count
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if before(values[middle]) { lower = middle + 1 }
+            else { upper = middle }
+        }
+        return lower
     }
 }
