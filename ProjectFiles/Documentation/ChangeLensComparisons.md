@@ -36,3 +36,16 @@ An optimized standalone Swift benchmark over five 1,000-line comparisons measure
 0.82 ms for a single middle-line replacement with a disjoint suffix. These are
 synthetic measurements, not timing requirements. That localized fixture reduces
 the matrix from 1,002,001 cells to four; unchanged text allocates no matrix.
+
+Correction-passage matching compares an existing source slice with the selected
+lines using `elementsEqual`, after checking both supplied adjacent anchors.
+It creates no per-position candidate arrays. Exact line equality, boundary
+handling, and rejection immediately after a second valid occurrence are
+unchanged. Offline comparison against `0e7168e` matched all 15,120 combinations
+of short repeated-line texts, passages, and anchors. A 125,013-byte fixture with
+1,000 repeated paragraphs measured 31.25 ms before versus 18.70 ms after across
+20 checks in an optimized standalone Swift build. The previous method created
+9,993 candidate arrays per check; the new method creates none, and only one
+anchor pair in that fixture reaches the passage comparison. Timing is descriptive,
+not a regression threshold. The focused suite also covers overlapping matches,
+Unicode, whitespace, CRLF, empty/invalid passages, and document boundaries.

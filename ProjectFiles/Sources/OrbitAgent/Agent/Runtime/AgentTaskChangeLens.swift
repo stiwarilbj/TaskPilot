@@ -65,7 +65,6 @@ struct AgentTaskChangeLensSnapshot: Equatable, Identifiable {
         var matches = 0
         if selected.count <= source.count {
             for start in 0...(source.count - selected.count) {
-                guard Array(source[start..<(start + selected.count)]) == selected else { continue }
                 if !beforeAnchor.isEmpty {
                     guard start > 0, source[start - 1] == beforeAnchor else { continue }
                 }
@@ -73,6 +72,7 @@ struct AgentTaskChangeLensSnapshot: Equatable, Identifiable {
                 if !afterAnchor.isEmpty {
                     guard afterIndex < source.count, source[afterIndex] == afterAnchor else { continue }
                 }
+                guard source[start..<afterIndex].elementsEqual(selected) else { continue }
                 matches += 1
                 if matches > 1 { return false }
             }

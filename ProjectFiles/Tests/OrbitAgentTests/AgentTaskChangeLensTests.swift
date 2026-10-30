@@ -130,6 +130,53 @@ final class AgentTaskChangeLensTests: XCTestCase {
         XCTAssertTrue(base.uniquelyIdentifies(passage: "other", beforeAnchor: "second", afterAnchor: "shared passage"))
     }
 
+    func testCorrectionPassageMatchingKeepsExactLinesAndAnchorBoundaries() {
+        let cases: [(source: String, passage: String, before: String, after: String, expected: Bool)] = [
+            ("first\nmiddle\nlast", "first", "", "middle", true),
+            ("first\nmiddle\nlast", "first", "missing", "middle", false),
+            ("first\nmiddle\nlast", "last", "middle", "", true),
+            ("first\nmiddle\nlast", "last", "middle", "missing", false),
+            ("first\nmiddle\nlast", "first\nmiddle\nlast", "", "", true),
+            ("first\nmiddle\nlast", "middle", "first", "wrong", false),
+            ("first\nalmost middle\nlast", "middle", "first", "last", false),
+            ("first\nmiddle \nlast", "middle", "first", "last", false),
+            ("first\nMiddle\nlast", "middle", "first", "last", false),
+            ("first\nmiddle\nlast", "", "", "", false),
+            ("first\nmiddle\nlast", "middle\0", "", "", false),
+            ("", "first\nsecond", "", "", false),
+            ("first\r\nmiddle\r\nlast", "middle", "first\r", "last", false),
+            ("first\r\nmiddle\r\nlast", "middle\r", "first\r", "last", true),
+            ("😀\ncafe\u{301}\n終", "café", "😀", "終", true),
+            ("first\n\nlast", "\n", "", "", false),
+        ]
+        for (index, item) in cases.enumerated() {
+            XCTAssertEqual(passageSnapshot(item.source).uniquelyIdentifies(passage: item.passage,
+                beforeAnchor: item.before, afterAnchor: item.after), item.expected, "Case \(index)")
+        }
+    }
+
+    func testOverlappingCorrectionPassagesStillRequireOneAnchoredOccurrence() {
+        let snapshot = passageSnapshot("a\na\na")
+        XCTAssertFalse(snapshot.uniquelyIdentifies(passage: "a\na", beforeAnchor: "", afterAnchor: ""))
+        XCTAssertTrue(snapshot.uniquelyIdentifies(passage: "a\na", beforeAnchor: "a", afterAnchor: ""))
+        XCTAssertTrue(snapshot.uniquelyIdentifies(passage: "a\na", beforeAnchor: "", afterAnchor: "a"))
+        XCTAssertFalse(snapshot.uniquelyIdentifies(passage: "a\na", beforeAnchor: "a", afterAnchor: "a"))
+    }
+
+    func testLongRepeatedParagraphsAreUniqueOnlyWithDistinguishingAnchors() {
+        let paragraph = ["before", "shared first", "shared second", "after"]
+        var lines = Array(repeating: paragraph, count: 1_000).flatMap { $0 }
+        lines[2_000] = "chosen before"
+        lines[2_003] = "chosen after"
+        let snapshot = passageSnapshot(lines.joined(separator: "\n"))
+        let passage = "shared first\nshared second"
+        XCTAssertFalse(snapshot.uniquelyIdentifies(passage: passage, beforeAnchor: "", afterAnchor: ""))
+        XCTAssertFalse(snapshot.uniquelyIdentifies(passage: passage, beforeAnchor: "before", afterAnchor: "after"))
+        XCTAssertTrue(snapshot.uniquelyIdentifies(passage: passage, beforeAnchor: "chosen before", afterAnchor: "chosen after"))
+        XCTAssertFalse(snapshot.uniquelyIdentifies(passage: passage, beforeAnchor: "chosen before", afterAnchor: "after"))
+        XCTAssertFalse(snapshot.uniquelyIdentifies(passage: passage, beforeAnchor: "missing", afterAnchor: "after"))
+    }
+
     func testLineEndingNormalizationAndEmptyTextAreHandled() throws {
         guard case .hunks(let hunks) = AgentTaskChangeLensDiff.build(
             before: "one\r\nold\r\nthree\r\n", after: "one\nnew\nthree\n") else {
@@ -143,5 +190,12 @@ final class AgentTaskChangeLensTests: XCTestCase {
 
     private func sha256(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func passageSnapshot(_ text: String) -> AgentTaskChangeLensSnapshot {
+        .init(generationID: "task", instructionRevision: 0, actionID: "a", path: "/tmp/a.txt",
+              fileIdentity: digest, fileVersion: digest, parentIdentity: digest,
+              beforeVersion: digest, beforeText: "", afterText: text, requirementIDs: [],
+              created: false, chainReset: false)
     }
 }
